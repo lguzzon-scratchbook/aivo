@@ -47,6 +47,8 @@ pub struct LaunchOptions {
     pub debug: bool,
     pub model: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    /// Temporary key override for this launch (does not persist to config)
+    pub key_override: Option<ApiKey>,
 }
 
 /// Tool configuration including command and environment variables
@@ -74,17 +76,20 @@ impl AILauncher {
 
     /// Spawns an AI tool with configured environment and stdio passthrough
     pub async fn launch(&self, options: &LaunchOptions) -> Result<i32> {
-        let key = match self.session_store.get_active_key().await? {
-            Some(k) => k,
-            None => {
-                return Err(CLIError::new(
-                    "No API key configured. Please add a key with 'aivo keys add'.",
-                    ErrorCategory::Auth,
-                    None::<String>,
-                    Some("Run 'aivo keys add' to add an API key"),
-                )
-                .into());
-            }
+        let key = match &options.key_override {
+            Some(k) => k.clone(),
+            None => match self.session_store.get_active_key().await? {
+                Some(k) => k,
+                None => {
+                    return Err(CLIError::new(
+                        "No API key configured. Please add a key with 'aivo keys add'.",
+                        ErrorCategory::Auth,
+                        None::<String>,
+                        Some("Run 'aivo keys add' to add an API key"),
+                    )
+                    .into());
+                }
+            },
         };
 
         self.output_key_info(&key);

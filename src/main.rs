@@ -85,26 +85,23 @@ async fn main() {
         }
 
         Commands::Chat(chat_args) => {
-            // Handle --key flag: resolve and set active key
-            if let Some(ref key_id_or_name) = chat_args.key {
+            // Handle --key flag: resolve key for temporary use (not persisted)
+            let key_override = if let Some(ref key_id_or_name) = chat_args.key {
                 match session_store
                     .resolve_key_by_id_or_name(key_id_or_name)
                     .await
                 {
-                    Ok(key) => {
-                        if let Err(e) = session_store.set_active_key(&key.id).await {
-                            eprintln!("{} {}", style::red("Error:"), e);
-                            process::exit(ExitCode::UserError.code());
-                        }
-                    }
+                    Ok(key) => Some(key),
                     Err(e) => {
                         eprintln!("{} {}", style::red("Error:"), e);
                         process::exit(ExitCode::UserError.code());
                     }
                 }
-            }
+            } else {
+                None
+            };
             let command = ChatCommand::new(session_store);
-            command.execute(chat_args.model).await
+            command.execute(chat_args.model, key_override).await
         }
 
         Commands::Run(run_args) => {
@@ -168,24 +165,21 @@ async fn main() {
                 i += 1;
             }
 
-            // Handle --key flag: resolve and set active key
-            if let Some(ref key_id_or_name) = key_flag {
+            // Handle --key flag: resolve key for temporary use (not persisted)
+            let key_override = if let Some(ref key_id_or_name) = key_flag {
                 match session_store
                     .resolve_key_by_id_or_name(key_id_or_name)
                     .await
                 {
-                    Ok(key) => {
-                        if let Err(e) = session_store.set_active_key(&key.id).await {
-                            eprintln!("{} {}", style::red("Error:"), e);
-                            process::exit(ExitCode::UserError.code());
-                        }
-                    }
+                    Ok(key) => Some(key),
                     Err(e) => {
                         eprintln!("{} {}", style::red("Error:"), e);
                         process::exit(ExitCode::UserError.code());
                     }
                 }
-            }
+            } else {
+                None
+            };
 
             let env = if !env_strings.is_empty() {
                 let mut map = std::collections::HashMap::new();
@@ -206,7 +200,7 @@ async fn main() {
             };
 
             command
-                .execute(run_args.tool.as_deref(), remaining_args, debug, model, env)
+                .execute(run_args.tool.as_deref(), remaining_args, debug, model, env, key_override)
                 .await
         }
 

@@ -72,8 +72,8 @@ impl ChatCommand {
         Ok(DEFAULT_MODEL.to_string())
     }
 
-    pub async fn execute(&self, model: Option<String>) -> ExitCode {
-        match self.execute_internal(model).await {
+    pub async fn execute(&self, model: Option<String>, key_override: Option<ApiKey>) -> ExitCode {
+        match self.execute_internal(model, key_override).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -82,16 +82,19 @@ impl ChatCommand {
         }
     }
 
-    async fn execute_internal(&self, model_flag: Option<String>) -> Result<ExitCode> {
-        let key = match self.session_store.get_active_key().await? {
+    async fn execute_internal(&self, model_flag: Option<String>, key_override: Option<ApiKey>) -> Result<ExitCode> {
+        let key = match key_override {
             Some(k) => k,
-            None => {
-                eprintln!(
-                    "{} No API key configured. Run 'aivo keys add' first.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::AuthError);
-            }
+            None => match self.session_store.get_active_key().await? {
+                Some(k) => k,
+                None => {
+                    eprintln!(
+                        "{} No API key configured. Run 'aivo keys add' first.",
+                        style::red("Error:")
+                    );
+                    return Ok(ExitCode::AuthError);
+                }
+            },
         };
 
         let model = self.resolve_model(model_flag).await?;

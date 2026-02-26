@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
+use crate::services::session_store::ApiKey;
 use crate::style;
 
 /// RunCommand provides a unified interface to launch AI tools
@@ -25,8 +26,9 @@ impl RunCommand {
         debug: bool,
         model: Option<String>,
         env: Option<HashMap<String, String>>,
+        key_override: Option<ApiKey>,
     ) -> ExitCode {
-        match self.execute_internal(tool, args, debug, model, env).await {
+        match self.execute_internal(tool, args, debug, model, env, key_override).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -42,6 +44,7 @@ impl RunCommand {
         debug: bool,
         model: Option<String>,
         env: Option<HashMap<String, String>>,
+        key_override: Option<ApiKey>,
     ) -> anyhow::Result<ExitCode> {
         let tool = match tool {
             Some(t) => t,
@@ -83,6 +86,7 @@ impl RunCommand {
             debug,
             model,
             env,
+            key_override,
         };
 
         let exit_code = self.ai_launcher.launch(&options).await?;
