@@ -23,9 +23,13 @@ use services::{AILauncher, EnvironmentInjector, SessionStore};
 async fn main() {
     let args = Cli::parse();
 
+    // Initialize services early so we can show active key in help
+    let session_store = SessionStore::new();
+
     // Handle help and version flags at the top level
     if args.help {
         print_help();
+        print_active_key(&session_store).await;
         process::exit(0);
     }
 
@@ -39,12 +43,10 @@ async fn main() {
         Some(cmd) => cmd,
         None => {
             print_help();
+            print_active_key(&session_store).await;
             process::exit(0);
         }
     };
-
-    // Initialize services
-    let session_store = SessionStore::new();
 
     // Route to command handler
     let exit_code = match command {
@@ -86,7 +88,10 @@ async fn main() {
                     }
                 } else if arg == "--debug" {
                     debug = true;
-                } else if let Some(value) = arg.strip_prefix("--env=").or_else(|| arg.strip_prefix("-e=")) {
+                } else if let Some(value) = arg
+                    .strip_prefix("--env=")
+                    .or_else(|| arg.strip_prefix("-e="))
+                {
                     if !value.is_empty() {
                         env_strings.push(value.to_string());
                     }
@@ -118,13 +123,7 @@ async fn main() {
             };
 
             command
-                .execute(
-                    run_args.tool.as_deref(),
-                    remaining_args,
-                    debug,
-                    model,
-                    env,
-                )
+                .execute(run_args.tool.as_deref(), remaining_args, debug, model, env)
                 .await
         }
 
@@ -144,6 +143,39 @@ async fn main() {
     process::exit(exit_code.code());
 }
 
+/// Prints the active key info in the same format as `aivo keys`.
+async fn print_active_key(session_store: &SessionStore) {
+    let keys = session_store.get_keys().await.unwrap_or_default();
+    let active_key = session_store.get_active_key().await.ok().flatten();
+
+    println!("  {}", style::bold("Active key:"));
+    if keys.is_empty() {
+        println!(
+            "    {} {}",
+            style::dim("No keys found. Add one with"),
+            style::bold("aivo keys add")
+        );
+    } else {
+        for key in &keys {
+            let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
+            let indicator = if is_active {
+                style::bullet_symbol()
+            } else {
+                style::empty_bullet_symbol()
+            };
+            let id_padded = format!("{:<4}", key.id);
+            println!(
+                "    {} {}  {}  {}",
+                indicator,
+                style::cyan(&id_padded),
+                key.name,
+                style::dim(&key.base_url)
+            );
+        }
+    }
+    println!();
+}
+
 /// Prints help information
 fn print_help() {
     println!();
@@ -152,10 +184,7 @@ fn print_help() {
         style::cyan("aivo"),
         style::dim(format!("v{}", version::VERSION))
     );
-    println!(
-        "  {}",
-        style::dim("CLI for AI coding assistants")
-    );
+    println!("  {}", style::dim("CLI for AI coding assistants"));
     println!();
     println!("  {} aivo [options] [command]", style::bold("Usage:"));
     println!();
@@ -177,14 +206,8 @@ fn print_help() {
     );
     println!();
     println!("  {}", style::bold("Options:"));
-    println!(
-        "    {}  Display help information",
-        style::dim("-h, --help    ")
-    );
-    println!(
-        "    {}  Display the current version",
-        style::dim("-v, --version ")
-    );
+    println!("    {}  Display help information", style::dim("-h, --help    "));
+    println!("    {}  Display the current version", style::dim("-v, --version "));
     println!();
 }
 
