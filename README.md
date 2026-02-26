@@ -5,6 +5,7 @@ CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini) with
 ## Features
 
 - **Unified interface** for multiple AI coding assistants (Claude, Codex, Gemini)
+- **Interactive chat** - built-in REPL with streaming responses via OpenAI-compatible API
 - **API key management** - add, activate, and remove keys
 - **Secure storage** - API keys encrypted with AES-256-GCM
 - **Direct passthrough** of all tool arguments and flags
@@ -17,26 +18,6 @@ curl -fsSL https://raw.githubusercontent.com/yuanchuan/aivo/main/scripts/install
 ```
 
 Or download a binary manually from [GitHub Releases](https://github.com/yuanchuan/aivo/releases).
-
-## Prerequisites
-
-The AI tools you want to use must be installed separately:
-
-### macOS (Homebrew)
-
-```bash
-brew install claude              # Claude Code
-brew install openai/codex        # Codex
-brew tap google-gemini/gemini-cli && brew install gemini-cli  # Gemini CLI
-```
-
-### All Platforms (npm)
-
-```bash
-npm install -g @anthropic-ai/claude-code  # Claude Code
-npm install -g @openai/codex              # Codex
-npm install -g @google/gemini-cli         # Gemini CLI
-```
 
 ## Quick Start
 
@@ -58,6 +39,7 @@ aivo v1.0.0 — CLI for AI coding assistants
 
   Commands:
     run <claude|codex|gemini>  Launch AI tool with local API keys
+    chat [--model]             Start an interactive chat REPL
     keys [action]              Manage API keys (list, use, rm, add, cat)
     update                     Update to the latest version
 
@@ -100,6 +82,18 @@ aivo codex --model o4-mini file.ts
 aivo claude --debug
 ```
 
+### Chat REPL
+
+Start an interactive chat session with streaming responses:
+
+```bash
+aivo chat                        # Start with default model (gpt-4o)
+aivo chat --model claude-sonnet-4-5  # Use a specific model (saved for next session)
+aivo chat -m gpt-4o              # Short flag
+```
+
+Uses the active API key's base URL with the OpenAI-compatible `/v1/chat/completions` endpoint. Model choice is remembered across sessions.
+
 ### Manage API Keys
 
 ```bash
@@ -139,9 +133,29 @@ Keys are stored in `~/.config/aivo/config.json` with restricted file permissions
 
 ```bash
 cargo build --release    # Build release binary
-cargo test               # Run all tests (~53 tests)
+cargo test               # Run all tests
 cargo clippy             # Lint
 cargo check              # Quick type check
+```
+
+## Prerequisites
+
+The AI tools you want to use must be installed separately:
+
+### macOS (Homebrew)
+
+```bash
+brew install claude              # Claude Code
+brew install openai/codex        # Codex
+brew tap google-gemini/gemini-cli && brew install gemini-cli  # Gemini CLI
+```
+
+### All Platforms (npm)
+
+```bash
+npm install -g @anthropic-ai/claude-code  # Claude Code
+npm install -g @openai/codex              # Codex
+npm install -g @google/gemini-cli         # Gemini CLI
 ```
 
 ## License

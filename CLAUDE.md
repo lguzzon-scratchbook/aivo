@@ -71,6 +71,7 @@ Each command receives injected services. Commands return exit codes for testing.
   - `rm <id|name>` - Remove an API key
   - `cat <id|name>` - Display full key details
 - **run** - Launch AI tools with unified interface
+- **chat** - Interactive REPL with streaming responses via OpenAI-compatible `/v1/chat/completions` endpoint
 - **update** - Self-update with download progress display, cross-platform binary download from GitHub Releases
 
 ### Error Handling (`src/errors.rs`)
@@ -86,7 +87,7 @@ Single `ApiKey` struct with fields: `id`, `name`, `base_url`, `key`, `created_at
 - Unit tests in `#[cfg(test)]` modules within source files
 - Integration tests in `tests/` directory
 - Command handlers return exit codes for verification
-- **Test Coverage:** ~53 tests covering encryption, services, and command logic
+- **Test Coverage:** ~116 tests covering encryption, services, and command logic
 
 ## Build & Deployment
 
@@ -107,6 +108,7 @@ aivo/
 │   ├── errors.rs                    # Centralized error handling & exit codes
 │   ├── commands/
 │   │   ├── mod.rs
+│   │   ├── chat.rs                  # Interactive chat REPL
 │   │   ├── keys.rs                  # API key management
 │   │   ├── run.rs                   # Unified AI tool launcher
 │   │   └── update.rs               # Self-update via GitHub Releases
