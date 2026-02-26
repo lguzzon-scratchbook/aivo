@@ -39,8 +39,21 @@ async fn main() {
 
     // Handle help and version flags at the top level
     if args.help {
-        print_help();
-        print_active_key(&session_store).await;
+        match &args.command {
+            Some(Commands::Run(_)) => {
+                RunCommand::print_help();
+            }
+            Some(Commands::Keys(_)) => {
+                KeysCommand::print_help();
+            }
+            Some(Commands::Update) => {
+                UpdateCommand::print_help();
+            }
+            None => {
+                print_help();
+                print_active_key(&session_store).await;
+            }
+        }
         process::exit(0);
     }
 

@@ -54,7 +54,7 @@ impl KeysCommand {
             "cat" => self.cat_key(args.and_then(|a| a.first().copied())).await,
             _ => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
-                self.show_usage();
+                Self::print_help();
                 Ok(ExitCode::UserError)
             }
         }
@@ -418,7 +418,7 @@ impl KeysCommand {
     }
 
     /// Shows usage information
-    fn show_usage(&self) {
+    pub fn print_help() {
         println!();
         println!("{}", style::bold("Usage: aivo keys [action]"));
         println!();

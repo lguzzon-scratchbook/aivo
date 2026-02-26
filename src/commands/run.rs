@@ -46,14 +46,14 @@ impl RunCommand {
         let tool = match tool {
             Some(t) => t,
             None => {
-                self.show_usage();
+                Self::print_help();
                 return Ok(ExitCode::UserError);
             }
         };
 
         // Handle help flags
         if tool == "--help" || tool == "-h" {
-            self.show_usage();
+            Self::print_help();
             return Ok(ExitCode::Success);
         }
 
@@ -93,7 +93,7 @@ impl RunCommand {
     }
 
     /// Shows usage information
-    fn show_usage(&self) {
+    pub fn print_help() {
         println!("{} aivo run <tool> [args...]", style::bold("Usage:"));
         println!();
         println!(

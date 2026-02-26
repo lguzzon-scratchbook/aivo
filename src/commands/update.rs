@@ -38,6 +38,20 @@ struct GitHubRelease {
 }
 
 impl UpdateCommand {
+    /// Shows usage information for the update command
+    pub fn print_help() {
+        println!("{} aivo update", style::bold("Usage:"));
+        println!();
+        println!(
+            "{}",
+            style::dim("Update the CLI tool to the latest version from GitHub Releases.")
+        );
+        println!(
+            "{}",
+            style::dim("Downloads and verifies the binary with SHA-256 checksum.")
+        );
+    }
+
     /// Creates a new UpdateCommand instance
     pub fn new() -> Result<Self> {
         let client = Client::builder()
