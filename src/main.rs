@@ -168,18 +168,17 @@ async fn main() {
 }
 
 /// Prints the active key info in the same format as `aivo keys`.
+/// Only prints if there are keys configured.
 async fn print_active_key(session_store: &SessionStore) {
     let keys = session_store.get_keys().await.unwrap_or_default();
+    if keys.is_empty() {
+        return;
+    }
+
     let active_key = session_store.get_active_key().await.ok().flatten();
 
     println!("  {}", style::bold("Active key:"));
-    if keys.is_empty() {
-        println!(
-            "    {} {}",
-            style::dim("No keys found. Add one with"),
-            style::bold("aivo keys add")
-        );
-    } else {
+    {
         for key in &keys {
             let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
             let indicator = if is_active {
