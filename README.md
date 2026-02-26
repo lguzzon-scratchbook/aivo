@@ -12,11 +12,11 @@ CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini) with
 
 ## Installation
 
-Download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/releases), or build from source:
-
 ```bash
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/yuanchuan/aivo/main/scripts/install.sh | sh
 ```
+
+Or download a binary manually from [GitHub Releases](https://github.com/yuanchuan/aivo/releases).
 
 ## Prerequisites
 
