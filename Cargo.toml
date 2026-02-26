@@ -7,6 +7,9 @@ description = "CLI tool for unified access to AI coding assistants (Claude, Code
 license = "MIT"
 repository = "https://github.com/yuanchuan/aivo"
 
+[lib]
+doctest = false
+
 [dependencies]
 # CLI
 clap = { version = "4.5", features = ["derive"] }
