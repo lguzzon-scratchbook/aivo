@@ -60,9 +60,9 @@ impl SecretKey {
 }
 
 // Use much lower iterations in tests for speed (PBKDF2 is still secure with lower iterations for testing)
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fast-crypto"))]
 const ITERATIONS: u32 = 100;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-fast-crypto")))]
 const ITERATIONS: u32 = 100_000;
 
 /// API key stored on user's machine

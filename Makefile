@@ -15,10 +15,10 @@ build: ## Build release binary
 	cargo build --release
 
 test: ## Run all tests
-	cargo test
+	cargo test --features test-fast-crypto
 
 test-release: ## Run tests on release build
-	cargo test --release
+	cargo test --release --features test-fast-crypto
 
 check: ## Quick type check
 	cargo check
