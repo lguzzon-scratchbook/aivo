@@ -51,17 +51,34 @@ aivo run claude
 
 ## Usage
 
+```
+aivo v1.0.0 — CLI for AI coding assistants
+
+  Usage: aivo <command> [options]
+
+  Commands:
+    run <claude|codex|gemini>  Launch AI tool with local API keys
+    keys [action]              Manage API keys (list, use, rm, add, cat)
+    update                     Update to the latest version
+
+  Shortcuts: aivo claude, aivo codex, aivo gemini
+
+  Options:
+    -h, --help      Display help information
+    -v, --version   Display the current version
+```
+
 ### Run AI Tools
 
 Run any supported AI tool with automatic API key injection:
 
 ```bash
-# Quick aliases
+# Quick shortcuts
 aivo claude
 aivo codex
 aivo gemini
 
-# Or use the full form
+# Or use the run command
 aivo run claude
 aivo run codex
 aivo run gemini
