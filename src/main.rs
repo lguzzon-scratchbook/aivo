@@ -18,10 +18,21 @@ use commands::{KeysCommand, RunCommand, UpdateCommand};
 use errors::ExitCode;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
+/// Known AI tool names that can be used as shortcut aliases for `run`.
+const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini"];
+
 /// Main entry point for the CLI
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args = Cli::parse();
+    // Rewrite `aivo <tool> ...` to `aivo run <tool> ...` for known tool aliases
+    let raw_args: Vec<String> = std::env::args().collect();
+    let args = if raw_args.len() > 1 && TOOL_ALIASES.contains(&raw_args[1].as_str()) {
+        let mut rewritten = vec![raw_args[0].clone(), "run".to_string()];
+        rewritten.extend_from_slice(&raw_args[1..]);
+        Cli::parse_from(rewritten)
+    } else {
+        Cli::parse()
+    };
 
     // Initialize services early so we can show active key in help
     let session_store = SessionStore::new();
@@ -203,6 +214,23 @@ fn print_help() {
         "    {}  {}",
         style::cyan("update "),
         style::dim("Update the CLI tool to the latest version")
+    );
+    println!();
+    println!("  {}", style::bold("Aliases:"));
+    println!(
+        "    {}  {}",
+        style::cyan("claude "),
+        style::dim("Shortcut for 'aivo run claude'")
+    );
+    println!(
+        "    {}  {}",
+        style::cyan("codex  "),
+        style::dim("Shortcut for 'aivo run codex'")
+    );
+    println!(
+        "    {}  {}",
+        style::cyan("gemini "),
+        style::dim("Shortcut for 'aivo run gemini'")
     );
     println!();
     println!("  {}", style::bold("Options:"));

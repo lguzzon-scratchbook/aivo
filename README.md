@@ -44,11 +44,44 @@ npm install -g @google/gemini-cli         # Gemini CLI
 # Add an API key
 aivo keys add
 
-# Run an AI tool
+# Run an AI tool (these are equivalent)
+aivo claude
 aivo run claude
 ```
 
 ## Usage
+
+### Run AI Tools
+
+Run any supported AI tool with automatic API key injection:
+
+```bash
+# Quick aliases
+aivo claude
+aivo codex
+aivo gemini
+
+# Or use the full form
+aivo run claude
+aivo run codex
+aivo run gemini
+```
+
+All arguments are passed through directly to the underlying tool:
+
+```bash
+# Specify a model
+aivo claude --model claude-sonnet-4-5-20251001
+
+# Inject environment variables
+aivo claude --env DEBUG=true --env CUSTOM_VAR=value
+
+# Pass tool-specific options
+aivo codex --model o4-mini file.ts
+
+# Enable debug output (shows injected env vars)
+aivo claude --debug
+```
 
 ### Manage API Keys
 
@@ -58,37 +91,6 @@ aivo keys add                # Add a new API key (interactive)
 aivo keys use <id|name>      # Activate a specific key
 aivo keys cat <id|name>      # Display full key details
 aivo keys rm <id|name>       # Remove an API key
-```
-
-### Run AI Tools
-
-Run any supported AI tool with automatic API key injection:
-
-```bash
-# Run Claude
-aivo run claude
-
-# Run Codex
-aivo run codex
-
-# Run Gemini
-aivo run gemini
-```
-
-All arguments are passed through directly to the underlying tool:
-
-```bash
-# Specify a model
-aivo run claude --model claude-sonnet-4-5-20251001
-
-# Inject environment variables
-aivo run claude --env DEBUG=true --env CUSTOM_VAR=value
-
-# Pass tool-specific options
-aivo run codex --model o4-mini file.ts
-
-# Enable debug output (shows injected env vars)
-aivo run claude --debug
 ```
 
 ### Other Commands

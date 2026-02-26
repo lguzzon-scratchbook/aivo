@@ -291,4 +291,60 @@ mod tests {
             panic!("Expected Run command");
         }
     }
+
+    /// Helper to simulate the alias rewriting done in main.rs
+    fn rewrite_alias(args: &[&str]) -> Vec<String> {
+        let aliases = ["claude", "codex", "gemini"];
+        let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
+            let mut rewritten = vec![raw[0].clone(), "run".to_string()];
+            rewritten.extend_from_slice(&raw[1..]);
+            rewritten
+        } else {
+            raw
+        }
+    }
+
+    #[test]
+    fn test_tool_alias_claude() {
+        let args = rewrite_alias(&["aivo", "claude"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.tool, Some("claude".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_tool_alias_codex_with_args() {
+        let args = rewrite_alias(&["aivo", "codex", "--model", "o4-mini", "file.ts"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.tool, Some("codex".to_string()));
+            assert_eq!(run_args.model, Some("o4-mini".to_string()));
+            assert!(run_args.args.contains(&"file.ts".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_tool_alias_gemini_with_debug() {
+        let args = rewrite_alias(&["aivo", "gemini", "--debug"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.tool, Some("gemini".to_string()));
+            assert!(run_args.debug);
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_non_alias_not_rewritten() {
+        let args = rewrite_alias(&["aivo", "keys"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Keys(_))));
+    }
 }
