@@ -20,10 +20,7 @@ fn test_for_claude() {
         env.get("ANTHROPIC_BASE_URL").unwrap(),
         "http://localhost:8080"
     );
-    assert_eq!(
-        env.get("ANTHROPIC_API_KEY").unwrap(),
-        "sk-test-key-12345"
-    );
+    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "sk-test-key-12345");
     assert_eq!(
         env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap(),
         "1"
@@ -50,14 +47,8 @@ fn test_for_codex() {
     let key = test_key();
     let env = injector.for_codex(&key, None);
 
-    assert_eq!(
-        env.get("OPENAI_BASE_URL").unwrap(),
-        "http://localhost:8080"
-    );
-    assert_eq!(
-        env.get("OPENAI_API_KEY").unwrap(),
-        "sk-test-key-12345"
-    );
+    assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "http://localhost:8080");
+    assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "sk-test-key-12345");
 }
 
 #[test]
@@ -70,10 +61,7 @@ fn test_for_gemini() {
         env.get("GOOGLE_GEMINI_BASE_URL").unwrap(),
         "http://localhost:8080"
     );
-    assert_eq!(
-        env.get("GEMINI_API_KEY").unwrap(),
-        "sk-test-key-12345"
-    );
+    assert_eq!(env.get("GEMINI_API_KEY").unwrap(), "sk-test-key-12345");
 }
 
 #[test]

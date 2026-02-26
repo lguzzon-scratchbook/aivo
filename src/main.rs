@@ -206,8 +206,14 @@ fn print_help() {
     );
     println!();
     println!("  {}", style::bold("Options:"));
-    println!("    {}  Display help information", style::dim("-h, --help    "));
-    println!("    {}  Display the current version", style::dim("-v, --version "));
+    println!(
+        "    {}  Display help information",
+        style::dim("-h, --help    ")
+    );
+    println!(
+        "    {}  Display the current version",
+        style::dim("-v, --version ")
+    );
     println!();
 }
 

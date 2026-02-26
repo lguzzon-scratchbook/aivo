@@ -17,6 +17,9 @@ cargo build --release --target <target>  # Cross-compile for specific platform
 cargo test             # Run all tests (~53 tests)
 cargo test --release   # Run tests on release build
 
+# Format
+cargo fmt              # Format code (always run before committing)
+
 # Check
 cargo clippy           # Lint with clippy
 cargo check            # Quick type check

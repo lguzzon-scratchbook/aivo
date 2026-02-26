@@ -175,8 +175,7 @@ mod tests {
         }
 
         // --model=value
-        let cli =
-            Cli::try_parse_from(["aivo", "run", "claude", "--model=gpt-5"]).unwrap();
+        let cli = Cli::try_parse_from(["aivo", "run", "claude", "--model=gpt-5"]).unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.model, Some("gpt-5".to_string()));
         } else {
@@ -208,7 +207,13 @@ mod tests {
     fn test_run_args_passthrough() {
         // Arguments not matching aivo flags should be passed through
         let cli = Cli::try_parse_from([
-            "aivo", "run", "claude", "--debug", "--", "--some-tool-flag", "value",
+            "aivo",
+            "run",
+            "claude",
+            "--debug",
+            "--",
+            "--some-tool-flag",
+            "value",
         ])
         .unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
@@ -254,7 +259,9 @@ mod tests {
             assert!(run_args.args.contains(&"senior-engineer".to_string()));
             assert!(run_args.args.contains(&"--team-name".to_string()));
             assert!(run_args.args.contains(&"ai-gateway-team".to_string()));
-            assert!(run_args.args.contains(&"--dangerously-skip-permissions".to_string()));
+            assert!(run_args
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()));
         } else {
             panic!("Expected Run command");
         }
@@ -277,7 +284,9 @@ mod tests {
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.model, Some("claude-opus-4-6".to_string()));
             assert!(run_args.args.contains(&"--agent-name".to_string()));
-            assert!(run_args.args.contains(&"--dangerously-skip-permissions".to_string()));
+            assert!(run_args
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()));
         } else {
             panic!("Expected Run command");
         }

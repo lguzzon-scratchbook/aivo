@@ -124,7 +124,12 @@ mod tests {
 
     #[test]
     fn test_cli_error_creation() {
-        let err = CLIError::new("test error", ErrorCategory::User, None::<String>, None::<String>);
+        let err = CLIError::new(
+            "test error",
+            ErrorCategory::User,
+            None::<String>,
+            None::<String>,
+        );
         assert_eq!(err.to_string(), "test error");
     }
 }

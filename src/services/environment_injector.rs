@@ -21,11 +21,7 @@ impl EnvironmentInjector {
     /// Sets ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY from the key.
     /// Disables nonessential traffic.
     /// When model is provided, sets ANTHROPIC_MODEL and related env vars for Claude Code routing.
-    pub fn for_claude(
-        &self,
-        key: &ApiKey,
-        model: Option<&str>,
-    ) -> HashMap<String, String> {
+    pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
         env.insert("ANTHROPIC_BASE_URL".to_string(), key.base_url.clone());
         env.insert("ANTHROPIC_API_KEY".to_string(), key.key.to_string());
@@ -37,9 +33,18 @@ impl EnvironmentInjector {
         if let Some(model) = model {
             env.insert("ANTHROPIC_MODEL".to_string(), model.to_string());
             env.insert("ANTHROPIC_SMALL_FAST_MODEL".to_string(), model.to_string());
-            env.insert("ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(), model.to_string());
-            env.insert("ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(), model.to_string());
-            env.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(), model.to_string());
+            env.insert(
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+                model.to_string(),
+            );
+            env.insert(
+                "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+                model.to_string(),
+            );
+            env.insert(
+                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+                model.to_string(),
+            );
             env.insert("ANTHROPIC_REASONING_MODEL".to_string(), model.to_string());
         }
 
@@ -49,11 +54,7 @@ impl EnvironmentInjector {
     /// Prepares environment variables for Codex CLI
     ///
     /// Sets OPENAI_BASE_URL and OPENAI_API_KEY from the key.
-    pub fn for_codex(
-        &self,
-        key: &ApiKey,
-        model: Option<&str>,
-    ) -> HashMap<String, String> {
+    pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
         env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
         env.insert("OPENAI_API_KEY".to_string(), key.key.to_string());
@@ -70,10 +71,7 @@ impl EnvironmentInjector {
     /// Prepares environment variables for Gemini CLI
     ///
     /// Sets GOOGLE_GEMINI_BASE_URL and GEMINI_API_KEY from the key.
-    pub fn for_gemini(
-        &self,
-        key: &ApiKey,
-    ) -> HashMap<String, String> {
+    pub fn for_gemini(&self, key: &ApiKey) -> HashMap<String, String> {
         let mut env = HashMap::new();
         env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), key.base_url.clone());
         env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());

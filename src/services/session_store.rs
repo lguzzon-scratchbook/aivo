@@ -254,8 +254,8 @@ impl SessionStore {
             .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
 
         let encrypted = self.encrypt_keys(config)?;
-        let data = serde_json::to_string_pretty(&encrypted)
-            .context("Failed to serialize config")?;
+        let data =
+            serde_json::to_string_pretty(&encrypted).context("Failed to serialize config")?;
 
         #[cfg(unix)]
         {
@@ -301,8 +301,7 @@ impl SessionStore {
     pub async fn add_key(&self, name: &str, base_url: &str, key: &str) -> Result<String> {
         let mut config = self.load().await?;
 
-        let existing_ids: HashSet<String> =
-            config.api_keys.iter().map(|k| k.id.clone()).collect();
+        let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
         let id = loop {
             let id = format!("{:04x}", rand::random::<u16>());
             if !existing_ids.contains(&id) {

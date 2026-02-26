@@ -65,10 +65,7 @@ pub struct AILauncher {
 
 impl AILauncher {
     /// Creates a new AILauncher
-    pub fn new(
-        session_store: SessionStore,
-        env_injector: EnvironmentInjector,
-    ) -> Self {
+    pub fn new(session_store: SessionStore, env_injector: EnvironmentInjector) -> Self {
         Self {
             session_store,
             env_injector,
@@ -92,19 +89,17 @@ impl AILauncher {
 
         self.output_key_info(&key);
 
-        let tool_config =
-            self.get_tool_config(options.tool, &key, options.model.as_deref());
+        let tool_config = self.get_tool_config(options.tool, &key, options.model.as_deref());
 
-        let env = self
-            .env_injector
-            .merge(&tool_config.env_vars, options.env.as_ref(), options.debug);
+        let env =
+            self.env_injector
+                .merge(&tool_config.env_vars, options.env.as_ref(), options.debug);
 
         // For Claude, inject --teammate-mode in-process to run in single window
         let args = inject_claude_teammate_mode(options.tool, &options.args);
 
         // Spawn the process with inherited stdio
-        self.spawn_process(&tool_config.command, &args, env)
-            .await
+        self.spawn_process(&tool_config.command, &args, env).await
     }
 
     /// Outputs information about which key is being used
@@ -121,12 +116,7 @@ impl AILauncher {
     }
 
     /// Gets tool-specific configuration including command and environment variables
-    fn get_tool_config(
-        &self,
-        tool: AIToolType,
-        key: &ApiKey,
-        model: Option<&str>,
-    ) -> ToolConfig {
+    fn get_tool_config(&self, tool: AIToolType, key: &ApiKey, model: Option<&str>) -> ToolConfig {
         let env_vars = match tool {
             AIToolType::Claude => self.env_injector.for_claude(key, model),
             AIToolType::Codex => self.env_injector.for_codex(key, model),
@@ -222,7 +212,9 @@ fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String>
     }
 
     // Check if the user already specified --teammate-mode
-    let has_teammate_mode = args.iter().any(|a| a == "--teammate-mode" || a.starts_with("--teammate-mode="));
+    let has_teammate_mode = args
+        .iter()
+        .any(|a| a == "--teammate-mode" || a.starts_with("--teammate-mode="));
     if has_teammate_mode {
         return args.to_vec();
     }
@@ -231,7 +223,6 @@ fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String>
     new_args.extend_from_slice(args);
     new_args
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -279,10 +270,7 @@ mod tests {
         assert_eq!(result, vec!["--teammate-mode", "split", "prompt"]);
 
         // User specified --teammate-mode=value format
-        let args = vec![
-            "--teammate-mode=split".to_string(),
-            "prompt".to_string(),
-        ];
+        let args = vec!["--teammate-mode=split".to_string(), "prompt".to_string()];
         let result = inject_claude_teammate_mode(AIToolType::Claude, &args);
         assert_eq!(result, vec!["--teammate-mode=split", "prompt"]);
     }

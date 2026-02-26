@@ -49,18 +49,9 @@ impl KeysCommand {
         match action {
             "add" => self.add_key().await,
             "list" => self.list_keys().await,
-            "rm" => {
-                self.remove_key(args.and_then(|a| a.first().copied()))
-                    .await
-            }
-            "use" => {
-                self.use_key(args.and_then(|a| a.first().copied()))
-                    .await
-            }
-            "cat" => {
-                self.cat_key(args.and_then(|a| a.first().copied()))
-                    .await
-            }
+            "rm" => self.remove_key(args.and_then(|a| a.first().copied())).await,
+            "use" => self.use_key(args.and_then(|a| a.first().copied())).await,
+            "cat" => self.cat_key(args.and_then(|a| a.first().copied())).await,
             _ => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
                 self.show_usage();
@@ -91,10 +82,7 @@ impl KeysCommand {
 
         println!("  {}", style::dim("Keys:"));
         for key in &keys {
-            let is_active = active_key
-                .as_ref()
-                .map(|k| k.id == key.id)
-                .unwrap_or(false);
+            let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
             let active_indicator = if is_active {
                 style::bullet_symbol()
             } else {
@@ -187,14 +175,7 @@ impl KeysCommand {
 
         let choices: Vec<_> = name_matches
             .iter()
-            .map(|k| {
-                format!(
-                    "{} - {} - {}",
-                    k.id,
-                    k.base_url,
-                    key_preview(&k.key)
-                )
-            })
+            .map(|k| format!("{} - {} - {}", k.id, k.base_url, key_preview(&k.key)))
             .collect();
 
         let selection = Select::new()
@@ -316,10 +297,7 @@ impl KeysCommand {
 
         println!();
 
-        let id = self
-            .session_store
-            .add_key(&name, &base_url, &key)
-            .await?;
+        let id = self.session_store.add_key(&name, &base_url, &key).await?;
         self.session_store.set_active_key(&id).await?;
 
         println!(
@@ -364,10 +342,7 @@ impl KeysCommand {
             key.clone()
         } else {
             // Try name match
-            let name_matches: Vec<_> = keys
-                .iter()
-                .filter(|k| k.name == key_id_or_name)
-                .collect();
+            let name_matches: Vec<_> = keys.iter().filter(|k| k.name == key_id_or_name).collect();
 
             if name_matches.is_empty() {
                 eprintln!(
@@ -460,10 +435,7 @@ impl KeysCommand {
             "  cat <id|name>   {}",
             style::dim("- Display details for a key")
         );
-        println!(
-            "  rm <id|name>    {}",
-            style::dim("- Remove an API key")
-        );
+        println!("  rm <id|name>    {}", style::dim("- Remove an API key"));
         println!("  add             {}", style::dim("- Add an API key"));
     }
 }
