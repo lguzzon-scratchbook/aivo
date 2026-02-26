@@ -97,7 +97,11 @@ pub struct StoredConfig {
     pub api_keys: Vec<ApiKey>,
     #[serde(rename = "active_key_id")]
     pub active_key_id: Option<String>,
-    #[serde(rename = "chat_model", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "chat_model",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub chat_model: Option<String>,
 }
 
@@ -370,6 +374,42 @@ impl SessionStore {
         self.save(&config).await
     }
 
+    /// Resolves an API key by ID or name.
+    /// Tries exact ID match first, then name match.
+    /// Returns an error if no match found or multiple names match.
+    pub async fn resolve_key_by_id_or_name(&self, id_or_name: &str) -> Result<ApiKey> {
+        let keys = self.get_keys().await?;
+
+        // Try exact ID match first
+        if let Some(key) = keys.iter().find(|k| k.id == id_or_name) {
+            return Ok(key.clone());
+        }
+
+        // Try name match
+        let name_matches: Vec<_> = keys.iter().filter(|k| k.name == id_or_name).collect();
+
+        match name_matches.len() {
+            0 => Err(CLIError::new(
+                format!("API key \"{}\" not found", id_or_name),
+                ErrorCategory::User,
+                None::<String>,
+                Some("Run 'aivo keys list' to see available keys"),
+            )
+            .into()),
+            1 => Ok(name_matches[0].clone()),
+            _ => Err(CLIError::new(
+                format!(
+                    "Multiple keys found with name \"{}\". Use the key ID instead.",
+                    id_or_name
+                ),
+                ErrorCategory::User,
+                None::<String>,
+                Some("Run 'aivo keys list' to see key IDs"),
+            )
+            .into()),
+        }
+    }
+
     /// Gets the currently active API key
     pub async fn get_active_key(&self) -> Result<Option<ApiKey>> {
         let config = self.load().await?;
@@ -516,5 +556,70 @@ mod tests {
         // Active key should be cleared
         let active = store.get_active_key().await.unwrap();
         assert!(active.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_key_by_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key("my-key", "http://localhost:8080", "sk-test")
+            .await
+            .unwrap();
+
+        let resolved = store.resolve_key_by_id_or_name(&id).await.unwrap();
+        assert_eq!(resolved.id, id);
+        assert_eq!(resolved.name, "my-key");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_key_by_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key("my-key", "http://localhost:8080", "sk-test")
+            .await
+            .unwrap();
+
+        let resolved = store.resolve_key_by_id_or_name("my-key").await.unwrap();
+        assert_eq!(resolved.id, id);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_key_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let result = store.resolve_key_by_id_or_name("nonexistent").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_key_ambiguous_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        store
+            .add_key("same-name", "http://localhost:8080", "sk-test1")
+            .await
+            .unwrap();
+        store
+            .add_key("same-name", "http://localhost:9090", "sk-test2")
+            .await
+            .unwrap();
+
+        let result = store.resolve_key_by_id_or_name("same-name").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple keys found"));
     }
 }

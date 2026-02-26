@@ -85,6 +85,24 @@ async fn main() {
         }
 
         Commands::Chat(chat_args) => {
+            // Handle --key flag: resolve and set active key
+            if let Some(ref key_id_or_name) = chat_args.key {
+                match session_store
+                    .resolve_key_by_id_or_name(key_id_or_name)
+                    .await
+                {
+                    Ok(key) => {
+                        if let Err(e) = session_store.set_active_key(&key.id).await {
+                            eprintln!("{} {}", style::red("Error:"), e);
+                            process::exit(ExitCode::UserError.code());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        process::exit(ExitCode::UserError.code());
+                    }
+                }
+            }
             let command = ChatCommand::new(session_store);
             command.execute(chat_args.model).await
         }
@@ -98,6 +116,7 @@ async fn main() {
             // may have swallowed (e.g. `aivo run claude --agent-name foo --model opus`
             // puts --model into args instead of parsing it as an aivo flag).
             let mut model = run_args.model;
+            let mut key_flag = run_args.key;
             let mut debug = run_args.debug;
             let mut env_strings = run_args.envs;
             let mut remaining_args = Vec::new();
@@ -118,6 +137,19 @@ async fn main() {
                     } else {
                         remaining_args.push(arg.clone());
                     }
+                } else if let Some(value) = arg.strip_prefix("--key=") {
+                    if !value.is_empty() && key_flag.is_none() {
+                        key_flag = Some(value.to_string());
+                    } else {
+                        remaining_args.push(arg.clone());
+                    }
+                } else if (arg == "--key" || arg == "-k") && key_flag.is_none() {
+                    if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                        key_flag = Some(args[i + 1].clone());
+                        i += 1;
+                    } else {
+                        remaining_args.push(arg.clone());
+                    }
                 } else if arg == "--debug" {
                     debug = true;
                 } else if let Some(value) = arg
@@ -134,6 +166,25 @@ async fn main() {
                     remaining_args.push(arg.clone());
                 }
                 i += 1;
+            }
+
+            // Handle --key flag: resolve and set active key
+            if let Some(ref key_id_or_name) = key_flag {
+                match session_store
+                    .resolve_key_by_id_or_name(key_id_or_name)
+                    .await
+                {
+                    Ok(key) => {
+                        if let Err(e) = session_store.set_active_key(&key.id).await {
+                            eprintln!("{} {}", style::red("Error:"), e);
+                            process::exit(ExitCode::UserError.code());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        process::exit(ExitCode::UserError.code());
+                    }
+                }
             }
 
             let env = if !env_strings.is_empty() {
@@ -236,14 +287,12 @@ fn print_help() {
     println!();
     println!("{}", style::bold("Options:"));
     println!(
-        "  {}   {}",
-        style::dim("-h, --help   "),
-        "Display help information"
+        "  {}   Display help information",
+        style::dim("-h, --help   ")
     );
     println!(
-        "  {}   {}",
-        style::dim("-v, --version"),
-        "Display the current version"
+        "  {}   Display the current version",
+        style::dim("-v, --version")
     );
 }
 

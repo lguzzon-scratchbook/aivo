@@ -113,6 +113,11 @@ impl RunCommand {
         );
         println!(
             "  {}  {}",
+            style::cyan("-k, --key <id|name>"),
+            style::dim("Select API key by ID or name")
+        );
+        println!(
+            "  {}  {}",
             style::cyan("--env <k=v>"),
             style::dim("Inject environment variable")
         );

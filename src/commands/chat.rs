@@ -102,10 +102,7 @@ impl ChatCommand {
             style::cyan(&model),
             style::dim(format!("({})", key.base_url))
         );
-        eprintln!(
-            "{}",
-            style::dim("Type 'exit' to end. Ctrl+D also works.")
-        );
+        eprintln!("{}", style::dim("Type 'exit' to end. Ctrl+D also works."));
 
         let client = Client::new();
         let mut history: Vec<ChatMessage> = Vec::new();
@@ -157,13 +154,10 @@ impl ChatCommand {
             });
 
             // Stream response (retry once on transient errors)
-            let result =
-                match send_chat_request(&client, &key, &model, &history, &spinning).await {
-                    Ok(content) => Ok(content),
-                    Err(_) => {
-                        send_chat_request(&client, &key, &model, &history, &spinning).await
-                    }
-                };
+            let result = match send_chat_request(&client, &key, &model, &history, &spinning).await {
+                Ok(content) => Ok(content),
+                Err(_) => send_chat_request(&client, &key, &model, &history, &spinning).await,
+            };
 
             stop_spinner(&spinning);
             let _ = spinner_handle.await;
@@ -204,6 +198,11 @@ impl ChatCommand {
             "  {}  {}",
             style::cyan("-m, --model <model>"),
             style::dim("Specify AI model (saved for next session)")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("-k, --key <id|name>"),
+            style::dim("Select API key by ID or name")
         );
         println!();
         println!("{}", style::bold("Examples:"));

@@ -70,6 +70,10 @@ pub struct RunArgs {
     #[arg(short, long, value_name = "MODEL")]
     pub model: Option<String>,
 
+    /// Select API key by ID or name
+    #[arg(short = 'k', long, value_name = "ID|NAME")]
+    pub key: Option<String>,
+
     /// Enable debug output
     #[arg(long)]
     pub debug: bool,
@@ -94,6 +98,10 @@ pub struct ChatArgs {
     /// Specify AI model to use (remembered across sessions)
     #[arg(short, long, value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Select API key by ID or name
+    #[arg(short = 'k', long, value_name = "ID|NAME")]
+    pub key: Option<String>,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE
@@ -384,6 +392,67 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "chat", "-m", "claude-sonnet-4-5"]).unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
             assert_eq!(chat_args.model, Some("claude-sonnet-4-5".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_run_args_key_flag() {
+        let cli = Cli::try_parse_from(["aivo", "run", "claude", "--key", "my-key"]).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.key, Some("my-key".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_run_args_key_short_flag() {
+        let cli = Cli::try_parse_from(["aivo", "run", "claude", "-k", "a1b2"]).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.key, Some("a1b2".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_run_args_key_equals_syntax() {
+        let cli = Cli::try_parse_from(["aivo", "run", "claude", "--key=my-key"]).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.key, Some("my-key".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_key_flag() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "--key", "my-key"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.key, Some("my-key".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_key_short_flag() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-k", "a1b2"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.key, Some("a1b2".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_key_with_model() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.key, Some("my-key".to_string()));
+            assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
         } else {
             panic!("Expected Chat command");
         }

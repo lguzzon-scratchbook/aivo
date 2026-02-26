@@ -72,6 +72,10 @@ All arguments are passed through directly to the underlying tool:
 # Specify a model
 aivo claude --model claude-sonnet-4-5-20251001
 
+# Select a specific API key by ID or name
+aivo claude --key my-proxy
+aivo claude -k a1b2
+
 # Inject environment variables
 aivo claude --env DEBUG=true --env CUSTOM_VAR=value
 
@@ -90,6 +94,8 @@ Start an interactive chat session with streaming responses:
 aivo chat                        # Start with default model (gpt-4o)
 aivo chat --model claude-sonnet-4-5  # Use a specific model (saved for next session)
 aivo chat -m gpt-4o              # Short flag
+aivo chat --key my-proxy         # Use a specific API key
+aivo chat -k a1b2 -m gpt-4o     # Combine key and model
 ```
 
 Uses the active API key's base URL with the OpenAI-compatible `/v1/chat/completions` endpoint. Model choice is remembered across sessions.
