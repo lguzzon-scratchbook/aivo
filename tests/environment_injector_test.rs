@@ -20,12 +20,15 @@ fn test_for_claude() {
         env.get("ANTHROPIC_BASE_URL").unwrap(),
         "http://localhost:8080"
     );
-    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "sk-test-key-12345");
+    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "");
+    assert_eq!(
+        env.get("ANTHROPIC_AUTH_TOKEN").unwrap(),
+        "sk-test-key-12345"
+    );
     assert_eq!(
         env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap(),
         "1"
     );
-    assert!(env.get("ANTHROPIC_AUTH_TOKEN").is_none());
 }
 
 #[test]

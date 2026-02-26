@@ -24,7 +24,8 @@ impl EnvironmentInjector {
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
         env.insert("ANTHROPIC_BASE_URL".to_string(), key.base_url.clone());
-        env.insert("ANTHROPIC_API_KEY".to_string(), key.key.to_string());
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
         env.insert(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
             "1".to_string(),
@@ -174,14 +175,16 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_API_KEY"),
+            Some(&String::new())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN"),
             Some(&"sk-test-key-12345".to_string())
         );
         assert_eq!(
             env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
             Some(&"1".to_string())
         );
-        // No ANTHROPIC_AUTH_TOKEN
-        assert!(env.get("ANTHROPIC_AUTH_TOKEN").is_none());
     }
 
     #[test]
