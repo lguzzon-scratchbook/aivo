@@ -112,7 +112,6 @@ impl AILauncher {
             style::cyan(&key.name),
             style::dim(format!("({})", key.base_url))
         );
-        eprintln!();
     }
 
     /// Gets tool-specific configuration including command and environment variables

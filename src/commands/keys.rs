@@ -66,21 +66,17 @@ impl KeysCommand {
         let active_key = self.session_store.get_active_key().await?;
 
         if keys.is_empty() {
-            println!();
-            println!("  {}", style::dim("No API keys found."));
+            println!("{}", style::dim("No API keys found."));
             println!();
             println!(
-                "  {} {}",
+                "{} {}",
                 style::yellow("Add a key:"),
                 style::bold("aivo keys add")
             );
-            println!();
             return Ok(ExitCode::Success);
         }
 
-        println!();
-
-        println!("  {}", style::dim("Keys:"));
+        println!("{}", style::dim("Keys:"));
         for key in &keys {
             let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
             let active_indicator = if is_active {
@@ -90,7 +86,7 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<4}", key.id);
             println!(
-                "    {} {}  {}  {}",
+                "  {} {}  {}  {}",
                 active_indicator,
                 style::cyan(&id_padded),
                 key.name,
@@ -99,24 +95,23 @@ impl KeysCommand {
         }
         println!();
 
-        println!("  {}", style::yellow("Commands:"));
+        println!("{}", style::yellow("Commands:"));
         println!(
-            "    aivo keys use <id|name>    {}",
+            "  aivo keys use <id|name>    {}",
             style::dim("- Activate a specific key by ID or name")
         );
         println!(
-            "    aivo keys cat <id|name>    {}",
+            "  aivo keys cat <id|name>    {}",
             style::dim("- Display details for a key")
         );
         println!(
-            "    aivo keys rm <id|name>     {}",
+            "  aivo keys rm <id|name>     {}",
             style::dim("- Remove an API key")
         );
         println!(
-            "    aivo keys add              {}",
+            "  aivo keys add              {}",
             style::dim("- Add an API key")
         );
-        println!();
 
         Ok(ExitCode::Success)
     }
@@ -251,9 +246,9 @@ impl KeysCommand {
     /// Displays key details
     fn display_key_details(&self, key: &ApiKey) {
         println!();
-        println!("  Name:     {}", style::cyan(&key.name));
-        println!("  Base URL: {}", style::blue(&key.base_url));
-        println!("  API Key:  {}", style::yellow(&*key.key));
+        println!("Name:     {}", style::cyan(&key.name));
+        println!("Base URL: {}", style::blue(&key.base_url));
+        println!("API Key:  {}", style::yellow(&*key.key));
         println!();
     }
 
@@ -419,7 +414,6 @@ impl KeysCommand {
 
     /// Shows usage information
     pub fn print_help() {
-        println!();
         println!("{}", style::bold("Usage: aivo keys [action]"));
         println!();
         println!("{}", style::bold("Actions:"));

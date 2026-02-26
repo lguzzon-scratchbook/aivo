@@ -342,14 +342,12 @@ impl UpdateCommand {
 
     /// Handles errors
     fn handle_error(&self, error: anyhow::Error) {
-        eprintln!();
         eprintln!("{} {}", style::red("Error:"), error);
         eprintln!();
         eprintln!(
             "{} Check your internet connection and try again.",
             style::yellow("Suggestion:")
         );
-        eprintln!();
     }
 }
 

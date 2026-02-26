@@ -177,7 +177,7 @@ async fn print_active_key(session_store: &SessionStore) {
 
     let active_key = session_store.get_active_key().await.ok().flatten();
 
-    println!("  {}", style::bold("Active key:"));
+    println!("{}", style::bold("Active key:"));
     {
         for key in &keys {
             let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
@@ -188,7 +188,7 @@ async fn print_active_key(session_store: &SessionStore) {
             };
             let id_padded = format!("{:<4}", key.id);
             println!(
-                "    {} {}  {}  {}",
+                "  {} {}  {}  {}",
                 indicator,
                 style::cyan(&id_padded),
                 key.name,
@@ -196,56 +196,53 @@ async fn print_active_key(session_store: &SessionStore) {
             );
         }
     }
-    println!();
 }
 
 /// Prints help information
 fn print_help() {
-    println!();
     println!(
-        "  {} {} {}",
+        "{} {} {}",
         style::cyan("aivo"),
         style::dim(format!("v{}", version::VERSION)),
         style::dim("— CLI for AI coding assistants")
     );
     println!();
-    println!("  {} aivo <command> [options]", style::bold("Usage:"));
+    println!("{} aivo <command> [options]", style::bold("Usage:"));
     println!();
-    println!("  {}", style::bold("Commands:"));
+    println!("{}", style::bold("Commands:"));
     println!(
-        "    {}  {}",
+        "  {}  {}",
         style::cyan("run <claude|codex|gemini>"),
         style::dim("Launch AI tool with local API keys")
     );
     println!(
-        "    {}              {}",
+        "  {}              {}",
         style::cyan("keys [action]"),
         style::dim("Manage API keys (list, use, rm, add, cat)")
     );
     println!(
-        "    {}                     {}",
+        "  {}                     {}",
         style::cyan("update"),
         style::dim("Update to the latest version")
     );
     println!();
     println!(
-        "  {} {}",
+        "{} {}",
         style::bold("Shortcuts:"),
         style::dim("aivo claude, aivo codex, aivo gemini")
     );
     println!();
-    println!("  {}", style::bold("Options:"));
+    println!("{}", style::bold("Options:"));
     println!(
-        "    {}   {}",
+        "  {}   {}",
         style::dim("-h, --help   "),
         "Display help information"
     );
     println!(
-        "    {}   {}",
+        "  {}   {}",
         style::dim("-v, --version"),
         "Display the current version"
     );
-    println!();
 }
 
 /// Prints version information
