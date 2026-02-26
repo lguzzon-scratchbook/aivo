@@ -37,6 +37,9 @@ pub enum Commands {
     /// Manage API keys (list, use <id|name>, rm <id|name>, add)
     Keys(KeysArgs),
 
+    /// Start an interactive chat REPL
+    Chat(ChatArgs),
+
     /// Update the CLI tool to the latest version
     Update,
 }
@@ -85,6 +88,14 @@ pub struct RunArgs {
     pub args: Vec<String>,
 }
 
+/// Arguments for the chat command
+#[derive(Args, Debug, Clone)]
+pub struct ChatArgs {
+    /// Specify AI model to use (remembered across sessions)
+    #[arg(short, long, value_name = "MODEL")]
+    pub model: Option<String>,
+}
+
 /// Parse environment variable strings in the format KEY=VALUE
 #[allow(dead_code)]
 pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
@@ -102,7 +113,7 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
 /// Get the list of valid commands
 #[allow(dead_code)]
 pub fn get_valid_commands() -> Vec<&'static str> {
-    vec!["update", "keys", "run"]
+    vec!["update", "keys", "run", "chat"]
 }
 
 /// Check if a command is a passthrough command (passes all args to underlying tool)
@@ -346,5 +357,35 @@ mod tests {
         let args = rewrite_alias(&["aivo", "keys"]);
         let cli = Cli::try_parse_from(&args).unwrap();
         assert!(matches!(cli.command, Some(Commands::Keys(_))));
+    }
+
+    #[test]
+    fn test_chat_command_no_model() {
+        let cli = Cli::try_parse_from(["aivo", "chat"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.model, None);
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_command_with_model() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "--model", "gpt-4o"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_command_with_short_model() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-m", "claude-sonnet-4-5"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.model, Some("claude-sonnet-4-5".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
     }
 }

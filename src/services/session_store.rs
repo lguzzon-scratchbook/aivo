@@ -97,6 +97,8 @@ pub struct StoredConfig {
     pub api_keys: Vec<ApiKey>,
     #[serde(rename = "active_key_id")]
     pub active_key_id: Option<String>,
+    #[serde(rename = "chat_model", default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
 }
 
 impl Default for StoredConfig {
@@ -110,6 +112,7 @@ impl StoredConfig {
         Self {
             api_keys: Vec::new(),
             active_key_id: None,
+            chat_model: None,
         }
     }
 }
@@ -381,6 +384,19 @@ impl SessionStore {
     #[allow(dead_code)]
     pub fn get_config_path(&self) -> &PathBuf {
         &self.config_path
+    }
+
+    /// Gets the persisted chat model
+    pub async fn get_chat_model(&self) -> Result<Option<String>> {
+        let config = self.load().await?;
+        Ok(config.chat_model)
+    }
+
+    /// Saves the chat model to config
+    pub async fn set_chat_model(&self, model: &str) -> Result<()> {
+        let mut config = self.load().await?;
+        config.chat_model = Some(model.to_string());
+        self.save(&config).await
     }
 
     /// Encrypts API keys before saving

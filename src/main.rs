@@ -14,7 +14,7 @@ mod style;
 mod version;
 
 use cli::{Cli, Commands};
-use commands::{KeysCommand, RunCommand, UpdateCommand};
+use commands::{ChatCommand, KeysCommand, RunCommand, UpdateCommand};
 use errors::ExitCode;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
@@ -45,6 +45,9 @@ async fn main() {
             }
             Some(Commands::Keys(_)) => {
                 KeysCommand::print_help();
+            }
+            Some(Commands::Chat(_)) => {
+                ChatCommand::print_help();
             }
             Some(Commands::Update) => {
                 UpdateCommand::print_help();
@@ -79,6 +82,11 @@ async fn main() {
             let action = keys_args.action.as_deref();
             let args: Vec<_> = keys_args.args.iter().map(|s| s.as_str()).collect();
             command.execute(action, Some(&args)).await
+        }
+
+        Commands::Chat(chat_args) => {
+            let command = ChatCommand::new(session_store);
+            command.execute(chat_args.model).await
         }
 
         Commands::Run(run_args) => {
@@ -167,35 +175,24 @@ async fn main() {
     process::exit(exit_code.code());
 }
 
-/// Prints the active key info in the same format as `aivo keys`.
-/// Only prints if there are keys configured.
+/// Prints the active key info.
+/// Only prints if there is an active key configured.
 async fn print_active_key(session_store: &SessionStore) {
-    let keys = session_store.get_keys().await.unwrap_or_default();
-    if keys.is_empty() {
-        return;
-    }
+    let active_key = match session_store.get_active_key().await.ok().flatten() {
+        Some(key) => key,
+        None => return,
+    };
 
-    let active_key = session_store.get_active_key().await.ok().flatten();
-
+    println!();
     println!("{}", style::bold("Active key:"));
-    {
-        for key in &keys {
-            let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
-            let indicator = if is_active {
-                style::bullet_symbol()
-            } else {
-                style::empty_bullet_symbol()
-            };
-            let id_padded = format!("{:<4}", key.id);
-            println!(
-                "  {} {}  {}  {}",
-                indicator,
-                style::cyan(&id_padded),
-                key.name,
-                style::dim(&key.base_url)
-            );
-        }
-    }
+    let id_padded = format!("{:<4}", active_key.id);
+    println!(
+        "  {} {}  {}  {}",
+        style::bullet_symbol(),
+        style::cyan(&id_padded),
+        active_key.name,
+        style::dim(&active_key.base_url)
+    );
 }
 
 /// Prints help information
@@ -214,6 +211,11 @@ fn print_help() {
         "  {}  {}",
         style::cyan("run <claude|codex|gemini>"),
         style::dim("Launch AI tool with local API keys")
+    );
+    println!(
+        "  {}             {}",
+        style::cyan("chat [--model]"),
+        style::dim("Start an interactive chat REPL")
     );
     println!(
         "  {}              {}",
