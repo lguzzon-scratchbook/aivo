@@ -130,6 +130,15 @@ fn parse_content_length(headers: &str) -> Option<usize> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// Extracts the HTTP request body (everything after the blank line separator).
+/// Returns an error for malformed requests that are missing `\r\n\r\n`.
+fn extract_request_body(request: &str) -> Result<&str> {
+    let pos = request
+        .find("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP request: missing header separator"))?;
+    Ok(request[pos + 4..].trim_end_matches('\0').trim())
+}
+
 fn extract_request_path(request: &str) -> String {
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -148,8 +157,7 @@ async fn handle_api_request(
     request: &str,
     config: &Arc<CodexRouterConfig>,
 ) -> Result<String> {
-    let body_start = request.find("\r\n\r\n").unwrap_or(0) + 4;
-    let body_str = request[body_start..].trim_end_matches('\0').trim();
+    let body_str = extract_request_body(request)?;
     let body: Value = serde_json::from_str(body_str)?;
 
     if is_responses_api_format(&body) {
@@ -257,8 +265,7 @@ async fn forward_request(
     request: &str,
     config: &Arc<CodexRouterConfig>,
 ) -> Result<String> {
-    let body_start = request.find("\r\n\r\n").unwrap_or(0) + 4;
-    let body_str = request[body_start..].trim_end_matches('\0').trim();
+    let body_str = extract_request_body(request)?;
 
     let target_url = build_target_url(&config.target_base_url, path);
 
@@ -427,7 +434,7 @@ pub fn convert_responses_to_chat_request(body: &Value, base_url: &str) -> Value 
             tools
                 .iter()
                 .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"))
-                .map(|t| convert_tool_to_chat_format(t))
+                .map(convert_tool_to_chat_format)
                 .collect()
         })
         .unwrap_or_default();
@@ -805,6 +812,25 @@ fn http_error(status: u16, message: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── HTTP body extraction ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_request_body_normal() {
+        let req = "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"model\":\"gpt-4\"}";
+        assert_eq!(extract_request_body(req).unwrap(), "{\"model\":\"gpt-4\"}");
+    }
+
+    #[test]
+    fn test_extract_request_body_missing_separator_returns_error() {
+        let req = "POST /v1/chat/completions HTTP/1.1";
+        assert!(extract_request_body(req).is_err());
+    }
+
+    #[test]
+    fn test_extract_request_body_short_request_no_panic() {
+        assert!(extract_request_body("AB").is_err());
+    }
 
     // ── Tool filtering ─────────────────────────────────────────────────────────
 

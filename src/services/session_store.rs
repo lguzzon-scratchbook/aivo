@@ -298,7 +298,11 @@ impl SessionStore {
 
         let parsed: StoredConfig = match serde_json::from_str(&data) {
             Ok(p) => p,
-            Err(_) => return Ok(StoredConfig::new()),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "config file is corrupted and cannot be read: {e}"
+                ))
+            }
         };
 
         self.decrypt_keys(&parsed)
@@ -455,9 +459,9 @@ impl SessionStore {
         let mut decrypted = config.clone();
         for key in &mut decrypted.api_keys {
             if is_encrypted(&key.key) {
-                if let Ok(d) = decrypt(&key.key) {
-                    key.key = Zeroizing::new(d);
-                }
+                let plaintext = decrypt(&key.key)
+                    .with_context(|| format!("failed to decrypt key '{}'", key.name))?;
+                key.key = Zeroizing::new(plaintext);
             }
         }
         Ok(decrypted)
@@ -621,5 +625,34 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Multiple keys found"));
+    }
+
+    #[tokio::test]
+    async fn test_load_corrupted_config_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        tokio::fs::write(&config_path, b"not valid json {{{")
+            .await
+            .unwrap();
+        let store = SessionStore::with_path(config_path);
+        let result = store.load().await;
+        assert!(result.is_err(), "expected Err on corrupted config, got Ok");
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_error_on_invalid_encrypted_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        // "enc:" prefix triggers decryption; the payload is not valid ciphertext
+        let bad_config = r#"{"api_keys":[{"id":"aaaa","name":"test","baseUrl":"http://example.com","key":"enc:notvalidbase64!!!","createdAt":"2024-01-01T00:00:00Z"}],"active_key_id":null}"#;
+        tokio::fs::write(&config_path, bad_config.as_bytes())
+            .await
+            .unwrap();
+        let store = SessionStore::with_path(config_path);
+        let result = store.load().await;
+        assert!(
+            result.is_err(),
+            "expected Err on invalid encrypted key, got Ok"
+        );
     }
 }

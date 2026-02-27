@@ -255,7 +255,12 @@ async fn start_router(env: &HashMap<String, String>) -> Result<u16> {
     };
 
     let router = ClaudeCodeRouter::new(config);
-    let (port, _handle) = router.start_background().await?;
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: claude code router exited unexpectedly: {e}");
+        }
+    });
     Ok(port)
 }
 
@@ -277,7 +282,12 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
         target_base_url: base_url,
         api_key,
     });
-    let (port, _handle) = router.start_background().await?;
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: codex router exited unexpectedly: {e}");
+        }
+    });
     Ok(port)
 }
 
@@ -299,7 +309,12 @@ async fn start_gemini_router(env: &HashMap<String, String>) -> Result<u16> {
         target_base_url: base_url,
         api_key,
     });
-    let (port, _handle) = router.start_background().await?;
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: gemini router exited unexpectedly: {e}");
+        }
+    });
     Ok(port)
 }
 

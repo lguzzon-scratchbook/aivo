@@ -12,7 +12,7 @@ pub mod session_store;
 pub use ai_launcher::{AILauncher, LaunchOptions, ToolConfig};
 pub use claude_code_router::{ClaudeCodeRouter, RouterConfig};
 pub use codex_router::{CodexRouter, CodexRouterConfig};
-pub use gemini_router::{GeminiRouter, GeminiRouterConfig};
 pub use environment_injector::EnvironmentInjector;
+pub use gemini_router::{GeminiRouter, GeminiRouterConfig};
 #[allow(unused_imports)]
 pub use session_store::{ApiKey, SessionStore};

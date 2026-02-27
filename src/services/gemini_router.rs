@@ -25,10 +25,7 @@ impl GeminiRouter {
     }
 }
 
-async fn run_router(
-    listener: tokio::net::TcpListener,
-    config: GeminiRouterConfig,
-) -> Result<()> {
+async fn run_router(listener: tokio::net::TcpListener, config: GeminiRouterConfig) -> Result<()> {
     let config = std::sync::Arc::new(config);
     loop {
         let (mut socket, _) = listener.accept().await?;
@@ -76,9 +73,11 @@ async fn handle_request(
                 Ok(http_response(200, "application/json", &json))
             }
         }
-        None => {
-            Ok(http_response(404, "application/json", "{\"error\":\"not found\"}"))
-        }
+        None => Ok(http_response(
+            404,
+            "application/json",
+            "{\"error\":\"not found\"}",
+        )),
     }
 }
 
@@ -335,10 +334,7 @@ fn repair_tool_call_args(
         for choice in choices.iter_mut() {
             if let Some(tool_calls) = choice["message"]["tool_calls"].as_array_mut() {
                 for tc in tool_calls.iter_mut() {
-                    let name = tc["function"]["name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
+                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                     if let Some(schema) = schemas.get(&name) {
                         repair_single_tool_call(tc, schema);
                     }
@@ -353,7 +349,11 @@ fn repair_single_tool_call(tc: &mut Value, schema: &Value) {
     let required: Vec<String> = schema
         .get("required")
         .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     if required.is_empty() {
         return;
@@ -392,13 +392,15 @@ fn repair_single_tool_call(tc: &mut Value, schema: &Value) {
             .and_then(|p| p.get("type"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
-        if prop_type == "string" && (req.contains("dir") || req.ends_with("_path") || req == "path") {
+        if prop_type == "string" && (req.contains("dir") || req.ends_with("_path") || req == "path")
+        {
             args.insert(req.clone(), Value::String(".".to_string()));
         }
     }
 
-    tc["function"]["arguments"] =
-        Value::String(serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".to_string()));
+    tc["function"]["arguments"] = Value::String(
+        serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".to_string()),
+    );
 }
 
 fn normalize_parameters(params: &Value) -> Value {
@@ -473,7 +475,10 @@ fn convert_parts_to_messages(parts: &[Value], openai_role: &str, messages: &mut 
 pub fn convert_openai_to_gemini(body: &Value) -> Value {
     let empty_msg = serde_json::json!({"role": "assistant", "content": ""});
     let choices = body.get("choices").and_then(|c| c.as_array());
-    let choice = choices.and_then(|arr| arr.first()).cloned().unwrap_or(serde_json::json!({}));
+    let choice = choices
+        .and_then(|arr| arr.first())
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
     let message = choice.get("message").cloned().unwrap_or(empty_msg);
     let finish_reason = choice
         .get("finish_reason")
@@ -527,9 +532,7 @@ fn message_to_gemini_parts(message: &Value) -> Vec<Value> {
                 let name = tc["function"]["name"].as_str().unwrap_or("");
                 // Some providers return arguments as a JSON string; others as an object
                 let args: Value = match &tc["function"]["arguments"] {
-                    Value::String(s) => {
-                        serde_json::from_str(s).unwrap_or(serde_json::json!({}))
-                    }
+                    Value::String(s) => serde_json::from_str(s).unwrap_or(serde_json::json!({})),
                     obj @ Value::Object(_) => obj.clone(),
                     _ => serde_json::json!({}),
                 };
@@ -558,8 +561,9 @@ mod tests {
 
     #[test]
     fn test_parse_gemini_path_stream_generate_content() {
-        let result =
-            parse_gemini_path("/v1beta/models/google/gemini-2.0-flash:streamGenerateContent?alt=sse");
+        let result = parse_gemini_path(
+            "/v1beta/models/google/gemini-2.0-flash:streamGenerateContent?alt=sse",
+        );
         assert_eq!(result, Some(("google/gemini-2.0-flash".to_string(), true)));
     }
 

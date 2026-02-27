@@ -115,8 +115,7 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 }
 
 async fn handle_messages_raw(request: &str, config: &Arc<RouterConfig>) -> Result<String> {
-    let body_start = request.find("\r\n\r\n").unwrap_or(0) + 4;
-    let body_str = request[body_start..].trim_end_matches('\0').trim();
+    let body_str = extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
 
@@ -158,8 +157,7 @@ async fn handle_messages_raw(request: &str, config: &Arc<RouterConfig>) -> Resul
 }
 
 async fn handle_chat_completions_raw(request: &str, config: &Arc<RouterConfig>) -> Result<String> {
-    let body_start = request.find("\r\n\r\n").unwrap_or(0) + 4;
-    let body_str = &request[body_start..];
+    let body_str = extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
 
@@ -197,6 +195,15 @@ async fn handle_chat_completions_raw(request: &str, config: &Arc<RouterConfig>) 
         response_body.len(),
         response_body
     ))
+}
+
+/// Extracts the HTTP request body (everything after the blank line separator).
+/// Returns an error for malformed requests that are missing `\r\n\r\n`.
+fn extract_request_body(request: &str) -> Result<&str> {
+    let pos = request
+        .find("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP request: missing header separator"))?;
+    Ok(request[pos + 4..].trim_end_matches('\0').trim())
 }
 
 /// Transforms model names based on the provider
@@ -316,5 +323,24 @@ mod tests {
             normalize_claude_version("claude-haiku-4-5-20251001"),
             "claude-haiku-4-5-20251001"
         );
+    }
+
+    #[test]
+    fn test_extract_request_body_normal() {
+        let req =
+            "POST /v1/messages HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"key\":\"val\"}";
+        assert_eq!(extract_request_body(req).unwrap(), "{\"key\":\"val\"}");
+    }
+
+    #[test]
+    fn test_extract_request_body_missing_separator_returns_error() {
+        let req = "POST /v1/messages HTTP/1.1";
+        assert!(extract_request_body(req).is_err());
+    }
+
+    #[test]
+    fn test_extract_request_body_short_request_no_panic() {
+        // A request shorter than 4 bytes must not panic
+        assert!(extract_request_body("AB").is_err());
     }
 }

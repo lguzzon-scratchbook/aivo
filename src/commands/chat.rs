@@ -206,8 +206,13 @@ impl ChatCommand {
 
             // Stream response (retry once on transient errors)
             let result = match send_chat_request(&client, &key, &model, &history, &spinning).await {
-                Ok(content) => Ok(content),
-                Err(_) => send_chat_request(&client, &key, &model, &history, &spinning).await,
+                ok @ Ok(_) => ok,
+                Err(first_err) => {
+                    match send_chat_request(&client, &key, &model, &history, &spinning).await {
+                        ok @ Ok(_) => ok,
+                        Err(_) => Err(first_err), // report the original error, not the retry error
+                    }
+                }
             };
 
             stop_spinner(&spinning);
