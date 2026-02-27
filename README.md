@@ -33,7 +33,7 @@ aivo claude
 ## Usage
 
 ```
-aivo v1.0.0 — CLI for AI coding assistants
+aivo v0.1.0 — CLI for AI coding assistants
 
 Usage: aivo <command> [options]
 
@@ -119,10 +119,14 @@ aivo --help
 
 1. **Key Management**: API keys are stored in `~/.config/aivo/config.json` with AES-256-GCM encryption. Machine-specific key derivation ensures keys cannot be used on another machine.
 2. **Environment Injection**: When you run a tool, the CLI injects the appropriate environment variables:
-   - **Claude**: `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` (when `--model` is used)
+   - **Claude**: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` (when `--model` is used)
    - **Codex**: `OPENAI_BASE_URL`, `OPENAI_API_KEY`
    - **Gemini**: `GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_KEY`
-3. **Process Spawning**: The AI tool is spawned with the injected environment and all arguments passed through. Signals (SIGINT, SIGTERM) are forwarded to child processes.
+3. **Built-in Routers**: For third-party providers, aivo starts a lightweight local HTTP proxy that handles API compatibility automatically — no external tools needed:
+   - **Claude + OpenRouter**: Proxies Claude Code's Anthropic API requests to OpenRouter, transforming model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`)
+   - **Codex + non-OpenAI**: Strips unsupported built-in tool types and converts between the Responses API and Chat Completions API
+   - **Gemini + non-Google**: Converts Gemini CLI's native API format to OpenAI Chat Completions and back
+4. **Process Spawning**: The AI tool is spawned with the injected environment and all arguments passed through. Signals (SIGINT, SIGTERM) are forwarded to child processes.
 
 ## Configuration
 
@@ -162,7 +166,9 @@ aivo chat --model claude-sonnet-4-6
 
 ### Other providers
 
-Any Anthropic-compatible provider works with `aivo run claude`. Any OpenAI-compatible provider works with `aivo chat`. Use the provider's base URL when adding the key — aivo handles trailing `/v1` automatically.
+Any Anthropic-compatible provider works with `aivo run claude`. Any OpenAI-compatible provider works with `aivo chat` and `aivo codex`. Any provider with an OpenAI-compatible Chat Completions endpoint works with `aivo gemini` (the built-in Gemini router handles the format translation).
+
+Use the provider's base URL when adding the key — aivo handles trailing `/v1` automatically.
 
 ## Development
 

@@ -14,7 +14,7 @@ cargo build --release  # Compile optimized binary to target/release/aivo
 cargo build --release --target <target>  # Cross-compile for specific platform
 
 # Test
-cargo test             # Run all tests (~53 tests)
+cargo test             # Run all tests (~140 tests)
 cargo test --release   # Run tests on release build
 
 # Format
@@ -52,12 +52,21 @@ SessionStore → EnvironmentInjector → AILauncher
 
 - **SessionStore** (`session_store.rs`) - Persists API keys to `~/.config/aivo/config.json` with AES-256-GCM encryption. Machine-specific key derivation using username + home directory.
 
-- **AILauncher** (`ai_launcher.rs`) - Spawns AI tool processes (claude, codex, gemini) with environment injection using tokio. Forwards signals (SIGINT, SIGTERM) and inherits stdio for interactive passthrough.
+- **AILauncher** (`ai_launcher.rs`) - Spawns AI tool processes (claude, codex, gemini) with environment injection using tokio. Forwards signals (SIGINT, SIGTERM) and inherits stdio for interactive passthrough. Injects `--teammate-mode in-process` for Claude to ensure single-window mode. Starts the appropriate built-in router when needed, then overwrites the placeholder base URL with the actual bound port.
 
 - **EnvironmentInjector** (`environment_injector.rs`) - Configures tool-specific environment variables:
-  - Claude: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` (optional)
-  - Codex: `OPENAI_API_KEY`, `OPENAI_BASE_URL`
-  - Gemini: `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL`
+  - Claude (direct): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` (empty), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` and related model env vars (optional)
+  - Claude (OpenRouter): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_ROUTER=1` to trigger `ClaudeCodeRouter`
+  - Codex (OpenAI): `OPENAI_API_KEY`, `OPENAI_BASE_URL` (direct)
+  - Codex (non-OpenAI): uses placeholder `OPENAI_BASE_URL` + sets `AIVO_USE_CODEX_ROUTER=1` to trigger `CodexRouter`
+  - Gemini (Google): `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL` (direct)
+  - Gemini (non-Google): uses placeholder `GOOGLE_GEMINI_BASE_URL` + sets `AIVO_USE_GEMINI_ROUTER=1` to trigger `GeminiRouter`
+
+- **ClaudeCodeRouter** (`claude_code_router.rs`) - Built-in HTTP proxy for OpenRouter. Intercepts Claude Code's `/v1/messages` and `/v1/chat/completions` requests, transforms model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`), and forwards to OpenRouter. Binds to a random port.
+
+- **CodexRouter** (`codex_router.rs`) - Built-in HTTP proxy for non-OpenAI providers. Strips unsupported built-in tool types (`computer_use`, `file_search`, `web_search`, `code_interpreter`) that most third-party providers reject. Converts between Codex CLI's Responses API (`/v1/responses`) and the Chat Completions API (`/v1/chat/completions`) for providers that only support the latter. Binds to a random port.
+
+- **GeminiRouter** (`gemini_router.rs`) - Built-in HTTP proxy for non-Google providers. Converts Gemini CLI's native API format (`/v1beta/models/{model}:generateContent`) to OpenAI Chat Completions format, then converts the response back. Handles streaming, tool calls, function responses, and generation config. Binds to a random port.
 
 ### Command Handlers (`src/commands/`)
 
@@ -87,7 +96,7 @@ Single `ApiKey` struct with fields: `id`, `name`, `base_url`, `key`, `created_at
 - Unit tests in `#[cfg(test)]` modules within source files
 - Integration tests in `tests/` directory
 - Command handlers return exit codes for verification
-- **Test Coverage:** ~116 tests covering encryption, services, and command logic
+- **Test Coverage:** ~140 tests covering encryption, services, router logic, and command handlers
 
 ## Build & Deployment
 
@@ -116,7 +125,10 @@ aivo/
 │       ├── mod.rs
 │       ├── session_store.rs         # Key persistence & AES-256-GCM encryption
 │       ├── environment_injector.rs  # Tool-specific env configuration
-│       └── ai_launcher.rs          # Process spawning & signal forwarding
+│       ├── ai_launcher.rs          # Process spawning & signal forwarding
+│       ├── claude_code_router.rs   # Built-in proxy for Claude + OpenRouter
+│       ├── codex_router.rs         # Built-in proxy for Codex + non-OpenAI providers
+│       └── gemini_router.rs        # Built-in proxy for Gemini + non-Google providers
 ├── tests/
 │   ├── encryption_test.rs
 │   ├── encryption_property.rs
