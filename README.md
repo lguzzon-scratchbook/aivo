@@ -140,12 +140,11 @@ Add your OpenRouter key using `https://openrouter.ai/api/v1` as the base URL.
 
 ```bash
 # aivo chat - uses OpenAI-compatible endpoint
-aivo chat --model claude-sonnet-4-6
+aivo chat --model openai/gpt-4o-mini
 
-# aivo run claude - uses a built-in proxy that handles OpenRouter's API format
+# aivo claude - uses a built-in proxy that handles OpenRouter's API format
 aivo claude --model claude-sonnet-4-6
-aivo claude --model claude-opus-4-6
-aivo claude --model claude-haiku-4-5
+aivo claude --model moonshotai/kimi-k2.5
 ```
 
 Both `aivo chat` and `aivo run claude` work out of the box. aivo automatically:
@@ -154,7 +153,7 @@ Both `aivo chat` and `aivo run claude` work out of the box. aivo automatically:
 
 ### Vercel AI Gateway
 
-Add your Vercel key using `https://ai-gateway.vercel.sh` as the base URL.
+Add your Vercel key using `https://ai-gateway.vercel.sh/v1` as the base URL.
 
 ```bash
 aivo claude    # works directly, no special setup needed
