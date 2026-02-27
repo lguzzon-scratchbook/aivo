@@ -109,6 +109,24 @@ impl AILauncher {
             );
         }
 
+        // Start CodexRouter for non-OpenAI providers, update OPENAI_BASE_URL with actual port
+        if options.tool == AIToolType::Codex && env.contains_key("AIVO_USE_CODEX_ROUTER") {
+            let port = start_codex_router(&env).await?;
+            env.insert(
+                "OPENAI_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{}", port),
+            );
+        }
+
+        // Start GeminiRouter for non-Google providers, update GOOGLE_GEMINI_BASE_URL with actual port
+        if options.tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_ROUTER") {
+            let port = start_gemini_router(&env).await?;
+            env.insert(
+                "GOOGLE_GEMINI_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{}", port),
+            );
+        }
+
         // For Claude, inject --teammate-mode in-process to run in single window
         let args = inject_claude_teammate_mode(options.tool, &options.args);
 
@@ -133,7 +151,7 @@ impl AILauncher {
         let env_vars = match tool {
             AIToolType::Claude => self.env_injector.for_claude(key, model),
             AIToolType::Codex => self.env_injector.for_codex(key, model),
-            AIToolType::Gemini => self.env_injector.for_gemini(key),
+            AIToolType::Gemini => self.env_injector.for_gemini(key, model),
         };
 
         ToolConfig {
@@ -217,8 +235,6 @@ impl AILauncher {
     }
 }
 
-/// Injects `--teammate-mode in-process` for Claude if not already specified by the user.
-/// This ensures Claude runs in a single window instead of using split panels.
 /// Starts the built-in Claude Code Router and returns the port it bound to
 async fn start_router(env: &HashMap<String, String>) -> Result<u16> {
     use crate::services::{ClaudeCodeRouter, RouterConfig};
@@ -243,6 +259,52 @@ async fn start_router(env: &HashMap<String, String>) -> Result<u16> {
     Ok(port)
 }
 
+/// Starts the built-in CodexRouter for non-OpenAI providers and returns the port it bound to
+async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::{CodexRouter, CodexRouterConfig};
+
+    let api_key = env
+        .get("AIVO_CODEX_ROUTER_API_KEY")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_CODEX_ROUTER_API_KEY"))?
+        .clone();
+
+    let base_url = env
+        .get("AIVO_CODEX_ROUTER_BASE_URL")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_CODEX_ROUTER_BASE_URL"))?
+        .clone();
+
+    let router = CodexRouter::new(CodexRouterConfig {
+        target_base_url: base_url,
+        api_key,
+    });
+    let (port, _handle) = router.start_background().await?;
+    Ok(port)
+}
+
+/// Starts the built-in GeminiRouter for non-Google providers and returns the port it bound to
+async fn start_gemini_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::{GeminiRouter, GeminiRouterConfig};
+
+    let api_key = env
+        .get("AIVO_GEMINI_ROUTER_API_KEY")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_GEMINI_ROUTER_API_KEY"))?
+        .clone();
+
+    let base_url = env
+        .get("AIVO_GEMINI_ROUTER_BASE_URL")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_GEMINI_ROUTER_BASE_URL"))?
+        .clone();
+
+    let router = GeminiRouter::new(GeminiRouterConfig {
+        target_base_url: base_url,
+        api_key,
+    });
+    let (port, _handle) = router.start_background().await?;
+    Ok(port)
+}
+
+/// Injects `--teammate-mode in-process` for Claude if not already specified by the user.
+/// This ensures Claude runs in a single window instead of using split panels.
 fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String> {
     if tool != AIToolType::Claude {
         return args.to_vec();

@@ -46,25 +46,38 @@ fn test_for_claude_with_model() {
 
 #[test]
 fn test_for_codex() {
+    // test_key() uses http://localhost:8080 (non-OpenAI) → router enabled
     let injector = EnvironmentInjector::new();
     let key = test_key();
     let env = injector.for_codex(&key, None);
 
-    assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "http://localhost:8080");
+    // Placeholder; AI launcher overwrites with actual port after binding
+    assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "http://127.0.0.1:0");
     assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "sk-test-key-12345");
+    assert_eq!(env.get("AIVO_USE_CODEX_ROUTER").unwrap(), "1");
+    assert_eq!(
+        env.get("AIVO_CODEX_ROUTER_BASE_URL").unwrap(),
+        "http://localhost:8080"
+    );
 }
 
 #[test]
 fn test_for_gemini() {
     let injector = EnvironmentInjector::new();
-    let key = test_key();
-    let env = injector.for_gemini(&key);
+    let key = test_key(); // base_url = http://localhost:8080 (non-Google → router)
+    let env = injector.for_gemini(&key, None);
 
+    // Non-Google URL: placeholder is used, router env vars are set
     assert_eq!(
         env.get("GOOGLE_GEMINI_BASE_URL").unwrap(),
-        "http://localhost:8080"
+        "http://127.0.0.1:0"
     );
     assert_eq!(env.get("GEMINI_API_KEY").unwrap(), "sk-test-key-12345");
+    assert_eq!(env.get("AIVO_USE_GEMINI_ROUTER").unwrap(), "1");
+    assert_eq!(
+        env.get("AIVO_GEMINI_ROUTER_BASE_URL").unwrap(),
+        "http://localhost:8080"
+    );
 }
 
 #[test]

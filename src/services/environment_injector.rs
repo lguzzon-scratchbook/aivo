@@ -78,11 +78,31 @@ impl EnvironmentInjector {
 
     /// Prepares environment variables for Codex CLI
     ///
-    /// Sets OPENAI_BASE_URL and OPENAI_API_KEY from the key.
+    /// For non-OpenAI providers, activates the CodexRouter to strip unsupported
+    /// built-in tool types (computer_use, file_search, etc.) before forwarding.
+    /// For official OpenAI (api.openai.com), connects directly.
     pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
-        env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
-        env.insert("OPENAI_API_KEY".to_string(), key.key.to_string());
+
+        if !key.base_url.contains("api.openai.com") {
+            // Non-OpenAI provider: use CodexRouter to strip unsupported tool types
+            // Placeholder URL - AI launcher overwrites with the actual random port after binding
+            env.insert(
+                "OPENAI_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("OPENAI_API_KEY".to_string(), key.key.to_string());
+            env.insert("AIVO_USE_CODEX_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_CODEX_ROUTER_API_KEY".to_string(), key.key.to_string());
+            env.insert(
+                "AIVO_CODEX_ROUTER_BASE_URL".to_string(),
+                key.base_url.clone(),
+            );
+        } else {
+            // Official OpenAI: direct connection, no proxy needed
+            env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
+            env.insert("OPENAI_API_KEY".to_string(), key.key.to_string());
+        }
 
         if let Some(model) = model {
             env.insert("CODEX_MODEL".to_string(), model.to_string());
@@ -96,10 +116,38 @@ impl EnvironmentInjector {
     /// Prepares environment variables for Gemini CLI
     ///
     /// Sets GOOGLE_GEMINI_BASE_URL and GEMINI_API_KEY from the key.
-    pub fn for_gemini(&self, key: &ApiKey) -> HashMap<String, String> {
+    /// For non-Google endpoints, activates GeminiRouter to convert native Gemini
+    /// API format to OpenAI chat completions format.
+    /// When model is provided, sets GEMINI_MODEL.
+    pub fn for_gemini(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
-        env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), key.base_url.clone());
-        env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());
+
+        if key.base_url.contains("generativelanguage.googleapis.com") {
+            // Native Google endpoint: connect directly
+            env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), key.base_url.clone());
+            env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());
+        } else {
+            // Non-Google provider: use GeminiRouter to convert Gemini API → OpenAI format
+            // Placeholder URL — AI launcher overwrites with actual random port after binding
+            env.insert(
+                "GOOGLE_GEMINI_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());
+            env.insert("AIVO_USE_GEMINI_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_GEMINI_ROUTER_API_KEY".to_string(),
+                key.key.to_string(),
+            );
+            env.insert(
+                "AIVO_GEMINI_ROUTER_BASE_URL".to_string(),
+                key.base_url.clone(),
+            );
+        }
+
+        if let Some(model) = model {
+            env.insert("GEMINI_MODEL".to_string(), model.to_string());
+        }
 
         env
     }
@@ -340,21 +388,49 @@ mod tests {
     }
 
     #[test]
-    fn test_for_codex() {
+    fn test_for_codex_non_openai_uses_router() {
+        // test_key() uses http://localhost:8080 (non-OpenAI) → router enabled
         let injector = EnvironmentInjector::new();
         let key = test_key();
         let env = injector.for_codex(&key, None);
 
+        // Placeholder; AI launcher overwrites with actual port after binding
         assert_eq!(
             env.get("OPENAI_BASE_URL"),
-            Some(&"http://localhost:8080".to_string())
+            Some(&"http://127.0.0.1:0".to_string())
         );
         assert_eq!(
             env.get("OPENAI_API_KEY"),
             Some(&"sk-test-key-12345".to_string())
         );
-        // No CLOUDHARB_API_KEY
-        assert!(env.get("CLOUDHARB_API_KEY").is_none());
+        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CODEX_ROUTER_API_KEY"),
+            Some(&"sk-test-key-12345".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            Some(&"http://localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_codex_official_openai_direct() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.openai.com/v1".to_string();
+        let env = injector.for_codex(&key, None);
+
+        // Direct connection: no router, use actual base URL
+        assert_eq!(
+            env.get("OPENAI_BASE_URL"),
+            Some(&"https://api.openai.com/v1".to_string())
+        );
+        assert_eq!(
+            env.get("OPENAI_API_KEY"),
+            Some(&"sk-test-key-12345".to_string())
+        );
+        assert!(env.get("AIVO_USE_CODEX_ROUTER").is_none());
     }
 
     #[test]
@@ -369,18 +445,106 @@ mod tests {
     }
 
     #[test]
+    fn test_for_codex_vercel_uses_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://ai-gateway.vercel.sh/v1".to_string();
+        let env = injector.for_codex(&key, None);
+
+        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            Some(&"https://ai-gateway.vercel.sh/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_codex_openrouter_uses_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+        let env = injector.for_codex(&key, None);
+
+        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            Some(&"https://openrouter.ai/api/v1".to_string())
+        );
+    }
+
+    #[test]
     fn test_for_gemini() {
         let injector = EnvironmentInjector::new();
-        let key = test_key();
-        let env = injector.for_gemini(&key);
+        let key = test_key(); // base_url = http://localhost:8080 (non-Google → router)
+        let env = injector.for_gemini(&key, None);
 
+        // Non-Google URL: placeholder is used, router env vars are set
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
-            Some(&"http://localhost:8080".to_string())
+            Some(&"http://127.0.0.1:0".to_string())
         );
         assert_eq!(
             env.get("GEMINI_API_KEY"),
             Some(&"sk-test-key-12345".to_string())
+        );
+        assert!(env.get("GEMINI_MODEL").is_none());
+    }
+
+    #[test]
+    fn test_for_gemini_with_model() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let env = injector.for_gemini(&key, Some("google/gemini-2.0-flash"));
+        assert_eq!(
+            env.get("GEMINI_MODEL"),
+            Some(&"google/gemini-2.0-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_gemini_native_google_no_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://generativelanguage.googleapis.com/".to_string();
+        let env = injector.for_gemini(&key, None);
+        assert!(env.get("AIVO_USE_GEMINI_ROUTER").is_none());
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&"https://generativelanguage.googleapis.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_gemini_non_google_uses_router() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key(); // base_url = http://localhost:8080 (non-Google)
+        let env = injector.for_gemini(&key, None);
+        assert_eq!(env.get("AIVO_USE_GEMINI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_GEMINI_ROUTER_API_KEY"),
+            Some(&"sk-test-key-12345".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_GEMINI_ROUTER_BASE_URL"),
+            Some(&"http://localhost:8080".to_string())
+        );
+        // Placeholder — launcher overwrites with actual port
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_gemini_vercel_uses_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://ai-gateway.vercel.sh/v1".to_string();
+        let env = injector.for_gemini(&key, None);
+        assert_eq!(env.get("AIVO_USE_GEMINI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_GEMINI_ROUTER_BASE_URL"),
+            Some(&"https://ai-gateway.vercel.sh/v1".to_string())
         );
     }
 

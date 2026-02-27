@@ -1,6 +1,6 @@
 # aivo
 
-CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini) with local API key management.
+CLI tool for unified access to AI coding assistants with local API key management. Best for **Claude Code** — run it with any provider without touching your environment.
 
 ## Features
 
