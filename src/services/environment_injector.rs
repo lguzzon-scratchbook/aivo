@@ -21,17 +21,41 @@ impl EnvironmentInjector {
     /// Sets ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY from the key.
     /// Disables nonessential traffic.
     /// When model is provided, sets ANTHROPIC_MODEL and related env vars for Claude Code routing.
+    /// For OpenRouter, uses Claude Code Router if available, otherwise applies model name transformation.
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
-        env.insert("ANTHROPIC_BASE_URL".to_string(), key.base_url.clone());
+
+        // For OpenRouter, use the built-in router (needs model name transformation + API proxying)
+        if key.base_url.contains("openrouter") {
+            // Placeholder URL - AI launcher overwrites with the actual random port after binding
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            // Router will handle the OpenRouter API key transformation
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
+            // Signal to start the router
+            env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_ROUTER_API_KEY".to_string(), key.key.to_string());
+            env.insert("AIVO_ROUTER_BASE_URL".to_string(), key.base_url.to_string());
+        } else {
+            // Direct connection to provider
+            // Claude Code appends /v1/messages itself, so strip any trailing /v1 to avoid doubling
+            let base_url = key.base_url.trim_end_matches('/');
+            let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
+            env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.to_string());
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
+        }
+
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
-        env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
         env.insert(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
             "1".to_string(),
         );
 
         if let Some(model) = model {
+            // Router handles OpenRouter model names transformation internally
+            // Send the model name as-is; the router will transform it
             env.insert("ANTHROPIC_MODEL".to_string(), model.to_string());
             env.insert("ANTHROPIC_SMALL_FAST_MODEL".to_string(), model.to_string());
             env.insert(
@@ -173,10 +197,7 @@ mod tests {
             env.get("ANTHROPIC_BASE_URL"),
             Some(&"http://localhost:8080".to_string())
         );
-        assert_eq!(
-            env.get("ANTHROPIC_API_KEY"),
-            Some(&String::new())
-        );
+        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
         assert_eq!(
             env.get("ANTHROPIC_AUTH_TOKEN"),
             Some(&"sk-test-key-12345".to_string())
@@ -217,6 +238,105 @@ mod tests {
             env.get("ANTHROPIC_REASONING_MODEL"),
             Some(&"claude-3-opus".to_string())
         );
+    }
+
+    #[test]
+    fn test_for_claude_openrouter_model_transformation() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+        let env = injector.for_claude(&key, Some("claude-haiku-4-5"));
+
+        // With built-in router: model names pass through unchanged
+        // Router handles transformation
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-haiku-4-5".to_string())
+        );
+        // Router should be started
+        assert_eq!(env.get("AIVO_USE_ROUTER"), Some(&"1".to_string()));
+        // Base URL is a placeholder; AI launcher overwrites with actual port after binding
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_claude_openrouter_sonnet_model() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+        let env = injector.for_claude(&key, Some("claude-sonnet-4-6"));
+
+        // Model name passes through unchanged - router will transform it
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-sonnet-4-6".to_string())
+        );
+        // Verify router configuration is set
+        assert_eq!(env.get("AIVO_ROUTER_API_KEY"), Some(&key.key.to_string()));
+    }
+
+    #[test]
+    fn test_for_claude_openrouter_opus_model() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+        let env = injector.for_claude(&key, Some("claude-opus-4-6"));
+
+        // Model passes through unchanged - router transforms
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-opus-4-6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_claude_openrouter_future_models() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+
+        // All models pass through unchanged - router handles transformation
+        let env = injector.for_claude(&key, Some("claude-some-model-5-10"));
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-some-model-5-10".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_claude_non_claude_model_no_transformation() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+        let env = injector.for_claude(&key, Some("gpt-4o"));
+
+        // Non-Claude models should not be transformed
+        assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&"gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn test_router_integration_example() {
+        // The built-in router is always used for OpenRouter
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+        let env = injector.for_claude(&key, Some("claude-sonnet-4-6"));
+
+        // Placeholder; AI launcher overwrites with the actual random port after binding
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        // Model name passes through unchanged - router transforms it
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-sonnet-4-6".to_string())
+        );
+        // Router configuration is set
+        assert_eq!(env.get("AIVO_USE_ROUTER"), Some(&"1".to_string()));
     }
 
     #[test]

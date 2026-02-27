@@ -96,9 +96,18 @@ impl AILauncher {
 
         let tool_config = self.get_tool_config(options.tool, &key, options.model.as_deref());
 
-        let env =
+        let mut env =
             self.env_injector
                 .merge(&tool_config.env_vars, options.env.as_ref(), options.debug);
+
+        // Start built-in router for OpenRouter + Claude, update ANTHROPIC_BASE_URL with actual port
+        if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
+            let port = start_router(&env).await?;
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{}", port),
+            );
+        }
 
         // For Claude, inject --teammate-mode in-process to run in single window
         let args = inject_claude_teammate_mode(options.tool, &options.args);
@@ -210,6 +219,30 @@ impl AILauncher {
 
 /// Injects `--teammate-mode in-process` for Claude if not already specified by the user.
 /// This ensures Claude runs in a single window instead of using split panels.
+/// Starts the built-in Claude Code Router and returns the port it bound to
+async fn start_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::{ClaudeCodeRouter, RouterConfig};
+
+    let api_key = env
+        .get("AIVO_ROUTER_API_KEY")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_ROUTER_API_KEY"))?
+        .clone();
+
+    let base_url = env
+        .get("AIVO_ROUTER_BASE_URL")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_ROUTER_BASE_URL"))?
+        .clone();
+
+    let config = RouterConfig {
+        openrouter_base_url: base_url,
+        openrouter_api_key: api_key,
+    };
+
+    let router = ClaudeCodeRouter::new(config);
+    let (port, _handle) = router.start_background().await?;
+    Ok(port)
+}
+
 fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String> {
     if tool != AIToolType::Claude {
         return args.to_vec();

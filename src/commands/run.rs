@@ -28,7 +28,10 @@ impl RunCommand {
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
     ) -> ExitCode {
-        match self.execute_internal(tool, args, debug, model, env, key_override).await {
+        match self
+            .execute_internal(tool, args, debug, model, env, key_override)
+            .await
+        {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);

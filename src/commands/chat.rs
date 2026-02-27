@@ -72,6 +72,47 @@ impl ChatCommand {
         Ok(DEFAULT_MODEL.to_string())
     }
 
+    /// Transforms model names for OpenRouter compatibility
+    /// OpenRouter uses dots in version numbers: 4.6 instead of 4-6
+    fn transform_model_for_provider(base_url: &str, model: &str) -> String {
+        if base_url.contains("openrouter") && model.starts_with("claude-") {
+            // Convert version hyphens to dots: claude-sonnet-4-6 -> claude-sonnet-4.6
+            Self::normalize_claude_version(model)
+        } else {
+            model.to_string()
+        }
+    }
+
+    /// Converts Claude model version from hyphen to dot notation
+    /// e.g., claude-sonnet-4-6 -> claude-sonnet-4.6
+    fn normalize_claude_version(model: &str) -> String {
+        // Find the pattern: <name>-<digit>-<digit> and convert to <name>-<digit>.<digit>
+        // Work backwards from end of string to handle optional suffixes
+        if let Some(last_hyphen_pos) = model.rfind('-') {
+            // Check if the part after last hyphen is a digit
+            if model[last_hyphen_pos + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+            {
+                // Check if there's another hyphen before this one with a digit after it
+                if let Some(second_last_hyphen) = model[..last_hyphen_pos].rfind('-') {
+                    if model[second_last_hyphen + 1..last_hyphen_pos]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                    {
+                        // Replace the last hyphen with a dot
+                        let mut result = model.to_string();
+                        result.replace_range(last_hyphen_pos..=last_hyphen_pos, ".");
+                        return result;
+                    }
+                }
+            }
+        }
+        model.to_string()
+    }
+
     pub async fn execute(&self, model: Option<String>, key_override: Option<ApiKey>) -> ExitCode {
         match self.execute_internal(model, key_override).await {
             Ok(code) => code,
@@ -82,7 +123,11 @@ impl ChatCommand {
         }
     }
 
-    async fn execute_internal(&self, model_flag: Option<String>, key_override: Option<ApiKey>) -> Result<ExitCode> {
+    async fn execute_internal(
+        &self,
+        model_flag: Option<String>,
+        key_override: Option<ApiKey>,
+    ) -> Result<ExitCode> {
         let key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
@@ -97,7 +142,10 @@ impl ChatCommand {
             },
         };
 
-        let model = self.resolve_model(model_flag).await?;
+        let mut model = self.resolve_model(model_flag).await?;
+
+        // Transform model name for OpenRouter compatibility
+        model = Self::transform_model_for_provider(&key.base_url, &model);
 
         eprintln!(
             "{} model: {} {}",

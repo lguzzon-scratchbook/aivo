@@ -5,6 +5,7 @@ CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini) with
 ## Features
 
 - **Unified interface** for multiple AI coding assistants (Claude, Codex, Gemini)
+- **Multi-provider support** - works with OpenRouter, Vercel AI Gateway, and other compatible providers
 - **Interactive chat** - built-in REPL with streaming responses via OpenAI-compatible API
 - **API key management** - add, activate, and remove keys
 - **Secure storage** - API keys encrypted with AES-256-GCM
@@ -35,19 +36,19 @@ aivo run claude
 ```
 aivo v1.0.0 — CLI for AI coding assistants
 
-  Usage: aivo <command> [options]
+Usage: aivo <command> [options]
 
-  Commands:
-    run <claude|codex|gemini>  Launch AI tool with local API keys
-    chat [--model]             Start an interactive chat REPL
-    keys [action]              Manage API keys (list, use, rm, add, cat)
-    update                     Update to the latest version
+Commands:
+  run <claude|codex|gemini>  Launch AI tool with local API keys
+  chat [--model]             Start an interactive chat REPL
+  keys [action]              Manage API keys (list, use, rm, add, cat)
+  update                     Update to the latest version
 
-  Shortcuts: aivo claude, aivo codex, aivo gemini
+Shortcuts: aivo claude, aivo codex, aivo gemini
 
-  Options:
-    -h, --help      Display help information
-    -v, --version   Display the current version
+Options:
+  -h, --help      Display help information
+  -v, --version   Display the current version
 ```
 
 ### Run AI Tools
@@ -134,6 +135,41 @@ aivo --help
 Keys are stored in `~/.config/aivo/config.json` with restricted file permissions (0600).
 
 **Encryption**: API key values are encrypted using AES-256-GCM with machine-specific key derivation (PBKDF2 with SHA-256, 100k iterations) based on system username and home directory path.
+
+## Provider Compatibility
+
+aivo works with the official Anthropic API and third-party providers. All URL normalization and API compatibility is handled automatically.
+
+### OpenRouter
+
+Add your OpenRouter key using `https://openrouter.ai/api/v1` as the base URL.
+
+```bash
+# aivo chat - uses OpenAI-compatible endpoint
+aivo chat --model claude-sonnet-4-6
+
+# aivo run claude - uses a built-in proxy that handles OpenRouter's API format
+aivo claude --model claude-sonnet-4-6
+aivo claude --model claude-opus-4-6
+aivo claude --model claude-haiku-4-5
+```
+
+Both `aivo chat` and `aivo run claude` work out of the box. aivo automatically:
+- Converts model names to OpenRouter's format (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`)
+- Starts a lightweight background proxy to bridge Claude Code's API with OpenRouter
+
+### Vercel AI Gateway
+
+Add your Vercel key using `https://ai-gateway.vercel.sh` as the base URL.
+
+```bash
+aivo claude    # works directly, no special setup needed
+aivo chat --model claude-sonnet-4-6
+```
+
+### Other providers
+
+Any Anthropic-compatible provider works with `aivo run claude`. Any OpenAI-compatible provider works with `aivo chat`. Use the provider's base URL when adding the key — aivo handles trailing `/v1` automatically.
 
 ## Development
 

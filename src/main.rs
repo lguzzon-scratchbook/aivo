@@ -200,7 +200,14 @@ async fn main() {
             };
 
             command
-                .execute(run_args.tool.as_deref(), remaining_args, debug, model, env, key_override)
+                .execute(
+                    run_args.tool.as_deref(),
+                    remaining_args,
+                    debug,
+                    model,
+                    env,
+                    key_override,
+                )
                 .await
         }
 
