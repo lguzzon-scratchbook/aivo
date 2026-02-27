@@ -47,7 +47,7 @@ impl KeysCommand {
         let action = action.unwrap_or("list");
 
         match action {
-            "add" => self.add_key().await,
+            "add" => self.add_key(args.and_then(|a| a.first().copied())).await,
             "list" => self.list_keys().await,
             "rm" => self.remove_key(args.and_then(|a| a.first().copied())).await,
             "use" => self.use_key(args.and_then(|a| a.first().copied())).await,
@@ -67,16 +67,9 @@ impl KeysCommand {
 
         if keys.is_empty() {
             println!("{}", style::dim("No API keys found."));
-            println!();
-            println!(
-                "{} {}",
-                style::yellow("Add a key:"),
-                style::bold("aivo keys add")
-            );
             return Ok(ExitCode::Success);
         }
 
-        println!("{}", style::dim("Keys:"));
         for key in &keys {
             let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
             let active_indicator = if is_active {
@@ -93,25 +86,6 @@ impl KeysCommand {
                 style::dim(&key.base_url)
             );
         }
-        println!();
-
-        println!("{}", style::yellow("Commands:"));
-        println!(
-            "  aivo keys use <id|name>    {}",
-            style::dim("- Activate a specific key by ID or name")
-        );
-        println!(
-            "  aivo keys cat <id|name>    {}",
-            style::dim("- Display details for a key")
-        );
-        println!(
-            "  aivo keys rm <id|name>     {}",
-            style::dim("- Remove an API key")
-        );
-        println!(
-            "  aivo keys add              {}",
-            style::dim("- Add an API key")
-        );
 
         Ok(ExitCode::Success)
     }
@@ -253,7 +227,7 @@ impl KeysCommand {
     }
 
     /// Interactively adds an API key
-    async fn add_key(&self) -> Result<ExitCode> {
+    async fn add_key(&self, provided_name: Option<&str>) -> Result<ExitCode> {
         use std::io::{self, Write};
 
         println!("{}", style::bold("Add API Key"));
@@ -267,11 +241,20 @@ impl KeysCommand {
             Ok(input.trim().to_string())
         }
 
-        let name = read_line("Name (e.g., my-openai-proxy): ")?;
-        if name.is_empty() {
-            eprintln!("{} Name cannot be empty", style::red("Error:"));
-            return Ok(ExitCode::UserError);
-        }
+        let name = if let Some(n) = provided_name {
+            if n.is_empty() {
+                eprintln!("{} Name cannot be empty", style::red("Error:"));
+                return Ok(ExitCode::UserError);
+            }
+            n.to_string()
+        } else {
+            let input = read_line("Name (e.g., my-openai-proxy): ")?;
+            if input.is_empty() {
+                eprintln!("{} Name cannot be empty", style::red("Error:"));
+                return Ok(ExitCode::UserError);
+            }
+            input
+        };
 
         let base_url = loop {
             let input = read_line("Base URL (e.g., http://localhost:8080): ")?;
@@ -430,7 +413,7 @@ impl KeysCommand {
             style::dim("- Display details for a key")
         );
         println!("  rm <id|name>    {}", style::dim("- Remove an API key"));
-        println!("  add             {}", style::dim("- Add an API key"));
+        println!("  add [name]      {}", style::dim("- Add an API key"));
     }
 }
 

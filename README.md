@@ -23,12 +23,11 @@ Or download a binary manually from [GitHub Releases](https://github.com/yuanchua
 ## Quick Start
 
 ```bash
-# Add an API key
+# Add an API key from OpenRouter or Vercel
 aivo keys add
 
-# Run an AI tool (these are equivalent)
+# Run claude code
 aivo claude
-aivo run claude
 ```
 
 ## Usage
@@ -44,7 +43,8 @@ Commands:
   keys [action]              Manage API keys (list, use, rm, add, cat)
   update                     Update to the latest version
 
-Shortcuts: aivo claude, aivo codex, aivo gemini
+Shortcuts:
+  aivo claude, aivo codex, aivo gemini
 
 Options:
   -h, --help      Display help information
@@ -56,15 +56,9 @@ Options:
 Run any supported AI tool with automatic API key injection:
 
 ```bash
-# Quick shortcuts
-aivo claude
-aivo codex
-aivo gemini
-
-# Or use the run command
-aivo run claude
-aivo run codex
-aivo run gemini
+aivo run claude # or aivo claude
+aivo run codex  # or aivo codex
+aivo run gemini # or aivo gemini
 ```
 
 All arguments are passed through directly to the underlying tool:
@@ -105,7 +99,7 @@ Uses the active API key's base URL with the OpenAI-compatible `/v1/chat/completi
 
 ```bash
 aivo keys                    # List all keys
-aivo keys add                # Add a new API key (interactive)
+aivo keys add [name]         # Add a new API key (interactive)
 aivo keys use <id|name>      # Activate a specific key
 aivo keys cat <id|name>      # Display full key details
 aivo keys rm <id|name>       # Remove an API key
