@@ -93,15 +93,32 @@ impl KeysCommand {
 
     /// Activates a specific API key by ID or name
     async fn use_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
-        let key_id_or_name = match key_id_or_name {
-            Some(k) => k,
-            None => {
-                eprintln!("{} Missing key ID or name", style::red("Error:"));
-                eprintln!();
-                eprintln!("{}", style::dim("Usage: aivo keys use <key-id-or-name>"));
-                return Ok(ExitCode::UserError);
+        // No argument — show interactive selector
+        if key_id_or_name.is_none() {
+            let all_keys = self.session_store.get_keys().await?;
+            if all_keys.is_empty() {
+                println!("{}", style::dim("No API keys found."));
+                return Ok(ExitCode::Success);
             }
-        };
+            let choices: Vec<_> = all_keys
+                .iter()
+                .map(|k| format!("{:<4}  {}  {}", k.id, k.name, style::dim(&k.base_url)))
+                .collect();
+            let selection = Select::new()
+                .with_prompt("Select a key to activate")
+                .items(&choices)
+                .interact()
+                .ok();
+            return if let Some(idx) = selection {
+                self.activate_key(&all_keys[idx]).await?;
+                Ok(ExitCode::Success)
+            } else {
+                println!("{}", style::dim("Cancelled."));
+                Ok(ExitCode::Success)
+            };
+        }
+
+        let key_id_or_name = key_id_or_name.unwrap();
 
         let all_keys = self.session_store.get_keys().await?;
 
@@ -560,5 +577,16 @@ mod tests {
         let cmd = KeysCommand::new(store);
         let code = cmd.execute(Some("edit"), Some(&["nonexistent"])).await;
         assert_eq!(code, crate::errors::ExitCode::UserError);
+    }
+
+    #[tokio::test]
+    async fn test_use_key_no_arg_no_keys() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+        // No keys stored — should succeed (prints "No API keys found.")
+        let code = cmd.execute(Some("use"), Some(&[])).await;
+        assert_eq!(code, crate::errors::ExitCode::Success);
     }
 }
