@@ -109,7 +109,7 @@ impl KeysCommand {
                 .map(|k| {
                     format!(
                         "{}  {}  {}",
-                        style::cyan(&format!("{:<4}", k.id)),
+                        style::cyan(format!("{:<4}", k.id)),
                         k.name,
                         style::dim(&k.base_url)
                     )
@@ -585,9 +585,7 @@ fn select_interactive(
         match term.read_key()? {
             Key::ArrowUp | Key::Char('\x10') => {
                 // Arrow up or Ctrl+P
-                if sel > 0 {
-                    sel -= 1;
-                }
+                sel = sel.saturating_sub(1);
             }
             Key::ArrowDown | Key::Char('\x0e') => {
                 // Arrow down or Ctrl+N
