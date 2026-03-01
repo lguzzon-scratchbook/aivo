@@ -94,7 +94,7 @@ impl KeysCommand {
     /// Activates a specific API key by ID or name
     async fn use_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
         // No argument — show interactive selector
-        if key_id_or_name.is_none() {
+        let Some(key_id_or_name) = key_id_or_name else {
             let all_keys = self.session_store.get_keys().await?;
             if all_keys.is_empty() {
                 println!("{}", style::dim("No API keys found."));
@@ -109,16 +109,13 @@ impl KeysCommand {
                 .items(&choices)
                 .interact()
                 .ok();
-            return if let Some(idx) = selection {
+            if let Some(idx) = selection {
                 self.activate_key(&all_keys[idx]).await?;
-                Ok(ExitCode::Success)
             } else {
                 println!("{}", style::dim("Cancelled."));
-                Ok(ExitCode::Success)
-            };
-        }
-
-        let key_id_or_name = key_id_or_name.unwrap();
+            }
+            return Ok(ExitCode::Success);
+        };
 
         let all_keys = self.session_store.get_keys().await?;
 
@@ -173,11 +170,10 @@ impl KeysCommand {
 
         if let Some(idx) = selection {
             self.activate_key(name_matches[idx]).await?;
-            Ok(ExitCode::Success)
         } else {
-            eprintln!("{} Invalid selection", style::red("Error:"));
-            Ok(ExitCode::UserError)
+            println!("{}", style::dim("Cancelled."));
         }
+        Ok(ExitCode::Success)
     }
 
     /// Activates a key and prints confirmation
