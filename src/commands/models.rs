@@ -33,8 +33,11 @@ struct GeminiModelsResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiModel {
     name: String,
+    #[serde(default)]
+    supported_generation_methods: Vec<String>,
 }
 
 impl ModelsCommand {
@@ -135,6 +138,25 @@ fn url_origin(url: &str) -> Option<String> {
     Some(origin)
 }
 
+/// Returns true if the model is suitable for text chat.
+/// Filters out embedding models and image/audio-only generation models.
+pub(crate) fn is_text_chat_model(id: &str) -> bool {
+    let lower = id.to_lowercase();
+    // Embedding models
+    if lower.contains("embed") {
+        return false;
+    }
+    // Image generation, TTS, and speech recognition
+    if lower.starts_with("dall-e")
+        || lower.starts_with("tts-")
+        || lower.starts_with("whisper-")
+        || lower.starts_with("gpt-image-")
+    {
+        return false;
+    }
+    true
+}
+
 pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<String>> {
     let base = normalize_base_url(&key.base_url);
 
@@ -153,10 +175,15 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
         }
 
         let resp: GeminiModelsResponse = response.json().await?;
-        // Gemini model names are like "models/gemini-1.5-pro"; strip the prefix
+        // Keep only models that support text generation; filter out embed-only models
         Ok(resp
             .models
             .into_iter()
+            .filter(|m| {
+                m.supported_generation_methods
+                    .iter()
+                    .any(|method| method == "generateContent")
+            })
             .map(|m| {
                 m.name
                     .strip_prefix("models/")
@@ -192,7 +219,14 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             if response.status().is_success() {
                 let body = response.text().await.unwrap_or_default();
                 match serde_json::from_str::<OpenAIModelsResponse>(&body) {
-                    Ok(resp) => return Ok(resp.data.into_iter().map(|m| m.id).collect()),
+                    Ok(resp) => {
+                        return Ok(resp
+                            .data
+                            .into_iter()
+                            .map(|m| m.id)
+                            .filter(|id| is_text_chat_model(id))
+                            .collect())
+                    }
                     Err(e) => {
                         last_err = format!("Invalid models response from {}: {}", url, e);
                         continue;
@@ -243,6 +277,38 @@ mod tests {
             key: Zeroizing::new("sk-test".to_string()),
             created_at: "2026-01-01".to_string(),
         }
+    }
+
+    #[test]
+    fn test_is_text_chat_model_keeps_chat_models() {
+        assert!(is_text_chat_model("gpt-4o"));
+        assert!(is_text_chat_model("gpt-4o-mini"));
+        assert!(is_text_chat_model("claude-sonnet-4-6"));
+        assert!(is_text_chat_model("gpt-3.5-turbo"));
+        assert!(is_text_chat_model("o1"));
+        assert!(is_text_chat_model("o3-mini"));
+        assert!(is_text_chat_model("gpt-4o-audio-preview"));
+        assert!(is_text_chat_model("gemini-1.5-pro"));
+        assert!(is_text_chat_model("gemini-2.0-flash"));
+    }
+
+    #[test]
+    fn test_is_text_chat_model_filters_embeddings() {
+        assert!(!is_text_chat_model("text-embedding-3-small"));
+        assert!(!is_text_chat_model("text-embedding-3-large"));
+        assert!(!is_text_chat_model("text-embedding-ada-002"));
+        assert!(!is_text_chat_model("embedding-001"));
+        assert!(!is_text_chat_model("text-embeddings-inference"));
+    }
+
+    #[test]
+    fn test_is_text_chat_model_filters_image_and_audio() {
+        assert!(!is_text_chat_model("dall-e-2"));
+        assert!(!is_text_chat_model("dall-e-3"));
+        assert!(!is_text_chat_model("tts-1"));
+        assert!(!is_text_chat_model("tts-1-hd"));
+        assert!(!is_text_chat_model("whisper-1"));
+        assert!(!is_text_chat_model("gpt-image-1"));
     }
 
     #[tokio::test]
