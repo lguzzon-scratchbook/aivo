@@ -25,6 +25,7 @@ use std::borrow::Cow;
 use crate::commands::models::fetch_models;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
+use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
@@ -150,11 +151,15 @@ struct AnthropicDelta {
 /// ChatCommand provides an interactive REPL for chatting with AI models
 pub struct ChatCommand {
     session_store: SessionStore,
+    cache: ModelsCache,
 }
 
 impl ChatCommand {
-    pub fn new(session_store: SessionStore) -> Self {
-        Self { session_store }
+    pub fn new(session_store: SessionStore, cache: ModelsCache) -> Self {
+        Self {
+            session_store,
+            cache,
+        }
     }
 
     /// Resolves the model to use: --model flag > persisted > default
@@ -259,7 +264,6 @@ impl ChatCommand {
         let client = Client::new();
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut format = ChatFormat::OpenAI;
-        let mut models_cache: Option<Vec<String>> = None;
         let prompt = format!("{} ", style::cyan(">"));
 
         let mut rl = Editor::<ChatHelper, rustyline::history::DefaultHistory>::new()
@@ -291,26 +295,29 @@ impl ChatCommand {
 
             if input == CMD_MODEL || input.starts_with(CMD_MODEL_ARG) {
                 let selected_raw: Option<String> = if input == CMD_MODEL {
-                    // Fetch once per session; show spinner on first fetch
-                    if models_cache.is_none() {
-                        let spinning = Arc::new(AtomicBool::new(true));
-                        let spinning_clone = spinning.clone();
-                        let spinner_handle = tokio::task::spawn_blocking(move || {
-                            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                            let mut i = 0;
-                            while spinning_clone.load(Ordering::Relaxed) {
-                                eprint!("\r{}", style::dim(frames[i % frames.len()]));
-                                let _ = io::stderr().flush();
-                                std::thread::sleep(std::time::Duration::from_millis(80));
-                                i += 1;
-                            }
-                        });
-                        let list = fetch_models(&client, &key).await.unwrap_or_default();
-                        stop_spinner(&spinning);
-                        let _ = spinner_handle.await;
-                        models_cache = Some(list);
-                    }
-                    let models_list = models_cache.as_ref().unwrap();
+                    // Check disk cache first; only show spinner if we need a network fetch
+                    let models_list: Vec<String> =
+                        if let Some(cached) = self.cache.get(&key.base_url).await {
+                            cached
+                        } else {
+                            let spinning = Arc::new(AtomicBool::new(true));
+                            let spinning_clone = spinning.clone();
+                            let spinner_handle = tokio::task::spawn_blocking(move || {
+                                let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                                let mut i = 0;
+                                while spinning_clone.load(Ordering::Relaxed) {
+                                    eprint!("\r{}", style::dim(frames[i % frames.len()]));
+                                    let _ = io::stderr().flush();
+                                    std::thread::sleep(std::time::Duration::from_millis(80));
+                                    i += 1;
+                                }
+                            });
+                            let list = fetch_models(&client, &key).await.unwrap_or_default();
+                            stop_spinner(&spinning);
+                            let _ = spinner_handle.await;
+                            self.cache.set(&key.base_url, list.clone()).await;
+                            list
+                        };
                     if models_list.is_empty() {
                         eprintln!("  model: {}", style::cyan(&model));
                         None
@@ -322,7 +329,7 @@ impl ChatCommand {
                             .unwrap_or(0);
                         FuzzySelect::new()
                             .with_prompt("Select model")
-                            .items(models_list)
+                            .items(&models_list)
                             .default(current_idx)
                             .interact_opt()
                             .ok()

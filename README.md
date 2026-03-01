@@ -29,6 +29,7 @@ aivo claude
 | `aivo gemini` | Run Gemini |
 | `aivo opencode` | Run OpenCode |
 | `aivo chat` | Interactive chat REPL |
+| `aivo models` | List available models from active provider |
 | `aivo keys add` | Add an API key |
 | `aivo keys use <name>` | Switch active key |
 | `aivo keys list` | List all keys |
@@ -43,6 +44,8 @@ aivo claude --key my-proxy          # use a specific saved key
 aivo claude --env DEBUG=true        # inject extra env vars
 aivo chat --model gpt-4o            # chat with any model
 aivo chat --key my-proxy -m gpt-4o
+aivo models                         # list models (cached for 24h)
+aivo models --refresh               # force-refresh the model list
 ```
 
 ## Provider Compatibility

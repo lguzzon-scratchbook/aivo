@@ -40,6 +40,7 @@ async fn main() {
 
     // Initialize services early so we can show active key in help
     let session_store = SessionStore::new();
+    let models_cache = services::ModelsCache::new();
 
     // Handle help and version flags at the top level
     if args.help {
@@ -107,13 +108,13 @@ async fn main() {
             } else {
                 None
             };
-            let command = ChatCommand::new(session_store);
+            let command = ChatCommand::new(session_store, models_cache.clone());
             command.execute(chat_args.model, key_override).await
         }
 
         Commands::Run(run_args) => {
             let env_injector = EnvironmentInjector::new();
-            let ai_launcher = AILauncher::new(session_store.clone(), env_injector);
+            let ai_launcher = AILauncher::new(session_store.clone(), env_injector, models_cache);
             let command = RunCommand::new(ai_launcher);
 
             // Re-extract aivo flags from passthrough args that clap's trailing_var_arg
@@ -233,8 +234,8 @@ async fn main() {
             } else {
                 None
             };
-            let command = ModelsCommand::new(session_store);
-            command.execute(key_override).await
+            let command = ModelsCommand::new(session_store, models_cache);
+            command.execute(key_override, models_args.refresh).await
         }
 
         Commands::Update => match UpdateCommand::new() {
@@ -286,27 +287,32 @@ fn print_help() {
     println!();
     println!("{}", style::bold("Commands:"));
     println!(
-        "  {}  {}",
-        style::cyan("run <claude|codex|gemini|opencode>"),
+        "  {}      {}",
+        style::cyan("run <tool>"),
         style::dim("Launch AI tool with local API keys")
     );
     println!(
-        "  {}             {}",
+        "  {}  {}",
         style::cyan("chat [--model]"),
         style::dim("Start an interactive chat REPL")
     );
     println!(
-        "  {}              {}",
+        "  {}   {}",
         style::cyan("keys [action]"),
         style::dim("Manage API keys (list, use, rm, add, cat)")
     );
     println!(
-        "  {}                     {}",
+        "  {}      {}",
+        style::cyan("use [name]"),
+        style::dim("Switch active API key")
+    );
+    println!(
+        "  {}          {}",
         style::cyan("models"),
         style::dim("List available models from the active provider")
     );
     println!(
-        "  {}                     {}",
+        "  {}          {}",
         style::cyan("update"),
         style::dim("Update to the latest version")
     );
@@ -314,7 +320,7 @@ fn print_help() {
     println!(
         "{} {}",
         style::bold("Shortcuts:"),
-        style::dim("aivo claude, aivo codex, aivo gemini, aivo opencode, aivo use")
+        style::dim("aivo claude/codex/gemini/opencode")
     );
     println!();
     println!("{}", style::bold("Options:"));

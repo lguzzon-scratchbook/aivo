@@ -13,6 +13,7 @@ use tokio::signal;
 
 use crate::errors::{CLIError, ErrorCategory};
 use crate::services::environment_injector::EnvironmentInjector;
+use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 
 /// Supported AI tool types
@@ -70,14 +71,20 @@ pub struct ToolConfig {
 pub struct AILauncher {
     session_store: SessionStore,
     env_injector: EnvironmentInjector,
+    cache: ModelsCache,
 }
 
 impl AILauncher {
     /// Creates a new AILauncher
-    pub fn new(session_store: SessionStore, env_injector: EnvironmentInjector) -> Self {
+    pub fn new(
+        session_store: SessionStore,
+        env_injector: EnvironmentInjector,
+        cache: ModelsCache,
+    ) -> Self {
         Self {
             session_store,
             env_injector,
+            cache,
         }
     }
 
@@ -174,26 +181,36 @@ impl AILauncher {
         let requested_model = model.map(|m| m.strip_prefix("aivo/").unwrap_or(m).to_string());
         let client = Client::new();
 
-        let spinning = Arc::new(AtomicBool::new(true));
-        let spinning_clone = spinning.clone();
-        let spinner_handle = tokio::task::spawn_blocking(move || {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut i = 0;
-            while spinning_clone.load(Ordering::Relaxed) {
-                eprint!("\r{} Fetching models...", frames[i % frames.len()]);
-                let _ = io::stderr().flush();
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                i += 1;
-            }
-        });
+        // Check cache first — skip the spinner if we get a hit
+        let fetch_result = if let Some(cached) = self.cache.get(&key.base_url).await {
+            Ok(cached)
+        } else {
+            // Cache miss: show spinner while fetching from network
+            let spinning = Arc::new(AtomicBool::new(true));
+            let spinning_clone = spinning.clone();
+            let spinner_handle = tokio::task::spawn_blocking(move || {
+                let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let mut i = 0;
+                while spinning_clone.load(Ordering::Relaxed) {
+                    eprint!("\r{} Fetching models...", frames[i % frames.len()]);
+                    let _ = io::stderr().flush();
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    i += 1;
+                }
+            });
 
-        let fetch_result = crate::commands::models::fetch_models(&client, key).await;
+            // bypass_cache=true: we know it's a miss; fetch_models_cached will still write result to cache
+            let result =
+                crate::commands::models::fetch_models_cached(&client, key, &self.cache, true).await;
 
-        spinning.store(false, Ordering::Relaxed);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        eprint!("\r \r");
-        let _ = io::stderr().flush();
-        let _ = spinner_handle.await;
+            spinning.store(false, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            eprint!("\r \r");
+            let _ = io::stderr().flush();
+            let _ = spinner_handle.await;
+
+            result
+        };
 
         let mut models = match fetch_result {
             Ok(models) => models,

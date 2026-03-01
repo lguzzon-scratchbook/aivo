@@ -104,6 +104,10 @@ pub struct ModelsArgs {
     /// Select API key by ID or name
     #[arg(short = 'k', long, value_name = "ID|NAME")]
     pub key: Option<String>,
+
+    /// Bypass cache and fetch fresh model list from the provider
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
 }
 
 /// Arguments for the chat command

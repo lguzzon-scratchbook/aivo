@@ -8,11 +8,13 @@ use serde::Deserialize;
 
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
+use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
 pub struct ModelsCommand {
     session_store: SessionStore,
+    cache: ModelsCache,
 }
 
 #[derive(Deserialize)]
@@ -36,12 +38,15 @@ struct GeminiModel {
 }
 
 impl ModelsCommand {
-    pub fn new(session_store: SessionStore) -> Self {
-        Self { session_store }
+    pub fn new(session_store: SessionStore, cache: ModelsCache) -> Self {
+        Self {
+            session_store,
+            cache,
+        }
     }
 
-    pub async fn execute(&self, key_override: Option<ApiKey>) -> ExitCode {
-        match self.execute_internal(key_override).await {
+    pub async fn execute(&self, key_override: Option<ApiKey>, refresh: bool) -> ExitCode {
+        match self.execute_internal(key_override, refresh).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -50,7 +55,11 @@ impl ModelsCommand {
         }
     }
 
-    async fn execute_internal(&self, key_override: Option<ApiKey>) -> Result<ExitCode> {
+    async fn execute_internal(
+        &self,
+        key_override: Option<ApiKey>,
+        refresh: bool,
+    ) -> Result<ExitCode> {
         let key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
@@ -66,7 +75,7 @@ impl ModelsCommand {
         };
 
         let client = Client::new();
-        let mut models = fetch_models(&client, &key).await?;
+        let mut models = fetch_models_cached(&client, &key, &self.cache, refresh).await?;
         models.sort();
 
         eprintln!(
@@ -102,10 +111,16 @@ impl ModelsCommand {
             style::cyan("-k, --key <id|name>"),
             style::dim("Select API key by ID or name")
         );
+        println!(
+            "  {}        {}",
+            style::cyan("-r, --refresh"),
+            style::dim("Bypass cache and fetch fresh model list")
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo models"));
         println!("  {}", style::dim("aivo models --key openrouter"));
+        println!("  {}", style::dim("aivo models --refresh"));
     }
 }
 
@@ -191,5 +206,79 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
         }
 
         anyhow::bail!("{}", last_err)
+    }
+}
+
+/// Cache-aware wrapper around `fetch_models`.
+/// Returns cached result if present and not expired (unless `bypass_cache` is true).
+/// On cache miss, fetches from the network and writes the result to the cache.
+pub(crate) async fn fetch_models_cached(
+    client: &Client,
+    key: &ApiKey,
+    cache: &ModelsCache,
+    bypass_cache: bool,
+) -> Result<Vec<String>> {
+    if !bypass_cache {
+        if let Some(cached) = cache.get(&key.base_url).await {
+            return Ok(cached);
+        }
+    }
+    let models = fetch_models(client, key).await?;
+    cache.set(&key.base_url, models.clone()).await;
+    Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::models_cache::ModelsCache;
+    use tempfile::TempDir;
+
+    fn make_key(url: &str) -> ApiKey {
+        use zeroize::Zeroizing;
+        ApiKey {
+            id: "1".to_string(),
+            name: "test".to_string(),
+            base_url: url.to_string(),
+            key: Zeroizing::new("sk-test".to_string()),
+            created_at: "2026-01-01".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_models_returned_without_network() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let models = vec!["model-a".to_string()];
+        cache.set("https://api.example.com", models.clone()).await;
+
+        let key = make_key("https://api.example.com");
+        let client = reqwest::Client::new();
+        // With a valid cache, fetch_models_cached should return cached list
+        // without making a network call (network call would fail with this fake key)
+        let result = fetch_models_cached(&client, &key, &cache, false).await;
+        assert_eq!(result.unwrap(), models);
+    }
+
+    #[tokio::test]
+    async fn bypass_cache_ignores_warm_cache() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        // Seed cache with stale data
+        cache
+            .set("https://api.example.com", vec!["stale-model".to_string()])
+            .await;
+
+        let key = make_key("https://api.example.com");
+        let client = reqwest::Client::new();
+        // With bypass_cache=true, the function should NOT return the cached value.
+        // It will try a network call (which will fail with a fake key) — that's fine,
+        // we just verify it didn't return the cached stale data.
+        let result = fetch_models_cached(&client, &key, &cache, true).await;
+        // Network call will fail (fake key) — result should be Err, not the stale cached value
+        assert!(
+            result.is_err(),
+            "Expected network error, not cached stale data"
+        );
     }
 }

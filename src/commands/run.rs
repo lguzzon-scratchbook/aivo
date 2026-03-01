@@ -70,14 +70,10 @@ impl RunCommand {
                 eprintln!("{} Unknown AI tool '{}'", style::red("Error:"), tool);
                 eprintln!();
                 eprintln!("Available tools:");
-                eprintln!("  {}  {}", style::cyan("claude"), style::dim("- Claude AI"));
-                eprintln!("  {}  {}", style::cyan("codex"), style::dim("- Codex AI"));
-                eprintln!("  {}  {}", style::cyan("gemini"), style::dim("- Gemini AI"));
-                eprintln!(
-                    "  {}  {}",
-                    style::cyan("opencode"),
-                    style::dim("- OpenCode")
-                );
+                eprintln!("  {}    {}", style::cyan("claude"), style::dim("Claude Code"));
+                eprintln!("  {}     {}", style::cyan("codex"), style::dim("Codex"));
+                eprintln!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
+                eprintln!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
                 eprintln!();
                 eprintln!(
                     "{}",
@@ -129,25 +125,21 @@ impl RunCommand {
             style::dim("Select API key by ID or name")
         );
         println!(
-            "  {}  {}",
+            "  {}          {}",
             style::cyan("--env <k=v>"),
             style::dim("Inject environment variable")
         );
         println!(
-            "  {}      {}",
+            "  {}              {}",
             style::cyan("--debug"),
             style::dim("Enable debug output")
         );
         println!();
         println!("{}", style::bold("Tools:"));
-        println!("  {}  {}", style::cyan("claude"), style::dim("- Claude AI"));
-        println!("  {}  {}", style::cyan("codex"), style::dim("- Codex AI"));
-        println!("  {}  {}", style::cyan("gemini"), style::dim("- Gemini AI"));
-        println!(
-            "  {}  {}",
-            style::cyan("opencode"),
-            style::dim("- OpenCode")
-        );
+        println!("  {}    {}", style::cyan("claude"), style::dim("Claude Code"));
+        println!("  {}     {}", style::cyan("codex"), style::dim("Codex"));
+        println!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
+        println!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo run claude"));
