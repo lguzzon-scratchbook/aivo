@@ -100,6 +100,10 @@ impl KeysCommand {
                 println!("{}", style::dim("No API keys found."));
                 return Ok(ExitCode::Success);
             }
+            let active_key = self.session_store.get_active_key().await?;
+            let active_idx = active_key
+                .and_then(|ak| all_keys.iter().position(|k| k.id == ak.id))
+                .unwrap_or(0);
             let choices: Vec<_> = all_keys
                 .iter()
                 .map(|k| format!("{:<4}  {}  {}", k.id, k.name, style::dim(&k.base_url)))
@@ -107,6 +111,7 @@ impl KeysCommand {
             let selection = Select::new()
                 .with_prompt("Select a key to activate")
                 .items(&choices)
+                .default(active_idx)
                 .interact()
                 .ok();
             if let Some(idx) = selection {
