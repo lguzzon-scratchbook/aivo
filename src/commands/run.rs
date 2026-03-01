@@ -70,7 +70,11 @@ impl RunCommand {
                 eprintln!("{} Unknown AI tool '{}'", style::red("Error:"), tool);
                 eprintln!();
                 eprintln!("Available tools:");
-                eprintln!("  {}    {}", style::cyan("claude"), style::dim("Claude Code"));
+                eprintln!(
+                    "  {}    {}",
+                    style::cyan("claude"),
+                    style::dim("Claude Code")
+                );
                 eprintln!("  {}     {}", style::cyan("codex"), style::dim("Codex"));
                 eprintln!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
                 eprintln!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
@@ -136,7 +140,11 @@ impl RunCommand {
         );
         println!();
         println!("{}", style::bold("Tools:"));
-        println!("  {}    {}", style::cyan("claude"), style::dim("Claude Code"));
+        println!(
+            "  {}    {}",
+            style::cyan("claude"),
+            style::dim("Claude Code")
+        );
         println!("  {}     {}", style::cyan("codex"), style::dim("Codex"));
         println!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
         println!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
