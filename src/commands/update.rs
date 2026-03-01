@@ -74,7 +74,6 @@ impl UpdateCommand {
     }
 
     async fn execute_internal(&self) -> Result<ExitCode> {
-        println!();
         println!("{} Checking for updates...", style::arrow_symbol());
 
         let current_version = crate::version::VERSION;
@@ -92,33 +91,26 @@ impl UpdateCommand {
             .await?;
 
         if !self.is_newer_version(latest_version, current_version) {
-            println!();
             println!(
                 "{} Already up to date {}",
                 style::success_symbol(),
                 style::dim(format!("({})", current_version))
             );
-            println!();
             return Ok(ExitCode::Success);
         }
 
-        println!();
         println!("  Current: {}", style::dim(current_version));
         println!("  Latest:  {}", style::green(latest_version));
-        println!();
         println!("{} Downloading update...", style::arrow_symbol());
-        println!();
 
         self.install_update(&asset.browser_download_url, &expected_sha256)
             .await?;
 
-        println!();
         println!(
             "{} Updated to version {}",
             style::success_symbol(),
             latest_version
         );
-        println!();
 
         Ok(ExitCode::Success)
     }
