@@ -82,6 +82,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -92,10 +96,51 @@ jobs:
           cd artifacts
           for f in aivo-*; do sha256sum "$f" > "$f.sha256"; done
 
+      - name: Generate changelog
+        id: changelog
+        run: |
+          TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="$TAG"
+          else
+            RANGE="${PREV_TAG}..${TAG}"
+          fi
+
+          FEATS=$(git log "$RANGE" --oneline --grep="^feat:" --format="- %s" | sed 's/^- feat: /- /')
+          FIXES=$(git log "$RANGE" --oneline --grep="^fix:" --format="- %s" | sed 's/^- fix: /- /')
+          REFACTORS=$(git log "$RANGE" --oneline --grep="^refactor:" --format="- %s" | sed 's/^- refactor: /- /')
+          OTHER=$(git log "$RANGE" --oneline --format="%s" | grep -v -E "^(feat|fix|refactor|style|chore|docs|test|ci):" | sed 's/^/- /')
+
+          BODY=""
+          if [ -n "$FEATS" ]; then
+            BODY="${BODY}### Features\n${FEATS}\n\n"
+          fi
+          if [ -n "$FIXES" ]; then
+            BODY="${BODY}### Fixes\n${FIXES}\n\n"
+          fi
+          if [ -n "$REFACTORS" ]; then
+            BODY="${BODY}### Refactoring\n${REFACTORS}\n\n"
+          fi
+          if [ -n "$OTHER" ]; then
+            BODY="${BODY}### Other\n${OTHER}\n\n"
+          fi
+
+          if [ -z "$BODY" ]; then
+            BODY="Release ${TAG}"
+          fi
+
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo -e "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: false
-          body: "Release ${{ github.ref_name }}"
+          body: ${{ steps.changelog.outputs.body }}
           files: artifacts/*
