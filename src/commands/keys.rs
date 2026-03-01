@@ -578,7 +578,7 @@ fn select_interactive(
         Ok(())
     };
 
-    term.write_line(&format!("  {}:", prompt))?;
+    term.write_line(&format!("{}:", prompt))?;
     draw(&term, sel)?;
 
     let result = loop {
