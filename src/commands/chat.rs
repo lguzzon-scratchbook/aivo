@@ -11,8 +11,15 @@ use anyhow::Result;
 use dialoguer::FuzzySelect;
 use futures_util::StreamExt;
 use reqwest::Client;
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{
+    completion::{Completer, Pair},
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    validate::Validator,
+    Context, Editor, Helper,
+};
+use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::models::fetch_models;
@@ -22,6 +29,72 @@ use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
 const DEFAULT_MODEL: &str = "gpt-4o";
+const CMD_EXIT: &str = "/exit";
+const CMD_MODEL: &str = "/model";
+const CMD_MODEL_ARG: &str = "/model ";
+
+struct ChatHelper {
+    commands: Vec<&'static str>,
+}
+
+impl ChatHelper {
+    fn new() -> Self {
+        Self {
+            commands: vec![CMD_EXIT, CMD_MODEL],
+        }
+    }
+}
+
+impl Completer for ChatHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if !line.starts_with('/') {
+            return Ok((0, vec![]));
+        }
+        let prefix = &line[..pos];
+        let completions = self
+            .commands
+            .iter()
+            .filter(|&&cmd| cmd.starts_with(prefix))
+            .map(|&cmd| Pair {
+                display: cmd.to_string(),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        Ok((0, completions))
+    }
+}
+
+impl Hinter for ChatHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        // Only hint when cursor is at end of input and input starts with /
+        if pos < line.len() || !line.starts_with('/') {
+            return None;
+        }
+        self.commands
+            .iter()
+            .find(|&&cmd| cmd.starts_with(line) && cmd != line)
+            .map(|&cmd| cmd[pos..].to_string())
+    }
+}
+
+impl Highlighter for ChatHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(crate::style::dim(hint))
+    }
+}
+
+impl Validator for ChatHelper {}
+
+impl Helper for ChatHelper {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -189,7 +262,9 @@ impl ChatCommand {
         let mut models_cache: Option<Vec<String>> = None;
         let prompt = format!("{} ", style::cyan(">"));
 
-        let mut rl = DefaultEditor::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut rl = Editor::<ChatHelper, rustyline::history::DefaultHistory>::new()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        rl.set_helper(Some(ChatHelper::new()));
 
         loop {
             let input = match rl.readline(&prompt) {
@@ -210,12 +285,12 @@ impl ChatCommand {
             rl.add_history_entry(&input)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            if input == "/exit" {
+            if input == CMD_EXIT {
                 break;
             }
 
-            if input == "/model" || input.starts_with("/model ") {
-                let selected_raw: Option<String> = if input == "/model" {
+            if input == CMD_MODEL || input.starts_with(CMD_MODEL_ARG) {
+                let selected_raw: Option<String> = if input == CMD_MODEL {
                     // Fetch once per session; show spinner on first fetch
                     if models_cache.is_none() {
                         let spinning = Arc::new(AtomicBool::new(true));
@@ -256,10 +331,10 @@ impl ChatCommand {
                     }
                 } else {
                     input
-                        .strip_prefix("/model ")
-                        .map(str::trim)
+                        .strip_prefix(CMD_MODEL_ARG)
+                        .map(|s| s.trim())
                         .filter(|s| !s.is_empty())
-                        .map(str::to_string)
+                        .map(|s| s.to_string())
                 };
 
                 if let Some(raw) = selected_raw {
@@ -680,6 +755,93 @@ pub fn parse_anthropic_chunk(data: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::history::DefaultHistory;
+    use rustyline::Context;
+
+    fn make_history() -> DefaultHistory {
+        DefaultHistory::new()
+    }
+
+    #[test]
+    fn test_completer_exit_prefix() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        let (start, completions) = h.complete("/e", 2, &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert!(completions.iter().any(|p| p.replacement == "/exit"));
+    }
+
+    #[test]
+    fn test_completer_model_prefix() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        let (start, completions) = h.complete("/m", 2, &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert!(completions.iter().any(|p| p.replacement == "/model"));
+    }
+
+    #[test]
+    fn test_completer_no_match_for_normal_text() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        let (_, completions) = h.complete("hello", 5, &ctx).unwrap();
+        assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn test_completer_full_slash_prefix_returns_all() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        let (_, completions) = h.complete("/", 1, &ctx).unwrap();
+        assert_eq!(completions.len(), 2);
+    }
+
+    #[test]
+    fn test_hinter_shows_remainder_for_partial_exit() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        let hint = h.hint("/e", 2, &ctx);
+        assert_eq!(hint.as_deref(), Some("xit"));
+    }
+
+    #[test]
+    fn test_hinter_shows_remainder_for_partial_model() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        let hint = h.hint("/m", 2, &ctx);
+        assert_eq!(hint.as_deref(), Some("odel"));
+    }
+
+    #[test]
+    fn test_hinter_no_hint_for_complete_command() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        assert!(h.hint("/exit", 5, &ctx).is_none());
+    }
+
+    #[test]
+    fn test_hinter_no_hint_for_normal_text() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        assert!(h.hint("hello", 5, &ctx).is_none());
+    }
+
+    #[test]
+    fn test_hinter_no_hint_when_cursor_not_at_end() {
+        let h = ChatHelper::new();
+        let hist = make_history();
+        let ctx = Context::new(&hist);
+        // cursor at pos 2, line is longer — mid-edit, no hint
+        assert!(h.hint("/exit", 2, &ctx).is_none());
+    }
 
     #[test]
     fn test_parse_sse_chunk_with_content() {
