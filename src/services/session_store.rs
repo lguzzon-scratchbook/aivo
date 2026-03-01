@@ -360,6 +360,20 @@ impl SessionStore {
         }
     }
 
+    /// Updates an existing API key's fields by ID. Returns false if not found.
+    pub async fn update_key(&self, id: &str, name: &str, base_url: &str, key: &str) -> Result<bool> {
+        let mut config = self.load().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            entry.name = name.to_string();
+            entry.base_url = base_url.to_string();
+            entry.key = Zeroizing::new(key.to_string());
+            self.save(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Sets the currently active API key
     pub async fn set_active_key(&self, id: &str) -> Result<()> {
         let mut config = self.load().await?;
@@ -654,5 +668,63 @@ mod tests {
             result.is_err(),
             "expected Err on invalid encrypted key, got Ok"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_key_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key("original", "http://localhost:8080", "sk-old")
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_key(&id, "renamed", "https://new.example.com", "sk-new")
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.name, "renamed");
+        assert_eq!(key.base_url, "https://new.example.com");
+        assert_eq!(key.key.as_str(), "sk-new");
+        assert_eq!(key.id, id);
+    }
+
+    #[tokio::test]
+    async fn test_update_key_not_found_returns_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let updated = store
+            .update_key("nonexistent", "name", "http://example.com", "sk-key")
+            .await
+            .unwrap();
+        assert!(!updated);
+    }
+
+    #[tokio::test]
+    async fn test_update_key_preserves_created_at() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key("orig", "http://localhost", "sk-test")
+            .await
+            .unwrap();
+        let before = store.get_key_by_id(&id).await.unwrap().unwrap();
+
+        store
+            .update_key(&id, "new-name", "http://localhost", "sk-test")
+            .await
+            .unwrap();
+        let after = store.get_key_by_id(&id).await.unwrap().unwrap();
+
+        assert_eq!(before.created_at, after.created_at);
     }
 }

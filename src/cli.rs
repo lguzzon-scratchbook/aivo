@@ -34,7 +34,7 @@ pub enum Commands {
     /// Run AI tools (claude, codex, gemini) - all args passed through
     Run(RunArgs),
 
-    /// Manage API keys (list, use <id|name>, rm <id|name>, add)
+    /// Manage API keys (list, use <id|name>, rm <id|name>, add, cat, edit)
     Keys(KeysArgs),
 
     /// Start an interactive chat REPL
@@ -53,7 +53,7 @@ pub struct KeysArgs {
     /// The action to perform (list, use, rm, add, cat)
     #[arg(
         value_name = "ACTION",
-        help = "Action to perform: list, use, rm, add, cat"
+        help = "Action to perform: list, use, rm, add, cat, edit"
     )]
     pub action: Option<String>,
 

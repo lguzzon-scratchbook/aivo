@@ -52,6 +52,7 @@ impl KeysCommand {
             "rm" => self.remove_key(args.and_then(|a| a.first().copied())).await,
             "use" => self.use_key(args.and_then(|a| a.first().copied())).await,
             "cat" => self.cat_key(args.and_then(|a| a.first().copied())).await,
+            "edit" => self.edit_key(args.and_then(|a| a.first().copied())).await,
             _ => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
                 Self::print_help();
@@ -224,6 +225,117 @@ impl KeysCommand {
         println!("Base URL: {}", style::blue(&key.base_url));
         println!("API Key:  {}", style::yellow(&*key.key));
         println!();
+    }
+
+    /// Interactively edits an API key
+    async fn edit_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
+        use std::io::{self, Write};
+
+        let key_id_or_name = match key_id_or_name {
+            Some(k) => k,
+            None => {
+                eprintln!("{} Missing key ID or name", style::red("Error:"));
+                eprintln!();
+                eprintln!("{}", style::dim("Usage: aivo keys edit <key-id-or-name>"));
+                return Ok(ExitCode::UserError);
+            }
+        };
+
+        let key = match self.session_store.resolve_key_by_id_or_name(key_id_or_name).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("{} {}", style::red("Error:"), e);
+                eprintln!();
+                eprintln!(
+                    "{}",
+                    style::dim("Run 'aivo keys list' to see available keys.")
+                );
+                return Ok(ExitCode::UserError);
+            }
+        };
+
+        println!("{}", style::bold("Edit API Key"));
+        println!();
+        println!("Press Enter to keep the current value.");
+        println!();
+
+        fn read_line_with_default(prompt: &str) -> io::Result<String> {
+            print!("{}", prompt);
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            Ok(input.trim().to_string())
+        }
+
+        // Name
+        let name = loop {
+            let input = read_line_with_default(&format!("Name [{}]: ", key.name))?;
+            let value = if input.is_empty() {
+                key.name.clone()
+            } else {
+                input
+            };
+            if value.is_empty() {
+                eprintln!("{} Name cannot be empty", style::red("Error:"));
+            } else {
+                break value;
+            }
+        };
+
+        // Base URL
+        let base_url = loop {
+            let input = read_line_with_default(&format!("Base URL [{}]: ", key.base_url))?;
+            let value = if input.is_empty() {
+                key.base_url.clone()
+            } else {
+                input
+            };
+            if value.starts_with("http://") || value.starts_with("https://") {
+                break value;
+            }
+            eprintln!(
+                "{} URL must start with http:// or https://",
+                style::red("Error:")
+            );
+        };
+
+        // API Key
+        let api_key = loop {
+            let preview = key_preview(&key.key);
+            let input = read_line_with_default(&format!("API Key [{}]: ", preview))?;
+            let value = if input.is_empty() {
+                key.key.as_str().to_string()
+            } else {
+                input
+            };
+            if value.is_empty() {
+                eprintln!("{} API Key cannot be empty", style::red("Error:"));
+            } else {
+                break value;
+            }
+        };
+
+        println!();
+
+        let updated = self.session_store
+            .update_key(&key.id, &name, &base_url, &api_key)
+            .await?;
+
+        if !updated {
+            eprintln!(
+                "{} Key no longer exists",
+                style::red("Error:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
+        println!(
+            "{} Updated key: {}",
+            style::success_symbol(),
+            style::cyan(&name)
+        );
+
+        Ok(ExitCode::Success)
     }
 
     /// Interactively adds an API key
@@ -414,6 +526,10 @@ impl KeysCommand {
         );
         println!("  rm <id|name>    {}", style::dim("- Remove an API key"));
         println!("  add [name]      {}", style::dim("- Add an API key"));
+        println!(
+            "  edit <id|name>  {}",
+            style::dim("- Edit an API key")
+        );
     }
 }
 
@@ -425,5 +541,25 @@ mod tests {
     fn test_keys_command_creation() {
         let session_store = SessionStore::new();
         let _command = KeysCommand::new(session_store);
+    }
+
+    #[tokio::test]
+    async fn test_edit_key_missing_id() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+        let code = cmd.execute(Some("edit"), Some(&[])).await;
+        assert_eq!(code, crate::errors::ExitCode::UserError);
+    }
+
+    #[tokio::test]
+    async fn test_edit_key_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+        let code = cmd.execute(Some("edit"), Some(&["nonexistent"])).await;
+        assert_eq!(code, crate::errors::ExitCode::UserError);
     }
 }

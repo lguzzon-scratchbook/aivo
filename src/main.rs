@@ -297,7 +297,7 @@ fn print_help() {
         style::dim("Manage API keys (list, use, rm, add, cat)")
     );
     println!(
-        "  {}                    {}",
+        "  {}                     {}",
         style::cyan("models"),
         style::dim("List available models from the active provider")
     );
