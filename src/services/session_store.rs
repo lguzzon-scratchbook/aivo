@@ -361,7 +361,13 @@ impl SessionStore {
     }
 
     /// Updates an existing API key's fields by ID. Returns false if not found.
-    pub async fn update_key(&self, id: &str, name: &str, base_url: &str, key: &str) -> Result<bool> {
+    pub async fn update_key(
+        &self,
+        id: &str,
+        name: &str,
+        base_url: &str,
+        key: &str,
+    ) -> Result<bool> {
         let mut config = self.load().await?;
         if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
             entry.name = name.to_string();

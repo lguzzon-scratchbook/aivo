@@ -241,7 +241,11 @@ impl KeysCommand {
             }
         };
 
-        let key = match self.session_store.resolve_key_by_id_or_name(key_id_or_name).await {
+        let key = match self
+            .session_store
+            .resolve_key_by_id_or_name(key_id_or_name)
+            .await
+        {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -317,15 +321,13 @@ impl KeysCommand {
 
         println!();
 
-        let updated = self.session_store
+        let updated = self
+            .session_store
             .update_key(&key.id, &name, &base_url, &api_key)
             .await?;
 
         if !updated {
-            eprintln!(
-                "{} Key no longer exists",
-                style::red("Error:")
-            );
+            eprintln!("{} Key no longer exists", style::red("Error:"));
             return Ok(ExitCode::UserError);
         }
 
@@ -526,10 +528,7 @@ impl KeysCommand {
         );
         println!("  rm <id|name>    {}", style::dim("- Remove an API key"));
         println!("  add [name]      {}", style::dim("- Add an API key"));
-        println!(
-            "  edit <id|name>  {}",
-            style::dim("- Edit an API key")
-        );
+        println!("  edit <id|name>  {}", style::dim("- Edit an API key"));
     }
 }
 

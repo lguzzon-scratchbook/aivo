@@ -19,8 +19,8 @@ use rustyline::{
     validate::Validator,
     Context, Editor, Helper,
 };
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::commands::models::fetch_models;
 use crate::commands::normalize_base_url;
