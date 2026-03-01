@@ -16,6 +16,7 @@ mod version;
 use cli::{Cli, Commands};
 use commands::{ChatCommand, KeysCommand, ModelsCommand, RunCommand, UpdateCommand};
 use errors::ExitCode;
+use services::session_store::ApiKey;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
 /// Known AI tool names that can be used as shortcut aliases for `run`.
@@ -106,7 +107,10 @@ async fn main() {
                     }
                 }
             } else {
-                None
+                match resolve_active_key_or_prompt(&session_store).await {
+                    Some(key) => Some(key),
+                    None => process::exit(ExitCode::AuthError.code()),
+                }
             };
             let command = ChatCommand::new(session_store, models_cache.clone());
             command.execute(chat_args.model, key_override).await
@@ -186,7 +190,10 @@ async fn main() {
                     }
                 }
             } else {
-                None
+                match resolve_active_key_or_prompt(&session_store).await {
+                    Some(key) => Some(key),
+                    None => process::exit(ExitCode::AuthError.code()),
+                }
             };
 
             let env = if !env_strings.is_empty() {
@@ -232,7 +239,10 @@ async fn main() {
                     }
                 }
             } else {
-                None
+                match resolve_active_key_or_prompt(&session_store).await {
+                    Some(key) => Some(key),
+                    None => process::exit(ExitCode::AuthError.code()),
+                }
             };
             let command = ModelsCommand::new(session_store, models_cache);
             command.execute(key_override, models_args.refresh).await
@@ -252,6 +262,52 @@ async fn main() {
     };
 
     process::exit(exit_code.code());
+}
+
+/// When no active key is set, prompts the user to select one (if keys exist)
+/// or to add one (if no keys exist). Returns the selected key on success.
+async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<ApiKey> {
+    // Already have an active key — nothing to do
+    if let Ok(Some(key)) = session_store.get_active_key().await {
+        return Some(key);
+    }
+
+    let all_keys = match session_store.get_keys().await {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            return None;
+        }
+    };
+
+    if all_keys.is_empty() {
+        eprintln!("{} No API keys configured.", style::yellow("Note:"));
+        eprintln!();
+        eprintln!("  Run {} to add one.", style::cyan("aivo keys add"));
+        return None;
+    }
+
+    // Keys exist but none is active — let the user pick
+    eprintln!(
+        "{} No active API key. Select one to continue:",
+        style::yellow("Note:")
+    );
+    eprintln!();
+
+    match commands::keys::prompt_select_key(session_store, &all_keys, "Select a key", 0).await {
+        Ok(Some(key)) => {
+            eprintln!();
+            Some(key)
+        }
+        Ok(None) => {
+            eprintln!("{}", style::dim("Cancelled."));
+            None
+        }
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            None
+        }
+    }
 }
 
 /// Prints the active key info.

@@ -104,21 +104,14 @@ impl KeysCommand {
             let active_idx = active_key
                 .and_then(|ak| all_keys.iter().position(|k| k.id == ak.id))
                 .unwrap_or(0);
-            let choices: Vec<_> = all_keys
-                .iter()
-                .map(|k| {
-                    format!(
-                        "{}  {}  {}",
-                        style::cyan(format!("{:<4}", k.id)),
-                        k.name,
-                        style::dim(&k.base_url)
-                    )
-                })
-                .collect();
-            let selection = select_interactive("Select a key to activate", &choices, active_idx)?;
-            if let Some(idx) = selection {
-                self.activate_key(&all_keys[idx]).await?;
-            } else {
+            let result = prompt_select_key(
+                &self.session_store,
+                &all_keys,
+                "Select a key to activate",
+                active_idx,
+            )
+            .await?;
+            if result.is_none() {
                 println!("{}", style::dim("Cancelled."));
             }
             return Ok(ExitCode::Success);
@@ -549,6 +542,43 @@ impl KeysCommand {
         println!("  rm <id|name>    {}", style::dim("- Remove an API key"));
         println!("  add [name]      {}", style::dim("- Add an API key"));
         println!("  edit <id|name>  {}", style::dim("- Edit an API key"));
+    }
+}
+
+/// Formats an API key as a choice string for interactive selectors.
+pub(crate) fn format_key_choice(key: &ApiKey) -> String {
+    format!(
+        "{}  {}  {}",
+        style::cyan(format!("{:<4}", key.id)),
+        key.name,
+        style::dim(&key.base_url)
+    )
+}
+
+/// Prompts the user to select a key from the given list and activates it.
+/// Returns `Ok(Some(key))` if selected, `Ok(None)` if cancelled.
+pub(crate) async fn prompt_select_key(
+    session_store: &SessionStore,
+    keys: &[ApiKey],
+    prompt: &str,
+    default: usize,
+) -> Result<Option<ApiKey>> {
+    let choices: Vec<String> = keys.iter().map(format_key_choice).collect();
+    let selection = select_interactive(prompt, &choices, default)?;
+    match selection {
+        Some(idx) => {
+            let key = &keys[idx];
+            session_store.set_active_key(&key.id).await?;
+            let preview = key_preview(&key.key);
+            eprintln!(
+                "{} Activated key: {} {}",
+                style::success_symbol(),
+                style::cyan(&key.name),
+                style::dim(&preview)
+            );
+            Ok(Some(key.clone()))
+        }
+        None => Ok(None),
     }
 }
 
