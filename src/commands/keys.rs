@@ -568,11 +568,12 @@ fn select_interactive(
 
     let draw = |term: &Term, sel: usize| -> std::io::Result<()> {
         for (i, choice) in choices.iter().enumerate() {
-            if i == sel {
-                term.write_line(&format!("  \u{276f} {}", choice))?;
+            let indicator = if i == sel {
+                style::bullet_symbol()
             } else {
-                term.write_line(&format!("    {}", choice))?;
-            }
+                style::empty_bullet_symbol()
+            };
+            term.write_line(&format!("  {} {}", indicator, choice))?;
         }
         Ok(())
     };
