@@ -2,8 +2,13 @@
  * CLI argument parsing and command routing.
  * Uses clap for argument parsing.
  */
+use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
+
+fn non_empty() -> NonEmptyStringValueParser {
+    NonEmptyStringValueParser::new()
+}
 
 /// The aivo CLI - unified access to AI coding assistants
 #[derive(Parser, Debug)]
@@ -73,11 +78,11 @@ pub struct RunArgs {
     pub tool: Option<String>,
 
     /// Specify AI model to use
-    #[arg(short, long, value_name = "MODEL")]
+    #[arg(short, long, value_name = "MODEL", value_parser = non_empty())]
     pub model: Option<String>,
 
     /// Select API key by ID or name
-    #[arg(short = 'k', long, value_name = "ID|NAME")]
+    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
     pub key: Option<String>,
 
     /// Enable debug output
@@ -102,7 +107,7 @@ pub struct RunArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ModelsArgs {
     /// Select API key by ID or name
-    #[arg(short = 'k', long, value_name = "ID|NAME")]
+    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
     pub key: Option<String>,
 
     /// Bypass cache and fetch fresh model list from the provider
@@ -114,11 +119,11 @@ pub struct ModelsArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ChatArgs {
     /// Specify AI model to use (remembered across sessions)
-    #[arg(short, long, value_name = "MODEL")]
+    #[arg(short, long, value_name = "MODEL", value_parser = non_empty())]
     pub model: Option<String>,
 
     /// Select API key by ID or name
-    #[arg(short = 'k', long, value_name = "ID|NAME")]
+    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
     pub key: Option<String>,
 }
 
