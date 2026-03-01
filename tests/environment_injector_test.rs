@@ -81,6 +81,25 @@ fn test_for_gemini() {
 }
 
 #[test]
+fn test_for_opencode() {
+    let injector = EnvironmentInjector::new();
+    let key = test_key();
+    let env = injector.for_opencode(&key, Some("gpt-5"), None);
+
+    let config: serde_json::Value =
+        serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+    assert_eq!(config["model"], "aivo/gpt-5");
+    assert_eq!(
+        config["provider"]["aivo"]["options"]["apiKey"],
+        "sk-test-key-12345"
+    );
+    assert_eq!(
+        config["provider"]["aivo"]["options"]["baseURL"],
+        "http://localhost:8080"
+    );
+}
+
+#[test]
 fn test_merge() {
     let injector = EnvironmentInjector::new();
     let key = test_key();

@@ -2,8 +2,12 @@
 //! Handles process spawning with environment injection and stdio passthrough.
 
 use anyhow::{Context, Result};
+use reqwest::Client;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::signal;
 
@@ -17,6 +21,7 @@ pub enum AIToolType {
     Claude,
     Codex,
     Gemini,
+    Opencode,
 }
 
 impl AIToolType {
@@ -26,6 +31,7 @@ impl AIToolType {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "gemini" => Some(Self::Gemini),
+            "opencode" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -35,6 +41,7 @@ impl AIToolType {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Opencode => "opencode",
         }
     }
 }
@@ -94,7 +101,20 @@ impl AILauncher {
 
         self.output_key_info(&key);
 
-        let tool_config = self.get_tool_config(options.tool, &key, options.model.as_deref());
+        let (model, opencode_models) = if options.tool == AIToolType::Opencode {
+            let (selected_model, discovered_models) = self
+                .resolve_opencode_model_config(&key, options.model.as_deref())
+                .await?;
+            (selected_model, Some(discovered_models))
+        } else {
+            (options.model.clone(), None)
+        };
+        let tool_config = self.get_tool_config(
+            options.tool,
+            &key,
+            model.as_deref(),
+            opencode_models.as_deref(),
+        );
 
         let mut env =
             self.env_injector
@@ -146,12 +166,84 @@ impl AILauncher {
         );
     }
 
+    async fn resolve_opencode_model_config(
+        &self,
+        key: &ApiKey,
+        model: Option<&str>,
+    ) -> Result<(Option<String>, Vec<String>)> {
+        let requested_model = model.map(|m| m.strip_prefix("aivo/").unwrap_or(m).to_string());
+        let client = Client::new();
+
+        let spinning = Arc::new(AtomicBool::new(true));
+        let spinning_clone = spinning.clone();
+        let spinner_handle = tokio::task::spawn_blocking(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0;
+            while spinning_clone.load(Ordering::Relaxed) {
+                eprint!("\r{} Fetching models...", frames[i % frames.len()]);
+                let _ = io::stderr().flush();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                i += 1;
+            }
+        });
+
+        let fetch_result = crate::commands::models::fetch_models(&client, key).await;
+
+        spinning.store(false, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        eprint!("\r \r");
+        let _ = io::stderr().flush();
+        let _ = spinner_handle.await;
+
+        let mut models = match fetch_result {
+            Ok(models) => models,
+            Err(e) => {
+                if let Some(requested_model) = requested_model.clone() {
+                    return Ok((Some(requested_model.clone()), vec![requested_model]));
+                }
+                return Err(e).with_context(|| {
+                    "Unable to determine an OpenCode model from your provider. Pass --model <provider/model>."
+                });
+            }
+        };
+        if let Some(requested_model) = requested_model {
+            if !models.contains(&requested_model) {
+                models.push(requested_model.clone());
+            }
+            models.sort();
+            models.dedup();
+            return Ok((Some(requested_model), models));
+        }
+
+        models.sort();
+        models.dedup();
+
+        let selected_model = models
+            .iter()
+            .find(|m| m.contains("claude") && m.contains("sonnet"))
+            .or_else(|| models.first())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No models returned by provider. Pass --model <provider/model> for opencode."
+                )
+            })?;
+        Ok((Some(selected_model), models))
+    }
+
     /// Gets tool-specific configuration including command and environment variables
-    fn get_tool_config(&self, tool: AIToolType, key: &ApiKey, model: Option<&str>) -> ToolConfig {
+    fn get_tool_config(
+        &self,
+        tool: AIToolType,
+        key: &ApiKey,
+        model: Option<&str>,
+        opencode_models: Option<&[String]>,
+    ) -> ToolConfig {
         let env_vars = match tool {
             AIToolType::Claude => self.env_injector.for_claude(key, model),
             AIToolType::Codex => self.env_injector.for_codex(key, model),
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
+            AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
         };
 
         ToolConfig {
@@ -349,6 +441,7 @@ mod tests {
         assert_eq!(AIToolType::parse("CLAUDE"), Some(AIToolType::Claude));
         assert_eq!(AIToolType::parse("codex"), Some(AIToolType::Codex));
         assert_eq!(AIToolType::parse("gemini"), Some(AIToolType::Gemini));
+        assert_eq!(AIToolType::parse("opencode"), Some(AIToolType::Opencode));
         assert_eq!(AIToolType::parse("unknown"), None);
     }
 
@@ -369,6 +462,9 @@ mod tests {
         assert_eq!(result, vec!["--verbose"]);
 
         let result = inject_claude_teammate_mode(AIToolType::Gemini, &args);
+        assert_eq!(result, vec!["--verbose"]);
+
+        let result = inject_claude_teammate_mode(AIToolType::Opencode, &args);
         assert_eq!(result, vec!["--verbose"]);
     }
 

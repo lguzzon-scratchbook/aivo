@@ -73,6 +73,11 @@ impl RunCommand {
                 eprintln!("  {}  {}", style::cyan("claude"), style::dim("- Claude AI"));
                 eprintln!("  {}  {}", style::cyan("codex"), style::dim("- Codex AI"));
                 eprintln!("  {}  {}", style::cyan("gemini"), style::dim("- Gemini AI"));
+                eprintln!(
+                    "  {}  {}",
+                    style::cyan("opencode"),
+                    style::dim("- OpenCode")
+                );
                 eprintln!();
                 eprintln!(
                     "{}",
@@ -138,6 +143,11 @@ impl RunCommand {
         println!("  {}  {}", style::cyan("claude"), style::dim("- Claude AI"));
         println!("  {}  {}", style::cyan("codex"), style::dim("- Codex AI"));
         println!("  {}  {}", style::cyan("gemini"), style::dim("- Gemini AI"));
+        println!(
+            "  {}  {}",
+            style::cyan("opencode"),
+            style::dim("- OpenCode")
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo run claude"));
@@ -157,5 +167,6 @@ mod tests {
         assert!(AIToolType::parse("claude").is_some());
         assert!(AIToolType::parse("codex").is_some());
         assert!(AIToolType::parse("gemini").is_some());
+        assert!(AIToolType::parse("opencode").is_some());
     }
 }

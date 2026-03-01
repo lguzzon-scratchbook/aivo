@@ -1,6 +1,6 @@
 # aivo
 
-Run Claude Code (and Codex, Gemini) with any API provider — OpenRouter, Vercel AI Gateway, or your own.
+Run Claude Code (and Codex, Gemini, OpenCode) with any API provider — OpenRouter, Vercel AI Gateway, or your own.
 
 No env var juggling. No config files. Just add a key and go.
 
@@ -27,6 +27,7 @@ aivo claude
 | `aivo claude` | Run Claude Code |
 | `aivo codex` | Run Codex |
 | `aivo gemini` | Run Gemini |
+| `aivo opencode` | Run OpenCode |
 | `aivo chat` | Interactive chat REPL |
 | `aivo keys add` | Add an API key |
 | `aivo keys use <name>` | Switch active key |
@@ -37,6 +38,7 @@ Flags pass through directly:
 
 ```bash
 aivo claude --model claude-sonnet-4-6
+aivo opencode --model gpt-5
 aivo claude --key my-proxy          # use a specific saved key
 aivo claude --env DEBUG=true        # inject extra env vars
 aivo chat --model gpt-4o            # chat with any model

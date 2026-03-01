@@ -175,13 +175,19 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                 .await?;
 
             if response.status().is_success() {
-                let resp: OpenAIModelsResponse = response.json().await?;
-                return Ok(resp.data.into_iter().map(|m| m.id).collect());
+                let body = response.text().await.unwrap_or_default();
+                match serde_json::from_str::<OpenAIModelsResponse>(&body) {
+                    Ok(resp) => return Ok(resp.data.into_iter().map(|m| m.id).collect()),
+                    Err(e) => {
+                        last_err = format!("Invalid models response from {}: {}", url, e);
+                        continue;
+                    }
+                }
             }
 
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            last_err = format!("API returned {} — {}", status, body);
+            last_err = format!("API returned {} from {} — {}", status, url, body);
         }
 
         anyhow::bail!("{}", last_err)

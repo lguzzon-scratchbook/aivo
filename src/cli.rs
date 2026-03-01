@@ -9,7 +9,7 @@ use std::collections::HashMap;
 #[derive(Parser, Debug)]
 #[command(
     name = "aivo",
-    about = "CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini)",
+    about = "CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini, OpenCode)",
     version = crate::version::VERSION,
     author = "yuanchuan",
     disable_help_flag = true,
@@ -31,7 +31,7 @@ pub struct Cli {
 /// Available commands for the CLI
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
-    /// Run AI tools (claude, codex, gemini) - all args passed through
+    /// Run AI tools (claude, codex, gemini, opencode) - all args passed through
     Run(RunArgs),
 
     /// Manage API keys (list, use <id|name>, rm <id|name>, add, cat, edit)
@@ -65,8 +65,11 @@ pub struct KeysArgs {
 /// Arguments for the run command
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// The AI tool to run (claude, codex, gemini)
-    #[arg(value_name = "TOOL", help = "AI tool to run: claude, codex, or gemini")]
+    /// The AI tool to run (claude, codex, gemini, opencode)
+    #[arg(
+        value_name = "TOOL",
+        help = "AI tool to run: claude, codex, gemini, or opencode"
+    )]
     pub tool: Option<String>,
 
     /// Specify AI model to use
@@ -324,7 +327,7 @@ mod tests {
 
     /// Helper to simulate the alias rewriting done in main.rs
     fn rewrite_alias(args: &[&str]) -> Vec<String> {
-        let aliases = ["claude", "codex", "gemini"];
+        let aliases = ["claude", "codex", "gemini", "opencode"];
         let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
             let mut rewritten = vec![raw[0].clone(), "run".to_string()];
@@ -366,6 +369,17 @@ mod tests {
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.tool, Some("gemini".to_string()));
             assert!(run_args.debug);
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_tool_alias_opencode() {
+        let args = rewrite_alias(&["aivo", "opencode"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.tool, Some("opencode".to_string()));
         } else {
             panic!("Expected Run command");
         }

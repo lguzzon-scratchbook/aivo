@@ -4,6 +4,8 @@
  */
 use std::collections::HashMap;
 
+use serde_json::{json, Map, Value};
+
 use crate::services::session_store::ApiKey;
 
 /// EnvironmentInjector prepares tool-specific environment variables for AI tools
@@ -152,6 +154,79 @@ impl EnvironmentInjector {
         env
     }
 
+    /// Prepares environment variables for OpenCode CLI.
+    ///
+    /// Uses OPENCODE_CONFIG_CONTENT to inject an inline OpenCode config
+    /// so aivo can provide base URL and API key without writing config files.
+    pub fn for_opencode(
+        &self,
+        key: &ApiKey,
+        model: Option<&str>,
+        discovered_models: Option<&[String]>,
+    ) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+
+        let mut provider = Map::new();
+        provider.insert("npm".to_string(), json!("@ai-sdk/openai-compatible"));
+        provider.insert("name".to_string(), json!("aivo"));
+        provider.insert(
+            "options".to_string(),
+            json!({
+                "baseURL": key.base_url.as_str(),
+                "apiKey": key.key.as_str(),
+            }),
+        );
+
+        let mut model_ids: Vec<String> = discovered_models
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|m| strip_aivo_prefix(m).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(model) = model {
+            let model_name = strip_aivo_prefix(model).to_string();
+            if !model_ids.contains(&model_name) {
+                model_ids.push(model_name);
+            }
+        }
+
+        model_ids.sort();
+        model_ids.dedup();
+        if !model_ids.is_empty() {
+            let mut models = Map::new();
+            for model_id in model_ids {
+                models.insert(model_id.clone(), json!({ "name": model_id }));
+            }
+            provider.insert("models".to_string(), Value::Object(models));
+        }
+
+        let mut providers = Map::new();
+        providers.insert("aivo".to_string(), Value::Object(provider));
+
+        let mut config = Map::new();
+        config.insert(
+            "$schema".to_string(),
+            json!("https://opencode.ai/config.json"),
+        );
+        config.insert("provider".to_string(), Value::Object(providers));
+
+        if let Some(model) = model {
+            config.insert(
+                "model".to_string(),
+                json!(format!("aivo/{}", strip_aivo_prefix(model))),
+            );
+        }
+
+        env.insert(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            Value::Object(config).to_string(),
+        );
+        env
+    }
+
     /// Merges tool-specific environment variables with the current process environment
     ///
     /// Tool environment variables take precedence over existing process.env values.
@@ -184,15 +259,7 @@ impl EnvironmentInjector {
             keys.sort();
             for key in keys {
                 let value = &tool_env[key];
-                let display = if key.contains("TOKEN") || key.contains("KEY") {
-                    if value.len() > 12 {
-                        format!("{}...{}", &value[..8], &value[value.len() - 4..])
-                    } else {
-                        "***".to_string()
-                    }
-                } else {
-                    value.clone()
-                };
+                let display = redact_env_value(key, value);
                 eprintln!("  {}={}", key, display);
             }
 
@@ -203,15 +270,7 @@ impl EnvironmentInjector {
                     keys.sort();
                     for key in keys {
                         let value = &manual[key];
-                        let display = if key.contains("TOKEN") || key.contains("KEY") {
-                            if value.len() > 12 {
-                                format!("{}...{}", &value[..8], &value[value.len() - 4..])
-                            } else {
-                                "***".to_string()
-                            }
-                        } else {
-                            value.clone()
-                        };
+                        let display = redact_env_value(key, value);
                         eprintln!("  {}={}", key, display);
                     }
                 }
@@ -219,6 +278,26 @@ impl EnvironmentInjector {
         }
 
         merged
+    }
+}
+
+fn strip_aivo_prefix(model: &str) -> &str {
+    model.strip_prefix("aivo/").unwrap_or(model)
+}
+
+fn redact_env_value(key: &str, value: &str) -> String {
+    if key == "OPENCODE_CONFIG_CONTENT" {
+        return "<redacted>".to_string();
+    }
+
+    if key.contains("TOKEN") || key.contains("KEY") {
+        if value.len() > 12 {
+            format!("{}...{}", &value[..8], &value[value.len() - 4..])
+        } else {
+            "***".to_string()
+        }
+    } else {
+        value.to_string()
     }
 }
 
@@ -545,6 +624,105 @@ mod tests {
         assert_eq!(
             env.get("AIVO_GEMINI_ROUTER_BASE_URL"),
             Some(&"https://ai-gateway.vercel.sh/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_opencode() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let env = injector.for_opencode(&key, None, None);
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(config["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(
+            config["provider"]["aivo"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
+        assert_eq!(config["provider"]["aivo"]["name"], "aivo");
+        assert_eq!(
+            config["provider"]["aivo"]["options"]["baseURL"],
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            config["provider"]["aivo"]["options"]["apiKey"],
+            "sk-test-key-12345"
+        );
+        assert!(config.get("model").is_none());
+    }
+
+    #[test]
+    fn test_for_opencode_with_model() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let env = injector.for_opencode(&key, Some("gpt-5"), None);
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(config["model"], "aivo/gpt-5");
+        assert_eq!(
+            config["provider"]["aivo"]["models"]["gpt-5"]["name"],
+            "gpt-5"
+        );
+    }
+
+    #[test]
+    fn test_for_opencode_with_prefixed_model() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let env = injector.for_opencode(&key, Some("aivo/gpt-5"), None);
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(config["model"], "aivo/gpt-5");
+        assert_eq!(
+            config["provider"]["aivo"]["models"]["gpt-5"]["name"],
+            "gpt-5"
+        );
+    }
+
+    #[test]
+    fn test_for_opencode_with_discovered_models() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let discovered = vec!["gpt-4o".to_string(), "claude-sonnet-4".to_string()];
+        let env = injector.for_opencode(&key, None, Some(&discovered));
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert!(config.get("model").is_none());
+        assert_eq!(
+            config["provider"]["aivo"]["models"]["claude-sonnet-4"]["name"],
+            "claude-sonnet-4"
+        );
+        assert_eq!(
+            config["provider"]["aivo"]["models"]["gpt-4o"]["name"],
+            "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn test_for_opencode_with_model_and_discovered_models() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let discovered = vec!["gpt-4o".to_string(), "claude-sonnet-4".to_string()];
+        let env = injector.for_opencode(&key, Some("gpt-5"), Some(&discovered));
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(config["model"], "aivo/gpt-5");
+        assert_eq!(
+            config["provider"]["aivo"]["models"]["gpt-5"]["name"],
+            "gpt-5"
+        );
+        assert_eq!(
+            config["provider"]["aivo"]["models"]["gpt-4o"]["name"],
+            "gpt-4o"
+        );
+        assert_eq!(
+            config["provider"]["aivo"]["models"]["claude-sonnet-4"]["name"],
+            "claude-sonnet-4"
         );
     }
 

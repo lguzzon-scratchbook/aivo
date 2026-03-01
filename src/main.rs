@@ -19,7 +19,7 @@ use errors::ExitCode;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
 /// Known AI tool names that can be used as shortcut aliases for `run`.
-const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini"];
+const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode"];
 
 /// Main entry point for the CLI
 #[tokio::main(flavor = "current_thread")]
@@ -283,7 +283,7 @@ fn print_help() {
     println!("{}", style::bold("Commands:"));
     println!(
         "  {}  {}",
-        style::cyan("run <claude|codex|gemini>"),
+        style::cyan("run <claude|codex|gemini|opencode>"),
         style::dim("Launch AI tool with local API keys")
     );
     println!(
@@ -310,7 +310,7 @@ fn print_help() {
     println!(
         "{} {}",
         style::bold("Shortcuts:"),
-        style::dim("aivo claude, aivo codex, aivo gemini")
+        style::dim("aivo claude, aivo codex, aivo gemini, aivo opencode")
     );
     println!();
     println!("{}", style::bold("Options:"));
