@@ -32,8 +32,9 @@ fmt: ## Format code
 clean: ## Clean build artifacts
 	cargo clean
 
-install: build ## Install binary locally (requires cargo install)
-	cargo install --path . --force
+install: build ## Install binary to /usr/local/bin (re-signs for macOS arm64)
+	cp target/release/aivo /usr/local/bin/aivo
+	codesign --force -s - /usr/local/bin/aivo 2>/dev/null || true
 
 dev: check test clippy ## Run all checks (check, test, clippy)
 

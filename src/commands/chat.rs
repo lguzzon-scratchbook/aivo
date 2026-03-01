@@ -1,18 +1,21 @@
 /**
  * ChatCommand handler for interactive REPL with streaming API responses.
- * Makes direct HTTP calls to OpenAI-compatible /v1/chat/completions endpoint.
+ * Tries OpenAI-compatible /v1/chat/completions first; falls back to
+ * Anthropic's /v1/messages format if the provider returns 404/405.
  */
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use dialoguer::FuzzySelect;
 use futures_util::StreamExt;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 
+use crate::commands::models::fetch_models;
 use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -45,6 +48,29 @@ struct ChunkChoice {
 #[derive(Debug, Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
+}
+
+/// Which API format the provider speaks
+#[derive(Debug, Clone, PartialEq)]
+enum ChatFormat {
+    /// OpenAI-compatible: POST /v1/chat/completions
+    OpenAI,
+    /// Anthropic native: POST /v1/messages
+    Anthropic,
+}
+
+// Anthropic response structs
+
+#[derive(Deserialize)]
+struct AnthropicStreamEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    delta: Option<AnthropicDelta>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicDelta {
+    text: Option<String>,
 }
 
 /// ChatCommand provides an interactive REPL for chatting with AI models
@@ -142,10 +168,8 @@ impl ChatCommand {
             },
         };
 
-        let mut model = self.resolve_model(model_flag).await?;
-
-        // Transform model name for OpenRouter compatibility
-        model = Self::transform_model_for_provider(&key.base_url, &model);
+        let mut raw_model = self.resolve_model(model_flag).await?;
+        let mut model = Self::transform_model_for_provider(&key.base_url, &raw_model);
 
         eprintln!(
             "{} model: {} {}",
@@ -153,10 +177,15 @@ impl ChatCommand {
             style::cyan(&model),
             style::dim(format!("({})", key.base_url))
         );
-        eprintln!("{}", style::dim("Type 'exit' to end. Ctrl+D also works."));
+        eprintln!(
+            "{}",
+            style::dim("Type /exit to quit, /model to pick a model, /model <name> to set directly. Ctrl+D also works.")
+        );
 
         let client = Client::new();
         let mut history: Vec<ChatMessage> = Vec::new();
+        let mut format = ChatFormat::OpenAI;
+        let mut models_cache: Option<Vec<String>> = None;
         let prompt = format!("{} ", style::cyan(">"));
 
         let mut rl = DefaultEditor::new().map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -180,8 +209,75 @@ impl ChatCommand {
             rl.add_history_entry(&input)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            if input == "exit" || input == "quit" {
+            if input == "/exit" {
                 break;
+            }
+
+            if input == "/model" || input.starts_with("/model ") {
+                let selected_raw: Option<String> = if input == "/model" {
+                    // Fetch once per session; show spinner on first fetch
+                    if models_cache.is_none() {
+                        let spinning = Arc::new(AtomicBool::new(true));
+                        let spinning_clone = spinning.clone();
+                        let spinner_handle = tokio::task::spawn_blocking(move || {
+                            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                            let mut i = 0;
+                            while spinning_clone.load(Ordering::Relaxed) {
+                                eprint!("\r{}", style::dim(frames[i % frames.len()]));
+                                let _ = io::stderr().flush();
+                                std::thread::sleep(std::time::Duration::from_millis(80));
+                                i += 1;
+                            }
+                        });
+                        let list = fetch_models(&client, &key).await.unwrap_or_default();
+                        stop_spinner(&spinning);
+                        let _ = spinner_handle.await;
+                        models_cache = Some(list);
+                    }
+                    let models_list = models_cache.as_ref().unwrap();
+                    if models_list.is_empty() {
+                        eprintln!("  model: {}", style::cyan(&model));
+                        None
+                    } else {
+                        // Use raw_model (pre-transform) to find current selection in the list
+                        let current_idx = models_list
+                            .iter()
+                            .position(|m| m == &raw_model)
+                            .unwrap_or(0);
+                        FuzzySelect::new()
+                            .with_prompt("Select model")
+                            .items(models_list)
+                            .default(current_idx)
+                            .interact_opt()
+                            .ok()
+                            .flatten()
+                            .map(|idx| models_list[idx].clone())
+                    }
+                } else {
+                    input
+                        .strip_prefix("/model ")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                };
+
+                if let Some(raw) = selected_raw {
+                    self.session_store.set_chat_model(&raw).await?;
+                    raw_model = raw.clone();
+                    model = Self::transform_model_for_provider(&key.base_url, &raw);
+                    eprintln!("  model: {}", style::cyan(&model));
+                }
+                continue;
+            }
+
+            if input.starts_with('/') {
+                let cmd = input.split_whitespace().next().unwrap_or(&input);
+                eprintln!(
+                    "{} Unknown command: {}",
+                    style::yellow("Warning:"),
+                    style::cyan(cmd)
+                );
+                continue;
             }
 
             // Add user message to history
@@ -204,14 +300,32 @@ impl ChatCommand {
                 }
             });
 
-            // Stream response (retry once on transient errors)
-            let result = match send_chat_request(&client, &key, &model, &history, &spinning).await {
-                ok @ Ok(_) => ok,
-                Err(first_err) => {
+            // Stream response, auto-detecting provider format
+            let result = match format {
+                ChatFormat::OpenAI => {
                     match send_chat_request(&client, &key, &model, &history, &spinning).await {
                         ok @ Ok(_) => ok,
-                        Err(_) => Err(first_err), // report the original error, not the retry error
+                        Err(e) if is_format_mismatch(&e) => {
+                            // Provider doesn't speak OpenAI format; try Anthropic
+                            match send_anthropic_request(&client, &key, &model, &history, &spinning)
+                                .await
+                            {
+                                Ok(content) => {
+                                    eprintln!(
+                                        "{}",
+                                        style::dim("  (using Anthropic messages format)")
+                                    );
+                                    format = ChatFormat::Anthropic;
+                                    Ok(content)
+                                }
+                                Err(_) => Err(e), // both failed; report original error
+                            }
+                        }
+                        Err(e) => Err(e),
                     }
+                }
+                ChatFormat::Anthropic => {
+                    send_anthropic_request(&client, &key, &model, &history, &spinning).await
                 }
             };
 
@@ -278,8 +392,14 @@ fn stop_spinner(spinning: &Arc<AtomicBool>) {
     }
 }
 
+/// Strips trailing slashes and a bare `/v1` suffix from a provider base URL.
+fn normalize_base_url(url: &str) -> &str {
+    let url = url.trim_end_matches('/');
+    url.strip_suffix("/v1").unwrap_or(url)
+}
+
 /// Sends a chat completion request and prints the response.
-/// Tries streaming first; falls back to non-streaming if the server returns 503.
+/// Tries streaming first; falls back to non-streaming if the server returns a 5xx error.
 /// Returns the full assistant message content.
 async fn send_chat_request(
     client: &Client,
@@ -288,8 +408,7 @@ async fn send_chat_request(
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
 ) -> Result<String> {
-    let base = key.base_url.trim_end_matches('/');
-    let base = base.strip_suffix("/v1").unwrap_or(base);
+    let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/chat/completions", base);
 
     // Try streaming first; fall back to non-streaming on server errors
@@ -308,8 +427,10 @@ async fn send_chat_request(
         .send()
         .await?;
 
-    // If streaming is not supported, fall back to non-streaming
-    if response.status().is_server_error() || response.status() == reqwest::StatusCode::NOT_FOUND {
+    // If the server can't handle streaming, fall back to non-streaming.
+    // Note: 404 is NOT included here — it means wrong endpoint, not streaming unsupported.
+    // The caller detects 404 and switches to a different API format instead.
+    if response.status().is_server_error() {
         return send_non_streaming(client, &url, key, model, messages, spinning).await;
     }
 
@@ -412,6 +533,155 @@ pub fn parse_sse_chunk(data: &str) -> Option<String> {
     chunk.choices.first()?.delta.content.clone()
 }
 
+/// Returns true when the error indicates the endpoint doesn't exist,
+/// meaning we should try a different API format.
+fn is_format_mismatch(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("404") || msg.contains("405")
+}
+
+/// Sends a request using Anthropic's native /v1/messages API.
+/// Tries streaming first; falls back to non-streaming on server errors.
+async fn send_anthropic_request(
+    client: &Client,
+    key: &ApiKey,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+) -> Result<String> {
+    let base = normalize_base_url(&key.base_url);
+    let url = format!("{}/v1/messages", base);
+
+    let request = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": 8096,
+        "stream": true,
+    });
+
+    let response = client
+        .post(&url)
+        // Send both auth headers: gateways vary on which they accept
+        .header("Authorization", format!("Bearer {}", key.key.as_str()))
+        .header("x-api-key", key.key.as_str())
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+        .json(&request)
+        .send()
+        .await?;
+
+    if response.status().is_server_error() || response.status() == reqwest::StatusCode::NOT_FOUND {
+        return send_anthropic_non_streaming(client, &url, key, model, messages, spinning).await;
+    }
+
+    if !response.status().is_success() {
+        stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let mut full_content = String::new();
+    let mut line_buf = String::new();
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let text = String::from_utf8_lossy(&chunk);
+        line_buf.push_str(&text);
+
+        while let Some(pos) = line_buf.find('\n') {
+            let line = line_buf[..pos].trim_end_matches('\r').to_string();
+            line_buf = line_buf[pos + 1..].to_string();
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Some(text) = parse_anthropic_chunk(data) {
+                    stop_spinner(spinning);
+                    print!("{}", text);
+                    io::stdout().flush()?;
+                    full_content.push_str(&text);
+                }
+            }
+        }
+    }
+
+    // If streaming produced no content, fall back to non-streaming
+    if full_content.is_empty() {
+        return send_anthropic_non_streaming(client, &url, key, model, messages, spinning).await;
+    }
+
+    Ok(full_content)
+}
+
+/// Non-streaming fallback for Anthropic-format providers.
+async fn send_anthropic_non_streaming(
+    client: &Client,
+    url: &str,
+    key: &ApiKey,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+) -> Result<String> {
+    let request = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": 8096,
+        "stream": false,
+    });
+
+    let response = client
+        .post(url)
+        // Send both auth headers: gateways vary on which they accept
+        .header("Authorization", format!("Bearer {}", key.key.as_str()))
+        .header("x-api-key", key.key.as_str())
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+        .json(&request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let body: serde_json::Value = response.json().await?;
+
+    // Try Anthropic format: content[].text
+    let content: String = body["content"]
+        .as_array()
+        .iter()
+        .flat_map(|arr| arr.iter())
+        .filter(|c| c["type"].as_str() == Some("text"))
+        .filter_map(|c| c["text"].as_str())
+        .collect();
+
+    if content.is_empty() {
+        stop_spinner(spinning);
+        anyhow::bail!("Provider returned an empty response");
+    }
+
+    stop_spinner(spinning);
+    print!("{}", content);
+    io::stdout().flush()?;
+
+    Ok(content)
+}
+
+/// Parses an Anthropic SSE data line and returns the text delta if present.
+pub fn parse_anthropic_chunk(data: &str) -> Option<String> {
+    let event: AnthropicStreamEvent = serde_json::from_str(data).ok()?;
+    if event.event_type == "content_block_delta" {
+        event.delta?.text
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +718,48 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"content\":\"hello\""));
+    }
+
+    #[test]
+    fn test_parse_anthropic_chunk_with_text() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+        assert_eq!(parse_anthropic_chunk(data), Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn test_parse_anthropic_chunk_non_delta_event() {
+        let data = r#"{"type":"message_start","message":{"id":"msg_1"}}"#;
+        assert_eq!(parse_anthropic_chunk(data), None);
+    }
+
+    #[test]
+    fn test_parse_anthropic_chunk_ping() {
+        let data = r#"{"type":"ping"}"#;
+        assert_eq!(parse_anthropic_chunk(data), None);
+    }
+
+    #[test]
+    fn test_parse_anthropic_chunk_invalid_json() {
+        assert_eq!(parse_anthropic_chunk("not json"), None);
+    }
+
+    #[test]
+    fn test_is_format_mismatch_404() {
+        let e = anyhow::anyhow!("API returned 404 Not Found — endpoint missing");
+        assert!(is_format_mismatch(&e));
+    }
+
+    #[test]
+    fn test_is_format_mismatch_405() {
+        let e = anyhow::anyhow!("API returned 405 Method Not Allowed");
+        assert!(is_format_mismatch(&e));
+    }
+
+    #[test]
+    fn test_is_format_mismatch_other_errors() {
+        let e = anyhow::anyhow!("API returned 401 Unauthorized");
+        assert!(!is_format_mismatch(&e));
+        let e = anyhow::anyhow!("API returned 429 Too Many Requests");
+        assert!(!is_format_mismatch(&e));
     }
 }

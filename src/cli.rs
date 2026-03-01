@@ -40,6 +40,9 @@ pub enum Commands {
     /// Start an interactive chat REPL
     Chat(ChatArgs),
 
+    /// List available models from the active provider
+    Models(ModelsArgs),
+
     /// Update the CLI tool to the latest version
     Update,
 }
@@ -92,6 +95,14 @@ pub struct RunArgs {
     pub args: Vec<String>,
 }
 
+/// Arguments for the models command
+#[derive(Args, Debug, Clone)]
+pub struct ModelsArgs {
+    /// Select API key by ID or name
+    #[arg(short = 'k', long, value_name = "ID|NAME")]
+    pub key: Option<String>,
+}
+
 /// Arguments for the chat command
 #[derive(Args, Debug, Clone)]
 pub struct ChatArgs {
@@ -121,7 +132,7 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
 /// Get the list of valid commands
 #[allow(dead_code)]
 pub fn get_valid_commands() -> Vec<&'static str> {
-    vec!["update", "keys", "run", "chat"]
+    vec!["update", "keys", "run", "chat", "models"]
 }
 
 /// Check if a command is a passthrough command (passes all args to underlying tool)

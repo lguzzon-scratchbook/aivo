@@ -14,7 +14,7 @@ mod style;
 mod version;
 
 use cli::{Cli, Commands};
-use commands::{ChatCommand, KeysCommand, RunCommand, UpdateCommand};
+use commands::{ChatCommand, KeysCommand, ModelsCommand, RunCommand, UpdateCommand};
 use errors::ExitCode;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
@@ -48,6 +48,9 @@ async fn main() {
             }
             Some(Commands::Chat(_)) => {
                 ChatCommand::print_help();
+            }
+            Some(Commands::Models(_)) => {
+                ModelsCommand::print_help();
             }
             Some(Commands::Update) => {
                 UpdateCommand::print_help();
@@ -211,6 +214,25 @@ async fn main() {
                 .await
         }
 
+        Commands::Models(models_args) => {
+            let key_override = if let Some(ref key_id_or_name) = models_args.key {
+                match session_store
+                    .resolve_key_by_id_or_name(key_id_or_name)
+                    .await
+                {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        process::exit(ExitCode::UserError.code());
+                    }
+                }
+            } else {
+                None
+            };
+            let command = ModelsCommand::new(session_store);
+            command.execute(key_override).await
+        }
+
         Commands::Update => match UpdateCommand::new() {
             Ok(command) => command.execute().await,
             Err(e) => {
@@ -273,6 +295,11 @@ fn print_help() {
         "  {}              {}",
         style::cyan("keys [action]"),
         style::dim("Manage API keys (list, use, rm, add, cat)")
+    );
+    println!(
+        "  {}                    {}",
+        style::cyan("models"),
+        style::dim("List available models from the active provider")
     );
     println!(
         "  {}                     {}",
