@@ -115,13 +115,7 @@ impl KeysCommand {
                     )
                 })
                 .collect();
-            let selection = Select::new()
-                .with_prompt("Select a key to activate")
-                .items(&choices)
-                .default(active_idx)
-                .interact_opt()
-                .ok()
-                .flatten();
+            let selection = select_interactive("Select a key to activate", &choices, active_idx)?;
             if let Some(idx) = selection {
                 self.activate_key(&all_keys[idx]).await?;
             } else {
@@ -556,6 +550,61 @@ impl KeysCommand {
         println!("  add [name]      {}", style::dim("- Add an API key"));
         println!("  edit <id|name>  {}", style::dim("- Edit an API key"));
     }
+}
+
+/// Minimal interactive selector supporting arrow keys, Ctrl+N/P, Enter, and ESC.
+/// Returns the selected index, or None if cancelled.
+fn select_interactive(
+    prompt: &str,
+    choices: &[String],
+    default: usize,
+) -> std::io::Result<Option<usize>> {
+    use console::{Key, Term};
+    let term = Term::stderr();
+    term.hide_cursor()?;
+
+    let n = choices.len();
+    let mut sel = default;
+
+    let draw = |term: &Term, sel: usize| -> std::io::Result<()> {
+        for (i, choice) in choices.iter().enumerate() {
+            if i == sel {
+                term.write_line(&format!("  \u{276f} {}", choice))?;
+            } else {
+                term.write_line(&format!("    {}", choice))?;
+            }
+        }
+        Ok(())
+    };
+
+    term.write_line(&format!("  {}:", prompt))?;
+    draw(&term, sel)?;
+
+    let result = loop {
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('\x10') => {
+                // Arrow up or Ctrl+P
+                if sel > 0 {
+                    sel -= 1;
+                }
+            }
+            Key::ArrowDown | Key::Char('\x0e') => {
+                // Arrow down or Ctrl+N
+                if sel < n - 1 {
+                    sel += 1;
+                }
+            }
+            Key::Enter => break Some(sel),
+            Key::Escape => break None,
+            _ => continue,
+        }
+        term.clear_last_lines(n)?;
+        draw(&term, sel)?;
+    };
+
+    term.clear_last_lines(n + 1)?; // choices + prompt
+    term.show_cursor()?;
+    Ok(result)
 }
 
 #[cfg(test)]
