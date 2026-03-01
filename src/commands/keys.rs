@@ -119,8 +119,9 @@ impl KeysCommand {
                 .with_prompt("Select a key to activate")
                 .items(&choices)
                 .default(active_idx)
-                .interact()
-                .ok();
+                .interact_opt()
+                .ok()
+                .flatten();
             if let Some(idx) = selection {
                 self.activate_key(&all_keys[idx]).await?;
             } else {
