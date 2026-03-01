@@ -6,6 +6,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -108,11 +109,6 @@ impl ModelsCommand {
     }
 }
 
-fn normalize_base_url(url: &str) -> &str {
-    let url = url.trim_end_matches('/');
-    url.strip_suffix("/v1").unwrap_or(url)
-}
-
 /// Returns just the scheme + host + port of a URL, e.g. "https://api.example.com".
 /// Used to probe the root when the base URL includes a path segment like /endpoint.
 fn url_origin(url: &str) -> Option<String> {
@@ -154,15 +150,18 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             })
             .collect())
     } else {
-        // Build candidate URLs: try with the full base path first, then at the bare origin.
-        // e.g. base = "https://api.example.com/endpoint" → also tries "https://api.example.com"
-        let mut candidates = vec![format!("{}/v1/models", base), format!("{}/models", base)];
+        // Build candidate URLs. When the base URL has a path segment (e.g.
+        // "https://api.example.com/endpoint"), the bare origin is tried first
+        // because the /v1/models endpoint is typically at the root, not under
+        // the chat-completions path prefix.
+        let model_endpoints = |b: &str| [format!("{}/v1/models", b), format!("{}/models", b)];
+        let mut candidates = Vec::new();
         if let Some(origin) = url_origin(base) {
             if origin != base {
-                candidates.push(format!("{}/v1/models", origin));
-                candidates.push(format!("{}/models", origin));
+                candidates.extend(model_endpoints(&origin));
             }
         }
+        candidates.extend(model_endpoints(base));
         let auth = format!("Bearer {}", key.key.as_str());
         let user_agent = format!("aivo/{}", crate::version::VERSION);
 

@@ -16,6 +16,7 @@ use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::models::fetch_models;
+use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -390,12 +391,6 @@ fn stop_spinner(spinning: &Arc<AtomicBool>) {
         eprint!("\r \r");
         let _ = io::stderr().flush();
     }
-}
-
-/// Strips trailing slashes and a bare `/v1` suffix from a provider base URL.
-fn normalize_base_url(url: &str) -> &str {
-    let url = url.trim_end_matches('/');
-    url.strip_suffix("/v1").unwrap_or(url)
 }
 
 /// Sends a chat completion request and prints the response.

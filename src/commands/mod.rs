@@ -1,6 +1,12 @@
 //! Command handlers module for the aivo CLI.
 //! Provides implementations for all CLI commands.
 
+/// Strips trailing slashes and a bare `/v1` suffix from a provider base URL.
+pub(crate) fn normalize_base_url(url: &str) -> &str {
+    let url = url.trim_end_matches('/');
+    url.strip_suffix("/v1").unwrap_or(url)
+}
+
 pub mod chat;
 pub mod keys;
 pub mod models;
