@@ -135,7 +135,7 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
 /// Get the list of valid commands
 #[allow(dead_code)]
 pub fn get_valid_commands() -> Vec<&'static str> {
-    vec!["update", "keys", "run", "chat", "models"]
+    vec!["update", "keys", "run", "chat", "models", "use"]
 }
 
 /// Check if a command is a passthrough command (passes all args to underlying tool)
@@ -390,6 +390,48 @@ mod tests {
         let args = rewrite_alias(&["aivo", "keys"]);
         let cli = Cli::try_parse_from(&args).unwrap();
         assert!(matches!(cli.command, Some(Commands::Keys(_))));
+    }
+
+    /// Helper to simulate the 'use' alias rewriting done in main.rs
+    fn rewrite_use_alias(args: &[&str]) -> Vec<String> {
+        let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        if raw.len() > 1 && raw[1] == "use" {
+            let mut rewritten = vec![raw[0].clone(), "keys".to_string(), "use".to_string()];
+            rewritten.extend_from_slice(&raw[2..]);
+            rewritten
+        } else {
+            raw
+        }
+    }
+
+    #[test]
+    fn test_use_alias_with_key_name() {
+        let args = rewrite_use_alias(&["aivo", "use", "my-key"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        if let Some(Commands::Keys(keys_args)) = cli.command {
+            assert_eq!(keys_args.action.as_deref(), Some("use"));
+            assert_eq!(keys_args.args, vec!["my-key"]);
+        } else {
+            panic!("Expected Keys command");
+        }
+    }
+
+    #[test]
+    fn test_use_alias_no_arg() {
+        let args = rewrite_use_alias(&["aivo", "use"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        if let Some(Commands::Keys(keys_args)) = cli.command {
+            assert_eq!(keys_args.action.as_deref(), Some("use"));
+            assert!(keys_args.args.is_empty());
+        } else {
+            panic!("Expected Keys command");
+        }
+    }
+
+    #[test]
+    fn test_get_valid_commands_includes_use() {
+        let commands = get_valid_commands();
+        assert!(commands.contains(&"use"));
     }
 
     #[test]

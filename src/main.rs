@@ -30,6 +30,10 @@ async fn main() {
         let mut rewritten = vec![raw_args[0].clone(), "run".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         Cli::parse_from(rewritten)
+    } else if raw_args.len() > 1 && raw_args[1] == "use" {
+        let mut rewritten = vec![raw_args[0].clone(), "keys".to_string(), "use".to_string()];
+        rewritten.extend_from_slice(&raw_args[2..]);
+        Cli::parse_from(rewritten)
     } else {
         Cli::parse()
     };
@@ -310,7 +314,7 @@ fn print_help() {
     println!(
         "{} {}",
         style::bold("Shortcuts:"),
-        style::dim("aivo claude, aivo codex, aivo gemini, aivo opencode")
+        style::dim("aivo claude, aivo codex, aivo gemini, aivo opencode, aivo use")
     );
     println!();
     println!("{}", style::bold("Options:"));
