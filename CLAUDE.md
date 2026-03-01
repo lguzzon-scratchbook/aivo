@@ -25,6 +25,26 @@ cargo clippy           # Lint with clippy
 cargo check            # Quick type check
 ```
 
+## Development Workflow
+
+After making code changes to CLI tools or binaries, always rebuild and reinstall before testing. Run `cargo build --release && cargo install --path .` (or equivalent) to avoid testing stale binaries.
+
+## Testing & Quality
+
+This project uses Rust as the primary language. Run `cargo clippy` before committing and fix all warnings. Run `cargo test` after any code changes and ensure all tests pass before committing.
+
+## Git Conventions
+
+Always use squash merge when merging branches to main. Never use fast-forward merge. Command: `git merge --squash <branch> && git commit`
+
+## Code Review
+
+For code reviews, be concise and deliver findings quickly. Do not extensively explore the entire codebase before providing review feedback. Focus on the diff and immediate context only.
+
+## CLI / UX Conventions
+
+When formatting CLI help text, pay close attention to alignment, spacing, bracket style, and description consistency. Match existing patterns exactly rather than inventing new formatting.
+
 ## Architecture
 
 ### Entry Point & Dependency Injection
