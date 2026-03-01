@@ -106,7 +106,14 @@ impl KeysCommand {
                 .unwrap_or(0);
             let choices: Vec<_> = all_keys
                 .iter()
-                .map(|k| format!("{:<4}  {}  {}", k.id, k.name, style::dim(&k.base_url)))
+                .map(|k| {
+                    format!(
+                        "{}  {}  {}",
+                        style::cyan(&format!("{:<4}", k.id)),
+                        k.name,
+                        style::dim(&k.base_url)
+                    )
+                })
                 .collect();
             let selection = Select::new()
                 .with_prompt("Select a key to activate")
