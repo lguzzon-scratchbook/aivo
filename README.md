@@ -1,8 +1,6 @@
 # aivo
 
-Run Claude Code, Gemini, and Codex with any API provider — OpenRouter, GitHub Copilot, Vercel AI Gateway, or your own custom proxy.
-
-No env var juggling. No config files. Just add a key and go.
+Run Claude Code on your GitHub Copilot subscription, or connect via OpenRouter, Vercel AI Gateway, and more.
 
 ## Install
 
@@ -20,14 +18,14 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 ## Quick Start
 
 ```bash
-# Add a key (OpenRouter, Vercel, or any compatible provider)
-aivo keys add
-
-# Or use your GitHub Copilot subscription
+# Use your GitHub Copilot subscription
 aivo keys add copilot
-
-# Run Claude Code
 aivo claude
+
+# Or add any other API key (OpenRouter, Vercel AI Gateway, etc.)
+aivo keys add
+aivo claude
+aivo claude --model moonshotai/kimi-k2.5
 ```
 
 ## Commands
@@ -65,7 +63,7 @@ aivo models --refresh            # force-refresh the model list
 
 ### GitHub Copilot
 
-Use your existing GitHub Copilot subscription to power Claude Code, chat, and more.
+Use your existing GitHub Copilot subscription to run Claude Code — no separate Anthropic API key needed.
 
 ```bash
 aivo keys add copilot         # authenticate via GitHub device flow
@@ -124,18 +122,28 @@ Keys are stored encrypted in `~/.config/aivo/config.json` (AES-256-GCM, machine-
 
 ## Prerequisites
 
-Install the AI tools you want to use:
+Install Claude Code:
 
 **macOS (Homebrew)**
 ```bash
 brew install claude
+```
+
+**All platforms (npm)**
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+For Codex, Gemini, and OpenCode:
+
+**macOS (Homebrew)**
+```bash
 brew install openai/codex
 brew tap google-gemini/gemini-cli && brew install gemini-cli
 ```
 
 **All platforms (npm)**
 ```bash
-npm install -g @anthropic-ai/claude-code
 npm install -g @openai/codex
 npm install -g @google/gemini-cli
 ```
