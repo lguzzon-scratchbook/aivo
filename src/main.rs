@@ -11,6 +11,7 @@ mod commands;
 mod errors;
 mod services;
 mod style;
+mod tui;
 mod version;
 
 use cli::{Cli, Commands};

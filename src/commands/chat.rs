@@ -7,8 +7,8 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::tui::FuzzySelect;
 use anyhow::Result;
-use dialoguer::FuzzySelect;
 use futures_util::StreamExt;
 use reqwest::Client;
 use rustyline::{
@@ -294,7 +294,7 @@ impl ChatCommand {
             }
 
             if input == CMD_MODEL || input.starts_with(CMD_MODEL_ARG) {
-                let selected_raw: Option<String> = if input == CMD_MODEL {
+                let selected_raw = if input == CMD_MODEL {
                     // Check disk cache first; only show spinner if we need a network fetch
                     let models_list: Vec<String> =
                         if let Some(cached) = self.cache.get(&key.base_url).await {

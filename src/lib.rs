@@ -6,6 +6,7 @@ pub mod commands;
 pub mod errors;
 pub mod services;
 pub mod style;
+pub mod tui;
 pub mod version;
 
 pub use errors::{CLIError, ErrorCategory, ExitCode};

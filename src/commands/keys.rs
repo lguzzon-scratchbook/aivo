@@ -2,7 +2,9 @@
  * KeysCommand handler for managing API keys.
  */
 use anyhow::Result;
-use dialoguer::{Confirm, Select};
+use dialoguer::Confirm;
+
+use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
@@ -162,11 +164,13 @@ impl KeysCommand {
             .map(|k| format!("{} - {} - {}", k.id, k.base_url, key_preview(&k.key)))
             .collect();
 
-        let selection = Select::new()
+        let selection = FuzzySelect::new()
             .with_prompt("Select a key")
             .items(&choices)
-            .interact()
-            .ok();
+            .default(0)
+            .interact_opt()
+            .ok()
+            .flatten();
 
         if let Some(idx) = selection {
             self.activate_key(name_matches[idx]).await?;
@@ -478,11 +482,13 @@ impl KeysCommand {
                     .map(|k| format!("{} - {} - {}", k.id, k.base_url, key_preview(&k.key)))
                     .collect();
 
-                let selection = Select::new()
+                let selection = FuzzySelect::new()
                     .with_prompt("Select a key to remove")
                     .items(&choices)
-                    .interact()
-                    .ok();
+                    .default(0)
+                    .interact_opt()
+                    .ok()
+                    .flatten();
 
                 if let Some(idx) = selection {
                     name_matches[idx].clone()
@@ -564,7 +570,11 @@ pub(crate) async fn prompt_select_key(
     default: usize,
 ) -> Result<Option<ApiKey>> {
     let choices: Vec<String> = keys.iter().map(format_key_choice).collect();
-    let selection = select_interactive(prompt, &choices, default)?;
+    let selection = FuzzySelect::new()
+        .with_prompt(prompt)
+        .items(&choices)
+        .default(default)
+        .interact_opt()?;
     match selection {
         Some(idx) => {
             let key = &keys[idx];
@@ -580,60 +590,6 @@ pub(crate) async fn prompt_select_key(
         }
         None => Ok(None),
     }
-}
-
-/// Minimal interactive selector supporting arrow keys, Ctrl+N/P, Enter, and ESC.
-/// Returns the selected index, or None if cancelled.
-fn select_interactive(
-    prompt: &str,
-    choices: &[String],
-    default: usize,
-) -> std::io::Result<Option<usize>> {
-    use console::{Key, Term};
-    let term = Term::stderr();
-    term.hide_cursor()?;
-
-    let n = choices.len();
-    let mut sel = default;
-
-    let draw = |term: &Term, sel: usize| -> std::io::Result<()> {
-        for (i, choice) in choices.iter().enumerate() {
-            let indicator = if i == sel {
-                style::bullet_symbol()
-            } else {
-                style::empty_bullet_symbol()
-            };
-            term.write_line(&format!("  {} {}", indicator, choice))?;
-        }
-        Ok(())
-    };
-
-    term.write_line(&format!("{}:", prompt))?;
-    draw(&term, sel)?;
-
-    let result = loop {
-        match term.read_key()? {
-            Key::ArrowUp | Key::Char('\x10') => {
-                // Arrow up or Ctrl+P
-                sel = sel.saturating_sub(1);
-            }
-            Key::ArrowDown | Key::Char('\x0e') => {
-                // Arrow down or Ctrl+N
-                if sel < n - 1 {
-                    sel += 1;
-                }
-            }
-            Key::Enter => break Some(sel),
-            Key::Escape => break None,
-            _ => continue,
-        }
-        term.clear_last_lines(n)?;
-        draw(&term, sel)?;
-    };
-
-    term.clear_last_lines(n + 1)?; // choices + prompt
-    term.show_cursor()?;
-    Ok(result)
 }
 
 #[cfg(test)]
