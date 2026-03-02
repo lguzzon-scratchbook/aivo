@@ -4,6 +4,7 @@
  * Anthropic's /v1/messages format if the provider returns 404/405.
  */
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use rustyline::{
     error::ReadlineError,
     highlight::Highlighter,
     hint::Hinter,
+    history::History,
     validate::Validator,
     Context, Editor, Helper,
 };
@@ -318,6 +320,19 @@ impl ChatCommand {
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         rl.set_helper(Some(ChatHelper::new()));
 
+        let history_path: PathBuf = dirs::home_dir()
+            .map(|p| p.join(".config").join("aivo").join("chat_history"))
+            .unwrap_or_else(|| PathBuf::from(".config/aivo/chat_history"));
+        if let Ok(data) = std::fs::read_to_string(&history_path) {
+            if let Ok(plain) = crate::services::session_store::decrypt(&data) {
+                for line in plain.lines() {
+                    if !line.is_empty() {
+                        let _ = rl.add_history_entry(line);
+                    }
+                }
+            }
+        }
+
         loop {
             let input = match rl.readline(&prompt) {
                 Ok(line) => line,
@@ -446,6 +461,24 @@ impl ChatCommand {
             }
         }
 
+        if !rl.history().is_empty() {
+            let joined = rl.history().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
+            if let Ok(encrypted) = crate::services::session_store::encrypt(&joined) {
+                if let Some(parent) = history_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&history_path, &encrypted).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &history_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                }
+            }
+        }
         Ok(ExitCode::Success)
     }
 

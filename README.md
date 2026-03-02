@@ -46,6 +46,7 @@ Flags pass through directly:
 
 ```bash
 aivo claude --dangerously-skip-permissions
+aivo claude --resume 16354407-050e-4447-a068-4db7922ff841
 aivo claude --model moonshotai/kimi-k2.5
 
 aivo claude --key my-proxy       # use a specific saved key
