@@ -7,16 +7,17 @@ No env var juggling. No config files. Just add a key and go.
 ## Install
 
 ```bash
-# Homebrew
 brew install yuanchuan/tap/aivo
 ```
+Or via shell script
 
 ```bash
-# Shell script
 curl -fsSL https://raw.githubusercontent.com/yuanchuan/aivo/main/scripts/install.sh | sh
 ```
 
 Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/releases).
+
+## Quick Start
 
 ```bash
 # Add a key (OpenRouter, Vercel, or any compatible provider)
