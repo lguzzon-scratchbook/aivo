@@ -31,8 +31,8 @@ impl RunCommand {
     }
 
     /// Resolves the model to use: flag > persisted per-key > picker.
-    /// Saves the resolved model to session_store so subsequent `aivo run` invocations
-    /// remember the choice without needing the `--model` flag again.
+    /// Only the picker selection is saved; an explicit --model <value> is used as-is
+    /// without persisting (run is a one-shot launcher, not a chat session).
     /// Returns None when the picker was cancelled.
     async fn resolve_model(
         &self,
@@ -43,15 +43,9 @@ impl RunCommand {
         match flag_model {
             // --model with no value → force picker (bypass persisted model)
             Some(ref m) if m.is_empty() => {}
-            // --model <value> → use it and save
-            Some(model) => {
-                let current = self.session_store.get_chat_model(&key.id).await?;
-                if current.as_deref() != Some(&model) {
-                    self.session_store.set_chat_model(&key.id, &model).await?;
-                }
-                return Ok(Some(model));
-            }
-            // No flag: check for persisted model
+            // --model <value> → use it as-is (do not save)
+            Some(model) => return Ok(Some(model)),
+            // No flag: check for persisted model (saved by a previous picker selection)
             None => {
                 if let Some(persisted) = self.session_store.get_chat_model(&key.id).await? {
                     return Ok(Some(persisted));
