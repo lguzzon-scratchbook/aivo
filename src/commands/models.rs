@@ -150,7 +150,7 @@ pub(crate) fn is_text_chat_model(id: &str) -> bool {
     if lower.starts_with("dall-e")
         || lower.starts_with("tts-")
         || lower.starts_with("whisper-")
-        || lower.starts_with("gpt-image-")
+        || lower.contains("-image")
     {
         return false;
     }
@@ -309,6 +309,7 @@ mod tests {
         assert!(!is_text_chat_model("tts-1-hd"));
         assert!(!is_text_chat_model("whisper-1"));
         assert!(!is_text_chat_model("gpt-image-1"));
+        assert!(!is_text_chat_model("google/gemini-3.1-flash-image-preview"));
     }
 
     #[tokio::test]

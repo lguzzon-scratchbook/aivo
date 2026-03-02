@@ -22,7 +22,7 @@ use rustyline::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-use crate::commands::models::fetch_models_cached;
+use crate::commands::models::{fetch_models_cached, is_text_chat_model};
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::models_cache::ModelsCache;
@@ -181,7 +181,10 @@ impl ChatCommand {
     /// Fetches the model list (cache-first) with a spinner for network fetches.
     async fn fetch_models_for_select(&self, client: &Client, key: &ApiKey) -> Vec<String> {
         if let Some(cached) = self.cache.get(&key.base_url).await {
-            return cached;
+            return cached
+                .into_iter()
+                .filter(|id| is_text_chat_model(id))
+                .collect();
         }
         let (spinning, spinner_handle) = style::start_spinner(None);
         let list = fetch_models_cached(client, key, &self.cache, false)
@@ -189,7 +192,9 @@ impl ChatCommand {
             .unwrap_or_default();
         style::stop_spinner(&spinning);
         let _ = spinner_handle.await;
-        list
+        list.into_iter()
+            .filter(|id| is_text_chat_model(id))
+            .collect()
     }
 
     /// Transforms model names for OpenRouter compatibility
