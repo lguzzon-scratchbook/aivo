@@ -7,6 +7,12 @@ No env var juggling. No config files. Just add a key and go.
 ## Install
 
 ```bash
+# Homebrew
+brew install yuanchuan/tap/aivo
+```
+
+```bash
+# Shell script
 curl -fsSL https://raw.githubusercontent.com/yuanchuan/aivo/main/scripts/install.sh | sh
 ```
 

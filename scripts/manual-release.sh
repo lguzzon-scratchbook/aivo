@@ -82,5 +82,38 @@ gh release create "$VERSION" \
 
 rm -rf "$TMPDIR"
 
+# Update Homebrew tap
+echo ""
+echo "→ Updating Homebrew formula..."
+HOMEBREW_TAP="$PROJECT_DIR/../homebrew-tap"
+if [ -d "$HOMEBREW_TAP" ]; then
+  FORMULA="$HOMEBREW_TAP/Formula/aivo.rb"
+  V="${VERSION#v}"
+  SHA_DARWIN_ARM64=$(awk '{print $1}' "$DIST/aivo-darwin-arm64.sha256")
+  SHA_DARWIN_X64=$(awk '{print $1}' "$DIST/aivo-darwin-x64.sha256")
+  SHA_LINUX_ARM64=$(awk '{print $1}' "$DIST/aivo-linux-arm64.sha256")
+  SHA_LINUX_X64=$(awk '{print $1}' "$DIST/aivo-linux-x64.sha256")
+
+  sed -i '' \
+    -e "s/version \".*\"/version \"$V\"/" \
+    "$FORMULA"
+
+  # Update SHA256 values in order: darwin-arm64, darwin-x64, linux-arm64, linux-x64
+  awk -v s1="$SHA_DARWIN_ARM64" -v s2="$SHA_DARWIN_X64" -v s3="$SHA_LINUX_ARM64" -v s4="$SHA_LINUX_X64" '
+    BEGIN { n=0 }
+    /sha256 "/ { n++; if(n==1) sub(/"[a-f0-9]{64}"/, "\"" s1 "\""); if(n==2) sub(/"[a-f0-9]{64}"/, "\"" s2 "\""); if(n==3) sub(/"[a-f0-9]{64}"/, "\"" s3 "\""); if(n==4) sub(/"[a-f0-9]{64}"/, "\"" s4 "\"") }
+    { print }
+  ' "$FORMULA" > "$FORMULA.tmp" && mv "$FORMULA.tmp" "$FORMULA"
+
+  cd "$HOMEBREW_TAP"
+  git add Formula/aivo.rb
+  git diff --cached --quiet || git commit -m "Update aivo to $VERSION"
+  git push
+  cd "$PROJECT_DIR"
+  echo "Homebrew formula updated to $VERSION"
+else
+  echo "Warning: homebrew-tap not found at $HOMEBREW_TAP, skipping"
+fi
+
 echo ""
 echo "Done! Release $VERSION published to yuanchuan/aivo"
