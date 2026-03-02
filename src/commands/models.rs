@@ -272,6 +272,25 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
     }
 }
 
+/// Fetches the model list (cache-first) with a spinner for network fetches,
+/// filtered to text-chat models only. Used by chat and run commands for the
+/// interactive model picker.
+pub(crate) async fn fetch_models_for_select(
+    client: &Client,
+    key: &ApiKey,
+    cache: &ModelsCache,
+) -> Vec<String> {
+    let (spinning, spinner_handle) = style::start_spinner(None);
+    let list = fetch_models_cached(client, key, cache, false)
+        .await
+        .unwrap_or_default();
+    style::stop_spinner(&spinning);
+    let _ = spinner_handle.await;
+    list.into_iter()
+        .filter(|id| is_text_chat_model(id))
+        .collect()
+}
+
 /// Cache-aware wrapper around `fetch_models`.
 /// Returns cached result if present and not expired (unless `bypass_cache` is true).
 /// On cache miss, fetches from the network and writes the result to the cache.

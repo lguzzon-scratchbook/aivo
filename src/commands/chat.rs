@@ -24,7 +24,7 @@ use rustyline::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-use crate::commands::models::{fetch_models_cached, is_text_chat_model};
+use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
@@ -167,39 +167,30 @@ impl ChatCommand {
     }
 
     /// Resolves the model to use: --model flag > persisted per-key > None
+    /// Returns None when the picker should be shown (no flag, no persisted, or --model with no value).
     async fn resolve_model(
         &self,
         key_id: &str,
         flag_model: Option<String>,
     ) -> Result<Option<String>> {
-        if let Some(model) = flag_model {
-            let current = self.session_store.get_chat_model(key_id).await?;
-            if current.as_deref() != Some(&model) {
-                self.session_store.set_chat_model(key_id, &model).await?;
+        match flag_model {
+            // --model with no value → force picker (bypass persisted model)
+            Some(ref m) if m.is_empty() => Ok(None),
+            // --model <value> → use it and save
+            Some(model) => {
+                let current = self.session_store.get_chat_model(key_id).await?;
+                if current.as_deref() != Some(&model) {
+                    self.session_store.set_chat_model(key_id, &model).await?;
+                }
+                Ok(Some(model))
             }
-            return Ok(Some(model));
+            None => self.session_store.get_chat_model(key_id).await,
         }
-
-        self.session_store.get_chat_model(key_id).await
     }
 
     /// Fetches the model list (cache-first) with a spinner for network fetches.
     async fn fetch_models_for_select(&self, client: &Client, key: &ApiKey) -> Vec<String> {
-        if let Some(cached) = self.cache.get(&key.base_url).await {
-            return cached
-                .into_iter()
-                .filter(|id| is_text_chat_model(id))
-                .collect();
-        }
-        let (spinning, spinner_handle) = style::start_spinner(None);
-        let list = fetch_models_cached(client, key, &self.cache, false)
-            .await
-            .unwrap_or_default();
-        style::stop_spinner(&spinning);
-        let _ = spinner_handle.await;
-        list.into_iter()
-            .filter(|id| is_text_chat_model(id))
-            .collect()
+        fetch_models_for_select(client, key, &self.cache).await
     }
 
     /// Transforms model names for OpenRouter compatibility

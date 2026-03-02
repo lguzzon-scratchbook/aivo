@@ -78,7 +78,7 @@ pub struct RunArgs {
     pub tool: Option<String>,
 
     /// Specify AI model to use
-    #[arg(short, long, value_name = "MODEL", value_parser = non_empty())]
+    #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub model: Option<String>,
 
     /// Select API key by ID or name
@@ -119,7 +119,7 @@ pub struct ModelsArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ChatArgs {
     /// Specify AI model to use (remembered across sessions)
-    #[arg(short, long, value_name = "MODEL", value_parser = non_empty())]
+    #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub model: Option<String>,
 
     /// Select API key by ID or name
@@ -228,6 +228,14 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "run", "claude", "-m", "gpt-5"]).unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.model, Some("gpt-5".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+
+        // --model with no value → triggers picker (Some(""))
+        let cli = Cli::try_parse_from(["aivo", "run", "claude", "--model"]).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.model, Some("".to_string()));
         } else {
             panic!("Expected Run command");
         }
@@ -458,6 +466,17 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "chat", "--model", "gpt-4o"]).unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
             assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_command_model_no_value() {
+        // --model with no value → triggers picker (Some(""))
+        let cli = Cli::try_parse_from(["aivo", "chat", "--model"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.model, Some("".to_string()));
         } else {
             panic!("Expected Chat command");
         }

@@ -119,8 +119,9 @@ async fn main() {
 
         Commands::Run(run_args) => {
             let env_injector = EnvironmentInjector::new();
-            let ai_launcher = AILauncher::new(session_store.clone(), env_injector, models_cache);
-            let command = RunCommand::new(ai_launcher);
+            let ai_launcher =
+                AILauncher::new(session_store.clone(), env_injector, models_cache.clone());
+            let command = RunCommand::new(ai_launcher, session_store.clone(), models_cache);
 
             // Re-extract aivo flags from passthrough args that clap's trailing_var_arg
             // may have swallowed (e.g. `aivo run claude --agent-name foo --model opus`
@@ -145,7 +146,8 @@ async fn main() {
                         model = Some(args[i + 1].clone());
                         i += 1;
                     } else {
-                        remaining_args.push(arg.clone());
+                        // --model with no value in passthrough args → trigger picker
+                        model = Some(String::new());
                     }
                 } else if let Some(value) = arg.strip_prefix("--key=") {
                     if !value.is_empty() && key_flag.is_none() {
