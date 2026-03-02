@@ -3,6 +3,10 @@
  * Provides cross-platform styling with ANSI fallback support.
  */
 use console::style;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::task::JoinHandle;
 
 /// Supported style names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +89,37 @@ pub fn bullet_symbol() -> String {
 /// Convenience function for the "○" empty bullet symbol.
 pub fn empty_bullet_symbol() -> String {
     dim("○")
+}
+
+/// Starts a braille spinner on stderr. Returns the flag and join handle.
+/// Pass an optional label to display after the spinner character.
+pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
+    let spinning = Arc::new(AtomicBool::new(true));
+    let spinning_clone = spinning.clone();
+    let label = label.unwrap_or("").to_string();
+    let handle = tokio::task::spawn_blocking(move || {
+        let frames = [
+            "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
+            "\u{2827}", "\u{2807}", "\u{280f}",
+        ];
+        let mut i = 0;
+        while spinning_clone.load(Ordering::Relaxed) {
+            eprint!("\r{}{}", dim(frames[i % frames.len()]), label);
+            let _ = io::stderr().flush();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            i += 1;
+        }
+    });
+    (spinning, handle)
+}
+
+/// Stops the spinner and clears its character from the line.
+pub fn stop_spinner(spinning: &Arc<AtomicBool>) {
+    if spinning.swap(false, Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        eprint!("\r \r");
+        let _ = io::stderr().flush();
+    }
 }
 
 #[cfg(test)]

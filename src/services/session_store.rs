@@ -10,7 +10,7 @@ use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 /**
  * SessionStore service for managing credential persistence.
  * Stores credentials in ~/.config/aivo/config.json with AES-256-GCM encryption.
@@ -98,11 +98,11 @@ pub struct StoredConfig {
     #[serde(rename = "active_key_id")]
     pub active_key_id: Option<String>,
     #[serde(
-        rename = "chat_model",
+        rename = "chat_models",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "HashMap::is_empty"
     )]
-    pub chat_model: Option<String>,
+    pub chat_models: HashMap<String, String>,
 }
 
 impl Default for StoredConfig {
@@ -116,7 +116,7 @@ impl StoredConfig {
         Self {
             api_keys: Vec::new(),
             active_key_id: None,
-            chat_model: None,
+            chat_models: HashMap::new(),
         }
     }
 }
@@ -353,6 +353,7 @@ impl SessionStore {
             if config.active_key_id.as_deref() == Some(id) {
                 config.active_key_id = None;
             }
+            config.chat_models.remove(id);
             self.save(&config).await?;
             Ok(true)
         } else {
@@ -450,16 +451,18 @@ impl SessionStore {
         &self.config_path
     }
 
-    /// Gets the persisted chat model
-    pub async fn get_chat_model(&self) -> Result<Option<String>> {
+    /// Gets the persisted chat model for a specific API key
+    pub async fn get_chat_model(&self, key_id: &str) -> Result<Option<String>> {
         let config = self.load().await?;
-        Ok(config.chat_model)
+        Ok(config.chat_models.get(key_id).cloned())
     }
 
-    /// Saves the chat model to config
-    pub async fn set_chat_model(&self, model: &str) -> Result<()> {
+    /// Saves the chat model for a specific API key
+    pub async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
         let mut config = self.load().await?;
-        config.chat_model = Some(model.to_string());
+        config
+            .chat_models
+            .insert(key_id.to_string(), model.to_string());
         self.save(&config).await
     }
 

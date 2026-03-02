@@ -4,10 +4,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tokio::process::Command;
 use tokio::signal;
 
@@ -186,27 +183,14 @@ impl AILauncher {
             Ok(cached)
         } else {
             // Cache miss: show spinner while fetching from network
-            let spinning = Arc::new(AtomicBool::new(true));
-            let spinning_clone = spinning.clone();
-            let spinner_handle = tokio::task::spawn_blocking(move || {
-                let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                let mut i = 0;
-                while spinning_clone.load(Ordering::Relaxed) {
-                    eprint!("\r{} Fetching models...", frames[i % frames.len()]);
-                    let _ = io::stderr().flush();
-                    std::thread::sleep(std::time::Duration::from_millis(80));
-                    i += 1;
-                }
-            });
+            let (spinning, spinner_handle) =
+                crate::style::start_spinner(Some(" Fetching models..."));
 
             // bypass_cache=true: we know it's a miss; fetch_models_cached will still write result to cache
             let result =
                 crate::commands::models::fetch_models_cached(&client, key, &self.cache, true).await;
 
-            spinning.store(false, Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            eprint!("\r \r");
-            let _ = io::stderr().flush();
+            crate::style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
 
             result

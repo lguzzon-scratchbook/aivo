@@ -4,7 +4,7 @@
  * Anthropic's /v1/messages format if the provider returns 404/405.
  */
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::tui::FuzzySelect;
@@ -22,14 +22,13 @@ use rustyline::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-use crate::commands::models::fetch_models;
+use crate::commands::models::fetch_models_cached;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
-const DEFAULT_MODEL: &str = "gpt-4o";
 const CMD_EXIT: &str = "/exit";
 const CMD_MODEL: &str = "/model";
 const CMD_MODEL_ARG: &str = "/model ";
@@ -162,19 +161,35 @@ impl ChatCommand {
         }
     }
 
-    /// Resolves the model to use: --model flag > persisted > default
-    async fn resolve_model(&self, flag_model: Option<String>) -> Result<String> {
+    /// Resolves the model to use: --model flag > persisted per-key > None
+    async fn resolve_model(
+        &self,
+        key_id: &str,
+        flag_model: Option<String>,
+    ) -> Result<Option<String>> {
         if let Some(model) = flag_model {
-            // Save as the new default
-            self.session_store.set_chat_model(&model).await?;
-            return Ok(model);
+            let current = self.session_store.get_chat_model(key_id).await?;
+            if current.as_deref() != Some(&model) {
+                self.session_store.set_chat_model(key_id, &model).await?;
+            }
+            return Ok(Some(model));
         }
 
-        if let Some(saved) = self.session_store.get_chat_model().await? {
-            return Ok(saved);
-        }
+        self.session_store.get_chat_model(key_id).await
+    }
 
-        Ok(DEFAULT_MODEL.to_string())
+    /// Fetches the model list (cache-first) with a spinner for network fetches.
+    async fn fetch_models_for_select(&self, client: &Client, key: &ApiKey) -> Vec<String> {
+        if let Some(cached) = self.cache.get(&key.base_url).await {
+            return cached;
+        }
+        let (spinning, spinner_handle) = style::start_spinner(None);
+        let list = fetch_models_cached(client, key, &self.cache, false)
+            .await
+            .unwrap_or_default();
+        style::stop_spinner(&spinning);
+        let _ = spinner_handle.await;
+        list
     }
 
     /// Transforms model names for OpenRouter compatibility
@@ -247,7 +262,37 @@ impl ChatCommand {
             },
         };
 
-        let mut raw_model = self.resolve_model(model_flag).await?;
+        let client = Client::new();
+
+        let mut raw_model = match self.resolve_model(&key.id, model_flag).await? {
+            Some(m) => m,
+            None => {
+                // No model set for this key — prompt user to select one
+                let models_list = self.fetch_models_for_select(&client, &key).await;
+
+                if models_list.is_empty() {
+                    anyhow::bail!("No model configured and could not fetch model list. Use --model <name> to specify one.");
+                }
+
+                match FuzzySelect::new()
+                    .with_prompt("Select model")
+                    .items(&models_list)
+                    .default(0)
+                    .interact_opt()
+                    .ok()
+                    .flatten()
+                    .map(|idx| models_list[idx].clone())
+                {
+                    Some(selected) => {
+                        self.session_store
+                            .set_chat_model(&key.id, &selected)
+                            .await?;
+                        selected
+                    }
+                    None => return Ok(ExitCode::Success),
+                }
+            }
+        };
         let mut model = Self::transform_model_for_provider(&key.base_url, &raw_model);
 
         eprintln!(
@@ -260,8 +305,6 @@ impl ChatCommand {
             "{}",
             style::dim("Type /exit to quit, /model to pick a model, /model <name> to set directly. Ctrl+D also works.")
         );
-
-        let client = Client::new();
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut format = ChatFormat::OpenAI;
         let prompt = format!("{} ", style::cyan(">"));
@@ -295,29 +338,7 @@ impl ChatCommand {
 
             if input == CMD_MODEL || input.starts_with(CMD_MODEL_ARG) {
                 let selected_raw = if input == CMD_MODEL {
-                    // Check disk cache first; only show spinner if we need a network fetch
-                    let models_list: Vec<String> =
-                        if let Some(cached) = self.cache.get(&key.base_url).await {
-                            cached
-                        } else {
-                            let spinning = Arc::new(AtomicBool::new(true));
-                            let spinning_clone = spinning.clone();
-                            let spinner_handle = tokio::task::spawn_blocking(move || {
-                                let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                                let mut i = 0;
-                                while spinning_clone.load(Ordering::Relaxed) {
-                                    eprint!("\r{}", style::dim(frames[i % frames.len()]));
-                                    let _ = io::stderr().flush();
-                                    std::thread::sleep(std::time::Duration::from_millis(80));
-                                    i += 1;
-                                }
-                            });
-                            let list = fetch_models(&client, &key).await.unwrap_or_default();
-                            stop_spinner(&spinning);
-                            let _ = spinner_handle.await;
-                            self.cache.set(&key.base_url, list.clone()).await;
-                            list
-                        };
+                    let models_list = self.fetch_models_for_select(&client, &key).await;
                     if models_list.is_empty() {
                         eprintln!("  model: {}", style::cyan(&model));
                         None
@@ -345,7 +366,7 @@ impl ChatCommand {
                 };
 
                 if let Some(raw) = selected_raw {
-                    self.session_store.set_chat_model(&raw).await?;
+                    self.session_store.set_chat_model(&key.id, &raw).await?;
                     raw_model = raw.clone();
                     model = Self::transform_model_for_provider(&key.base_url, &raw);
                     eprintln!("  model: {}", style::cyan(&model));
@@ -370,18 +391,7 @@ impl ChatCommand {
             });
 
             // Start loading spinner
-            let spinning = Arc::new(AtomicBool::new(true));
-            let spinning_clone = spinning.clone();
-            let spinner_handle = tokio::task::spawn_blocking(move || {
-                let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                let mut i = 0;
-                while spinning_clone.load(Ordering::Relaxed) {
-                    eprint!("\r{}", style::dim(frames[i % frames.len()]));
-                    let _ = io::stderr().flush();
-                    std::thread::sleep(std::time::Duration::from_millis(80));
-                    i += 1;
-                }
-            });
+            let (spinning, spinner_handle) = style::start_spinner(None);
 
             // Stream response, auto-detecting provider format
             let result = match format {
@@ -467,12 +477,7 @@ impl ChatCommand {
 
 /// Stops the spinner and clears its character from the line.
 fn stop_spinner(spinning: &Arc<AtomicBool>) {
-    if spinning.swap(false, Ordering::Relaxed) {
-        // Wait longer than one spinner frame (80ms) so the thread exits its loop
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        eprint!("\r \r");
-        let _ = io::stderr().flush();
-    }
+    style::stop_spinner(spinning);
 }
 
 /// Sends a chat completion request and prints the response.
