@@ -144,3 +144,60 @@ jobs:
           generate_release_notes: false
           body: ${{ steps.changelog.outputs.body }}
           files: artifacts/*
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Read checksums and update homebrew-tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+
+          DARWIN_ARM64_SHA=$(cut -d' ' -f1 < artifacts/aivo-darwin-arm64.sha256)
+          DARWIN_X64_SHA=$(cut -d' ' -f1 < artifacts/aivo-darwin-x64.sha256)
+          LINUX_ARM64_SHA=$(cut -d' ' -f1 < artifacts/aivo-linux-arm64.sha256)
+          LINUX_X64_SHA=$(cut -d' ' -f1 < artifacts/aivo-linux-x64.sha256)
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/yuanchuan/homebrew-tap.git"
+
+          python3 - <<EOF
+          import re
+
+          with open("homebrew-tap/Formula/aivo.rb") as f:
+              content = f.read()
+
+          content = re.sub(r'version "[^"]*"', 'version "${VERSION}"', content)
+
+          shas = [
+              "${DARWIN_ARM64_SHA}",
+              "${DARWIN_X64_SHA}",
+              "${LINUX_ARM64_SHA}",
+              "${LINUX_X64_SHA}",
+          ]
+          idx = 0
+          def replace_sha(m):
+              global idx
+              result = f'sha256 "{shas[idx]}"'
+              idx += 1
+              return result
+
+          content = re.sub(r'sha256 "[a-f0-9]+"', replace_sha, content)
+
+          with open("homebrew-tap/Formula/aivo.rb", "w") as f:
+              f.write(content)
+          EOF
+
+          cd homebrew-tap
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/aivo.rb
+          git commit -m "chore: update aivo to v${VERSION}"
+          git push
