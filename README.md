@@ -1,6 +1,6 @@
 # aivo
 
-Run Claude Code (and Codex, Gemini, OpenCode) with any API provider — OpenRouter, Vercel AI Gateway, or your own.
+Run Claude Code, Gemini, and Codex with any API provider — OpenRouter, Vercel AI Gateway, or your own custom proxy.
 
 No env var juggling. No config files. Just add a key and go.
 
@@ -16,7 +16,7 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 # Add a key (OpenRouter, Vercel, or any compatible provider)
 aivo keys add
 
-# Run Claude Code with it
+# Run Claude Code
 aivo claude
 ```
 
@@ -30,22 +30,24 @@ aivo claude
 | `aivo opencode` | Run OpenCode |
 | `aivo chat` | Interactive chat REPL |
 | `aivo models` | List available models from active provider |
+| `aivo use [name]` | Switch active key |
 | `aivo keys add` | Add an API key |
-| `aivo keys use <name>` | Switch active key |
 | `aivo keys list` | List all keys |
 | `aivo update` | Update aivo |
 
 Flags pass through directly:
 
 ```bash
-aivo claude --model claude-sonnet-4-6
-aivo opencode --model gpt-5
-aivo claude --key my-proxy          # use a specific saved key
-aivo claude --env DEBUG=true        # inject extra env vars
-aivo chat --model gpt-4o            # chat with any model
-aivo chat --key my-proxy -m gpt-4o
-aivo models                         # list models (cached for 24h)
-aivo models --refresh               # force-refresh the model list
+aivo claude --dangerously-skip-permissions
+aivo claude --model moonshotai/kimi-k2.5
+
+aivo claude --key my-proxy       # use a specific saved key
+aivo claude --env DEBUG=true     # inject extra env vars
+
+aivo chat --model openai/gpt-4o  # chat with any model
+
+aivo models                      # list models (cached for 24h)
+aivo models --refresh            # force-refresh the model list
 ```
 
 ## Provider Compatibility
@@ -80,7 +82,7 @@ Use the provider's base URL when adding a key — trailing `/v1` is handled auto
 ```bash
 aivo keys            # list all keys
 aivo keys add        # add a new key (interactive)
-aivo keys use <id>   # switch active key
+aivo keys use [id]   # switch active key
 aivo keys cat <id>   # show key details
 aivo keys rm <id>    # remove a key
 ```
