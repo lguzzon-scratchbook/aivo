@@ -361,9 +361,6 @@ impl KeysCommand {
     async fn add_key(&self, provided_name: Option<&str>) -> Result<ExitCode> {
         use std::io::{self, Write};
 
-        println!("{}", style::bold("Add API Key"));
-        println!();
-
         fn read_line(prompt: &str) -> io::Result<String> {
             print!("{}", prompt);
             io::stdout().flush()?;

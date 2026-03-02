@@ -70,8 +70,8 @@ Use your existing GitHub Copilot subscription to power Claude Code, chat, and mo
 ```bash
 aivo keys add copilot         # authenticate via GitHub device flow
 aivo claude                   # run Claude Code with Copilot
-aivo chat --model claude-sonnet-4.6
 aivo models                   # list available Copilot models
+aivo chat --model claude-sonnet-4.6
 ```
 
 ### OpenRouter

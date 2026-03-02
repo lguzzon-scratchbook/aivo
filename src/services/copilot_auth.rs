@@ -159,15 +159,12 @@ pub async fn device_flow_login() -> Result<String> {
         .context("Failed to parse device code response")?;
 
     // Step 2: Display instructions
-    println!();
     println!(
-        "  {} Open {} and enter code:",
+        "{} Visit {} — enter code: {}",
         style::yellow("→"),
-        style::blue(&device.verification_uri)
+        style::blue(&device.verification_uri),
+        style::bold(&device.user_code)
     );
-    println!();
-    println!("    {}", style::bold(&device.user_code));
-    println!();
 
     let (spinning, spinner_handle) = style::start_spinner(Some(" Waiting for authorization..."));
 
