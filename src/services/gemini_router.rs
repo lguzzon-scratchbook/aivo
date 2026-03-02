@@ -1,10 +1,20 @@
 use anyhow::Result;
 use serde_json::Value;
+use std::sync::Arc;
+
+use crate::services::copilot_auth::{
+    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT,
+};
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
     pub target_base_url: String,
     pub api_key: String,
+    /// When set, overrides the model name extracted from the URL path (used for Copilot mode
+    /// since Gemini model names like `gemini-2.0-flash` are not available on Copilot).
+    pub forced_model: Option<String>,
+    /// When Some, use Copilot token auth instead of api_key
+    pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
 }
 
 pub struct GeminiRouter {
@@ -20,16 +30,22 @@ impl GeminiRouter {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let config = self.config.clone();
-        let handle = tokio::spawn(async move { run_router(listener, config).await });
+        let client = Arc::new(reqwest::Client::new());
+        let handle = tokio::spawn(async move { run_router(listener, config, client).await });
         Ok((port, handle))
     }
 }
 
-async fn run_router(listener: tokio::net::TcpListener, config: GeminiRouterConfig) -> Result<()> {
+async fn run_router(
+    listener: tokio::net::TcpListener,
+    config: GeminiRouterConfig,
+    client: Arc<reqwest::Client>,
+) -> Result<()> {
     let config = std::sync::Arc::new(config);
     loop {
         let (mut socket, _) = listener.accept().await?;
         let config = config.clone();
+        let client = client.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let request_bytes = match read_full_request(&mut socket).await {
@@ -37,7 +53,7 @@ async fn run_router(listener: tokio::net::TcpListener, config: GeminiRouterConfi
                 Err(_) => return,
             };
             let request = String::from_utf8_lossy(&request_bytes);
-            let response = match handle_request(&request, &config).await {
+            let response = match handle_request(&request, &config, &client).await {
                 Ok(r) => r,
                 Err(e) => {
                     let body = serde_json::json!({"error": {"message": e.to_string()}}).to_string();
@@ -52,16 +68,18 @@ async fn run_router(listener: tokio::net::TcpListener, config: GeminiRouterConfi
 async fn handle_request(
     request: &str,
     config: &std::sync::Arc<GeminiRouterConfig>,
+    client: &Arc<reqwest::Client>,
 ) -> Result<String> {
     let path = extract_path(request);
 
     match parse_gemini_path(&path) {
-        Some((model, is_streaming)) => {
+        Some((extracted_model, is_streaming)) => {
+            let model = config.forced_model.clone().unwrap_or(extracted_model);
             let body_str = extract_body(request);
             let body: Value = serde_json::from_str(body_str.trim())?;
             let tool_schemas = extract_tool_schemas(&body);
             let openai_req = convert_gemini_to_openai(&body, &model);
-            let openai_response = forward_to_provider(openai_req, config).await?;
+            let openai_response = forward_to_provider(openai_req, config, client).await?;
             let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
 
             if is_streaming {
@@ -84,16 +102,31 @@ async fn handle_request(
 async fn forward_to_provider(
     openai_req: Value,
     config: &std::sync::Arc<GeminiRouterConfig>,
+    client: &Arc<reqwest::Client>,
 ) -> Result<Value> {
-    let target_url = build_chat_completions_url(&config.target_base_url);
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&target_url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .json(&openai_req)
-        .send()
-        .await?;
+    let response = if let Some(ref tm) = config.copilot_token_manager {
+        let (token, api_endpoint) = tm.get_token().await?;
+        let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .json(&openai_req)
+            .send()
+            .await?
+    } else {
+        let target_url = build_chat_completions_url(&config.target_base_url);
+        client
+            .post(&target_url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&openai_req)
+            .send()
+            .await?
+    };
 
     let status = response.status().as_u16();
     let body_text = response.text().await?;
@@ -750,6 +783,30 @@ mod tests {
             build_chat_completions_url("https://example.com"),
             "https://example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn test_gemini_config_forced_model_field() {
+        let config = GeminiRouterConfig {
+            target_base_url: String::new(),
+            api_key: String::new(),
+            forced_model: Some("gpt-4o".to_string()),
+            copilot_token_manager: None,
+        };
+        assert_eq!(config.forced_model, Some("gpt-4o".to_string()));
+        assert!(config.copilot_token_manager.is_none());
+    }
+
+    #[test]
+    fn test_gemini_config_no_copilot() {
+        let config = GeminiRouterConfig {
+            target_base_url: "https://example.com".to_string(),
+            api_key: "sk-test".to_string(),
+            forced_model: None,
+            copilot_token_manager: None,
+        };
+        assert!(config.copilot_token_manager.is_none());
+        assert!(config.forced_model.is_none());
     }
 
     #[test]

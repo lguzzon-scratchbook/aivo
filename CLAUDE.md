@@ -14,7 +14,7 @@ cargo build --release  # Compile optimized binary to target/release/aivo
 cargo build --release --target <target>  # Cross-compile for specific platform
 
 # Test
-cargo test             # Run all tests (~140 tests)
+cargo test             # Run all tests (~200 tests)
 cargo test --release   # Run tests on release build
 
 # Format
@@ -76,6 +76,7 @@ SessionStore → EnvironmentInjector → AILauncher
 
 - **EnvironmentInjector** (`environment_injector.rs`) - Configures tool-specific environment variables:
   - Claude (direct): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` (empty), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` and related model env vars (optional)
+  - Claude (Copilot): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_COPILOT_ROUTER=1` to trigger `CopilotRouter`
   - Claude (OpenRouter): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_ROUTER=1` to trigger `ClaudeCodeRouter`
   - Codex (OpenAI): `OPENAI_API_KEY`, `OPENAI_BASE_URL` (direct)
   - Codex (non-OpenAI): uses placeholder `OPENAI_BASE_URL` + sets `AIVO_USE_CODEX_ROUTER=1` to trigger `CodexRouter`
@@ -83,6 +84,10 @@ SessionStore → EnvironmentInjector → AILauncher
   - Gemini (non-Google): uses placeholder `GOOGLE_GEMINI_BASE_URL` + sets `AIVO_USE_GEMINI_ROUTER=1` to trigger `GeminiRouter`
 
 - **ClaudeCodeRouter** (`claude_code_router.rs`) - Built-in HTTP proxy for OpenRouter. Intercepts Claude Code's `/v1/messages` and `/v1/chat/completions` requests, transforms model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`), and forwards to OpenRouter. Binds to a random port.
+
+- **CopilotRouter** (`copilot_router.rs`) - Built-in HTTP proxy for GitHub Copilot. Intercepts Claude Code's `/v1/messages` requests (Anthropic Messages format), converts to OpenAI Chat Completions format, and forwards to the Copilot API. Converts responses back to Anthropic format including SSE streaming. Uses `CopilotTokenManager` from `copilot_auth.rs` for token exchange and auto-refresh. Binds to a random port.
+
+- **CopilotAuth** (`copilot_auth.rs`) - GitHub Copilot authentication. Implements OAuth device flow using the VS Code Copilot client ID (`Iv1.b507a08c87ecfe98`). Manages Copilot token lifecycle: exchanges GitHub OAuth token → short-lived Copilot token via `api.github.com/copilot_internal/v2/token`, caches with expiry-based auto-refresh.
 
 - **CodexRouter** (`codex_router.rs`) - Built-in HTTP proxy for non-OpenAI providers. Strips unsupported built-in tool types (`computer_use`, `file_search`, `web_search`, `code_interpreter`) that most third-party providers reject. Converts between Codex CLI's Responses API (`/v1/responses`) and the Chat Completions API (`/v1/chat/completions`) for providers that only support the latter. Binds to a random port.
 
@@ -96,11 +101,12 @@ Each command receives injected services. Commands return exit codes for testing.
 - **keys** - API key management:
   - `list` - List all keys
   - `use <id|name>` - Activate a specific key
-  - `add` - Add an API key interactively
+  - `add` - Add an API key interactively (`add copilot` triggers GitHub Copilot device flow)
   - `rm <id|name>` - Remove an API key
   - `cat <id|name>` - Display full key details
 - **run** - Launch AI tools with unified interface
-- **chat** - Interactive REPL with streaming responses via OpenAI-compatible `/v1/chat/completions` endpoint
+- **chat** - Interactive REPL with streaming responses. Supports OpenAI-compatible, Anthropic, and GitHub Copilot providers.
+- **models** - List available models from the active provider (cached, with `--refresh` to bypass)
 - **update** - Self-update with download progress display, cross-platform binary download from GitHub Releases
 
 ### Error Handling (`src/errors.rs`)
@@ -109,14 +115,14 @@ Exit codes: 0=success, 1=user error, 2=network, 3=auth. Errors are classified by
 
 ### Data Model
 
-Single `ApiKey` struct with fields: `id`, `name`, `base_url`, `key`, `created_at`. Keys are stored encrypted in a `StoredConfig` containing `api_keys: Vec<ApiKey>` and `active_key_id: Option<String>`.
+Single `ApiKey` struct with fields: `id`, `name`, `base_url`, `key`, `created_at`. Keys are stored encrypted in a `StoredConfig` containing `api_keys: Vec<ApiKey>` and `active_key_id: Option<String>`. The sentinel `base_url` value `"copilot"` identifies GitHub Copilot keys.
 
 ## Testing Patterns
 
 - Unit tests in `#[cfg(test)]` modules within source files
 - Integration tests in `tests/` directory
 - Command handlers return exit codes for verification
-- **Test Coverage:** ~140 tests covering encryption, services, router logic, and command handlers
+- **Test Coverage:** ~200 tests covering encryption, services, router logic, and command handlers
 
 ## Build & Deployment
 
@@ -134,11 +140,13 @@ aivo/
 │   ├── lib.rs                       # Library exports for testing
 │   ├── version.rs                   # Version constant
 │   ├── style.rs                     # Terminal styling with console crate
+│   ├── tui.rs                       # Custom TUI components (FuzzySelect)
 │   ├── errors.rs                    # Centralized error handling & exit codes
 │   ├── commands/
 │   │   ├── mod.rs
 │   │   ├── chat.rs                  # Interactive chat REPL
 │   │   ├── keys.rs                  # API key management
+│   │   ├── models.rs                # List available models from provider
 │   │   ├── run.rs                   # Unified AI tool launcher
 │   │   └── update.rs               # Self-update via GitHub Releases
 │   └── services/
@@ -147,8 +155,11 @@ aivo/
 │       ├── environment_injector.rs  # Tool-specific env configuration
 │       ├── ai_launcher.rs          # Process spawning & signal forwarding
 │       ├── claude_code_router.rs   # Built-in proxy for Claude + OpenRouter
+│       ├── copilot_auth.rs         # GitHub Copilot OAuth device flow & token management
+│       ├── copilot_router.rs       # Built-in proxy for Claude + GitHub Copilot
 │       ├── codex_router.rs         # Built-in proxy for Codex + non-OpenAI providers
-│       └── gemini_router.rs        # Built-in proxy for Gemini + non-Google providers
+│       ├── gemini_router.rs        # Built-in proxy for Gemini + non-Google providers
+│       └── models_cache.rs         # 24h file-backed cache for model lists
 ├── tests/
 │   ├── encryption_test.rs
 │   ├── encryption_property.rs

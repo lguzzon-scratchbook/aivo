@@ -1,6 +1,6 @@
 # aivo
 
-Run Claude Code, Gemini, and Codex with any API provider — OpenRouter, Vercel AI Gateway, or your own custom proxy.
+Run Claude Code, Gemini, and Codex with any API provider — OpenRouter, GitHub Copilot, Vercel AI Gateway, or your own custom proxy.
 
 No env var juggling. No config files. Just add a key and go.
 
@@ -22,6 +22,9 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 ```bash
 # Add a key (OpenRouter, Vercel, or any compatible provider)
 aivo keys add
+
+# Or use your GitHub Copilot subscription
+aivo keys add copilot
 
 # Run Claude Code
 aivo claude
@@ -59,6 +62,17 @@ aivo models --refresh            # force-refresh the model list
 ```
 
 ## Provider Compatibility
+
+### GitHub Copilot
+
+Use your existing GitHub Copilot subscription to power Claude Code, chat, and more.
+
+```bash
+aivo keys add copilot         # authenticate via GitHub device flow
+aivo claude                   # run Claude Code with Copilot
+aivo chat --model claude-sonnet-4.6
+aivo models                   # list available Copilot models
+```
 
 ### OpenRouter
 
@@ -102,6 +116,7 @@ Keys are stored encrypted in `~/.config/aivo/config.json` (AES-256-GCM, machine-
 1. **Key storage** — Keys are encrypted with AES-256-GCM in `~/.config/aivo/config.json`. Machine-specific key derivation (PBKDF2-SHA256, 100k iterations) means they can't be copied to another machine.
 2. **Environment injection** — When you run a tool, aivo injects the right env vars for that provider (`ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, etc.) without touching your shell environment.
 3. **Built-in routers** — For third-party providers, aivo starts a lightweight local HTTP proxy that handles API format differences automatically:
+   - Claude + GitHub Copilot: OAuth device flow auth, Copilot token exchange, converts between Anthropic Messages and OpenAI Chat Completions
    - Claude + OpenRouter: translates model names and proxies Anthropic API requests
    - Codex + non-OpenAI: strips unsupported tool types, converts between Responses and Chat Completions API
    - Gemini + non-Google: converts Gemini's native format to/from OpenAI Chat Completions

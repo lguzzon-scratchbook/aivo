@@ -8,6 +8,9 @@ use serde::Deserialize;
 
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
+use crate::services::copilot_auth::{
+    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID,
+};
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -160,7 +163,33 @@ pub(crate) fn is_text_chat_model(id: &str) -> bool {
 pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<String>> {
     let base = normalize_base_url(&key.base_url);
 
-    if key.base_url.contains("generativelanguage.googleapis.com") {
+    if key.base_url == "copilot" {
+        // Copilot: exchange GitHub token for Copilot token, then fetch models
+        let tm = CopilotTokenManager::new(key.key.as_str().to_string());
+        let (copilot_token, api_endpoint) = tm.get_token().await?;
+        let url = format!("{}/models", api_endpoint.trim_end_matches('/'));
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", copilot_token))
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Copilot API returned {} — {}", status, body);
+        }
+
+        let resp: OpenAIModelsResponse = response.json().await?;
+        Ok(resp
+            .data
+            .into_iter()
+            .map(|m| m.id)
+            .filter(|id| is_text_chat_model(id))
+            .collect())
+    } else if key.base_url.contains("generativelanguage.googleapis.com") {
         let url = format!("{}/v1beta/models?key={}", base, key.key.as_str());
         let response = client
             .get(&url)

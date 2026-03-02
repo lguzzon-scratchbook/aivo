@@ -133,9 +133,27 @@ impl AILauncher {
             );
         }
 
+        // Start CopilotRouter for GitHub Copilot, update ANTHROPIC_BASE_URL with actual port
+        if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_COPILOT_ROUTER") {
+            let port = start_copilot_router(&env).await?;
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{}", port),
+            );
+        }
+
         // Start CodexRouter for non-OpenAI providers, update OPENAI_BASE_URL with actual port
         if options.tool == AIToolType::Codex && env.contains_key("AIVO_USE_CODEX_ROUTER") {
             let port = start_codex_router(&env).await?;
+            env.insert(
+                "OPENAI_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{}", port),
+            );
+        }
+
+        // Start CodexRouter with CopilotTokenManager for GitHub Copilot, update OPENAI_BASE_URL
+        if options.tool == AIToolType::Codex && env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER") {
+            let port = start_codex_copilot_router(&env).await?;
             env.insert(
                 "OPENAI_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{}", port),
@@ -149,6 +167,28 @@ impl AILauncher {
                 "GOOGLE_GEMINI_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{}", port),
             );
+        }
+
+        // Start GeminiRouter (Copilot mode), update GOOGLE_GEMINI_BASE_URL with actual port
+        if options.tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER")
+        {
+            let port = start_gemini_copilot_router(&env).await?;
+            env.insert(
+                "GOOGLE_GEMINI_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{}", port),
+            );
+        }
+
+        // Start CodexRouter (Copilot mode) for OpenCode, patch OPENCODE_CONFIG_CONTENT with real port
+        if options.tool == AIToolType::Opencode
+            && env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER")
+        {
+            let port = start_codex_copilot_router(&env).await?;
+            let real_url = format!("http://127.0.0.1:{}", port);
+            if let Some(content) = env.get("OPENCODE_CONFIG_CONTENT").cloned() {
+                let patched = content.replace("http://127.0.0.1:0", &real_url);
+                env.insert("OPENCODE_CONFIG_CONTENT".to_string(), patched);
+            }
         }
 
         // For Claude, inject --teammate-mode in-process to run in single window
@@ -374,6 +414,7 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
     let router = CodexRouter::new(CodexRouterConfig {
         target_base_url: base_url,
         api_key,
+        copilot_token_manager: None,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -401,11 +442,93 @@ async fn start_gemini_router(env: &HashMap<String, String>) -> Result<u16> {
     let router = GeminiRouter::new(GeminiRouterConfig {
         target_base_url: base_url,
         api_key,
+        forced_model: None,
+        copilot_token_manager: None,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: gemini router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
+/// Starts a GeminiRouter configured for GitHub Copilot and returns the port it bound to
+async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::copilot_auth::CopilotTokenManager;
+    use crate::services::{GeminiRouter, GeminiRouterConfig};
+    use std::sync::Arc;
+
+    let github_token = env
+        .get("AIVO_COPILOT_GITHUB_TOKEN")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
+        .clone();
+
+    let forced_model = env.get("AIVO_GEMINI_COPILOT_FORCED_MODEL").cloned();
+
+    if forced_model.is_none() {
+        eprintln!(
+            "  {} Gemini + Copilot: no model specified. Gemini models are not available on \
+             Copilot. Pass --model <model> (e.g., --model gpt-4o).",
+            crate::style::yellow("warning:")
+        );
+    }
+
+    let router = GeminiRouter::new(GeminiRouterConfig {
+        target_base_url: String::new(),
+        api_key: String::new(),
+        forced_model,
+        copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
+    });
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: gemini copilot router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
+/// Starts the built-in CopilotRouter for GitHub Copilot and returns the port it bound to
+async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::{CopilotRouter, CopilotRouterConfig};
+
+    let github_token = env
+        .get("AIVO_COPILOT_GITHUB_TOKEN")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
+        .clone();
+
+    let router = CopilotRouter::new(CopilotRouterConfig { github_token });
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: copilot router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
+/// Starts a CodexRouter configured for GitHub Copilot and returns the port it bound to
+async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::copilot_auth::CopilotTokenManager;
+    use crate::services::{CodexRouter, CodexRouterConfig};
+    use std::sync::Arc;
+
+    let github_token = env
+        .get("AIVO_COPILOT_GITHUB_TOKEN")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
+        .clone();
+
+    let router = CodexRouter::new(CodexRouterConfig {
+        target_base_url: String::new(),
+        api_key: String::new(),
+        copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
+    });
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: codex copilot router exited unexpectedly: {e}");
         }
     });
     Ok(port)

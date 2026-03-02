@@ -311,11 +311,11 @@ impl KeysCommand {
             } else {
                 input
             };
-            if value.starts_with("http://") || value.starts_with("https://") {
+            if value == "copilot" || value.starts_with("http://") || value.starts_with("https://") {
                 break value;
             }
             eprintln!(
-                "{} URL must start with http:// or https://",
+                "{} URL must start with http:// or https:// (or enter 'copilot' for GitHub Copilot)",
                 style::red("Error:")
             );
         };
@@ -387,16 +387,50 @@ impl KeysCommand {
             input
         };
 
-        let base_url = loop {
-            let input = read_line("Base URL (e.g., http://localhost:8080): ")?;
-            if input.starts_with("http://") || input.starts_with("https://") {
-                break input;
+        // Shortcut: `aivo keys add copilot` skips all prompts
+        let base_url = if name == "copilot" {
+            "copilot".to_string()
+        } else {
+            loop {
+                let input = read_line("Base URL (e.g., http://localhost:8080 or 'copilot'): ")?;
+                if input == "copilot" {
+                    break input;
+                }
+                if input.starts_with("http://") || input.starts_with("https://") {
+                    break input;
+                }
+                eprintln!(
+                    "{} URL must start with http:// or https:// (or enter 'copilot' for GitHub Copilot)",
+                    style::red("Error:")
+                );
             }
-            eprintln!(
-                "{} URL must start with http:// or https://",
-                style::red("Error:")
-            );
         };
+
+        // GitHub Copilot: use device flow instead of manual key entry
+        if base_url == "copilot" {
+            let token = crate::services::copilot_auth::device_flow_login().await?;
+
+            let id = self.session_store.add_key(&name, "copilot", &token).await?;
+            self.session_store.set_active_key(&id).await?;
+
+            println!();
+            println!(
+                "{} Added and activated key: {}",
+                style::success_symbol(),
+                style::cyan(&name)
+            );
+            println!("  {}", style::dim(format!("ID: {}", id)));
+            println!("  {}", style::dim("Provider: GitHub Copilot"));
+            println!();
+            println!(
+                "{} {} {}",
+                style::yellow("Next:"),
+                style::bold("aivo run claude"),
+                style::dim("(uses Copilot subscription)")
+            );
+
+            return Ok(ExitCode::Success);
+        }
 
         let key = read_line("API Key: ")?;
         if key.is_empty() {

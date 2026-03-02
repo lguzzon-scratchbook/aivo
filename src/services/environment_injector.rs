@@ -27,8 +27,18 @@ impl EnvironmentInjector {
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
+        // For GitHub Copilot, use the built-in CopilotRouter (Anthropic → OpenAI conversion + token management)
+        if key.base_url == "copilot" {
+            // Placeholder URL - AI launcher overwrites with the actual random port after binding
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "copilot".to_string());
+            env.insert("AIVO_USE_COPILOT_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
         // For OpenRouter, use the built-in router (needs model name transformation + API proxying)
-        if key.base_url.contains("openrouter") {
+        } else if key.base_url.contains("openrouter") {
             // Placeholder URL - AI launcher overwrites with the actual random port after binding
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -86,7 +96,17 @@ impl EnvironmentInjector {
     pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
-        if !key.base_url.contains("api.openai.com") {
+        if key.base_url == "copilot" {
+            // GitHub Copilot: use CodexRouter with CopilotTokenManager for auth
+            // Placeholder URL — AI launcher overwrites with actual random port after binding
+            env.insert(
+                "OPENAI_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("OPENAI_API_KEY".to_string(), "copilot".to_string());
+            env.insert("AIVO_USE_CODEX_COPILOT_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+        } else if !key.base_url.contains("api.openai.com") {
             // Non-OpenAI provider: use CodexRouter to strip unsupported tool types
             // Placeholder URL - AI launcher overwrites with the actual random port after binding
             env.insert(
@@ -124,7 +144,24 @@ impl EnvironmentInjector {
     pub fn for_gemini(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
-        if key.base_url.contains("generativelanguage.googleapis.com") {
+        if key.base_url == "copilot" {
+            env.insert(
+                "GOOGLE_GEMINI_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("GEMINI_API_KEY".to_string(), "copilot".to_string());
+            env.insert(
+                "AIVO_USE_GEMINI_COPILOT_ROUTER".to_string(),
+                "1".to_string(),
+            );
+            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+            if let Some(m) = model {
+                env.insert(
+                    "AIVO_GEMINI_COPILOT_FORCED_MODEL".to_string(),
+                    m.to_string(),
+                );
+            }
+        } else if key.base_url.contains("generativelanguage.googleapis.com") {
             // Native Google endpoint: connect directly
             env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), key.base_url.clone());
             env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());
@@ -166,14 +203,27 @@ impl EnvironmentInjector {
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
+        // For GitHub Copilot, the base_url is the magic string "copilot" — not a real URL.
+        // Use a placeholder that ai_launcher will overwrite with the actual CopilotRouter port.
+        let (base_url, api_key) = if key.base_url == "copilot" {
+            env.insert(
+                "AIVO_USE_OPENCODE_COPILOT_ROUTER".to_string(),
+                "1".to_string(),
+            );
+            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+            ("http://127.0.0.1:0".to_string(), "copilot".to_string())
+        } else {
+            (key.base_url.clone(), key.key.to_string())
+        };
+
         let mut provider = Map::new();
         provider.insert("npm".to_string(), json!("@ai-sdk/openai-compatible"));
         provider.insert("name".to_string(), json!("aivo"));
         provider.insert(
             "options".to_string(),
             json!({
-                "baseURL": key.base_url.as_str(),
-                "apiKey": key.key.as_str(),
+                "baseURL": base_url,
+                "apiKey": api_key,
             }),
         );
 
@@ -628,6 +678,42 @@ mod tests {
     }
 
     #[test]
+    fn test_for_gemini_copilot_uses_copilot_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "copilot".to_string();
+        let env = injector.for_gemini(&key, None);
+        assert_eq!(
+            env.get("AIVO_USE_GEMINI_COPILOT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(env.get("GEMINI_API_KEY"), Some(&"copilot".to_string()));
+        assert!(env.get("AIVO_USE_GEMINI_ROUTER").is_none());
+        assert!(env.get("AIVO_GEMINI_COPILOT_FORCED_MODEL").is_none());
+    }
+
+    #[test]
+    fn test_for_gemini_copilot_with_model() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "copilot".to_string();
+        let env = injector.for_gemini(&key, Some("gpt-4o"));
+        assert_eq!(
+            env.get("AIVO_USE_GEMINI_COPILOT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_GEMINI_COPILOT_FORCED_MODEL"),
+            Some(&"gpt-4o".to_string())
+        );
+        assert_eq!(env.get("GEMINI_MODEL"), Some(&"gpt-4o".to_string()));
+    }
+
+    #[test]
     fn test_for_opencode() {
         let injector = EnvironmentInjector::new();
         let key = test_key();
@@ -727,6 +813,33 @@ mod tests {
     }
 
     #[test]
+    fn test_for_opencode_copilot_uses_placeholder_url() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "copilot".to_string();
+        let env = injector.for_opencode(&key, None, None);
+
+        // Must set the router trigger env vars
+        assert_eq!(
+            env.get("AIVO_USE_OPENCODE_COPILOT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_COPILOT_GITHUB_TOKEN"),
+            Some(&"sk-test-key-12345".to_string())
+        );
+
+        // Config must use placeholder URL (not the magic string "copilot")
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(
+            config["provider"]["aivo"]["options"]["baseURL"],
+            "http://127.0.0.1:0"
+        );
+        assert_eq!(config["provider"]["aivo"]["options"]["apiKey"], "copilot");
+    }
+
+    #[test]
     fn test_merge() {
         let injector = EnvironmentInjector::new();
         let key = test_key();
@@ -736,5 +849,73 @@ mod tests {
         // Should contain all the tool env vars
         assert!(merged.contains_key("ANTHROPIC_BASE_URL"));
         assert!(merged.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn test_for_claude_copilot_uses_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "copilot".to_string();
+        let env = injector.for_claude(&key, Some("claude-sonnet-4"));
+
+        assert_eq!(env.get("AIVO_USE_COPILOT_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_COPILOT_GITHUB_TOKEN"),
+            Some(&"sk-test-key-12345".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN"),
+            Some(&"copilot".to_string())
+        );
+        // Should NOT set OpenRouter router
+        assert!(env.get("AIVO_USE_ROUTER").is_none());
+        // Model should still be set
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-sonnet-4".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_codex_copilot_uses_copilot_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "copilot".to_string();
+        let env = injector.for_codex(&key, None);
+        assert_eq!(
+            env.get("AIVO_USE_CODEX_COPILOT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("OPENAI_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(env.get("OPENAI_API_KEY"), Some(&"copilot".to_string()));
+        assert_eq!(
+            env.get("AIVO_COPILOT_GITHUB_TOKEN"),
+            Some(&"sk-test-key-12345".to_string())
+        );
+        // Should NOT set the regular codex router
+        assert!(env.get("AIVO_USE_CODEX_ROUTER").is_none());
+    }
+
+    #[test]
+    fn test_for_codex_copilot_with_model() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "copilot".to_string();
+        let env = injector.for_codex(&key, Some("gpt-4o"));
+        assert_eq!(
+            env.get("AIVO_USE_CODEX_COPILOT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        // model env vars should still be set
+        assert_eq!(env.get("CODEX_MODEL"), Some(&"gpt-4o".to_string()));
+        assert_eq!(env.get("OPENAI_DEFAULT_MODEL"), Some(&"gpt-4o".to_string()));
+        assert_eq!(env.get("CODEX_MODEL_DEFAULT"), Some(&"gpt-4o".to_string()));
     }
 }

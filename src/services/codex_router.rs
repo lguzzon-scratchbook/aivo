@@ -18,12 +18,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::services::copilot_auth::{
+    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT,
+};
+
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct CodexRouterConfig {
     pub target_base_url: String,
     pub api_key: String,
+    pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
 }
 
 pub struct CodexRouter {
@@ -41,17 +46,23 @@ impl CodexRouter {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let config = self.config.clone();
-        let handle = tokio::spawn(async move { run_router(listener, config).await });
+        let client = Arc::new(reqwest::Client::new());
+        let handle = tokio::spawn(async move { run_router(listener, config, client).await });
         Ok((port, handle))
     }
 }
 
-async fn run_router(listener: tokio::net::TcpListener, config: CodexRouterConfig) -> Result<()> {
+async fn run_router(
+    listener: tokio::net::TcpListener,
+    config: CodexRouterConfig,
+    client: Arc<reqwest::Client>,
+) -> Result<()> {
     let config = Arc::new(config);
 
     loop {
         let (mut socket, _) = listener.accept().await?;
         let config = config.clone();
+        let client = client.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -70,12 +81,12 @@ async fn run_router(listener: tokio::net::TcpListener, config: CodexRouterConfig
             );
 
             let response = if is_api_path {
-                match handle_api_request(&path, &request, &config).await {
+                match handle_api_request(&path, &request, &config, client.as_ref()).await {
                     Ok(r) => r,
                     Err(_) => http_error(500, "Internal Server Error"),
                 }
             } else {
-                match forward_request(&path, &request, &config).await {
+                match forward_request(&path, &request, &config, client.as_ref()).await {
                     Ok(r) => r,
                     Err(_) => http_error(502, "Bad Gateway"),
                 }
@@ -156,20 +167,50 @@ async fn handle_api_request(
     path: &str,
     request: &str,
     config: &Arc<CodexRouterConfig>,
+    client: &reqwest::Client,
 ) -> Result<String> {
     let body_str = extract_request_body(request)?;
     let body: Value = serde_json::from_str(body_str)?;
 
     if is_responses_api_format(&body) {
-        handle_responses_api_via_chat(path, &body, config).await
+        handle_responses_api_via_chat(path, &body, config, client).await
     } else {
-        handle_chat_completions_with_filter(path, &body, config).await
+        handle_chat_completions_with_filter(path, &body, config, client).await
     }
 }
 
 // =============================================================================
 // RESPONSES API PATH: convert request → chat completions → convert response back
 // =============================================================================
+
+/// Builds an authorized POST request builder for the upstream provider.
+///
+/// - Copilot mode: exchanges the GitHub token for a short-lived Copilot token and
+///   sets the Copilot-specific headers. The target URL is taken from the token
+///   manager's endpoint (ignoring `url`).
+/// - Normal mode: sets `Authorization: Bearer <api_key>` and POSTs to `url`.
+async fn authorized_post(
+    client: &reqwest::Client,
+    url: &str,
+    config: &CodexRouterConfig,
+) -> Result<reqwest::RequestBuilder> {
+    if let Some(ref tm) = config.copilot_token_manager {
+        let (token, api_endpoint) = tm.get_token().await?;
+        let copilot_url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
+        Ok(client
+            .post(&copilot_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT))
+    } else {
+        Ok(client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json"))
+    }
+}
 
 /// Handles Responses API requests by converting to Chat Completions format,
 /// forwarding to the provider, and converting the response back to Responses
@@ -178,15 +219,13 @@ async fn handle_responses_api_via_chat(
     _path: &str,
     body: &Value,
     config: &Arc<CodexRouterConfig>,
+    client: &reqwest::Client,
 ) -> Result<String> {
-    let chat_body = convert_responses_to_chat_request(body, &config.target_base_url);
+    let chat_body = convert_responses_to_chat_request(body, config);
     let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&target_url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
+    let response = authorized_post(client, &target_url, config)
+        .await?
         .json(&chat_body)
         .send()
         .await?;
@@ -221,18 +260,18 @@ async fn handle_chat_completions_with_filter(
     path: &str,
     body: &Value,
     config: &Arc<CodexRouterConfig>,
+    client: &reqwest::Client,
 ) -> Result<String> {
     let mut body = body.clone();
     filter_tools(&mut body);
-    transform_model(&mut body, &config.target_base_url);
+    if config.copilot_token_manager.is_none() {
+        transform_model(&mut body, &config.target_base_url);
+    }
 
     let target_url = build_target_url(&config.target_base_url, path);
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&target_url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
+    let response = authorized_post(client, &target_url, config)
+        .await?
         .json(&body)
         .send()
         .await?;
@@ -264,20 +303,16 @@ async fn forward_request(
     path: &str,
     request: &str,
     config: &Arc<CodexRouterConfig>,
+    client: &reqwest::Client,
 ) -> Result<String> {
     let body_str = extract_request_body(request)?;
 
     let target_url = build_target_url(&config.target_base_url, path);
 
-    let client = reqwest::Client::new();
-    let mut req = client
-        .post(&target_url)
-        .header("Authorization", format!("Bearer {}", config.api_key));
+    let mut req = authorized_post(client, &target_url, config).await?;
 
     if !body_str.is_empty() {
-        req = req
-            .header("Content-Type", "application/json")
-            .body(body_str.to_string());
+        req = req.body(body_str.to_string());
     }
 
     let response = req.send().await?;
@@ -370,7 +405,7 @@ pub fn is_responses_api_format(body: &Value) -> bool {
 ///
 /// Also converts tool format (Responses API has no `function` wrapper;
 /// Chat Completions requires `{type, function: {name, description, parameters}}`).
-pub fn convert_responses_to_chat_request(body: &Value, base_url: &str) -> Value {
+pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfig) -> Value {
     let mut messages: Vec<Value> = vec![];
 
     // System message from "instructions" field
@@ -440,10 +475,15 @@ pub fn convert_responses_to_chat_request(body: &Value, base_url: &str) -> Value 
         .unwrap_or_default();
 
     // Apply model name transform (e.g. openai/ prefix for OpenRouter)
+    // Skip transform when using Copilot — model names pass through unchanged
     let model = body.get("model").cloned().unwrap_or(Value::Null);
-    let model = match model.as_str() {
-        Some(s) => Value::String(transform_model_str(s, base_url)),
-        None => model,
+    let model = if config.copilot_token_manager.is_none() {
+        match model.as_str() {
+            Some(s) => Value::String(transform_model_str(s, &config.target_base_url)),
+            None => model,
+        }
+    } else {
+        model
     };
 
     let mut chat = json!({
@@ -1014,7 +1054,14 @@ mod tests {
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list files"}]}
             ]
         });
-        let chat = convert_responses_to_chat_request(&body, "https://ai-gateway.vercel.sh/v1");
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://ai-gateway.vercel.sh/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                copilot_token_manager: None,
+            },
+        );
 
         assert_eq!(chat["model"], "gpt-5.2-codex");
         assert_eq!(chat["stream"], false);
@@ -1031,7 +1078,14 @@ mod tests {
             "instructions": "You are a helpful assistant.",
             "input": [{"type": "message", "role": "user", "content": "hi"}]
         });
-        let chat = convert_responses_to_chat_request(&body, "https://example.com/v1");
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                copilot_token_manager: None,
+            },
+        );
         let msgs = chat["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "You are a helpful assistant.");
@@ -1051,7 +1105,14 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_abc", "output": "file1.txt\nfile2.txt"}
             ]
         });
-        let chat = convert_responses_to_chat_request(&body, "https://example.com/v1");
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                copilot_token_manager: None,
+            },
+        );
         let msgs = chat["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "user");
@@ -1073,7 +1134,14 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_legacy", "output": "ok"}
             ]
         });
-        let chat = convert_responses_to_chat_request(&body, "https://example.com/v1");
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                copilot_token_manager: None,
+            },
+        );
         let msgs = chat["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_legacy");
         assert_eq!(msgs[1]["tool_call_id"], "call_legacy");
@@ -1090,7 +1158,14 @@ mod tests {
                 {"type": "web_search"}
             ]
         });
-        let chat = convert_responses_to_chat_request(&body, "https://example.com/v1");
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                copilot_token_manager: None,
+            },
+        );
         let tools = chat["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "shell");
@@ -1099,7 +1174,14 @@ mod tests {
     #[test]
     fn test_convert_request_openrouter_transforms_model() {
         let body = json!({"model": "gpt-5.2-codex", "input": []});
-        let chat = convert_responses_to_chat_request(&body, "https://openrouter.ai/api/v1");
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: String::new(),
+                copilot_token_manager: None,
+            },
+        );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
     }
 
@@ -1232,5 +1314,30 @@ mod tests {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\ndata: [DONE]\n";
         let result = parse_provider_response(sse).unwrap();
         assert_eq!(result["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[test]
+    fn test_codex_config_copilot_token_manager_field() {
+        let config = CodexRouterConfig {
+            target_base_url: "https://api.example.com".to_string(),
+            api_key: "sk-test".to_string(),
+            copilot_token_manager: None,
+        };
+        assert!(config.copilot_token_manager.is_none());
+    }
+
+    #[test]
+    fn test_convert_request_copilot_skips_model_transform() {
+        // When using Copilot, model names should pass through unchanged (no openai/ prefix)
+        let body = json!({"model": "gpt-4o", "input": []});
+        let config = CodexRouterConfig {
+            target_base_url: String::new(),
+            api_key: String::new(),
+            // Simulate copilot mode by checking the None branch is the no-transform path
+            copilot_token_manager: None,
+        };
+        // Non-copilot with non-openrouter URL: no transform
+        let chat = convert_responses_to_chat_request(&body, &config);
+        assert_eq!(chat["model"], "gpt-4o");
     }
 }

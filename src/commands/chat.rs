@@ -27,6 +27,9 @@ use std::borrow::Cow;
 use crate::commands::models::{fetch_models_cached, is_text_chat_model};
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
+use crate::services::copilot_auth::{
+    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT,
+};
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -316,6 +319,13 @@ impl ChatCommand {
         let mut format = ChatFormat::OpenAI;
         let prompt = format!("{} ", style::cyan(">"));
 
+        // Create once so its token cache is reused across messages in the session.
+        let copilot_tm = if key.base_url == "copilot" {
+            Some(CopilotTokenManager::new(key.key.as_str().to_string()))
+        } else {
+            None
+        };
+
         let mut rl = Editor::<ChatHelper, rustyline::history::DefaultHistory>::new()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         rl.set_helper(Some(ChatHelper::new()));
@@ -414,31 +424,37 @@ impl ChatCommand {
             let (spinning, spinner_handle) = style::start_spinner(None);
 
             // Stream response, auto-detecting provider format
-            let result = match format {
-                ChatFormat::OpenAI => {
-                    match send_chat_request(&client, &key, &model, &history, &spinning).await {
-                        ok @ Ok(_) => ok,
-                        Err(e) if is_format_mismatch(&e) => {
-                            // Provider doesn't speak OpenAI format; try Anthropic
-                            match send_anthropic_request(&client, &key, &model, &history, &spinning)
+            let result = if let Some(ref tm) = copilot_tm {
+                send_copilot_request(&client, tm, &model, &history, &spinning).await
+            } else {
+                match format {
+                    ChatFormat::OpenAI => {
+                        match send_chat_request(&client, &key, &model, &history, &spinning).await {
+                            ok @ Ok(_) => ok,
+                            Err(e) if is_format_mismatch(&e) => {
+                                // Provider doesn't speak OpenAI format; try Anthropic
+                                match send_anthropic_request(
+                                    &client, &key, &model, &history, &spinning,
+                                )
                                 .await
-                            {
-                                Ok(content) => {
-                                    eprintln!(
-                                        "{}",
-                                        style::dim("  (using Anthropic messages format)")
-                                    );
-                                    format = ChatFormat::Anthropic;
-                                    Ok(content)
+                                {
+                                    Ok(content) => {
+                                        eprintln!(
+                                            "{}",
+                                            style::dim("  (using Anthropic messages format)")
+                                        );
+                                        format = ChatFormat::Anthropic;
+                                        Ok(content)
+                                    }
+                                    Err(_) => Err(e), // both failed; report original error
                                 }
-                                Err(_) => Err(e), // both failed; report original error
                             }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     }
-                }
-                ChatFormat::Anthropic => {
-                    send_anthropic_request(&client, &key, &model, &history, &spinning).await
+                    ChatFormat::Anthropic => {
+                        send_anthropic_request(&client, &key, &model, &history, &spinning).await
+                    }
                 }
             };
 
@@ -462,7 +478,12 @@ impl ChatCommand {
         }
 
         if !rl.history().is_empty() {
-            let joined = rl.history().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
+            let joined = rl
+                .history()
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             if let Ok(encrypted) = crate::services::session_store::encrypt(&joined) {
                 if let Some(parent) = history_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -645,6 +666,82 @@ async fn send_non_streaming(
     io::stdout().flush()?;
 
     Ok(content)
+}
+
+/// Sends a chat request via GitHub Copilot (token exchange + Copilot API).
+async fn send_copilot_request(
+    client: &Client,
+    tm: &CopilotTokenManager,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+) -> Result<String> {
+    let (copilot_token, api_endpoint) = tm.get_token().await?;
+    let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
+
+    let request = ChatRequest {
+        model: model.to_string(),
+        messages: messages.to_vec(),
+        stream: true,
+    };
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", copilot_token))
+        .header("Content-Type", "application/json")
+        .header("Editor-Version", COPILOT_EDITOR_VERSION)
+        .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+        .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+        .json(&request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let mut full_content = String::new();
+    let mut line_buf = String::new();
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let text = String::from_utf8_lossy(&chunk);
+        line_buf.push_str(&text);
+
+        while let Some(pos) = line_buf.find('\n') {
+            let line = line_buf[..pos].trim_end_matches('\r').to_string();
+            line_buf = line_buf[pos + 1..].to_string();
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data.trim() == "[DONE]" {
+                    break;
+                }
+                if let Some(content) = parse_sse_chunk(data) {
+                    stop_spinner(spinning);
+                    print!("{}", content);
+                    io::stdout().flush()?;
+                    full_content.push_str(&content);
+                }
+            }
+        }
+    }
+
+    if full_content.is_empty() && !line_buf.is_empty() {
+        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line_buf) {
+            if let Some(content) = resp["choices"][0]["message"]["content"].as_str() {
+                stop_spinner(spinning);
+                print!("{}", content);
+                io::stdout().flush()?;
+                full_content = content.to_string();
+            }
+        }
+    }
+
+    Ok(full_content)
 }
 
 /// Parses a single SSE data chunk and extracts the content delta
