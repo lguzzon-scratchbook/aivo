@@ -405,7 +405,34 @@ impl KeysCommand {
 
         // GitHub Copilot: use device flow instead of manual key entry
         if base_url == "copilot" {
+            // Check for an existing Copilot key and prompt to replace
+            let existing_keys = self.session_store.get_keys().await?;
+            let existing_copilot_id =
+                if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "copilot") {
+                    eprint!(
+                        "{} Copilot key '{}' (ID: {}) already exists. Replace it? [y/N] ",
+                        style::yellow("Warning:"),
+                        existing.name,
+                        existing.id
+                    );
+                    use std::io::Write as _;
+                    std::io::stderr().flush()?;
+                    let answer = read_line("")?;
+                    if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
+                        println!("Aborted.");
+                        return Ok(ExitCode::Success);
+                    }
+                    Some(existing.id.clone())
+                } else {
+                    None
+                };
+
             let token = crate::services::copilot_auth::device_flow_login().await?;
+
+            // Device flow succeeded — now safe to remove the old key
+            if let Some(old_id) = existing_copilot_id {
+                self.session_store.delete_key(&old_id).await?;
+            }
 
             let id = self.session_store.add_key(&name, "copilot", &token).await?;
             self.session_store.set_active_key(&id).await?;
