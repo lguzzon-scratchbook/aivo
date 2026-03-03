@@ -398,9 +398,9 @@ impl UpdateCommand {
         // Run brew update first to fetch latest formulas (ignore errors)
         let _ = Command::new("brew").args(["update", "--quiet"]).output();
 
-        // Then upgrade aivo
+        // Then upgrade aivo (--overwrite to handle symlink conflicts)
         println!("{} Upgrading aivo...", style::arrow_symbol());
-        match Command::new("brew").args(["upgrade", "aivo"]).status() {
+        match Command::new("brew").args(["upgrade", "--overwrite", "aivo"]).status() {
             Ok(status) if status.success() => ExitCode::Success,
             Ok(_) => ExitCode::Success,
             Err(e) => {
