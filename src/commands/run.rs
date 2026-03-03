@@ -10,30 +10,25 @@ use crate::commands::models::fetch_models_for_select;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::models_cache::ModelsCache;
-use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::session_store::ApiKey;
 use crate::style;
 use crate::tui::FuzzySelect;
 
 /// RunCommand provides a unified interface to launch AI tools
 pub struct RunCommand {
     ai_launcher: AILauncher,
-    session_store: SessionStore,
     cache: ModelsCache,
 }
 
 impl RunCommand {
-    pub fn new(ai_launcher: AILauncher, session_store: SessionStore, cache: ModelsCache) -> Self {
-        Self {
-            ai_launcher,
-            session_store,
-            cache,
-        }
+    pub fn new(ai_launcher: AILauncher, cache: ModelsCache) -> Self {
+        Self { ai_launcher, cache }
     }
 
-    /// Resolves the model to use: flag > persisted per-key > picker.
-    /// Only the picker selection is saved; an explicit --model <value> is used as-is
-    /// without persisting (run is a one-shot launcher, not a chat session).
-    /// Returns None when the picker was cancelled.
+    /// Resolves the model to use when --model flag is provided.
+    /// --model <value> → use as-is. --model (no value) → show picker.
+    /// No --model flag → returns None (let the tool use its own default).
+    /// Returns None when the picker was cancelled or no flag was given.
     async fn resolve_model(
         &self,
         client: &Client,
@@ -41,19 +36,15 @@ impl RunCommand {
         flag_model: Option<String>,
     ) -> Result<Option<String>> {
         match flag_model {
-            // --model with no value → force picker (bypass persisted model)
-            Some(ref m) if m.is_empty() => {}
-            // --model <value> → use it as-is (do not save)
-            Some(model) => return Ok(Some(model)),
-            // No flag: check for persisted model (saved by a previous picker selection)
-            None => {
-                if let Some(persisted) = self.session_store.get_chat_model(&key.id).await? {
-                    return Ok(Some(persisted));
-                }
-            }
+            // No --model flag → don't override, let the tool use its default
+            None => return Ok(None),
+            // --model <value> → use it as-is
+            Some(ref m) if !m.is_empty() => return Ok(Some(m.clone())),
+            // --model with no value → show picker
+            Some(_) => {}
         }
 
-        // Show picker (either no model set, or --model with no value)
+        // Show picker (--model with no value)
         let models_list = fetch_models_for_select(client, key, &self.cache).await;
 
         if models_list.is_empty() {
@@ -70,10 +61,6 @@ impl RunCommand {
             .ok()
             .flatten()
             .map(|idx| models_list[idx].clone());
-
-        if let Some(ref model) = selected {
-            self.session_store.set_chat_model(&key.id, model).await?;
-        }
 
         Ok(selected)
     }
@@ -147,13 +134,16 @@ impl RunCommand {
             }
         };
 
-        // Resolve model: picker triggered when model is None or Some("") and key is known
+        // Resolve model: only triggered when --model flag is present
+        let picker_was_requested = model.as_ref().is_some_and(|m| m.is_empty());
         let client = Client::new();
         let resolved_model = if let Some(ref key) = key_override {
-            match self.resolve_model(&client, key, model).await? {
-                Some(m) => Some(m),
-                None => return Ok(ExitCode::Success), // user cancelled picker
+            let result = self.resolve_model(&client, key, model).await?;
+            // If user explicitly opened the picker (--model with no value) and cancelled, exit
+            if picker_was_requested && result.is_none() {
+                return Ok(ExitCode::Success);
             }
+            result
         } else {
             // key_override is always resolved in main.rs before reaching here; this
             // branch is unreachable in normal operation. Bail defensively rather than

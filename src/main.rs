@@ -121,7 +121,7 @@ async fn main() {
             let env_injector = EnvironmentInjector::new();
             let ai_launcher =
                 AILauncher::new(session_store.clone(), env_injector, models_cache.clone());
-            let command = RunCommand::new(ai_launcher, session_store.clone(), models_cache);
+            let command = RunCommand::new(ai_launcher, models_cache);
 
             // Re-extract aivo flags from passthrough args that clap's trailing_var_arg
             // may have swallowed (e.g. `aivo run claude --agent-name foo --model opus`
