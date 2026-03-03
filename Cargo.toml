@@ -1,6 +1,6 @@
 [package]
 name = "aivo"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 authors = ["yuanchuan"]
 description = "Run Claude Code via OpenRouter, Vercel AI Gateway, and more — with unified API key management."
