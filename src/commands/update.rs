@@ -2,7 +2,7 @@
  * UpdateCommand handler for CLI self-update functionality.
  */
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -40,7 +40,7 @@ struct GitHubRelease {
 impl UpdateCommand {
     /// Shows usage information for the update command
     pub fn print_help() {
-        println!("{} aivo update", style::bold("Usage:"));
+        println!("{} aivo update [OPTIONS]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
@@ -49,6 +49,13 @@ impl UpdateCommand {
         println!(
             "{}",
             style::dim("Downloads and verifies the binary with SHA-256 checksum.")
+        );
+        println!();
+        println!("{}", style::bold("Options:"));
+        println!(
+            "  {}, {}    Force update even if installed via a package manager",
+            style::green("-f"),
+            style::green("--force")
         );
     }
 
@@ -63,8 +70,8 @@ impl UpdateCommand {
     }
 
     /// Executes the update command
-    pub async fn execute(&self) -> ExitCode {
-        match self.execute_internal().await {
+    pub async fn execute(&self, force: bool) -> ExitCode {
+        match self.execute_internal(force).await {
             Ok(code) => code,
             Err(e) => {
                 self.handle_error(e);
@@ -73,7 +80,35 @@ impl UpdateCommand {
         }
     }
 
-    async fn execute_internal(&self) -> Result<ExitCode> {
+    async fn execute_internal(&self, force: bool) -> Result<ExitCode> {
+        // Check for package-manager-managed installations
+        if !force {
+            let install_path = get_install_path()?;
+            if let Some(manager) = detect_managed_install(&install_path) {
+                eprintln!(
+                    "{} aivo was installed via {}.",
+                    style::yellow("Warning:"),
+                    manager.name
+                );
+                eprintln!(
+                    "  Self-update would bypass {} and may cause issues.",
+                    manager.name
+                );
+                eprintln!();
+                eprintln!(
+                    "  {} {}",
+                    style::dim("Update with:"),
+                    style::green(manager.upgrade_command)
+                );
+                eprintln!(
+                    "  {} {}",
+                    style::dim("Force self-update:"),
+                    style::green("aivo update --force")
+                );
+                return Ok(ExitCode::UserError);
+            }
+        }
+
         println!("{} Checking for updates...", style::arrow_symbol());
 
         let current_version = crate::version::VERSION;
@@ -434,6 +469,41 @@ fn get_install_path() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
+/// Information about a detected package manager
+struct ManagedInstall {
+    name: &'static str,
+    upgrade_command: &'static str,
+}
+
+/// Detects whether the binary is managed by a package manager based on its path.
+/// Returns None if the binary appears to be a direct download or AIVO_PATH is set.
+fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
+    // If AIVO_PATH is explicitly set, user opted into this path — skip detection
+    if env::var("AIVO_PATH").is_ok() {
+        return None;
+    }
+
+    let path_str = install_path.to_string_lossy();
+
+    // Homebrew: /opt/homebrew/Cellar/..., /usr/local/Cellar/..., /home/linuxbrew/.linuxbrew/Cellar/...
+    if path_str.contains("/Cellar/") || path_str.contains("/homebrew/") {
+        return Some(ManagedInstall {
+            name: "Homebrew",
+            upgrade_command: "brew upgrade aivo",
+        });
+    }
+
+    // Cargo: ~/.cargo/bin/aivo
+    if path_str.contains("/.cargo/bin/") {
+        return Some(ManagedInstall {
+            name: "Cargo",
+            upgrade_command: "cargo install aivo",
+        });
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +578,63 @@ mod tests {
             parse_checksum_text(bsd, artifact),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string())
         );
+    }
+
+    #[test]
+    fn test_detect_homebrew_cellar_arm() {
+        let path = Path::new("/opt/homebrew/Cellar/aivo/0.4.3/bin/aivo");
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.name, "Homebrew");
+        assert_eq!(m.upgrade_command, "brew upgrade aivo");
+    }
+
+    #[test]
+    fn test_detect_homebrew_cellar_intel() {
+        let path = Path::new("/usr/local/Cellar/aivo/0.4.3/bin/aivo");
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "Homebrew");
+    }
+
+    #[test]
+    fn test_detect_homebrew_linuxbrew() {
+        let path = Path::new("/home/linuxbrew/.linuxbrew/Cellar/aivo/0.4.3/bin/aivo");
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "Homebrew");
+    }
+
+    #[test]
+    fn test_detect_homebrew_opt_path() {
+        let path = Path::new("/opt/homebrew/bin/aivo");
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "Homebrew");
+    }
+
+    #[test]
+    fn test_detect_cargo_install() {
+        let path = Path::new("/Users/user/.cargo/bin/aivo");
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.name, "Cargo");
+        assert_eq!(m.upgrade_command, "cargo install aivo");
+    }
+
+    #[test]
+    fn test_detect_direct_download() {
+        let path = Path::new("/usr/local/bin/aivo");
+        let result = detect_managed_install(path);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_custom_path() {
+        let path = Path::new("/home/user/bin/aivo");
+        let result = detect_managed_install(path);
+        assert!(result.is_none());
     }
 }

@@ -49,7 +49,7 @@ pub enum Commands {
     Models(ModelsArgs),
 
     /// Update the CLI tool to the latest version
-    Update,
+    Update(UpdateArgs),
 }
 
 /// Arguments for the keys command
@@ -113,6 +113,14 @@ pub struct ModelsArgs {
     /// Bypass cache and fetch fresh model list from the provider
     #[arg(short = 'r', long)]
     pub refresh: bool,
+}
+
+/// Arguments for the update command
+#[derive(Args, Debug, Clone)]
+pub struct UpdateArgs {
+    /// Force update even if installed via a package manager
+    #[arg(short, long)]
+    pub force: bool,
 }
 
 /// Arguments for the chat command

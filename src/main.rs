@@ -59,7 +59,7 @@ async fn main() {
             Some(Commands::Models(_)) => {
                 ModelsCommand::print_help();
             }
-            Some(Commands::Update) => {
+            Some(Commands::Update(_)) => {
                 UpdateCommand::print_help();
             }
             None => {
@@ -251,8 +251,8 @@ async fn main() {
             command.execute(key_override, models_args.refresh).await
         }
 
-        Commands::Update => match UpdateCommand::new() {
-            Ok(command) => command.execute().await,
+        Commands::Update(update_args) => match UpdateCommand::new() {
+            Ok(command) => command.execute(update_args.force).await,
             Err(e) => {
                 eprintln!(
                     "{} Failed to initialize update command: {}",
