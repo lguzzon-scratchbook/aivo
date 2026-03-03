@@ -3,6 +3,7 @@
  */
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -85,27 +86,34 @@ impl UpdateCommand {
         if !force {
             let install_path = get_install_path()?;
             if let Some(manager) = detect_managed_install(&install_path) {
-                eprintln!(
-                    "{} aivo was installed via {}.",
-                    style::yellow("Warning:"),
-                    manager.name
-                );
-                eprintln!(
-                    "  Self-update would bypass {} and may cause issues.",
-                    manager.name
-                );
-                eprintln!();
-                eprintln!(
-                    "  {} {}",
-                    style::dim("Update with:"),
-                    style::green(manager.upgrade_command)
-                );
-                eprintln!(
-                    "  {} {}",
-                    style::dim("Force self-update:"),
-                    style::green("aivo update --force")
-                );
-                return Ok(ExitCode::UserError);
+                match manager.kind {
+                    PackageManager::Homebrew => {
+                        return Ok(self.update_via_homebrew());
+                    }
+                    PackageManager::Cargo => {
+                        eprintln!(
+                            "{} aivo was installed via {}.",
+                            style::yellow("Warning:"),
+                            manager.name
+                        );
+                        eprintln!(
+                            "  Self-update would bypass {} and may cause issues.",
+                            manager.name
+                        );
+                        eprintln!();
+                        eprintln!(
+                            "  {} {}",
+                            style::dim("Update with:"),
+                            style::green(manager.upgrade_command)
+                        );
+                        eprintln!(
+                            "  {} {}",
+                            style::dim("Force self-update:"),
+                            style::green("aivo update --force")
+                        );
+                        return Ok(ExitCode::UserError);
+                    }
+                }
             }
         }
 
@@ -376,6 +384,34 @@ impl UpdateCommand {
             style::yellow("Suggestion:")
         );
     }
+
+    /// Delegates update to Homebrew by running `brew upgrade aivo`
+    fn update_via_homebrew(&self) -> ExitCode {
+        println!(
+            "{} Updating via Homebrew...",
+            style::arrow_symbol()
+        );
+        match Command::new("brew")
+            .args(["upgrade", "aivo"])
+            .status()
+        {
+            Ok(status) if status.success() => ExitCode::Success,
+            Ok(_) => {
+                // brew upgrade exits non-zero when already up to date
+                // or on actual failure — either way, let the user see
+                // brew's own output (it inherits stdio)
+                ExitCode::Success
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} Failed to run brew: {}",
+                    style::red("Error:"),
+                    e
+                );
+                ExitCode::UserError
+            }
+        }
+    }
 }
 
 fn parse_digest_sha256(digest: &str) -> Option<String> {
@@ -469,8 +505,15 @@ fn get_install_path() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
+/// Detected package manager type
+enum PackageManager {
+    Homebrew,
+    Cargo,
+}
+
 /// Information about a detected package manager
 struct ManagedInstall {
+    kind: PackageManager,
     name: &'static str,
     upgrade_command: &'static str,
 }
@@ -488,6 +531,7 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
     // Homebrew: /opt/homebrew/Cellar/..., /usr/local/Cellar/..., /home/linuxbrew/.linuxbrew/Cellar/...
     if path_str.contains("/Cellar/") || path_str.contains("/homebrew/") {
         return Some(ManagedInstall {
+            kind: PackageManager::Homebrew,
             name: "Homebrew",
             upgrade_command: "brew upgrade aivo",
         });
@@ -496,6 +540,7 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
     // Cargo: ~/.cargo/bin/aivo
     if path_str.contains("/.cargo/bin/") {
         return Some(ManagedInstall {
+            kind: PackageManager::Cargo,
             name: "Cargo",
             upgrade_command: "cargo install aivo",
         });
