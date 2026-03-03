@@ -74,7 +74,7 @@ SessionStore → EnvironmentInjector → AILauncher
 
 - **AILauncher** (`ai_launcher.rs`) - Spawns AI tool processes (claude, codex, gemini) with environment injection using tokio. Forwards signals (SIGINT, SIGTERM) and inherits stdio for interactive passthrough. Injects `--teammate-mode in-process` for Claude to ensure single-window mode. Starts the appropriate built-in router when needed, then overwrites the placeholder base URL with the actual bound port.
 
-- **EnvironmentInjector** (`environment_injector.rs`) - Configures tool-specific environment variables:
+- **EnvironmentInjector** (`environment_injector.rs`) - Configures tool-specific environment variables. Includes model name transformation for OpenRouter compatibility (converts hyphenated versions like `claude-sonnet-4-6` to dotted format `claude-sonnet-4.6`):
   - Claude (direct): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` (empty), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` and related model env vars (optional)
   - Claude (Copilot): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_COPILOT_ROUTER=1` to trigger `CopilotRouter`
   - Claude (OpenRouter): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_ROUTER=1` to trigger `ClaudeCodeRouter`
@@ -105,7 +105,7 @@ Each command receives injected services. Commands return exit codes for testing.
   - `rm <id|name>` - Remove an API key
   - `cat <id|name>` - Display full key details
 - **run** - Launch AI tools with unified interface
-- **chat** - Interactive REPL with streaming responses. Supports OpenAI-compatible, Anthropic, and GitHub Copilot providers.
+- **chat** - Interactive REPL with streaming responses. Supports OpenAI-compatible, Anthropic, and GitHub Copilot providers. Automatically transforms model names for OpenRouter compatibility (e.g., `claude-sonnet-4-6` → `claude-sonnet-4.6`).
 - **models** - List available models from the active provider (cached, with `--refresh` to bypass)
 - **update** - Self-update with download progress display, cross-platform binary download from GitHub Releases
 
@@ -181,3 +181,28 @@ aivo/
 - Key derivation: PBKDF2 with SHA-256, 100k iterations
 - Salt derived from HMAC of machine data (username + home directory)
 - 16-byte IV and 16-byte auth tag
+
+## Router Architecture
+
+### Built-in Proxy Pattern
+
+All routers follow a consistent pattern:
+
+1. **Placeholder Base URL**: EnvironmentInjector sets a placeholder URL (e.g., `http://localhost:0`) and a flag environment variable (e.g., `AIVO_USE_ROUTER=1`)
+
+2. **Router Discovery**: The appropriate router (ClaudeCodeRouter, CopilotRouter, CodexRouter, GeminiRouter) detects the flag and starts an HTTP server on a random available port
+
+3. **URL Replacement**: The router binds to the random port, then overwrites the placeholder base URL with the actual bound URL
+
+4. **Request Interception**: The router intercepts requests from the AI tool and forwards them to the target provider with necessary transformations
+
+### Router-Specific Transformations
+
+- **ClaudeCodeRouter**: Converts model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) for OpenRouter compatibility
+- **CopilotRouter**: Converts between Anthropic Messages format and OpenAI Chat Completions format, handles SSE streaming
+- **CodexRouter**: Strips unsupported tool types and converts between Responses API and Chat Completions API
+- **GeminiRouter**: Converts between Gemini native API format and OpenAI Chat Completions format
+
+### Signal Handling
+
+AILauncher forwards SIGINT and SIGTERM signals to spawned processes and inherits stdio for interactive passthrough, ensuring proper cleanup and user experience.
