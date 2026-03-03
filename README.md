@@ -1,6 +1,6 @@
 # aivo
 
-Run Claude Code on your GitHub Copilot subscription, or connect via OpenRouter, Vercel AI Gateway, and more.
+Run Claude Code via OpenRouter, Vercel AI Gateway, and more — with unified API key management.
 
 ## Install
 
@@ -18,14 +18,14 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 ## Quick Start
 
 ```bash
-# Use your GitHub Copilot subscription
-aivo keys add copilot
-aivo claude
-
-# Or add any other API key (OpenRouter, Vercel AI Gateway, etc.)
+# Add API key (OpenRouter, Vercel AI Gateway, etc.)
 aivo keys add
 aivo claude
 aivo claude --model moonshotai/kimi-k2.5
+
+# Or use your GitHub Copilot subscription
+aivo keys add copilot
+aivo claude
 ```
 
 ## Commands
@@ -61,17 +61,6 @@ aivo models --refresh            # force-refresh the model list
 
 ## Provider Compatibility
 
-### GitHub Copilot
-
-Use your existing GitHub Copilot subscription to run Claude Code — no separate Anthropic API key needed.
-
-```bash
-aivo keys add copilot         # authenticate via GitHub device flow
-aivo claude                   # run Claude Code with Copilot
-aivo models                   # list available Copilot models
-aivo chat --model claude-sonnet-4.6
-```
-
 ### OpenRouter
 
 Add your key with `https://openrouter.ai/api/v1` as the base URL.
@@ -96,6 +85,17 @@ Any Anthropic-compatible provider works with `aivo claude`.
 Any OpenAI-compatible provider works with `aivo chat` and `aivo codex`.
 
 Use the provider's base URL when adding a key — trailing `/v1` is handled automatically.
+
+### GitHub Copilot
+
+Use your existing GitHub Copilot subscription to run Claude Code — no separate Anthropic API key needed.
+
+```bash
+aivo keys add copilot         # authenticate via GitHub device flow
+aivo claude                   # run Claude Code with Copilot
+aivo models                   # list available Copilot models
+aivo chat --model claude-sonnet-4.6
+```
 
 ## Managing Keys
 
