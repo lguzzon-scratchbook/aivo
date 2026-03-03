@@ -94,13 +94,7 @@ impl UpdateCommand {
             if let Some(manager) = detect_managed_install(&install_path) {
                 match manager.kind {
                     PackageManager::Homebrew => {
-                        // Check GitHub version once and pass to homebrew updater
-                        let github_version = self
-                            .get_latest_release()
-                            .await
-                            .ok()
-                            .map(|r| r.version().to_string());
-                        return Ok(self.update_via_homebrew(github_version.as_deref()));
+                        return Ok(self.update_via_homebrew());
                     }
                     PackageManager::Cargo => {
                         eprintln!(
@@ -398,33 +392,11 @@ impl UpdateCommand {
     }
 
     /// Delegates update to Homebrew
-    /// If github_version is provided and newer than current, shows a warning
-    fn update_via_homebrew(&self, github_version: Option<&str>) -> ExitCode {
-        let current_version = crate::version::VERSION;
+    fn update_via_homebrew(&self) -> ExitCode {
+        println!("{} Updating via Homebrew...", style::arrow_symbol());
 
-        // Warn if GitHub has newer version than current
-        if let Some(github_ver) = github_version
-            && self.is_newer_version(github_ver, current_version)
-        {
-            eprintln!();
-            eprintln!(
-                "{} Current: {}, GitHub latest: {}",
-                style::yellow("Note:"),
-                current_version,
-                github_ver
-            );
-            eprintln!(
-                "  {}",
-                style::dim("Homebrew may be behind GitHub. Will upgrade via Homebrew...")
-            );
-        }
-
-        println!("{} Updating Homebrew...", style::arrow_symbol());
-
-        // Run brew update first to fetch latest formulas
-        if let Err(e) = Command::new("brew").args(["update", "--quiet"]).output() {
-            eprintln!("{} brew update failed: {}", style::yellow("Warning:"), e);
-        }
+        // Run brew update first to fetch latest formulas (ignore errors)
+        let _ = Command::new("brew").args(["update", "--quiet"]).output();
 
         // Then upgrade aivo
         println!("{} Upgrading aivo...", style::arrow_symbol());
