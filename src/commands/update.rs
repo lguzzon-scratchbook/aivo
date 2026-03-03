@@ -38,6 +38,12 @@ struct GitHubRelease {
     assets: Vec<GitHubAsset>,
 }
 
+impl GitHubRelease {
+    fn version(&self) -> &str {
+        self.tag_name.trim_start_matches('v')
+    }
+}
+
 impl UpdateCommand {
     /// Shows usage information for the update command
     pub fn print_help() {
@@ -88,7 +94,13 @@ impl UpdateCommand {
             if let Some(manager) = detect_managed_install(&install_path) {
                 match manager.kind {
                     PackageManager::Homebrew => {
-                        return Ok(self.update_via_homebrew());
+                        // Check GitHub version once and pass to homebrew updater
+                        let github_version = self
+                            .get_latest_release()
+                            .await
+                            .ok()
+                            .map(|r| r.version().to_string());
+                        return Ok(self.update_via_homebrew(github_version.as_deref()));
                     }
                     PackageManager::Cargo => {
                         eprintln!(
@@ -121,7 +133,7 @@ impl UpdateCommand {
 
         let current_version = crate::version::VERSION;
         let release = self.get_latest_release().await?;
-        let latest_version = release.tag_name.trim_start_matches('v');
+        let latest_version = release.version();
 
         let binary_name = get_binary_name()?;
         let asset = release
@@ -385,19 +397,42 @@ impl UpdateCommand {
         );
     }
 
-    /// Delegates update to Homebrew by running `brew upgrade aivo`
-    fn update_via_homebrew(&self) -> ExitCode {
-        println!("{} Updating via Homebrew...", style::arrow_symbol());
+    /// Delegates update to Homebrew
+    /// If github_version is provided and newer than current, shows a warning
+    fn update_via_homebrew(&self, github_version: Option<&str>) -> ExitCode {
+        let current_version = crate::version::VERSION;
+
+        // Warn if GitHub has newer version than current
+        if let Some(github_ver) = github_version
+            && self.is_newer_version(github_ver, current_version)
+        {
+            eprintln!();
+            eprintln!(
+                "{} Current: {}, GitHub latest: {}",
+                style::yellow("Note:"),
+                current_version,
+                github_ver
+            );
+            eprintln!(
+                "  {}",
+                style::dim("Homebrew may be behind GitHub. Will upgrade via Homebrew...")
+            );
+        }
+
+        println!("{} Updating Homebrew...", style::arrow_symbol());
+
+        // Run brew update first to fetch latest formulas
+        if let Err(e) = Command::new("brew").args(["update", "--quiet"]).output() {
+            eprintln!("{} brew update failed: {}", style::yellow("Warning:"), e);
+        }
+
+        // Then upgrade aivo
+        println!("{} Upgrading aivo...", style::arrow_symbol());
         match Command::new("brew").args(["upgrade", "aivo"]).status() {
             Ok(status) if status.success() => ExitCode::Success,
-            Ok(_) => {
-                // brew upgrade exits non-zero when already up to date
-                // or on actual failure — either way, let the user see
-                // brew's own output (it inherits stdio)
-                ExitCode::Success
-            }
+            Ok(_) => ExitCode::Success,
             Err(e) => {
-                eprintln!("{} Failed to run brew: {}", style::red("Error:"), e);
+                eprintln!("{} brew upgrade failed: {}", style::red("Error:"), e);
                 ExitCode::UserError
             }
         }
