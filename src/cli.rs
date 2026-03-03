@@ -317,9 +317,11 @@ mod tests {
             assert!(run_args.args.contains(&"senior-engineer".to_string()));
             assert!(run_args.args.contains(&"--team-name".to_string()));
             assert!(run_args.args.contains(&"ai-gateway-team".to_string()));
-            assert!(run_args
-                .args
-                .contains(&"--dangerously-skip-permissions".to_string()));
+            assert!(
+                run_args
+                    .args
+                    .contains(&"--dangerously-skip-permissions".to_string())
+            );
         } else {
             panic!("Expected Run command");
         }
@@ -342,9 +344,11 @@ mod tests {
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.model, Some("claude-opus-4-6".to_string()));
             assert!(run_args.args.contains(&"--agent-name".to_string()));
-            assert!(run_args
-                .args
-                .contains(&"--dangerously-skip-permissions".to_string()));
+            assert!(
+                run_args
+                    .args
+                    .contains(&"--dangerously-skip-permissions".to_string())
+            );
         } else {
             panic!("Expected Run command");
         }

@@ -4,8 +4,8 @@
  */
 use console::style;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
 /// Supported style names.

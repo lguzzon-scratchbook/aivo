@@ -4,7 +4,7 @@
  */
 use std::collections::HashMap;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::services::session_store::ApiKey;
 
@@ -313,16 +313,16 @@ impl EnvironmentInjector {
                 eprintln!("  {}={}", key, display);
             }
 
-            if let Some(manual) = manual_env {
-                if !manual.is_empty() {
-                    eprintln!("[aivo] Manual environment overrides:");
-                    let mut keys: Vec<_> = manual.keys().collect();
-                    keys.sort();
-                    for key in keys {
-                        let value = &manual[key];
-                        let display = redact_env_value(key, value);
-                        eprintln!("  {}={}", key, display);
-                    }
+            if let Some(manual) = manual_env
+                && !manual.is_empty()
+            {
+                eprintln!("[aivo] Manual environment overrides:");
+                let mut keys: Vec<_> = manual.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let value = &manual[key];
+                    let display = redact_env_value(key, value);
+                    eprintln!("  {}={}", key, display);
                 }
             }
         }

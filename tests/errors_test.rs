@@ -1,4 +1,4 @@
-use aivo::errors::{classify_error, get_exit_code, CLIError, ErrorCategory, ExitCode};
+use aivo::errors::{CLIError, ErrorCategory, ExitCode, classify_error, get_exit_code};
 
 #[test]
 fn test_exit_code_values() {

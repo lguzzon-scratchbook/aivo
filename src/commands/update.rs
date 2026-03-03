@@ -190,10 +190,10 @@ impl UpdateCommand {
         binary_name: &str,
         binary_asset: &GitHubAsset,
     ) -> Result<String> {
-        if let Some(digest) = binary_asset.digest.as_deref() {
-            if let Some(sha256) = parse_digest_sha256(digest) {
-                return Ok(sha256);
-            }
+        if let Some(digest) = binary_asset.digest.as_deref()
+            && let Some(sha256) = parse_digest_sha256(digest)
+        {
+            return Ok(sha256);
         }
 
         let sha256_name = format!("{}.sha256", binary_name);
@@ -387,14 +387,8 @@ impl UpdateCommand {
 
     /// Delegates update to Homebrew by running `brew upgrade aivo`
     fn update_via_homebrew(&self) -> ExitCode {
-        println!(
-            "{} Updating via Homebrew...",
-            style::arrow_symbol()
-        );
-        match Command::new("brew")
-            .args(["upgrade", "aivo"])
-            .status()
-        {
+        println!("{} Updating via Homebrew...", style::arrow_symbol());
+        match Command::new("brew").args(["upgrade", "aivo"]).status() {
             Ok(status) if status.success() => ExitCode::Success,
             Ok(_) => {
                 // brew upgrade exits non-zero when already up to date
@@ -403,11 +397,7 @@ impl UpdateCommand {
                 ExitCode::Success
             }
             Err(e) => {
-                eprintln!(
-                    "{} Failed to run brew: {}",
-                    style::red("Error:"),
-                    e
-                );
+                eprintln!("{} Failed to run brew: {}", style::red("Error:"), e);
                 ExitCode::UserError
             }
         }
@@ -437,29 +427,25 @@ fn parse_checksum_text(text: &str, binary_name: &str) -> Option<String> {
             continue;
         }
 
-        if let Some((left, right)) = line.split_once(" = ") {
-            if left.starts_with("SHA256 (")
-                && left.ends_with(')')
-                && (left.contains(binary_name) || binary_name.is_empty())
-            {
-                if let Some(hash) = normalize_sha256(right) {
-                    return Some(hash);
-                }
-            }
+        if let Some((left, right)) = line.split_once(" = ")
+            && left.starts_with("SHA256 (")
+            && left.ends_with(')')
+            && (left.contains(binary_name) || binary_name.is_empty())
+            && let Some(hash) = normalize_sha256(right)
+        {
+            return Some(hash);
         }
 
         let mut parts = line.split_whitespace();
-        if let Some(first) = parts.next() {
-            if let Some(hash) = normalize_sha256(first) {
-                let remainder = line[first.len()..].trim_start();
-                let cleaned_remainder = remainder.trim_start_matches('*').trim_start();
-                if cleaned_remainder.is_empty() {
-                    fallback_hash = Some(hash);
-                } else if cleaned_remainder.ends_with(binary_name)
-                    || cleaned_remainder == binary_name
-                {
-                    return Some(hash);
-                }
+        if let Some(first) = parts.next()
+            && let Some(hash) = normalize_sha256(first)
+        {
+            let remainder = line[first.len()..].trim_start();
+            let cleaned_remainder = remainder.trim_start_matches('*').trim_start();
+            if cleaned_remainder.is_empty() {
+                fallback_hash = Some(hash);
+            } else if cleaned_remainder.ends_with(binary_name) || cleaned_remainder == binary_name {
+                return Some(hash);
             }
         }
     }
@@ -490,7 +476,7 @@ fn get_binary_name() -> Result<String> {
                 "Unsupported platform: {}-{}",
                 platform,
                 arch
-            ))
+            ));
         }
     };
 

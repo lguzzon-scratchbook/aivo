@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
-    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID,
+    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, CopilotTokenManager,
 };
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
@@ -227,10 +227,10 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
         // the chat-completions path prefix.
         let model_endpoints = |b: &str| [format!("{}/v1/models", b), format!("{}/models", b)];
         let mut candidates = Vec::new();
-        if let Some(origin) = url_origin(base) {
-            if origin != base {
-                candidates.extend(model_endpoints(&origin));
-            }
+        if let Some(origin) = url_origin(base)
+            && origin != base
+        {
+            candidates.extend(model_endpoints(&origin));
         }
         candidates.extend(model_endpoints(base));
         let auth = format!("Bearer {}", key.key.as_str());
@@ -254,7 +254,7 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                             .into_iter()
                             .map(|m| m.id)
                             .filter(|id| is_text_chat_model(id))
-                            .collect())
+                            .collect());
                     }
                     Err(e) => {
                         last_err = format!("Invalid models response from {}: {}", url, e);
@@ -300,10 +300,8 @@ pub(crate) async fn fetch_models_cached(
     cache: &ModelsCache,
     bypass_cache: bool,
 ) -> Result<Vec<String>> {
-    if !bypass_cache {
-        if let Some(cached) = cache.get(&key.base_url).await {
-            return Ok(cached);
-        }
+    if !bypass_cache && let Some(cached) = cache.get(&key.base_url).await {
+        return Ok(cached);
     }
     let models = fetch_models(client, key).await?;
     cache.set(&key.base_url, models.clone()).await;

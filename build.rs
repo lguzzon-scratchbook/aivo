@@ -12,11 +12,10 @@ fn main() {
     if let Ok(output) = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let git_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            println!("cargo:rustc-env=VERGEN_GIT_SHA={}", git_sha);
-        }
+        let git_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("cargo:rustc-env=VERGEN_GIT_SHA={}", git_sha);
     }
 
     println!("cargo:rerun-if-changed=.git/HEAD");

@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::services::copilot_auth::{
-    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT,
+    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 
 #[derive(Clone)]
@@ -252,10 +252,9 @@ pub fn convert_gemini_to_openai(body: &Value, model: &str) -> Value {
         .and_then(|parts| parts.first())
         .and_then(|p| p.get("text"))
         .and_then(|t| t.as_str())
+        && !system_text.is_empty()
     {
-        if !system_text.is_empty() {
-            messages.push(serde_json::json!({"role": "system", "content": system_text}));
-        }
+        messages.push(serde_json::json!({"role": "system", "content": system_text}));
     }
 
     // Convert contents → messages
@@ -411,11 +410,11 @@ fn repair_single_tool_call(tc: &mut Value, schema: &Value) {
             let r_lower = req.to_lowercase();
             k_lower == r_lower || k_lower.contains(&r_lower) || r_lower.contains(&k_lower)
         });
-        if let Some(old_key) = similar_key {
-            if let Some(val) = args.remove(old_key) {
-                args.insert(req.clone(), val);
-                continue;
-            }
+        if let Some(old_key) = similar_key
+            && let Some(val) = args.remove(old_key)
+        {
+            args.insert(req.clone(), val);
+            continue;
         }
 
         // 2. Default: path-like string params default to current directory
@@ -437,12 +436,13 @@ fn repair_single_tool_call(tc: &mut Value, schema: &Value) {
 }
 
 fn normalize_parameters(params: &Value) -> Value {
-    if let Some(obj) = params.as_object() {
-        if obj.contains_key("properties") && !obj.contains_key("type") {
-            let mut normalized = obj.clone();
-            normalized.insert("type".to_string(), serde_json::json!("object"));
-            return Value::Object(normalized);
-        }
+    if let Some(obj) = params.as_object()
+        && obj.contains_key("properties")
+        && !obj.contains_key("type")
+    {
+        let mut normalized = obj.clone();
+        normalized.insert("type".to_string(), serde_json::json!("object"));
+        return Value::Object(normalized);
     }
     params.clone()
 }

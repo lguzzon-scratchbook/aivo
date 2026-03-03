@@ -13,13 +13,13 @@
  *    request/response conversion. This router handles that automatically.
  */
 use anyhow::Result;
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::services::copilot_auth::{
-    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT,
+    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -409,10 +409,10 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
     let mut messages: Vec<Value> = vec![];
 
     // System message from "instructions" field
-    if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
-        if !instructions.is_empty() {
-            messages.push(json!({"role": "system", "content": instructions}));
-        }
+    if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str())
+        && !instructions.is_empty()
+    {
+        messages.push(json!({"role": "system", "content": instructions}));
     }
 
     // Convert "input" array items
@@ -581,25 +581,25 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
                         while tool_calls_acc.len() <= idx {
                             tool_calls_acc.push((String::new(), String::new(), String::new()));
                         }
-                        if let Some(id) = tc["id"].as_str() {
-                            if !id.is_empty() {
-                                tool_calls_acc[idx].0 = id.to_string();
-                            }
+                        if let Some(id) = tc["id"].as_str()
+                            && !id.is_empty()
+                        {
+                            tool_calls_acc[idx].0 = id.to_string();
                         }
-                        if let Some(name) = tc["function"]["name"].as_str() {
-                            if !name.is_empty() {
-                                tool_calls_acc[idx].1.push_str(name);
-                            }
+                        if let Some(name) = tc["function"]["name"].as_str()
+                            && !name.is_empty()
+                        {
+                            tool_calls_acc[idx].1.push_str(name);
                         }
                         if let Some(args) = tc["function"]["arguments"].as_str() {
                             tool_calls_acc[idx].2.push_str(args);
                         }
                     }
                 }
-                if let Some(fr) = choice["finish_reason"].as_str() {
-                    if !fr.is_empty() {
-                        finish_reason = fr.to_string();
-                    }
+                if let Some(fr) = choice["finish_reason"].as_str()
+                    && !fr.is_empty()
+                {
+                    finish_reason = fr.to_string();
                 }
             }
         }
@@ -1296,10 +1296,12 @@ mod tests {
             .unwrap();
         assert_eq!(tcs[0]["id"], "call_x");
         assert_eq!(tcs[0]["function"]["name"], "shell");
-        assert!(tcs[0]["function"]["arguments"]
-            .as_str()
-            .unwrap()
-            .contains("ls"));
+        assert!(
+            tcs[0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .contains("ls")
+        );
     }
 
     #[test]

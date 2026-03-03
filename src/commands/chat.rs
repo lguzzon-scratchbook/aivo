@@ -5,21 +5,21 @@
  */
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::tui::FuzzySelect;
 use anyhow::Result;
 use futures_util::StreamExt;
 use reqwest::Client;
 use rustyline::{
+    Context, Editor, Helper,
     completion::{Completer, Pair},
     error::ReadlineError,
     highlight::Highlighter,
     hint::Hinter,
     history::History,
     validate::Validator,
-    Context, Editor, Helper,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -28,7 +28,7 @@ use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
-    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT,
+    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
@@ -217,17 +217,16 @@ impl ChatCommand {
                 .is_some_and(|c| c.is_ascii_digit())
             {
                 // Check if there's another hyphen before this one with a digit after it
-                if let Some(second_last_hyphen) = model[..last_hyphen_pos].rfind('-') {
-                    if model[second_last_hyphen + 1..last_hyphen_pos]
+                if let Some(second_last_hyphen) = model[..last_hyphen_pos].rfind('-')
+                    && model[second_last_hyphen + 1..last_hyphen_pos]
                         .chars()
                         .next()
                         .is_some_and(|c| c.is_ascii_digit())
-                    {
-                        // Replace the last hyphen with a dot
-                        let mut result = model.to_string();
-                        result.replace_range(last_hyphen_pos..=last_hyphen_pos, ".");
-                        return result;
-                    }
+                {
+                    // Replace the last hyphen with a dot
+                    let mut result = model.to_string();
+                    result.replace_range(last_hyphen_pos..=last_hyphen_pos, ".");
+                    return result;
                 }
             }
         }
@@ -272,7 +271,9 @@ impl ChatCommand {
                 let models_list = self.fetch_models_for_select(&client, &key).await;
 
                 if models_list.is_empty() {
-                    anyhow::bail!("No model configured and could not fetch model list. Use --model <name> to specify one.");
+                    anyhow::bail!(
+                        "No model configured and could not fetch model list. Use --model <name> to specify one."
+                    );
                 }
 
                 match FuzzySelect::new()
@@ -304,7 +305,9 @@ impl ChatCommand {
         );
         eprintln!(
             "{}",
-            style::dim("Type /exit to quit, /model to pick a model, /model <name> to set directly. Ctrl+D also works.")
+            style::dim(
+                "Type /exit to quit, /model to pick a model, /model <name> to set directly. Ctrl+D also works."
+            )
         );
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut format = ChatFormat::OpenAI;
@@ -324,12 +327,12 @@ impl ChatCommand {
         let history_path: PathBuf = dirs::home_dir()
             .map(|p| p.join(".config").join("aivo").join("chat_history"))
             .unwrap_or_else(|| PathBuf::from(".config/aivo/chat_history"));
-        if let Ok(data) = std::fs::read_to_string(&history_path) {
-            if let Ok(plain) = crate::services::session_store::decrypt(&data) {
-                for line in plain.lines() {
-                    if !line.is_empty() {
-                        let _ = rl.add_history_entry(line);
-                    }
+        if let Ok(data) = std::fs::read_to_string(&history_path)
+            && let Ok(plain) = crate::services::session_store::decrypt(&data)
+        {
+            for line in plain.lines() {
+                if !line.is_empty() {
+                    let _ = rl.add_history_entry(line);
                 }
             }
         }
@@ -601,15 +604,15 @@ async fn send_chat_request(
     }
 
     // If we got no streaming data, the response might be non-streaming JSON
-    if full_content.is_empty() && !line_buf.is_empty() {
-        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line_buf) {
-            if let Some(content) = resp["choices"][0]["message"]["content"].as_str() {
-                stop_spinner(spinning);
-                print!("{}", content);
-                io::stdout().flush()?;
-                full_content = content.to_string();
-            }
-        }
+    if full_content.is_empty()
+        && !line_buf.is_empty()
+        && let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line_buf)
+        && let Some(content) = resp["choices"][0]["message"]["content"].as_str()
+    {
+        stop_spinner(spinning);
+        print!("{}", content);
+        io::stdout().flush()?;
+        full_content = content.to_string();
     }
 
     Ok(full_content)
@@ -721,15 +724,15 @@ async fn send_copilot_request(
         }
     }
 
-    if full_content.is_empty() && !line_buf.is_empty() {
-        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line_buf) {
-            if let Some(content) = resp["choices"][0]["message"]["content"].as_str() {
-                stop_spinner(spinning);
-                print!("{}", content);
-                io::stdout().flush()?;
-                full_content = content.to_string();
-            }
-        }
+    if full_content.is_empty()
+        && !line_buf.is_empty()
+        && let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line_buf)
+        && let Some(content) = resp["choices"][0]["message"]["content"].as_str()
+    {
+        stop_spinner(spinning);
+        print!("{}", content);
+        io::stdout().flush()?;
+        full_content = content.to_string();
     }
 
     Ok(full_content)
@@ -803,13 +806,13 @@ async fn send_anthropic_request(
             let line = line_buf[..pos].trim_end_matches('\r').to_string();
             line_buf = line_buf[pos + 1..].to_string();
 
-            if let Some(data) = line.strip_prefix("data: ") {
-                if let Some(text) = parse_anthropic_chunk(data) {
-                    stop_spinner(spinning);
-                    print!("{}", text);
-                    io::stdout().flush()?;
-                    full_content.push_str(&text);
-                }
+            if let Some(data) = line.strip_prefix("data: ")
+                && let Some(text) = parse_anthropic_chunk(data)
+            {
+                stop_spinner(spinning);
+                print!("{}", text);
+                io::stdout().flush()?;
+                full_content.push_str(&text);
             }
         }
     }
@@ -893,8 +896,8 @@ pub fn parse_anthropic_chunk(data: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyline::history::DefaultHistory;
     use rustyline::Context;
+    use rustyline::history::DefaultHistory;
 
     fn make_history() -> DefaultHistory {
         DefaultHistory::new()

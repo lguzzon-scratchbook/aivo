@@ -119,10 +119,10 @@ async fn handle_messages_raw(request: &str, config: &Arc<RouterConfig>) -> Resul
 
     let mut body: Value = serde_json::from_str(body_str)?;
 
-    if let Some(model) = body.get_mut("model") {
-        if let Some(model_str) = model.as_str() {
-            *model = Value::String(transform_model(&config.openrouter_base_url, model_str));
-        }
+    if let Some(model) = body.get_mut("model")
+        && let Some(model_str) = model.as_str()
+    {
+        *model = Value::String(transform_model(&config.openrouter_base_url, model_str));
     }
 
     let client = reqwest::Client::new();
@@ -161,10 +161,10 @@ async fn handle_chat_completions_raw(request: &str, config: &Arc<RouterConfig>) 
 
     let mut body: Value = serde_json::from_str(body_str)?;
 
-    if let Some(model) = body.get_mut("model") {
-        if let Some(model_str) = model.as_str() {
-            *model = Value::String(transform_model(&config.openrouter_base_url, model_str));
-        }
+    if let Some(model) = body.get_mut("model")
+        && let Some(model_str) = model.as_str()
+    {
+        *model = Value::String(transform_model(&config.openrouter_base_url, model_str));
     }
 
     let client = reqwest::Client::new();
@@ -241,18 +241,15 @@ fn normalize_claude_version(model: &str) -> String {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_digit())
+            && let Some(second_last_hyphen) = model[..last_hyphen_pos].rfind('-')
+            && model[second_last_hyphen + 1..last_hyphen_pos]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
         {
-            if let Some(second_last_hyphen) = model[..last_hyphen_pos].rfind('-') {
-                if model[second_last_hyphen + 1..last_hyphen_pos]
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit())
-                {
-                    let mut result = model.to_string();
-                    result.replace_range(last_hyphen_pos..=last_hyphen_pos, ".");
-                    return result;
-                }
-            }
+            let mut result = model.to_string();
+            result.replace_range(last_hyphen_pos..=last_hyphen_pos, ".");
+            return result;
         }
     }
     model.to_string()

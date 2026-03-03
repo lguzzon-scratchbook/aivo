@@ -1,10 +1,10 @@
 use aes::Aes256;
 use aes_gcm::{
-    aead::{generic_array::GenericArray, Aead, KeyInit},
     AesGcm,
+    aead::{Aead, KeyInit, generic_array::GenericArray},
 };
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
@@ -301,7 +301,7 @@ impl SessionStore {
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "config file is corrupted and cannot be read: {e}"
-                ))
+                ));
             }
         };
 
@@ -644,10 +644,12 @@ mod tests {
 
         let result = store.resolve_key_by_id_or_name("same-name").await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Multiple keys found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Multiple keys found")
+        );
     }
 
     #[tokio::test]

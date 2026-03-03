@@ -5,11 +5,11 @@
 //! the response back to Anthropic format.
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::services::copilot_auth::{
-    CopilotTokenManager, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT,
+    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 
 #[derive(Clone)]
@@ -404,10 +404,10 @@ fn openai_to_anthropic(resp: &Value, model: &str) -> Value {
         }
 
         // Text content
-        if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
-            if !text.is_empty() {
-                content.push(json!({"type": "text", "text": text}));
-            }
+        if let Some(text) = message.get("content").and_then(|c| c.as_str())
+            && !text.is_empty()
+        {
+            content.push(json!({"type": "text", "text": text}));
         }
 
         // Tool calls
