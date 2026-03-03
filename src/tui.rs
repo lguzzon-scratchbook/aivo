@@ -1,22 +1,5 @@
 use console::{Key, Term};
 
-struct CursorGuard<'a> {
-    term: &'a Term,
-}
-
-impl<'a> CursorGuard<'a> {
-    fn new(term: &'a Term) -> std::io::Result<Self> {
-        term.hide_cursor()?;
-        Ok(Self { term })
-    }
-}
-
-impl Drop for CursorGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.term.show_cursor();
-    }
-}
-
 impl Default for FuzzySelect {
     fn default() -> Self {
         Self::new()
@@ -61,8 +44,6 @@ impl FuzzySelect {
         let mut selection = self.default.min(self.items.len().saturating_sub(1));
         let mut page_start = 0;
         let page_size = 10;
-
-        let _guard = CursorGuard::new(&term)?;
 
         loop {
             // Filter items based on query
@@ -126,7 +107,18 @@ impl FuzzySelect {
             };
 
             // Wait for input
-            let key = term.read_key()?;
+            let key = match term.read_key() {
+                Ok(key) => key,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // Ctrl-C pressed - explicitly restore cursor before exiting
+                    let _ = term.show_cursor();
+                    return Ok(None);
+                }
+                Err(e) => {
+                    let _ = term.show_cursor();
+                    return Err(e);
+                }
+            };
 
             // Clear lines for next redraw or exit
             term.clear_last_lines(1 + items_drawn_count)?;
@@ -151,12 +143,14 @@ impl FuzzySelect {
                     }
                 }
                 Key::Enter => {
+                    let _ = term.show_cursor();
                     if count > 0 {
                         return Ok(Some(filtered[selection].0));
                     }
                     return Ok(None);
                 }
                 Key::Escape => {
+                    let _ = term.show_cursor();
                     return Ok(None);
                 }
                 Key::Backspace => {
