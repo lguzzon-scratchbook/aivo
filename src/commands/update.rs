@@ -396,7 +396,7 @@ impl UpdateCommand {
         println!("{} Updating via Homebrew...", style::arrow_symbol());
 
         // Run brew update first to fetch latest formulas (ignore errors)
-        let _ = Command::new("brew").args(["update", "--quiet"]).output();
+        let _ = Command::new("brew").args(["update", "--quiet"]).status();
 
         // Then upgrade aivo (--overwrite to handle symlink conflicts)
         println!("{} Upgrading aivo...", style::arrow_symbol());
