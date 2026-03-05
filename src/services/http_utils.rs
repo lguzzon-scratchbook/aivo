@@ -10,8 +10,8 @@ use anyhow::Result;
 pub async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
 
-    let mut buf = Vec::with_capacity(16384);
-    let mut tmp = vec![0u8; 4096];
+    let mut buf = Vec::with_capacity(65536); // 64KB initial capacity
+    let mut tmp = vec![0u8; 16384]; // 16KB read buffer
 
     loop {
         let n = socket.read(&mut tmp).await?;
@@ -150,11 +150,14 @@ pub fn build_chat_completions_url(base_url: &str) -> String {
     }
 }
 
-/// Creates a `reqwest::Client` with sensible default timeouts for router use.
+/// Creates a `reqwest::Client` with connection pooling for router use.
+/// Enables keep-alive for connection reuse across requests.
 pub fn router_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 minute overall timeout
         .connect_timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(10) // Reuse up to 10 connections per host
+        .tcp_keepalive(std::time::Duration::from_secs(60)) // TCP keep-alive every 60s
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
