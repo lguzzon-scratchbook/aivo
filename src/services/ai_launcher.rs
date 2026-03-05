@@ -203,6 +203,9 @@ impl AILauncher {
         // For Claude, inject --teammate-mode in-process to run in single window
         let args = inject_claude_teammate_mode(options.tool, &options.args);
 
+        // For Codex, inject -m <model> if model is specified via --model flag
+        let args = inject_codex_model(model.as_deref(), &args);
+
         // Spawn the process with inherited stdio
         self.spawn_process(&tool_config.command, &args, env).await
     }
@@ -601,6 +604,27 @@ fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String>
     new_args
 }
 
+/// Injects `-m <model>` for Codex if not already specified by the user.
+/// Codex CLI requires the model to be passed as a CLI argument, not via env vars.
+fn inject_codex_model(model: Option<&str>, args: &[String]) -> Vec<String> {
+    let model = match model {
+        Some(m) if !m.is_empty() => m,
+        _ => return args.to_vec(),
+    };
+
+    // Check if the user already specified --model or -m
+    let has_model_flag = args
+        .iter()
+        .any(|a| a == "--model" || a == "-m" || a.starts_with("--model=") || a.starts_with("-m="));
+    if has_model_flag {
+        return args.to_vec();
+    }
+
+    let mut new_args = vec!["-m".to_string(), model.to_string()];
+    new_args.extend_from_slice(args);
+    new_args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +685,56 @@ mod tests {
         let args: Vec<String> = vec![];
         let result = inject_claude_teammate_mode(AIToolType::Claude, &args);
         assert_eq!(result, vec!["--teammate-mode", "in-process"]);
+    }
+
+    // Tests for inject_codex_model
+
+    #[test]
+    fn test_inject_codex_model_injects_when_provided() {
+        let model = Some("o4-mini");
+        let args = vec!["file.ts".to_string()];
+        let result = inject_codex_model(model, &args);
+        assert_eq!(result, vec!["-m", "o4-mini", "file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_skips_when_already_specified() {
+        let model = Some("o4-mini");
+        let args = vec!["--model".to_string(), "gpt-4o".to_string(), "file.ts".to_string()];
+        let result = inject_codex_model(model, &args);
+        // Should NOT inject since user already specified --model
+        assert_eq!(result, vec!["--model", "gpt-4o", "file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_skips_shorthand_flag() {
+        let model = Some("o4-mini");
+        let args = vec!["-m".to_string(), "gpt-4o".to_string(), "file.ts".to_string()];
+        let result = inject_codex_model(model, &args);
+        assert_eq!(result, vec!["-m", "gpt-4o", "file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_skips_equals_format() {
+        let model = Some("o4-mini");
+        let args = vec!["--model=gpt-4o".to_string(), "file.ts".to_string()];
+        let result = inject_codex_model(model, &args);
+        assert_eq!(result, vec!["--model=gpt-4o", "file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_skips_empty_model() {
+        let model = Some("");
+        let args = vec!["file.ts".to_string()];
+        let result = inject_codex_model(model, &args);
+        assert_eq!(result, vec!["file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_skips_none_model() {
+        let model: Option<&str> = None;
+        let args = vec!["file.ts".to_string()];
+        let result = inject_codex_model(model, &args);
+        assert_eq!(result, vec!["file.ts"]);
     }
 }
