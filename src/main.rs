@@ -128,9 +128,33 @@ async fn main() {
             // puts --model into args instead of parsing it as an aivo flag).
             let mut model = run_args.model;
             let mut key_flag = run_args.key;
+
+            // We'll accumulate remaining args as we process
+            let mut remaining_args: Vec<String> = Vec::new();
+
+            // Clap may incorrectly consume a flag as model's value (e.g. -m --resume
+            // gets parsed with model="--resume"). Check if model/key looks like a flag
+            // and if so, treat it as if -m/-k had no value and move the consumed value
+            // back to remaining_args so it gets passed to the AI tool.
+            if let Some(m) = model.take() {
+                if m.starts_with('-') {
+                    model = Some(String::new());
+                    remaining_args.push(m);
+                } else {
+                    model = Some(m);
+                }
+            }
+            if let Some(k) = key_flag.take() {
+                if k.starts_with('-') {
+                    key_flag = None;
+                    remaining_args.push(k);
+                } else {
+                    key_flag = Some(k);
+                }
+            }
+
             let mut debug = run_args.debug;
             let mut env_strings = run_args.envs;
-            let mut remaining_args = Vec::new();
             let mut i = 0;
             let args = &run_args.args;
             while i < args.len() {
