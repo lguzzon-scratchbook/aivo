@@ -13,6 +13,12 @@ use crate::services::session_store::ApiKey;
 pub struct EnvironmentInjector;
 
 impl EnvironmentInjector {
+    /// Returns true when the URL points to a native Anthropic endpoint that speaks
+    /// the Anthropic Messages API directly (no format conversion needed).
+    fn is_anthropic_native_endpoint(base_url: &str) -> bool {
+        base_url.contains("api.anthropic.com")
+    }
+
     /// Creates a new EnvironmentInjector
     pub fn new() -> Self {
         Self
@@ -50,13 +56,45 @@ impl EnvironmentInjector {
             env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_ROUTER_API_KEY".to_string(), key.key.to_string());
             env.insert("AIVO_ROUTER_BASE_URL".to_string(), key.base_url.to_string());
-        } else {
-            // Direct connection to provider
-            // Claude Code appends /v1/messages itself, so strip any trailing /v1 to avoid doubling
+        } else if Self::is_anthropic_native_endpoint(&key.base_url) {
+            // Direct connection — native Anthropic API (api.anthropic.com).
+            // Claude Code appends /v1/messages itself, so strip any trailing /v1 to avoid doubling.
             let base_url = key.base_url.trim_end_matches('/');
             let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
             env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.to_string());
             env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
+        } else {
+            // All other endpoints are assumed to be OpenAI-compatible providers.
+            // Use OpenAIRouter to convert Anthropic Messages format → OpenAI Chat Completions.
+            // Placeholder URL - AI launcher overwrites with the actual random port after binding.
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
+            env.insert("AIVO_USE_OPENAI_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_OPENAI_ROUTER_API_KEY".to_string(),
+                key.key.to_string(),
+            );
+            env.insert(
+                "AIVO_OPENAI_ROUTER_BASE_URL".to_string(),
+                key.base_url.to_string(),
+            );
+            // Cloudflare Workers AI requires a "@cf/" model prefix
+            if key.base_url.contains("cloudflare.com") {
+                env.insert(
+                    "AIVO_OPENAI_ROUTER_MODEL_PREFIX".to_string(),
+                    "@cf/".to_string(),
+                );
+            }
+            // Moonshot requires non-empty reasoning_content on assistant tool-call turns
+            if key.base_url.contains("moonshot.cn") || key.base_url.contains("moonshot.ai") {
+                env.insert(
+                    "AIVO_OPENAI_ROUTER_REQUIRE_REASONING".to_string(),
+                    "1".to_string(),
+                );
+            }
         }
 
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
@@ -369,20 +407,42 @@ mod tests {
     }
 
     #[test]
-    fn test_for_claude() {
+    fn test_for_claude_anthropic_native_direct() {
+        // api.anthropic.com is the only URL that bypasses all routers
         let injector = EnvironmentInjector::new();
-        let key = test_key();
+        let mut key = test_key();
+        key.base_url = "https://api.anthropic.com/v1".to_string();
         let env = injector.for_claude(&key, None);
 
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
-            Some(&"http://localhost:8080".to_string())
+            Some(&"https://api.anthropic.com".to_string())
         );
         assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
         assert_eq!(
             env.get("ANTHROPIC_AUTH_TOKEN"),
             Some(&"sk-test-key-12345".to_string())
         );
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+            Some(&"1".to_string())
+        );
+        assert!(env.get("AIVO_USE_OPENAI_ROUTER").is_none());
+    }
+
+    #[test]
+    fn test_for_claude_unknown_endpoint_uses_openai_router() {
+        // Any non-Anthropic, non-OpenRouter, non-Copilot URL goes through OpenAIRouter
+        let injector = EnvironmentInjector::new();
+        let key = test_key(); // http://localhost:8080
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
         assert_eq!(
             env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
             Some(&"1".to_string())
@@ -518,6 +578,62 @@ mod tests {
         );
         // Router configuration is set
         assert_eq!(env.get("AIVO_USE_ROUTER"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_for_claude_cloudflare_uses_openai_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string();
+        let env = injector.for_claude(&key, Some("llama-3.1-8b"));
+
+        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            Some(&"https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_OPENAI_ROUTER_MODEL_PREFIX"),
+            Some(&"@cf/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_claude_openai_uses_openai_router() {
+        // api.openai.com is an OpenAI-compatible endpoint, so it goes through OpenAIRouter
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.openai.com/v1".to_string();
+        let env = injector.for_claude(&key, Some("gpt-4o"));
+
+        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            Some(&"https://api.openai.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_claude_moonshot_uses_openai_router_with_reasoning() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.moonshot.cn/v1".to_string();
+        let env = injector.for_claude(&key, Some("kimi-k2.5"));
+
+        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            Some(&"https://api.moonshot.cn/v1".to_string())
+        );
+        assert!(env.get("AIVO_OPENAI_ROUTER_MODEL_PREFIX").is_none());
+        assert_eq!(
+            env.get("AIVO_OPENAI_ROUTER_REQUIRE_REASONING"),
+            Some(&"1".to_string())
+        );
     }
 
     #[test]

@@ -12,13 +12,15 @@ fn test_key() -> ApiKey {
 
 #[test]
 fn test_for_claude() {
+    // api.anthropic.com is the only URL that bypasses all routers (direct connection)
     let injector = EnvironmentInjector::new();
-    let key = test_key();
+    let mut key = test_key();
+    key.base_url = "https://api.anthropic.com/v1".to_string();
     let env = injector.for_claude(&key, None);
 
     assert_eq!(
         env.get("ANTHROPIC_BASE_URL").unwrap(),
-        "http://localhost:8080"
+        "https://api.anthropic.com"
     );
     assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "");
     assert_eq!(
@@ -29,6 +31,7 @@ fn test_for_claude() {
         env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap(),
         "1"
     );
+    assert!(env.get("AIVO_USE_OPENAI_ROUTER").is_none());
 }
 
 #[test]

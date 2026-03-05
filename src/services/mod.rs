@@ -11,6 +11,7 @@ pub mod gemini_router;
 pub mod http_utils;
 pub mod model_names;
 pub mod models_cache;
+pub mod openai_router;
 pub mod session_store;
 
 #[allow(unused_imports)]
@@ -21,5 +22,6 @@ pub use copilot_router::{CopilotRouter, CopilotRouterConfig};
 pub use environment_injector::EnvironmentInjector;
 pub use gemini_router::{GeminiRouter, GeminiRouterConfig};
 pub use models_cache::ModelsCache;
+pub use openai_router::{OpenAIRouter, OpenAIRouterConfig};
 #[allow(unused_imports)]
 pub use session_store::{ApiKey, SessionStore};

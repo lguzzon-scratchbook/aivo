@@ -133,6 +133,15 @@ impl AILauncher {
             );
         }
 
+        // Start OpenAI router for OpenAI-compatible providers (Cloudflare, etc.), update ANTHROPIC_BASE_URL
+        if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_OPENAI_ROUTER") {
+            let port = start_openai_router(&env).await?;
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{}", port),
+            );
+        }
+
         // Start CopilotRouter for GitHub Copilot, update ANTHROPIC_BASE_URL with actual port
         if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_COPILOT_ROUTER") {
             let port = start_copilot_router(&env).await?;
@@ -392,6 +401,44 @@ async fn start_router(env: &HashMap<String, String>) -> Result<u16> {
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: claude code router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
+/// Starts the built-in OpenAI router for OpenAI-compatible providers (Cloudflare, etc.)
+/// Returns the port it bound to
+async fn start_openai_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::{OpenAIRouter, OpenAIRouterConfig};
+
+    let api_key = env
+        .get("AIVO_OPENAI_ROUTER_API_KEY")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_OPENAI_ROUTER_API_KEY"))?
+        .clone();
+
+    let base_url = env
+        .get("AIVO_OPENAI_ROUTER_BASE_URL")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_OPENAI_ROUTER_BASE_URL"))?
+        .clone();
+
+    let model_prefix = env.get("AIVO_OPENAI_ROUTER_MODEL_PREFIX").cloned();
+    let requires_reasoning_content = env
+        .get("AIVO_OPENAI_ROUTER_REQUIRE_REASONING")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let config = OpenAIRouterConfig {
+        target_base_url: base_url,
+        target_api_key: api_key,
+        model_prefix,
+        requires_reasoning_content,
+    };
+
+    let router = OpenAIRouter::new(config);
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: openai router exited unexpectedly: {e}");
         }
     });
     Ok(port)
