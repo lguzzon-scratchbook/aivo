@@ -1,10 +1,11 @@
 /**
  * ModelsCommand handler for listing available models from the active provider.
- * Calls /v1/models (OpenAI-compatible) or /v1beta/models (Google Gemini).
+ * Calls provider-specific model listing endpoints (OpenAI, Gemini, Cloudflare).
  */
 use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashSet;
 
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
@@ -41,6 +42,26 @@ struct GeminiModel {
     name: String,
     #[serde(default)]
     supported_generation_methods: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CloudflareModelsResponse {
+    #[serde(default)]
+    result: Vec<CloudflareModel>,
+    result_info: Option<CloudflareResultInfo>,
+}
+
+#[derive(Deserialize)]
+struct CloudflareModel {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CloudflareResultInfo {
+    total_pages: Option<u32>,
 }
 
 impl ModelsCommand {
@@ -107,7 +128,7 @@ impl ModelsCommand {
         println!(
             "{}",
             style::dim(
-                "Calls /v1/models for OpenAI-compatible providers, or /v1beta/models for Google."
+                "Calls /v1/models (OpenAI-compatible), /v1beta/models (Google), or /ai/models/search (Cloudflare)."
             )
         );
         println!();
@@ -141,6 +162,34 @@ fn url_origin(url: &str) -> Option<String> {
     Some(origin)
 }
 
+/// Returns a Cloudflare Workers AI base URL ending in `/ai` when applicable.
+fn cloudflare_ai_base(base_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(base_url).ok()?;
+    let host = parsed.host_str()?;
+    if !host.contains("cloudflare.com") {
+        return None;
+    }
+
+    let mut base = base_url.trim_end_matches('/').to_string();
+    if base.ends_with("/v1/chat/completions") {
+        base.truncate(base.len() - "/v1/chat/completions".len());
+    } else if base.ends_with("/chat/completions") {
+        base.truncate(base.len() - "/chat/completions".len());
+    } else if base.ends_with("/v1") {
+        base.truncate(base.len() - "/v1".len());
+    }
+
+    if !base.ends_with("/ai") {
+        if let Some(idx) = base.find("/ai/") {
+            base.truncate(idx + "/ai".len());
+        } else {
+            return None;
+        }
+    }
+
+    Some(base)
+}
+
 /// Returns true if the model is suitable for text chat.
 /// Filters out embedding models and image/audio-only generation models.
 pub(crate) fn is_text_chat_model(id: &str) -> bool {
@@ -158,6 +207,13 @@ pub(crate) fn is_text_chat_model(id: &str) -> bool {
         return false;
     }
     true
+}
+
+fn cloudflare_model_name(model: CloudflareModel) -> String {
+    model
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(model.id)
 }
 
 pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<String>> {
@@ -220,6 +276,49 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                     .to_string()
             })
             .collect())
+    } else if let Some(cloudflare_base) = cloudflare_ai_base(base) {
+        let auth = format!("Bearer {}", key.key.as_str());
+        let user_agent = format!("aivo/{}", crate::version::VERSION);
+        let mut page = 1u32;
+        let mut seen = HashSet::new();
+        let mut models = Vec::new();
+
+        loop {
+            let url = format!(
+                "{}/models/search?hide_experimental=true&page={}&per_page=100",
+                cloudflare_base, page
+            );
+            let response = client
+                .get(&url)
+                .header("Authorization", &auth)
+                .header("User-Agent", &user_agent)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("API returned {} from {} — {}", status, url, body);
+            }
+
+            let resp: CloudflareModelsResponse = response.json().await?;
+            for model in resp.result.into_iter().map(cloudflare_model_name) {
+                if seen.insert(model.clone()) && is_text_chat_model(&model) {
+                    models.push(model);
+                }
+            }
+
+            let total_pages = resp
+                .result_info
+                .and_then(|info| info.total_pages)
+                .unwrap_or(page);
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(models)
     } else {
         // Build candidate URLs. When the base URL has a path segment (e.g.
         // "https://api.example.com/endpoint"), the bare origin is tried first
@@ -286,9 +385,7 @@ pub(crate) async fn fetch_models_for_select(
         .unwrap_or_default();
     style::stop_spinner(&spinning);
     let _ = spinner_handle.await;
-    list.into_iter()
-        .filter(|id| is_text_chat_model(id))
-        .collect()
+    list
 }
 
 /// Cache-aware wrapper around `fetch_models`.
@@ -356,6 +453,49 @@ mod tests {
         assert!(!is_text_chat_model("whisper-1"));
         assert!(!is_text_chat_model("gpt-image-1"));
         assert!(!is_text_chat_model("google/gemini-3.1-flash-image-preview"));
+    }
+
+    #[test]
+    fn cloudflare_ai_base_normalizes_v1_suffix() {
+        assert_eq!(
+            cloudflare_ai_base("https://api.cloudflare.com/client/v4/accounts/abc/ai/v1"),
+            Some("https://api.cloudflare.com/client/v4/accounts/abc/ai".to_string())
+        );
+    }
+
+    #[test]
+    fn cloudflare_ai_base_accepts_ai_root() {
+        assert_eq!(
+            cloudflare_ai_base("https://api.cloudflare.com/client/v4/accounts/abc/ai"),
+            Some("https://api.cloudflare.com/client/v4/accounts/abc/ai".to_string())
+        );
+    }
+
+    #[test]
+    fn cloudflare_ai_base_rejects_non_cloudflare() {
+        assert_eq!(cloudflare_ai_base("https://api.openai.com/v1"), None);
+    }
+
+    #[test]
+    fn cloudflare_model_name_prefers_name_over_id() {
+        let model: CloudflareModel = serde_json::from_str(
+            r#"{"id":"01564c52-8717-47dc-8efd-907a2ca18301","name":"@cf/meta/llama-3.1-8b-instruct"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cloudflare_model_name(model),
+            "@cf/meta/llama-3.1-8b-instruct".to_string()
+        );
+    }
+
+    #[test]
+    fn cloudflare_model_name_falls_back_to_id() {
+        let model: CloudflareModel =
+            serde_json::from_str(r#"{"id":"01564c52-8717-47dc-8efd-907a2ca18301"}"#).unwrap();
+        assert_eq!(
+            cloudflare_model_name(model),
+            "01564c52-8717-47dc-8efd-907a2ca18301".to_string()
+        );
     }
 
     #[tokio::test]

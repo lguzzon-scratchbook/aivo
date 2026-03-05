@@ -107,7 +107,10 @@ async fn handle_anthropic_to_openai(
     if let Some(model) = simplified.get_mut("model")
         && let Some(model_str) = model.as_str()
     {
-        *model = Value::String(apply_model_prefix(model_str, config.model_prefix.as_deref()));
+        *model = Value::String(apply_model_prefix(
+            model_str,
+            config.model_prefix.as_deref(),
+        ));
     }
 
     // Build target URL
@@ -188,12 +191,7 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value 
                     messages.push(json!({"role": role, "content": text}));
                 }
                 Some(Value::Array(blocks)) => {
-                    convert_content_blocks(
-                        blocks,
-                        role,
-                        &mut messages,
-                        requires_reasoning_content,
-                    );
+                    convert_content_blocks(blocks, role, &mut messages, requires_reasoning_content);
                 }
                 _ => {
                     messages.push(json!({"role": role, "content": ""}));
@@ -917,7 +915,12 @@ fn uuid_simple() -> String {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{:x}{:x}{:x}", duration.as_secs(), duration.subsec_nanos(), count)
+    format!(
+        "{:x}{:x}{:x}",
+        duration.as_secs(),
+        duration.subsec_nanos(),
+        count
+    )
 }
 
 #[cfg(test)]
