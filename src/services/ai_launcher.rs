@@ -204,7 +204,11 @@ impl AILauncher {
         let args = inject_claude_teammate_mode(options.tool, &options.args);
 
         // For Codex, inject -m <model> if model is specified via --model flag
-        let args = inject_codex_model(model.as_deref(), &args);
+        let args = if options.tool == AIToolType::Codex {
+            inject_codex_model(model.as_deref(), &args)
+        } else {
+            args
+        };
 
         // Spawn the process with inherited stdio
         self.spawn_process(&tool_config.command, &args, env).await
