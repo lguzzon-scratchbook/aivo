@@ -30,6 +30,7 @@ use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -37,6 +38,9 @@ use crate::style;
 const CMD_EXIT: &str = "/exit";
 const CMD_MODEL: &str = "/model";
 const CMD_MODEL_ARG: &str = "/model ";
+/// Maximum number of messages to keep in chat history.
+/// When exceeded, the oldest messages are dropped (keeping any system message).
+const MAX_HISTORY_MESSAGES: usize = 50;
 
 struct ChatHelper {
     commands: Vec<&'static str>,
@@ -196,41 +200,7 @@ impl ChatCommand {
     /// Transforms model names for OpenRouter compatibility
     /// OpenRouter uses dots in version numbers: 4.6 instead of 4-6
     fn transform_model_for_provider(base_url: &str, model: &str) -> String {
-        if base_url.contains("openrouter") && model.starts_with("claude-") {
-            // Convert version hyphens to dots: claude-sonnet-4-6 -> claude-sonnet-4.6
-            Self::normalize_claude_version(model)
-        } else {
-            model.to_string()
-        }
-    }
-
-    /// Converts Claude model version from hyphen to dot notation
-    /// e.g., claude-sonnet-4-6 -> claude-sonnet-4.6
-    fn normalize_claude_version(model: &str) -> String {
-        // Find the pattern: <name>-<digit>-<digit> and convert to <name>-<digit>.<digit>
-        // Work backwards from end of string to handle optional suffixes
-        if let Some(last_hyphen_pos) = model.rfind('-') {
-            // Check if the part after last hyphen is a digit
-            if model[last_hyphen_pos + 1..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit())
-            {
-                // Check if there's another hyphen before this one with a digit after it
-                if let Some(second_last_hyphen) = model[..last_hyphen_pos].rfind('-')
-                    && model[second_last_hyphen + 1..last_hyphen_pos]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_digit())
-                {
-                    // Replace the last hyphen with a dot
-                    let mut result = model.to_string();
-                    result.replace_range(last_hyphen_pos..=last_hyphen_pos, ".");
-                    return result;
-                }
-            }
-        }
-        model.to_string()
+        model_names::transform_model_for_provider(base_url, model)
     }
 
     pub async fn execute(&self, model: Option<String>, key_override: Option<ApiKey>) -> ExitCode {
@@ -408,11 +378,12 @@ impl ChatCommand {
                 continue;
             }
 
-            // Add user message to history
+            // Add user message to history and trim if needed
             history.push(ChatMessage {
                 role: "user".to_string(),
                 content: input,
             });
+            trim_history(&mut history, MAX_HISTORY_MESSAGES);
 
             // Start loading spinner
             let (spinning, spinner_handle) = style::start_spinner(None);
@@ -742,6 +713,31 @@ async fn send_copilot_request(
 pub fn parse_sse_chunk(data: &str) -> Option<String> {
     let chunk: ChatChunk = serde_json::from_str(data).ok()?;
     chunk.choices.first()?.delta.content.clone()
+}
+
+/// Trims chat history to keep at most `max_messages` messages.
+/// If there's a system message at the start, it's always preserved.
+/// Drops the oldest non-system messages first.
+fn trim_history(history: &mut Vec<ChatMessage>, max_messages: usize) {
+    if history.len() <= max_messages {
+        return;
+    }
+
+    let has_system = history.first().is_some_and(|m| m.role == "system");
+
+    if has_system {
+        // Keep the system message + last (max_messages - 1) messages
+        let keep_from = history.len() - (max_messages - 1);
+        let system_msg = history[0].clone();
+        let kept: Vec<ChatMessage> = std::iter::once(system_msg)
+            .chain(history[keep_from..].iter().cloned())
+            .collect();
+        *history = kept;
+    } else {
+        // Keep the last max_messages messages
+        let keep_from = history.len() - max_messages;
+        *history = history[keep_from..].to_vec();
+    }
 }
 
 /// Returns true when the error indicates the endpoint doesn't exist,

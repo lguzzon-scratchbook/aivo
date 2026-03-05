@@ -11,6 +11,8 @@ use std::sync::Arc;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::http_utils;
+use crate::services::model_names;
 
 #[derive(Clone)]
 pub struct CopilotRouterConfig {
@@ -30,7 +32,7 @@ impl CopilotRouter {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let token_manager = CopilotTokenManager::new(self.config.github_token.clone());
-        let client = reqwest::Client::new();
+        let client = http_utils::router_http_client();
         let handle = tokio::spawn(async move { run_router(listener, token_manager, client).await });
         Ok((port, handle))
     }
@@ -49,7 +51,7 @@ async fn run_router(
         let client = client.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let request_bytes = match read_full_request(&mut socket).await {
+            let request_bytes = match http_utils::read_full_request(&mut socket).await {
                 Ok(b) => b,
                 Err(_) => return,
             };
@@ -57,10 +59,10 @@ async fn run_router(
             let response = if request.contains("POST /v1/messages") {
                 match handle_messages(&request, &tm, &client).await {
                     Ok(r) => r,
-                    Err(e) => error_response(500, &e.to_string()),
+                    Err(e) => http_utils::http_error_response(500, &e.to_string()),
                 }
             } else {
-                error_response(404, "Not found")
+                http_utils::http_error_response(404, "Not found")
             };
             let _ = socket.write_all(response.as_bytes()).await;
         });
@@ -72,7 +74,7 @@ async fn handle_messages(
     tm: &Arc<CopilotTokenManager>,
     client: &reqwest::Client,
 ) -> Result<String> {
-    let body_str = extract_body(request)?;
+    let body_str = http_utils::extract_request_body(request)?;
     let body: Value = serde_json::from_str(body_str)?;
 
     let is_streaming = body
@@ -109,7 +111,7 @@ async fn handle_messages(
     let resp_body = resp.text().await?;
 
     if status != 200 {
-        return Ok(error_response(status, &resp_body));
+        return Ok(http_utils::http_error_response(status, &resp_body));
     }
 
     let openai_resp: Value = serde_json::from_str(&resp_body)?;
@@ -117,69 +119,20 @@ async fn handle_messages(
     if is_streaming {
         // Convert to Anthropic SSE format
         let sse = openai_to_anthropic_sse(&openai_resp, &model);
-        Ok(format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
-            sse
-        ))
+        Ok(http_utils::http_response(200, "text/event-stream", &sse))
     } else {
         // Convert to Anthropic Messages response
         let anthropic_resp = openai_to_anthropic(&openai_resp, &model);
         let json = serde_json::to_string(&anthropic_resp)?;
-        Ok(format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            json.len(),
-            json
-        ))
+        Ok(http_utils::http_json_response(200, &json))
     }
 }
 
 // --- Model name mapping ---
 
-/// Converts Anthropic/Claude Code model IDs to Copilot model IDs.
-///
-/// Claude Code sends names like `claude-sonnet-4-6-20250603` or `claude-sonnet-4-6`.
-/// Copilot API expects names like `claude-sonnet-4.6` (dots for minor versions).
-///
-/// Steps:
-///   1. Strip trailing date suffix `-YYYYMMDD`
-///   2. Convert `claude-{family}-{major}-{minor}` → `claude-{family}-{major}.{minor}`
+/// Re-export for tests and internal use.
 fn copilot_model_name(model: &str) -> String {
-    // Strip trailing -YYYYMMDD date suffix
-    let base = if model.len() > 9 {
-        let (prefix, suffix) = model.split_at(model.len() - 9);
-        if suffix.starts_with('-') && suffix[1..].chars().all(|c| c.is_ascii_digit()) {
-            prefix
-        } else {
-            model
-        }
-    } else {
-        model
-    };
-
-    // Convert hyphenated version to dotted: claude-sonnet-4-6 → claude-sonnet-4.6
-    // Pattern: claude-{family}-{major}-{minor} where major/minor are digits
-    if let Some(stripped) = base.strip_prefix("claude-") {
-        let parts: Vec<&str> = stripped.split('-').collect();
-        // e.g. ["sonnet", "4", "6"] or ["sonnet", "4"] or ["haiku", "4", "5"]
-        if parts.len() >= 3 {
-            let family = parts[0]; // sonnet, haiku, opus
-            let major = parts[1]; // "4"
-            let minor = parts[2]; // "6", "5"
-            if major.chars().all(|c| c.is_ascii_digit())
-                && minor.chars().all(|c| c.is_ascii_digit())
-            {
-                // Rejoin any remaining parts (e.g. "-thinking") after the version
-                let rest = if parts.len() > 3 {
-                    format!("-{}", parts[3..].join("-"))
-                } else {
-                    String::new()
-                };
-                return format!("claude-{}-{}.{}{}", family, major, minor, rest);
-            }
-        }
-    }
-
-    base.to_string()
+    model_names::copilot_model_name(model)
 }
 
 // --- Request conversion: Anthropic Messages → OpenAI Chat Completions ---
@@ -578,55 +531,7 @@ fn openai_to_anthropic_sse(resp: &Value, model: &str) -> String {
     events
 }
 
-// --- HTTP utilities ---
-
-async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::with_capacity(16384);
-    let mut tmp = vec![0u8; 4096];
-    loop {
-        let n = socket.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let headers = String::from_utf8_lossy(&buf[..header_end]);
-            let content_length = headers
-                .lines()
-                .find(|l| l.to_lowercase().starts_with("content-length:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            let body_read = buf.len() - (header_end + 4);
-            if body_read < content_length {
-                let remaining = content_length - body_read;
-                let mut body_buf = vec![0u8; remaining];
-                socket.read_exact(&mut body_buf).await?;
-                buf.extend_from_slice(&body_buf);
-            }
-            break;
-        }
-    }
-    Ok(buf)
-}
-
-fn extract_body(request: &str) -> Result<&str> {
-    let pos = request
-        .find("\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("malformed HTTP request"))?;
-    Ok(request[pos + 4..].trim_end_matches('\0').trim())
-}
-
-fn error_response(status: u16, message: &str) -> String {
-    let body = json!({"error": {"message": message}}).to_string();
-    format!(
-        "HTTP/1.1 {} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status,
-        body.len(),
-        body
-    )
-}
+// HTTP utilities are now provided by crate::services::http_utils
 
 #[cfg(test)]
 mod tests {
@@ -859,7 +764,10 @@ mod tests {
     fn test_extract_body() {
         let req =
             "POST /v1/messages HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"key\":\"val\"}";
-        assert_eq!(extract_body(req).unwrap(), "{\"key\":\"val\"}");
+        assert_eq!(
+            http_utils::extract_request_body(req).unwrap(),
+            "{\"key\":\"val\"}"
+        );
     }
 
     #[test]
@@ -929,12 +837,12 @@ mod tests {
 
     #[test]
     fn test_extract_body_missing_separator() {
-        assert!(extract_body("POST /v1/messages HTTP/1.1").is_err());
+        assert!(http_utils::extract_request_body("POST /v1/messages HTTP/1.1").is_err());
     }
 
     #[test]
     fn test_error_response() {
-        let resp = error_response(500, "test error");
+        let resp = http_utils::http_error_response(500, "test error");
         assert!(resp.contains("500"));
         assert!(resp.contains("test error"));
     }

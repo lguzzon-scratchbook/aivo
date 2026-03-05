@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::http_utils;
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
@@ -30,7 +31,7 @@ impl GeminiRouter {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let config = self.config.clone();
-        let client = Arc::new(reqwest::Client::new());
+        let client = Arc::new(http_utils::router_http_client());
         let handle = tokio::spawn(async move { run_router(listener, config, client).await });
         Ok((port, handle))
     }
@@ -48,17 +49,14 @@ async fn run_router(
         let client = client.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let request_bytes = match read_full_request(&mut socket).await {
+            let request_bytes = match http_utils::read_full_request(&mut socket).await {
                 Ok(b) => b,
                 Err(_) => return,
             };
             let request = String::from_utf8_lossy(&request_bytes);
             let response = match handle_request(&request, &config, &client).await {
                 Ok(r) => r,
-                Err(e) => {
-                    let body = serde_json::json!({"error": {"message": e.to_string()}}).to_string();
-                    http_response(500, "application/json", &body)
-                }
+                Err(e) => http_utils::http_error_response(500, &e.to_string()),
             };
             let _ = socket.write_all(response.as_bytes()).await;
         });
@@ -84,18 +82,14 @@ async fn handle_request(
 
             if is_streaming {
                 let sse = convert_openai_to_gemini_sse(&openai_response);
-                Ok(http_response(200, "text/event-stream", &sse))
+                Ok(http_utils::http_response(200, "text/event-stream", &sse))
             } else {
                 let gemini = convert_openai_to_gemini(&openai_response);
                 let json = serde_json::to_string(&gemini)?;
-                Ok(http_response(200, "application/json", &json))
+                Ok(http_utils::http_json_response(200, &json))
             }
         }
-        None => Ok(http_response(
-            404,
-            "application/json",
-            "{\"error\":\"not found\"}",
-        )),
+        None => Ok(http_utils::http_error_response(404, "not found")),
     }
 }
 
@@ -140,22 +134,11 @@ async fn forward_to_provider(
 
 /// Constructs /v1/chat/completions URL, avoiding /v1/v1 duplication.
 fn build_chat_completions_url(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{}/chat/completions", base)
-    } else {
-        format!("{}/v1/chat/completions", base)
-    }
+    http_utils::build_chat_completions_url(base_url)
 }
 
 fn extract_path(request: &str) -> String {
-    let first_line = request.lines().next().unwrap_or("");
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() >= 2 {
-        parts[1].to_string()
-    } else {
-        "/".to_string()
-    }
+    http_utils::extract_request_path(request)
 }
 
 fn extract_body(request: &str) -> &str {
@@ -164,48 +147,6 @@ fn extract_body(request: &str) -> &str {
         .map(|i| &request[i + 4..])
         .unwrap_or("")
         .trim_end_matches('\0')
-}
-
-fn http_response(status: u16, content_type: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-        status,
-        if status == 200 { "OK" } else { "Error" },
-        content_type,
-        body.len(),
-        body
-    )
-}
-
-async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::with_capacity(16384);
-    let mut tmp = vec![0u8; 4096];
-    loop {
-        let n = socket.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let headers = String::from_utf8_lossy(&buf[..header_end]);
-            let content_length = headers
-                .lines()
-                .find(|l| l.to_lowercase().starts_with("content-length:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            let body_read = buf.len() - (header_end + 4);
-            if body_read < content_length {
-                let remaining = content_length - body_read;
-                let mut body_buf = vec![0u8; remaining];
-                socket.read_exact(&mut body_buf).await?;
-                buf.extend_from_slice(&body_buf);
-            }
-            break;
-        }
-    }
-    Ok(buf)
 }
 
 /// Parses a Gemini API request path and extracts (model_name, is_streaming).

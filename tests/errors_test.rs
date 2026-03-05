@@ -18,7 +18,10 @@ fn test_cli_error_creation() {
         Some("suggestion"),
     );
 
-    assert_eq!(err.to_string(), "test error");
+    let display = err.to_string();
+    assert!(display.contains("test error"));
+    assert!(display.contains("details"));
+    assert!(display.contains("suggestion"));
 }
 
 #[test]

@@ -40,36 +40,61 @@ impl fmt::Display for ExitCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
     User,
-    #[allow(dead_code)]
     Network,
     Auth,
 }
 
 /// CLI error with category for exit code mapping.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub struct CLIError {
     message: String,
-    #[allow(dead_code)]
     category: ErrorCategory,
+    details: Option<String>,
+    suggestion: Option<String>,
 }
 
+#[allow(dead_code)]
 impl CLIError {
     pub fn new(
         message: impl Into<String>,
         category: ErrorCategory,
-        _details: Option<impl Into<String>>,
-        _suggestion: Option<impl Into<String>>,
+        details: Option<impl Into<String>>,
+        suggestion: Option<impl Into<String>>,
     ) -> Self {
         Self {
             message: message.into(),
             category,
+            details: details.map(|d| d.into()),
+            suggestion: suggestion.map(|s| s.into()),
+        }
+    }
+
+    /// Returns the error category for exit code mapping.
+    pub fn category(&self) -> ErrorCategory {
+        self.category
+    }
+
+    /// Returns the exit code for this error.
+    pub fn exit_code(&self) -> ExitCode {
+        match self.category {
+            ErrorCategory::User => ExitCode::UserError,
+            ErrorCategory::Network => ExitCode::NetworkError,
+            ErrorCategory::Auth => ExitCode::AuthError,
         }
     }
 }
 
 impl fmt::Display for CLIError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.message)?;
+        if let Some(ref details) = self.details {
+            write!(f, "\n  {}", details)?;
+        }
+        if let Some(ref suggestion) = self.suggestion {
+            write!(f, "\n  Suggestion: {}", suggestion)?;
+        }
+        Ok(())
     }
 }
 
@@ -131,5 +156,30 @@ mod tests {
             None::<String>,
         );
         assert_eq!(err.to_string(), "test error");
+    }
+
+    #[test]
+    fn test_cli_error_with_details_and_suggestion() {
+        let err = CLIError::new(
+            "Key not found",
+            ErrorCategory::User,
+            Some("No key matching 'foo' was found"),
+            Some("Run 'aivo keys list' to see available keys"),
+        );
+        let display = err.to_string();
+        assert!(display.contains("Key not found"));
+        assert!(display.contains("No key matching 'foo' was found"));
+        assert!(display.contains("Run 'aivo keys list'"));
+    }
+
+    #[test]
+    fn test_cli_error_exit_code() {
+        let err = CLIError::new(
+            "auth failed",
+            ErrorCategory::Auth,
+            None::<String>,
+            None::<String>,
+        );
+        assert_eq!(err.exit_code(), ExitCode::AuthError);
     }
 }

@@ -341,8 +341,12 @@ fn redact_env_value(key: &str, value: &str) -> String {
     }
 
     if key.contains("TOKEN") || key.contains("KEY") {
-        if value.len() > 12 {
-            format!("{}...{}", &value[..8], &value[value.len() - 4..])
+        let char_count = value.chars().count();
+        if char_count > 12 {
+            // Safely slice at character boundaries
+            let prefix: String = value.chars().take(8).collect();
+            let suffix: String = value.chars().skip(char_count - 4).collect();
+            format!("{}...{}", prefix, suffix)
         } else {
             "***".to_string()
         }

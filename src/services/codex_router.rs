@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::http_utils;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -46,7 +47,7 @@ impl CodexRouter {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let config = self.config.clone();
-        let client = Arc::new(reqwest::Client::new());
+        let client = Arc::new(http_utils::router_http_client());
         let handle = tokio::spawn(async move { run_router(listener, config, client).await });
         Ok((port, handle))
     }
@@ -67,13 +68,13 @@ async fn run_router(
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
 
-            let request_bytes = match read_full_request(&mut socket).await {
+            let request_bytes = match http_utils::read_full_request(&mut socket).await {
                 Ok(b) => b,
                 Err(_) => return,
             };
 
             let request = String::from_utf8_lossy(&request_bytes);
-            let path = extract_request_path(&request);
+            let path = http_utils::extract_request_path(&request);
 
             let is_api_path = matches!(
                 path.as_str(),
@@ -83,80 +84,17 @@ async fn run_router(
             let response = if is_api_path {
                 match handle_api_request(&path, &request, &config, client.as_ref()).await {
                     Ok(r) => r,
-                    Err(_) => http_error(500, "Internal Server Error"),
+                    Err(_) => http_utils::http_error_response(500, "Internal Server Error"),
                 }
             } else {
                 match forward_request(&path, &request, &config, client.as_ref()).await {
                     Ok(r) => r,
-                    Err(_) => http_error(502, "Bad Gateway"),
+                    Err(_) => http_utils::http_error_response(502, "Bad Gateway"),
                 }
             };
 
             let _ = socket.write_all(response.as_bytes()).await;
         });
-    }
-}
-
-/// Reads a complete HTTP request: headers + full body (using Content-Length)
-async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-
-    let mut buf = Vec::with_capacity(16384);
-    let mut tmp = vec![0u8; 4096];
-
-    loop {
-        let n = socket.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-
-        if let Some(header_end) = find_header_end(&buf) {
-            let headers = String::from_utf8_lossy(&buf[..header_end]);
-            let content_length = parse_content_length(&headers).unwrap_or(0);
-            let body_read = buf.len() - (header_end + 4);
-
-            if body_read < content_length {
-                let remaining = content_length - body_read;
-                let mut body_buf = vec![0u8; remaining];
-                socket.read_exact(&mut body_buf).await?;
-                buf.extend_from_slice(&body_buf);
-            }
-            break;
-        }
-    }
-
-    Ok(buf)
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &str) -> Option<usize> {
-    headers
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-}
-
-/// Extracts the HTTP request body (everything after the blank line separator).
-/// Returns an error for malformed requests that are missing `\r\n\r\n`.
-fn extract_request_body(request: &str) -> Result<&str> {
-    let pos = request
-        .find("\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("malformed HTTP request: missing header separator"))?;
-    Ok(request[pos + 4..].trim_end_matches('\0').trim())
-}
-
-fn extract_request_path(request: &str) -> String {
-    let first_line = request.lines().next().unwrap_or("");
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() >= 2 {
-        parts[1].to_string()
-    } else {
-        "/".to_string()
     }
 }
 
@@ -169,7 +107,7 @@ async fn handle_api_request(
     config: &Arc<CodexRouterConfig>,
     client: &reqwest::Client,
 ) -> Result<String> {
-    let body_str = extract_request_body(request)?;
+    let body_str = http_utils::extract_request_body(request)?;
     let body: Value = serde_json::from_str(body_str)?;
 
     if is_responses_api_format(&body) {
@@ -233,23 +171,14 @@ async fn handle_responses_api_via_chat(
     let status_code = response.status().as_u16();
     if status_code != 200 {
         let err_body = response.text().await?;
-        return Ok(format!(
-            "HTTP/1.1 {} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            status_code,
-            err_body.len(),
-            err_body
-        ));
+        return Ok(http_utils::http_json_response(status_code, &err_body));
     }
 
     let response_text = response.text().await?;
     let chat_response = parse_provider_response(&response_text)?;
     let sse = convert_chat_response_to_responses_sse(&chat_response);
 
-    Ok(format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
-        sse.len(),
-        sse
-    ))
+    Ok(http_utils::http_response(200, "text/event-stream", &sse))
 }
 
 // =============================================================================
@@ -284,13 +213,12 @@ async fn handle_chat_completions_with_filter(
         .unwrap_or("application/json")
         .to_string();
     let response_body = response.bytes().await?;
+    let body_str = String::from_utf8_lossy(&response_body);
 
-    Ok(format!(
-        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+    Ok(http_utils::http_response(
         status_code,
-        content_type,
-        response_body.len(),
-        String::from_utf8_lossy(&response_body)
+        &content_type,
+        &body_str,
     ))
 }
 
@@ -305,7 +233,7 @@ async fn forward_request(
     config: &Arc<CodexRouterConfig>,
     client: &reqwest::Client,
 ) -> Result<String> {
-    let body_str = extract_request_body(request)?;
+    let body_str = http_utils::extract_request_body(request)?;
 
     let target_url = build_target_url(&config.target_base_url, path);
 
@@ -324,13 +252,12 @@ async fn forward_request(
         .unwrap_or("application/json")
         .to_string();
     let response_body = response.bytes().await?;
+    let body_str = String::from_utf8_lossy(&response_body);
 
-    Ok(format!(
-        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+    Ok(http_utils::http_response(
         status_code,
-        content_type,
-        response_body.len(),
-        String::from_utf8_lossy(&response_body)
+        &content_type,
+        &body_str,
     ))
 }
 
@@ -340,13 +267,7 @@ async fn forward_request(
 
 /// Constructs target URL, avoiding /v1 duplication when base already ends with /v1
 fn build_target_url(base_url: &str, path: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    let effective_path = if base.ends_with("/v1") && path.starts_with("/v1/") {
-        &path[3..]
-    } else {
-        path
-    };
-    format!("{}/{}", base, effective_path.trim_start_matches('/'))
+    http_utils::build_target_url(base_url, path)
 }
 
 // =============================================================================
@@ -834,16 +755,6 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-fn http_error(status: u16, message: &str) -> String {
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status,
-        message,
-        message.len(),
-        message
-    )
-}
-
 // =============================================================================
 // TESTS
 // =============================================================================
@@ -858,18 +769,21 @@ mod tests {
     #[test]
     fn test_extract_request_body_normal() {
         let req = "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"model\":\"gpt-4\"}";
-        assert_eq!(extract_request_body(req).unwrap(), "{\"model\":\"gpt-4\"}");
+        assert_eq!(
+            http_utils::extract_request_body(req).unwrap(),
+            "{\"model\":\"gpt-4\"}"
+        );
     }
 
     #[test]
     fn test_extract_request_body_missing_separator_returns_error() {
         let req = "POST /v1/chat/completions HTTP/1.1";
-        assert!(extract_request_body(req).is_err());
+        assert!(http_utils::extract_request_body(req).is_err());
     }
 
     #[test]
     fn test_extract_request_body_short_request_no_panic() {
-        assert!(extract_request_body("AB").is_err());
+        assert!(http_utils::extract_request_body("AB").is_err());
     }
 
     // ── Tool filtering ─────────────────────────────────────────────────────────

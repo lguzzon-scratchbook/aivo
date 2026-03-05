@@ -254,7 +254,8 @@ impl SessionStore {
         }
     }
 
-    /// Saves config to the config file
+    /// Saves config to the config file.
+    /// Uses atomic write (write to temp file then rename) to prevent corruption.
     pub async fn save(&self, config: &StoredConfig) -> Result<()> {
         tokio::fs::create_dir_all(&self.config_dir)
             .await
@@ -264,24 +265,30 @@ impl SessionStore {
         let data =
             serde_json::to_string_pretty(&encrypted).context("Failed to serialize config")?;
 
+        // Write to a temp file first, then atomically rename to prevent partial writes
+        let tmp_path = self.config_path.with_extension("json.tmp");
+
+        tokio::fs::write(&tmp_path, &data)
+            .await
+            .with_context(|| format!("Failed to write temp config file: {:?}", tmp_path))?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::write(&self.config_path, data)
-                .await
-                .with_context(|| format!("Failed to write config file: {:?}", self.config_path))?;
-            let metadata = tokio::fs::metadata(&self.config_path).await?;
+            let metadata = tokio::fs::metadata(&tmp_path).await?;
             let mut permissions = metadata.permissions();
             permissions.set_mode(0o600);
-            tokio::fs::set_permissions(&self.config_path, permissions).await?;
+            tokio::fs::set_permissions(&tmp_path, permissions).await?;
         }
 
-        #[cfg(not(unix))]
-        {
-            tokio::fs::write(&self.config_path, data)
-                .await
-                .with_context(|| format!("Failed to write config file: {:?}", self.config_path))?;
-        }
+        tokio::fs::rename(&tmp_path, &self.config_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to rename temp config file to {:?}",
+                    self.config_path
+                )
+            })?;
 
         Ok(())
     }
@@ -313,10 +320,19 @@ impl SessionStore {
         let mut config = self.load().await?;
 
         let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
-        let id = loop {
-            let id = format!("{:04x}", rand::random::<u16>());
-            if !existing_ids.contains(&id) {
-                break id;
+        let id = {
+            let mut attempts = 0;
+            loop {
+                let id = format!("{:04x}", rand::random::<u16>());
+                if !existing_ids.contains(&id) {
+                    break id;
+                }
+                attempts += 1;
+                if attempts >= 1000 {
+                    anyhow::bail!(
+                        "Failed to generate unique key ID after 1000 attempts. Consider removing unused keys."
+                    );
+                }
             }
         };
 

@@ -400,7 +400,10 @@ impl UpdateCommand {
 
         // Then upgrade aivo (--overwrite to handle symlink conflicts)
         println!("{} Upgrading aivo...", style::arrow_symbol());
-        match Command::new("brew").args(["upgrade", "--overwrite", "aivo"]).status() {
+        match Command::new("brew")
+            .args(["upgrade", "--overwrite", "aivo"])
+            .status()
+        {
             Ok(status) if status.success() => ExitCode::Success,
             Ok(_) => ExitCode::Success,
             Err(e) => {

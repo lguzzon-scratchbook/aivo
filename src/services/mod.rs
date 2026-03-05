@@ -8,6 +8,8 @@ pub mod copilot_auth;
 pub mod copilot_router;
 pub mod environment_injector;
 pub mod gemini_router;
+pub mod http_utils;
+pub mod model_names;
 pub mod models_cache;
 pub mod session_store;
 
