@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde_json::json;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -203,15 +204,35 @@ impl AILauncher {
         // For Claude, inject --teammate-mode in-process to run in single window
         let args = inject_claude_teammate_mode(options.tool, &options.args);
 
+        // For Codex with routed non-OpenAI providers, optionally provide a local model catalog
+        // entry for namespaced custom models (e.g., vendor/model) to avoid fallback metadata mode.
+        let codex_model_catalog_path = if options.tool == AIToolType::Codex {
+            maybe_write_codex_model_catalog(
+                model.as_deref(),
+                env.contains_key("AIVO_USE_CODEX_ROUTER"),
+            )
+            .await?
+        } else {
+            None
+        };
+
         // For Codex, inject -m <model> if model is specified via --model flag
         let args = if options.tool == AIToolType::Codex {
-            inject_codex_model(model.as_deref(), &args)
+            let args = inject_codex_model(model.as_deref(), &args);
+            inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args)
         } else {
             args
         };
 
         // Spawn the process with inherited stdio
-        self.spawn_process(&tool_config.command, &args, env).await
+        let result = self.spawn_process(&tool_config.command, &args, env).await;
+
+        // Clean up temp model catalog file written for this invocation
+        if let Some(ref path) = codex_model_catalog_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+
+        result
     }
 
     /// Outputs information about which key is being used
@@ -465,10 +486,13 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_CODEX_ROUTER_BASE_URL"))?
         .clone();
 
+    let model_prefix = env.get("AIVO_CODEX_ROUTER_MODEL_PREFIX").cloned();
+
     let router = CodexRouter::new(CodexRouterConfig {
         target_base_url: base_url,
         api_key,
         copilot_token_manager: None,
+        model_prefix,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -578,6 +602,7 @@ async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16
         target_base_url: String::new(),
         api_key: String::new(),
         copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
+        model_prefix: None,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -627,6 +652,98 @@ fn inject_codex_model(model: Option<&str>, args: &[String]) -> Vec<String> {
     let mut new_args = vec!["-m".to_string(), model.to_string()];
     new_args.extend_from_slice(args);
     new_args
+}
+
+/// Injects `--config model_catalog_json="<path>"` for Codex unless already provided.
+fn inject_codex_model_catalog(path: Option<&str>, args: &[String]) -> Vec<String> {
+    let path = match path {
+        Some(p) if !p.is_empty() => p,
+        _ => return args.to_vec(),
+    };
+
+    // Respect user-specified model_catalog_json settings.
+    if args.iter().any(|a| a.contains("model_catalog_json")) {
+        return args.to_vec();
+    }
+
+    let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut new_args = vec![
+        "--config".to_string(),
+        format!("model_catalog_json=\"{}\"", escaped_path),
+    ];
+    new_args.extend_from_slice(args);
+    new_args
+}
+
+/// Creates a minimal custom Codex model catalog for namespaced non-OpenAI models.
+async fn maybe_write_codex_model_catalog(
+    model: Option<&str>,
+    uses_non_openai_router: bool,
+) -> Result<Option<String>> {
+    let model = match model {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(None),
+    };
+
+    if !uses_non_openai_router || !model.contains('/') {
+        return Ok(None);
+    }
+
+    let catalog_json = build_codex_model_catalog_json(model)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = format!(
+        "aivo-codex-model-catalog-{}-{}.json",
+        std::process::id(),
+        nonce
+    );
+    let path = std::env::temp_dir().join(file_name);
+
+    tokio::fs::write(&path, catalog_json)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to write Codex model catalog override at {}",
+                path.display()
+            )
+        })?;
+
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+fn build_codex_model_catalog_json(model: &str) -> Result<String> {
+    // Compatible with Codex's ModelsResponse/ModelInfo shape used in tests.
+    let catalog = json!({
+        "models": [{
+            "slug": model,
+            "display_name": model,
+            "description": format!("Custom model metadata for {}", model),
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "low"},
+                {"effort": "medium", "description": "medium"}
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "minimal_client_version": [0, 1, 0],
+            "supported_in_api": true,
+            "priority": 0,
+            "upgrade": serde_json::Value::Null,
+            "base_instructions": "base instructions",
+            "supports_reasoning_summaries": false,
+            "support_verbosity": false,
+            "default_verbosity": serde_json::Value::Null,
+            "apply_patch_tool_type": serde_json::Value::Null,
+            "truncation_policy": {"mode": "bytes", "limit": 10000},
+            "supports_parallel_tool_calls": false,
+            "supports_image_detail_original": false,
+            "context_window": 272000,
+            "experimental_supported_tools": []
+        }]
+    });
+    Ok(serde_json::to_string(&catalog)?)
 }
 
 #[cfg(test)]
@@ -704,7 +821,11 @@ mod tests {
     #[test]
     fn test_inject_codex_model_skips_when_already_specified() {
         let model = Some("o4-mini");
-        let args = vec!["--model".to_string(), "gpt-4o".to_string(), "file.ts".to_string()];
+        let args = vec![
+            "--model".to_string(),
+            "gpt-4o".to_string(),
+            "file.ts".to_string(),
+        ];
         let result = inject_codex_model(model, &args);
         // Should NOT inject since user already specified --model
         assert_eq!(result, vec!["--model", "gpt-4o", "file.ts"]);
@@ -713,7 +834,11 @@ mod tests {
     #[test]
     fn test_inject_codex_model_skips_shorthand_flag() {
         let model = Some("o4-mini");
-        let args = vec!["-m".to_string(), "gpt-4o".to_string(), "file.ts".to_string()];
+        let args = vec![
+            "-m".to_string(),
+            "gpt-4o".to_string(),
+            "file.ts".to_string(),
+        ];
         let result = inject_codex_model(model, &args);
         assert_eq!(result, vec!["-m", "gpt-4o", "file.ts"]);
     }
@@ -740,5 +865,39 @@ mod tests {
         let args = vec!["file.ts".to_string()];
         let result = inject_codex_model(model, &args);
         assert_eq!(result, vec!["file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_catalog_injects_when_path_provided() {
+        let args = vec!["file.ts".to_string()];
+        let result = inject_codex_model_catalog(Some("/tmp/catalog.json"), &args);
+        assert_eq!(
+            result,
+            vec![
+                "--config",
+                "model_catalog_json=\"/tmp/catalog.json\"",
+                "file.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inject_codex_model_catalog_skips_when_existing_setting_present() {
+        let args = vec![
+            "--config".to_string(),
+            "model_catalog_json=\"/tmp/custom.json\"".to_string(),
+            "file.ts".to_string(),
+        ];
+        let result = inject_codex_model_catalog(Some("/tmp/catalog.json"), &args);
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_build_codex_model_catalog_json_includes_model_slug() {
+        let model = "minimax/minimax-m2.5";
+        let json = build_codex_model_catalog_json(model).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["models"][0]["slug"], model);
+        assert_eq!(parsed["models"][0]["display_name"], model);
     }
 }

@@ -30,6 +30,8 @@ pub struct CodexRouterConfig {
     pub target_base_url: String,
     pub api_key: String,
     pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
+    /// Optional model prefix to add (e.g., "@cf/" for Cloudflare)
+    pub model_prefix: Option<String>,
 }
 
 pub struct CodexRouter {
@@ -194,7 +196,11 @@ async fn handle_chat_completions_with_filter(
     let mut body = body.clone();
     filter_tools(&mut body);
     if config.copilot_token_manager.is_none() {
-        transform_model(&mut body, &config.target_base_url);
+        transform_model(
+            &mut body,
+            &config.target_base_url,
+            config.model_prefix.as_deref(),
+        );
     }
 
     let target_url = build_target_url(&config.target_base_url, path);
@@ -289,21 +295,34 @@ fn filter_tools(body: &mut Value) {
 // MODEL TRANSFORM
 // =============================================================================
 
-/// For OpenRouter, prefixes model with "openai/" if not already namespaced
-fn transform_model(body: &mut Value, base_url: &str) {
+/// For OpenRouter, prefixes model with "openai/" if not already namespaced.
+/// Also applies a custom prefix (e.g., "@cf/" for Cloudflare) if configured.
+fn transform_model(body: &mut Value, base_url: &str, model_prefix: Option<&str>) {
     if let Some(model) = body["model"].as_str().map(String::from) {
-        let transformed = transform_model_str(&model, base_url);
+        let transformed = transform_model_str(&model, base_url, model_prefix);
         if transformed != model {
             body["model"] = Value::String(transformed);
         }
     }
 }
 
-fn transform_model_str(model: &str, base_url: &str) -> String {
-    if base_url.contains("openrouter") && !model.contains('/') {
-        format!("openai/{}", model)
+fn transform_model_str(model: &str, base_url: &str, model_prefix: Option<&str>) -> String {
+    // First apply custom prefix (e.g., "@cf/" for Cloudflare)
+    let with_prefix = if let Some(prefix) = model_prefix {
+        if !model.starts_with(prefix) {
+            format!("{}{}", prefix, model)
+        } else {
+            model.to_string()
+        }
     } else {
         model.to_string()
+    };
+
+    // Then apply OpenRouter prefix if needed
+    if base_url.contains("openrouter") && !with_prefix.contains('/') {
+        format!("openai/{}", with_prefix)
+    } else {
+        with_prefix
     }
 }
 
@@ -400,7 +419,11 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let model = if config.copilot_token_manager.is_none() {
         match model.as_str() {
-            Some(s) => Value::String(transform_model_str(s, &config.target_base_url)),
+            Some(s) => Value::String(transform_model_str(
+                s,
+                &config.target_base_url,
+                config.model_prefix.as_deref(),
+            )),
             None => model,
         }
     } else {
@@ -439,10 +462,20 @@ pub fn extract_content_text(content: Option<&Value>) -> String {
             .iter()
             .filter_map(|p| match p {
                 Value::String(s) => Some(s.clone()),
-                _ => p.get("text").and_then(|v| v.as_str()).map(String::from),
+                _ => p
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| p.get("content").and_then(|v| v.as_str()))
+                    .map(String::from),
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        Some(Value::Object(obj)) => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("content").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -573,16 +606,9 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
         }),
     ));
 
-    let empty_msg = json!({"role": "assistant", "content": ""});
-    let choice = chat
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .cloned()
-        .unwrap_or(json!({"message": empty_msg}));
-    let message = choice.get("message").cloned().unwrap_or(empty_msg);
+    let (content, tool_calls) = extract_chat_response_payload(chat);
 
-    if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+    if !tool_calls.is_empty() {
         // Tool call response — each tool call becomes a function_call output item
         for (i, tc) in tool_calls.iter().enumerate() {
             // call_id = the Chat Completions tool call ID (referenced in tool results)
@@ -642,10 +668,6 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
         }
     } else {
         // Text message response
-        let content = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
         let msg_id = gen_id("msg");
 
         sse.push_str(&sse_event(
@@ -728,6 +750,96 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
     ));
 
     sse
+}
+
+/// Extracts assistant text and tool calls from provider chat completion payloads.
+/// Handles multi-choice payloads and common non-standard envelopes.
+fn extract_chat_response_payload(chat: &Value) -> (String, Vec<Value>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    if let Some(choices) = chat.get("choices").and_then(|c| c.as_array()) {
+        for choice in choices {
+            let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+            let text = extract_message_text(&message);
+            if !text.is_empty() {
+                text_parts.push(text);
+            }
+            if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
+                tool_calls.extend(tcs.iter().cloned());
+            }
+        }
+    }
+
+    // Fallback: Responses API-style output payloads from some providers.
+    if text_parts.is_empty() && tool_calls.is_empty() {
+        let output_items = chat
+            .get("output")
+            .or_else(|| chat.get("response").and_then(|r| r.get("output")))
+            .and_then(|v| v.as_array());
+
+        if let Some(items) = output_items {
+            for item in items {
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("message") => {
+                        let text = extract_content_text(item.get("content"));
+                        if !text.is_empty() {
+                            text_parts.push(text);
+                        }
+                    }
+                    Some("function_call") => {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                            .unwrap_or("call_0");
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        tool_calls.push(json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments
+                            }
+                        }));
+                    }
+                    Some("output_text") => {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            text_parts.push(text.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Fallback envelopes seen from some OpenAI-compatible providers
+    if text_parts.is_empty() {
+        if let Some(text) = chat
+            .get("result")
+            .and_then(|r| r.get("response"))
+            .and_then(|v| v.as_str())
+        {
+            text_parts.push(text.to_string());
+        } else if let Some(text) = chat.get("response").and_then(|v| v.as_str()) {
+            text_parts.push(text.to_string());
+        } else if let Some(text) = chat.get("output_text").and_then(|v| v.as_str()) {
+            text_parts.push(text.to_string());
+        }
+    }
+
+    (text_parts.join("\n"), tool_calls)
+}
+
+fn extract_message_text(message: &Value) -> String {
+    extract_content_text(message.get("content"))
 }
 
 fn sse_event(event_type: &str, data: &Value) -> String {
@@ -844,22 +956,44 @@ mod tests {
     #[test]
     fn test_transform_model_openrouter_adds_prefix() {
         let mut body = json!({"model": "gpt-4o"});
-        transform_model(&mut body, "https://openrouter.ai/api/v1");
+        transform_model(&mut body, "https://openrouter.ai/api/v1", None);
         assert_eq!(body["model"], "openai/gpt-4o");
     }
 
     #[test]
     fn test_transform_model_openrouter_already_prefixed() {
         let mut body = json!({"model": "openai/gpt-4o"});
-        transform_model(&mut body, "https://openrouter.ai/api/v1");
+        transform_model(&mut body, "https://openrouter.ai/api/v1", None);
         assert_eq!(body["model"], "openai/gpt-4o");
     }
 
     #[test]
     fn test_transform_model_non_openrouter_passthrough() {
         let mut body = json!({"model": "gpt-4o"});
-        transform_model(&mut body, "https://ai-gateway.vercel.sh/v1");
+        transform_model(&mut body, "https://ai-gateway.vercel.sh/v1", None);
         assert_eq!(body["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn test_transform_model_cloudflare_prefix() {
+        let mut body = json!({"model": "glm-4.7-flash"});
+        transform_model(
+            &mut body,
+            "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1",
+            Some("@cf/"),
+        );
+        assert_eq!(body["model"], "@cf/glm-4.7-flash");
+    }
+
+    #[test]
+    fn test_transform_model_cloudflare_prefix_already_present() {
+        let mut body = json!({"model": "@cf/llama-3.1-8b"});
+        transform_model(
+            &mut body,
+            "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1",
+            Some("@cf/"),
+        );
+        assert_eq!(body["model"], "@cf/llama-3.1-8b");
     }
 
     // ── URL building ───────────────────────────────────────────────────────────
@@ -974,6 +1108,7 @@ mod tests {
                 target_base_url: "https://ai-gateway.vercel.sh/v1".to_string(),
                 api_key: "sk-test".to_string(),
                 copilot_token_manager: None,
+                model_prefix: None,
             },
         );
 
@@ -998,6 +1133,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 copilot_token_manager: None,
+                model_prefix: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1025,6 +1161,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 copilot_token_manager: None,
+                model_prefix: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1054,6 +1191,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 copilot_token_manager: None,
+                model_prefix: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1078,6 +1216,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 copilot_token_manager: None,
+                model_prefix: None,
             },
         );
         let tools = chat["tools"].as_array().unwrap();
@@ -1094,6 +1233,7 @@ mod tests {
                 target_base_url: "https://openrouter.ai/api/v1".to_string(),
                 api_key: String::new(),
                 copilot_token_manager: None,
+                model_prefix: None,
             },
         );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
@@ -1150,6 +1290,73 @@ mod tests {
         assert!(!sse.contains("response.output_text.delta"));
         // But done event should still be present
         assert!(sse.contains("response.output_text.done"));
+    }
+
+    #[test]
+    fn test_convert_response_joins_text_from_multiple_choices() {
+        let chat = json!({
+            "choices": [
+                {"message": {"role": "assistant", "content": "Hello"}},
+                {"message": {"role": "assistant", "content": "world"}}
+            ]
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat);
+        assert!(sse.contains("Hello\\nworld"));
+    }
+
+    #[test]
+    fn test_convert_response_supports_content_array_parts() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello"}, {"type": "text", "text": "world"}]
+                }
+            }]
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat);
+        assert!(sse.contains("Hello\\nworld"));
+    }
+
+    #[test]
+    fn test_convert_response_supports_result_response_envelope() {
+        let chat = json!({
+            "result": {"response": "Hello from envelope"}
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat);
+        assert!(sse.contains("Hello from envelope"));
+    }
+
+    #[test]
+    fn test_convert_response_supports_responses_output_message() {
+        let chat = json!({
+            "object": "response",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello from output"}]
+            }]
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat);
+        assert!(sse.contains("Hello from output"));
+    }
+
+    #[test]
+    fn test_convert_response_supports_responses_output_function_call() {
+        let chat = json!({
+            "response": {
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_123",
+                    "call_id": "call_123",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                }]
+            }
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat);
+        assert!(sse.contains("\"call_id\":\"call_123\""));
+        assert!(sse.contains("\"name\":\"shell\""));
     }
 
     #[test]
@@ -1238,6 +1445,7 @@ mod tests {
             target_base_url: "https://api.example.com".to_string(),
             api_key: "sk-test".to_string(),
             copilot_token_manager: None,
+            model_prefix: None,
         };
         assert!(config.copilot_token_manager.is_none());
     }
@@ -1251,6 +1459,7 @@ mod tests {
             api_key: String::new(),
             // Simulate copilot mode by checking the None branch is the no-transform path
             copilot_token_manager: None,
+            model_prefix: None,
         };
         // Non-copilot with non-openrouter URL: no transform
         let chat = convert_responses_to_chat_request(&body, &config);

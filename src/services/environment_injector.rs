@@ -158,6 +158,13 @@ impl EnvironmentInjector {
                 "AIVO_CODEX_ROUTER_BASE_URL".to_string(),
                 key.base_url.clone(),
             );
+            // Cloudflare Workers AI requires a "@cf/" model prefix
+            if key.base_url.contains("cloudflare.com") {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_MODEL_PREFIX".to_string(),
+                    "@cf/".to_string(),
+                );
+            }
         } else {
             // Official OpenAI: direct connection, no proxy needed
             env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
@@ -719,6 +726,26 @@ mod tests {
             env.get("AIVO_CODEX_ROUTER_BASE_URL"),
             Some(&"https://openrouter.ai/api/v1".to_string())
         );
+    }
+
+    #[test]
+    fn test_for_codex_cloudflare_uses_router_with_prefix() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string();
+        let env = injector.for_codex(&key, Some("glm-4.7-flash"));
+
+        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            Some(&"https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_CODEX_ROUTER_MODEL_PREFIX"),
+            Some(&"@cf/".to_string())
+        );
+        // Model should still be set
+        assert_eq!(env.get("CODEX_MODEL"), Some(&"glm-4.7-flash".to_string()));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use console::{Key, Term};
+use std::io::Write as _;
 
 impl Default for FuzzySelect {
     fn default() -> Self {
@@ -37,7 +38,7 @@ impl FuzzySelect {
     }
 
     pub fn interact_opt(self) -> std::io::Result<Option<usize>> {
-        let term = Term::stderr();
+        let mut term = Term::stderr();
 
         // Setup initial state
         let mut query = String::new();
@@ -77,14 +78,15 @@ impl FuzzySelect {
 
             let end_idx = (page_start + page_size).min(count);
 
+            // Save cursor position before drawing
+            term.write_all(b"\x1b7")?;
+
             // Draw prompt and query
             term.write_line(&format!("{}: {}", crate::style::bold(&self.prompt), query))?;
 
-            let items_drawn_count = if count == 0 {
+            if count == 0 {
                 term.write_line(&format!("  {}", crate::style::dim("(no matches)")))?;
-                1
             } else {
-                let mut lines = 0;
                 for (i, (_, item)) in filtered.iter().enumerate().take(end_idx).skip(page_start) {
                     let is_selected = i == selection;
 
@@ -101,27 +103,27 @@ impl FuzzySelect {
                     };
 
                     term.write_line(&format!("{} {}", symbol, styled_item))?;
-                    lines += 1;
                 }
-                lines
-            };
+            }
 
             // Wait for input
             let key = match term.read_key() {
                 Ok(key) => key,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    // Ctrl-C pressed - explicitly restore cursor before exiting
+                    // Ctrl-C pressed - restore cursor and clear before exiting
+                    let _ = term.write_all(b"\x1b8\x1b[0J");
                     let _ = term.show_cursor();
                     return Ok(None);
                 }
                 Err(e) => {
+                    let _ = term.write_all(b"\x1b8\x1b[0J");
                     let _ = term.show_cursor();
                     return Err(e);
                 }
             };
 
-            // Clear lines for next redraw or exit
-            term.clear_last_lines(1 + items_drawn_count)?;
+            // Restore cursor and clear to end of screen for next redraw or exit
+            term.write_all(b"\x1b8\x1b[0J")?;
 
             match key {
                 Key::ArrowUp | Key::Char('\x10') => {
