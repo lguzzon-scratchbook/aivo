@@ -32,6 +32,10 @@ pub struct CodexRouterConfig {
     pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
     /// Optional model prefix to add (e.g., "@cf/" for Cloudflare)
     pub model_prefix: Option<String>,
+    /// Whether the provider requires `reasoning_content` on assistant tool-call turns (e.g., Moonshot)
+    pub requires_reasoning_content: bool,
+    /// The actual model name to use with the provider (e.g., "kimi-k2.5" while Codex CLI sees "gpt-4o")
+    pub actual_model: Option<String>,
 }
 
 pub struct CodexRouter {
@@ -161,6 +165,12 @@ async fn handle_responses_api_via_chat(
     config: &Arc<CodexRouterConfig>,
     client: &reqwest::Client,
 ) -> Result<String> {
+    // Extract original model before conversion
+    let original_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-4o")
+        .to_string();
     let chat_body = convert_responses_to_chat_request(body, config);
     let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
 
@@ -178,7 +188,11 @@ async fn handle_responses_api_via_chat(
 
     let response_text = response.text().await?;
     let chat_response = parse_provider_response(&response_text)?;
-    let sse = convert_chat_response_to_responses_sse(&chat_response);
+    let sse = convert_chat_response_to_responses_sse(
+        &chat_response,
+        config.requires_reasoning_content,
+        &original_model,
+    );
 
     Ok(http_utils::http_response(200, "text/event-stream", &sse))
 }
@@ -326,6 +340,51 @@ fn transform_model_str(model: &str, base_url: &str, model_prefix: Option<&str>) 
     }
 }
 
+/// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
+/// This is ONLY used in the response back to Codex, NOT in requests to providers.
+fn map_model_for_codex_cli(model: &str) -> String {
+    // OpenAI models pass through unchanged
+    let model_lower = model.to_lowercase();
+    if model_lower.starts_with("gpt-") || model_lower.starts_with("o1") || model_lower.starts_with("o3") {
+        return model.to_string();
+    }
+
+    // Strip provider prefix (e.g., "moonshot/kimi-k2.5" -> "kimi-k2.5")
+    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
+
+    // High-capability/reasoning models -> o1 (for reasoning) or gpt-4o (for general)
+    let is_high_capability = name_only.contains("opus")
+        || name_only.contains("405b")
+        || name_only.contains("r1")
+        || name_only.contains("reasoner")
+        || name_only.contains("k2.5")
+        || name_only.contains("k2-5")
+        || name_only.contains("large")
+        || name_only.contains("pro");
+
+    // Lightweight/fast models -> gpt-4o-mini
+    let is_lightweight = name_only.contains("flash")
+        || name_only.contains("haiku")
+        || name_only.contains("small")
+        || name_only.contains("mini")
+        || name_only.contains("8b")
+        || name_only.contains("11b");
+
+    if is_high_capability {
+        // Reasoning-focused models get o1, others get gpt-4o
+        if name_only.contains("reasoner") || name_only.contains("r1") {
+            "o1".to_string()
+        } else {
+            "gpt-4o".to_string()
+        }
+    } else if is_lightweight {
+        "gpt-4o-mini".to_string()
+    } else {
+        // Default fallback for everything else
+        "gpt-4o".to_string()
+    }
+}
+
 // =============================================================================
 // RESPONSES API ↔ CHAT COMPLETIONS CONVERSION
 // =============================================================================
@@ -360,7 +419,12 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
         for item in input {
             match item.get("type").and_then(|v| v.as_str()) {
                 Some("message") => {
-                    let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                    // Validate role - only allow valid OpenAI chat completion roles
+                    let role = item
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .filter(|r| matches!(*r, "system" | "user" | "assistant" | "tool"))
+                        .unwrap_or("user");
                     let content = extract_content_text(item.get("content"));
                     messages.push(json!({"role": role, "content": content}));
                 }
@@ -378,11 +442,27 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
                         .get("arguments")
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    messages.push(json!({
+                    // Moonshot requires reasoning_content on assistant tool-call turns
+                    let reasoning_content = item
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            if config.requires_reasoning_content {
+                                Some(" ".to_string()) // single-space sentinel
+                            } else {
+                                None
+                            }
+                        });
+                    let mut msg = json!({
                         "role": "assistant",
                         "content": null,
                         "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}]
-                    }));
+                    });
+                    if let Some(rc) = reasoning_content {
+                        msg["reasoning_content"] = json!(rc);
+                    }
+                    messages.push(msg);
                 }
                 Some("function_call_output") => {
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -416,7 +496,12 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
 
     // Apply model name transform (e.g. openai/ prefix for OpenRouter)
     // Skip transform when using Copilot — model names pass through unchanged
-    let model = body.get("model").cloned().unwrap_or(Value::Null);
+    // If actual_model is set, use that (it was set by environment injector)
+    let model = if let Some(ref actual) = config.actual_model {
+        Value::String(actual.clone())
+    } else {
+        body.get("model").cloned().unwrap_or(Value::Null)
+    };
     let model = if config.copilot_token_manager.is_none() {
         match model.as_str() {
             Some(s) => Value::String(transform_model_str(
@@ -588,9 +673,15 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
 /// - Function call items need a `call_id` (= Chat Completions tc.id) separate
 ///   from `id` (a fresh item identifier); Codex puts `call_id` in the
 ///   follow-up `function_call_output.call_id` field
-pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
+pub fn convert_chat_response_to_responses_sse(
+    chat: &Value,
+    requires_reasoning_content: bool,
+    original_model: &str,
+) -> String {
     let resp_id = gen_id("resp");
     let created_at = unix_timestamp();
+    // Map model name for Codex CLI compatibility
+    let codex_model = map_model_for_codex_cli(original_model);
     let mut sse = String::new();
     let mut output_items: Vec<Value> = Vec::new();
 
@@ -601,12 +692,26 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
             "type": "response.created",
             "response": {
                 "id": resp_id, "object": "response",
+                "model": codex_model,
                 "created_at": created_at, "status": "in_progress", "output": []
             }
         }),
     ));
 
-    let (content, tool_calls) = extract_chat_response_payload(chat);
+    let (content, tool_calls, reasoning_content) = extract_chat_response_payload(chat);
+
+    // Prepare reasoning_content for function_call items if provider requires it
+    let reasoning_for_tool = if requires_reasoning_content {
+        if !reasoning_content.is_empty() {
+            reasoning_content.clone()
+        } else if !content.is_empty() {
+            content.clone()
+        } else {
+            " ".to_string() // single-space sentinel satisfies non-empty requirement
+        }
+    } else {
+        String::new()
+    };
 
     if !tool_calls.is_empty() {
         // Tool call response — each tool call becomes a function_call output item
@@ -647,11 +752,15 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
                 }),
             ));
 
-            let done_item = json!({
+            // Build done_item with reasoning_content if required
+            let mut done_item = json!({
                 "id": item_id, "call_id": call_id,
                 "type": "function_call", "status": "completed",
                 "name": tc_name, "arguments": tc_args
             });
+            if requires_reasoning_content {
+                done_item["reasoning_content"] = json!(reasoning_for_tool.clone());
+            }
             sse.push_str(&sse_event(
                 "response.output_item.done",
                 &json!({
@@ -660,11 +769,15 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
                     "item": done_item
                 }),
             ));
-            output_items.push(json!({
+            let mut output_item = json!({
                 "id": item_id, "call_id": call_id,
                 "type": "function_call", "status": "completed",
                 "name": tc_name, "arguments": tc_args
-            }));
+            });
+            if requires_reasoning_content {
+                output_item["reasoning_content"] = json!(reasoning_for_tool.clone());
+            }
+            output_items.push(output_item);
         }
     } else {
         // Text message response
@@ -743,6 +856,7 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
             "type": "response.completed",
             "response": {
                 "id": resp_id, "object": "response",
+                "model": codex_model,
                 "created_at": created_at, "status": "completed",
                 "output": output_items
             }
@@ -754,9 +868,12 @@ pub fn convert_chat_response_to_responses_sse(chat: &Value) -> String {
 
 /// Extracts assistant text and tool calls from provider chat completion payloads.
 /// Handles multi-choice payloads and common non-standard envelopes.
-fn extract_chat_response_payload(chat: &Value) -> (String, Vec<Value>) {
+/// Extracts assistant text, tool calls, and reasoning content from provider chat completion payloads.
+/// Handles multi-choice payloads and common non-standard envelopes.
+fn extract_chat_response_payload(chat: &Value) -> (String, Vec<Value>, String) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
 
     if let Some(choices) = chat.get("choices").and_then(|c| c.as_array()) {
         for choice in choices {
@@ -764,6 +881,12 @@ fn extract_chat_response_payload(chat: &Value) -> (String, Vec<Value>) {
             let text = extract_message_text(&message);
             if !text.is_empty() {
                 text_parts.push(text);
+            }
+            // Extract reasoning_content if present (Moonshot, etc.)
+            if let Some(reasoning) = message.get("reasoning_content").and_then(|r| r.as_str()) {
+                if !reasoning.is_empty() {
+                    reasoning_parts.push(reasoning.to_string());
+                }
             }
             if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
                 tool_calls.extend(tcs.iter().cloned());
@@ -835,7 +958,11 @@ fn extract_chat_response_payload(chat: &Value) -> (String, Vec<Value>) {
         }
     }
 
-    (text_parts.join("\n"), tool_calls)
+    (
+        text_parts.join("\n"),
+        tool_calls,
+        reasoning_parts.join("\n"),
+    )
 }
 
 fn extract_message_text(message: &Value) -> String {
@@ -1109,6 +1236,8 @@ mod tests {
                 api_key: "sk-test".to_string(),
                 copilot_token_manager: None,
                 model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
             },
         );
 
@@ -1134,6 +1263,8 @@ mod tests {
                 api_key: String::new(),
                 copilot_token_manager: None,
                 model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1162,6 +1293,8 @@ mod tests {
                 api_key: String::new(),
                 copilot_token_manager: None,
                 model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1192,6 +1325,8 @@ mod tests {
                 api_key: String::new(),
                 copilot_token_manager: None,
                 model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1217,6 +1352,8 @@ mod tests {
                 api_key: String::new(),
                 copilot_token_manager: None,
                 model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
             },
         );
         let tools = chat["tools"].as_array().unwrap();
@@ -1234,6 +1371,8 @@ mod tests {
                 api_key: String::new(),
                 copilot_token_manager: None,
                 model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
             },
         );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
@@ -1246,7 +1385,7 @@ mod tests {
         let chat = json!({
             "choices": [{"message": {"role": "assistant", "content": "Here are your files."}}]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("event: response.created\n"));
         assert!(sse.contains("event: response.output_text.delta\n"));
         assert!(sse.contains("event: response.output_text.done\n"));
@@ -1270,7 +1409,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("event: response.output_item.added\n"));
         assert!(sse.contains("event: response.function_call_arguments.delta\n"));
         assert!(sse.contains("event: response.function_call_arguments.done\n"));
@@ -1285,7 +1424,7 @@ mod tests {
         let chat = json!({
             "choices": [{"message": {"role": "assistant", "content": ""}}]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         // Empty content: delta event should be omitted
         assert!(!sse.contains("response.output_text.delta"));
         // But done event should still be present
@@ -1300,7 +1439,7 @@ mod tests {
                 {"message": {"role": "assistant", "content": "world"}}
             ]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("Hello\\nworld"));
     }
 
@@ -1314,7 +1453,7 @@ mod tests {
                 }
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("Hello\\nworld"));
     }
 
@@ -1323,7 +1462,7 @@ mod tests {
         let chat = json!({
             "result": {"response": "Hello from envelope"}
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("Hello from envelope"));
     }
 
@@ -1337,7 +1476,7 @@ mod tests {
                 "content": [{"type": "output_text", "text": "Hello from output"}]
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("Hello from output"));
     }
 
@@ -1354,7 +1493,7 @@ mod tests {
                 }]
             }
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("\"call_id\":\"call_123\""));
         assert!(sse.contains("\"name\":\"shell\""));
     }
@@ -1362,7 +1501,7 @@ mod tests {
     #[test]
     fn test_convert_response_uses_correct_object_type() {
         let chat = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("\"object\":\"response\""));
         assert!(!sse.contains("realtime.response"));
     }
@@ -1370,7 +1509,7 @@ mod tests {
     #[test]
     fn test_convert_response_includes_response_id() {
         let chat = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         assert!(sse.contains("\"response_id\""));
     }
 
@@ -1387,7 +1526,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat);
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
         // call_id must be the Chat Completions tool call id
         assert!(sse.contains("\"call_id\":\"call_abc123\""));
     }
@@ -1446,6 +1585,8 @@ mod tests {
             api_key: "sk-test".to_string(),
             copilot_token_manager: None,
             model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: None,
         };
         assert!(config.copilot_token_manager.is_none());
     }
@@ -1460,6 +1601,8 @@ mod tests {
             // Simulate copilot mode by checking the None branch is the no-transform path
             copilot_token_manager: None,
             model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: None,
         };
         // Non-copilot with non-openrouter URL: no transform
         let chat = convert_responses_to_chat_request(&body, &config);

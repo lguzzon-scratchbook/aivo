@@ -205,20 +205,18 @@ impl AILauncher {
         let args = inject_claude_teammate_mode(options.tool, &options.args);
 
         // For Codex with routed non-OpenAI providers, optionally provide a local model catalog
-        // entry for namespaced custom models (e.g., vendor/model) to avoid fallback metadata mode.
+        // entry for custom models to avoid fallback metadata mode.
+        let use_codex_router = env.contains_key("AIVO_USE_CODEX_ROUTER")
+            || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER");
         let codex_model_catalog_path = if options.tool == AIToolType::Codex {
-            maybe_write_codex_model_catalog(
-                model.as_deref(),
-                env.contains_key("AIVO_USE_CODEX_ROUTER"),
-            )
-            .await?
+            maybe_write_codex_model_catalog(model.as_deref(), use_codex_router).await?
         } else {
             None
         };
 
         // For Codex, inject -m <model> if model is specified via --model flag
         let args = if options.tool == AIToolType::Codex {
-            let args = inject_codex_model(model.as_deref(), &args);
+            let args = inject_codex_model(model.as_deref(), &args, use_codex_router);
             inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args)
         } else {
             args
@@ -487,12 +485,19 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
         .clone();
 
     let model_prefix = env.get("AIVO_CODEX_ROUTER_MODEL_PREFIX").cloned();
+    let requires_reasoning_content = env
+        .get("AIVO_CODEX_ROUTER_REQUIRE_REASONING")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let actual_model = env.get("AIVO_CODEX_ROUTER_ACTUAL_MODEL").cloned();
 
     let router = CodexRouter::new(CodexRouterConfig {
         target_base_url: base_url,
         api_key,
         copilot_token_manager: None,
         model_prefix,
+        requires_reasoning_content,
+        actual_model,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -603,6 +608,8 @@ async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16
         api_key: String::new(),
         copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
         model_prefix: None,
+        requires_reasoning_content: false,
+        actual_model: None,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -635,7 +642,9 @@ fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String>
 
 /// Injects `-m <model>` for Codex if not already specified by the user.
 /// Codex CLI requires the model to be passed as a CLI argument, not via env vars.
-fn inject_codex_model(model: Option<&str>, args: &[String]) -> Vec<String> {
+/// When using a router, passes the original model name (catalog provides metadata).
+/// For direct OpenAI connections, maps to a known OpenAI model so Codex CLI finds metadata.
+fn inject_codex_model(model: Option<&str>, args: &[String], use_router: bool) -> Vec<String> {
     let model = match model {
         Some(m) if !m.is_empty() => m,
         _ => return args.to_vec(),
@@ -649,9 +658,64 @@ fn inject_codex_model(model: Option<&str>, args: &[String]) -> Vec<String> {
         return args.to_vec();
     }
 
-    let mut new_args = vec!["-m".to_string(), model.to_string()];
+    // When using a router, pass the original model name so it matches the catalog entry.
+    // For direct OpenAI, map to a known model so Codex CLI finds built-in metadata.
+    let codex_model = if use_router {
+        model.to_string()
+    } else {
+        map_model_for_codex_cli(model)
+    };
+    let mut new_args = vec!["-m".to_string(), codex_model];
     new_args.extend_from_slice(args);
     new_args
+}
+
+/// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
+fn map_model_for_codex_cli(model: &str) -> String {
+    let model_lower = model.to_lowercase();
+
+    // OpenAI models pass through unchanged
+    if model_lower.starts_with("gpt-")
+        || model_lower.starts_with("o1")
+        || model_lower.starts_with("o3")
+        || model_lower.starts_with("o4")
+        || model_lower.starts_with("chatgpt")
+    {
+        return model.to_string();
+    }
+
+    // Strip provider prefix (e.g., "moonshot/kimi-k2.5" -> "kimi-k2.5")
+    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
+
+    // High-capability/reasoning models -> o1 (for reasoning) or gpt-4o (for general)
+    let is_high_capability = name_only.contains("opus")
+        || name_only.contains("405b")
+        || name_only.contains("r1")
+        || name_only.contains("reasoner")
+        || name_only.contains("k2.5")
+        || name_only.contains("k2-5")
+        || name_only.contains("large")
+        || name_only.contains("pro");
+
+    // Lightweight/fast models -> gpt-4o-mini
+    let is_lightweight = name_only.contains("flash")
+        || name_only.contains("haiku")
+        || name_only.contains("small")
+        || name_only.contains("mini")
+        || name_only.contains("8b")
+        || name_only.contains("11b");
+
+    if is_high_capability {
+        if name_only.contains("reasoner") || name_only.contains("r1") {
+            "o1".to_string()
+        } else {
+            "gpt-4o".to_string()
+        }
+    } else if is_lightweight {
+        "gpt-4o-mini".to_string()
+    } else {
+        "gpt-4o".to_string()
+    }
 }
 
 /// Injects `--config model_catalog_json="<path>"` for Codex unless already provided.
@@ -685,7 +749,19 @@ async fn maybe_write_codex_model_catalog(
         _ => return Ok(None),
     };
 
-    if !uses_non_openai_router || !model.contains('/') {
+    // Don't write catalog if not using a router (OpenAI official)
+    if !uses_non_openai_router {
+        return Ok(None);
+    }
+
+    // Don't write catalog for standard OpenAI models - they exist in Codex's built-in catalog
+    let model_lower = model.to_lowercase();
+    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
+    if name_only.starts_with("gpt-")
+        || name_only.starts_with("o1")
+        || name_only.starts_with("o3")
+        || name_only.starts_with("o4")
+    {
         return Ok(None);
     }
 
@@ -814,8 +890,24 @@ mod tests {
     fn test_inject_codex_model_injects_when_provided() {
         let model = Some("o4-mini");
         let args = vec!["file.ts".to_string()];
-        let result = inject_codex_model(model, &args);
+        let result = inject_codex_model(model, &args, false);
         assert_eq!(result, vec!["-m", "o4-mini", "file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_router_passes_original() {
+        let model = Some("kimi-k2.5");
+        let args = vec!["file.ts".to_string()];
+        let result = inject_codex_model(model, &args, true);
+        assert_eq!(result, vec!["-m", "kimi-k2.5", "file.ts"]);
+    }
+
+    #[test]
+    fn test_inject_codex_model_router_passes_namespaced() {
+        let model = Some("moonshot/kimi-k2.5");
+        let args = vec!["file.ts".to_string()];
+        let result = inject_codex_model(model, &args, true);
+        assert_eq!(result, vec!["-m", "moonshot/kimi-k2.5", "file.ts"]);
     }
 
     #[test]
@@ -826,7 +918,7 @@ mod tests {
             "gpt-4o".to_string(),
             "file.ts".to_string(),
         ];
-        let result = inject_codex_model(model, &args);
+        let result = inject_codex_model(model, &args, false);
         // Should NOT inject since user already specified --model
         assert_eq!(result, vec!["--model", "gpt-4o", "file.ts"]);
     }
@@ -839,7 +931,7 @@ mod tests {
             "gpt-4o".to_string(),
             "file.ts".to_string(),
         ];
-        let result = inject_codex_model(model, &args);
+        let result = inject_codex_model(model, &args, false);
         assert_eq!(result, vec!["-m", "gpt-4o", "file.ts"]);
     }
 
@@ -847,7 +939,7 @@ mod tests {
     fn test_inject_codex_model_skips_equals_format() {
         let model = Some("o4-mini");
         let args = vec!["--model=gpt-4o".to_string(), "file.ts".to_string()];
-        let result = inject_codex_model(model, &args);
+        let result = inject_codex_model(model, &args, false);
         assert_eq!(result, vec!["--model=gpt-4o", "file.ts"]);
     }
 
@@ -855,7 +947,7 @@ mod tests {
     fn test_inject_codex_model_skips_empty_model() {
         let model = Some("");
         let args = vec!["file.ts".to_string()];
-        let result = inject_codex_model(model, &args);
+        let result = inject_codex_model(model, &args, false);
         assert_eq!(result, vec!["file.ts"]);
     }
 
@@ -863,7 +955,7 @@ mod tests {
     fn test_inject_codex_model_skips_none_model() {
         let model: Option<&str> = None;
         let args = vec!["file.ts".to_string()];
-        let result = inject_codex_model(model, &args);
+        let result = inject_codex_model(model, &args, false);
         assert_eq!(result, vec!["file.ts"]);
     }
 

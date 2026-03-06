@@ -8,6 +8,57 @@ use serde_json::{Map, Value, json};
 
 use crate::services::session_store::ApiKey;
 
+/// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
+/// This prevents the "Model metadata not found" warning from Codex CLI.
+fn map_model_for_codex_cli(model: &str) -> String {
+    let model_lower = model.to_lowercase();
+
+    // OpenAI models pass through unchanged
+    if model_lower.starts_with("gpt-")
+        || model_lower.starts_with("o1")
+        || model_lower.starts_with("o3")
+        || model_lower.starts_with("o4")
+        || model_lower.starts_with("chatgpt")
+    {
+        return model.to_string();
+    }
+
+    // Strip provider prefix (e.g., "moonshot/kimi-k2.5" -> "kimi-k2.5")
+    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
+
+    // High-capability/reasoning models -> o1 (for reasoning) or gpt-4o (for general)
+    let is_high_capability = name_only.contains("opus")
+        || name_only.contains("405b")
+        || name_only.contains("r1")
+        || name_only.contains("reasoner")
+        || name_only.contains("k2.5")
+        || name_only.contains("k2-5")
+        || name_only.contains("large")
+        || name_only.contains("pro");
+
+    // Lightweight/fast models -> gpt-4o-mini
+    let is_lightweight = name_only.contains("flash")
+        || name_only.contains("haiku")
+        || name_only.contains("small")
+        || name_only.contains("mini")
+        || name_only.contains("8b")
+        || name_only.contains("11b");
+
+    if is_high_capability {
+        // Reasoning-focused models get o1, others get gpt-4o
+        if name_only.contains("reasoner") || name_only.contains("r1") {
+            "o1".to_string()
+        } else {
+            "gpt-4o".to_string()
+        }
+    } else if is_lightweight {
+        "gpt-4o-mini".to_string()
+    } else {
+        // Default fallback for everything else
+        "gpt-4o".to_string()
+    }
+}
+
 /// EnvironmentInjector prepares tool-specific environment variables for AI tools
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentInjector;
@@ -165,6 +216,13 @@ impl EnvironmentInjector {
                     "@cf/".to_string(),
                 );
             }
+            // Moonshot requires reasoning_content on assistant tool-call turns
+            if key.base_url.contains("moonshot.cn") {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
+                    "1".to_string(),
+                );
+            }
         } else {
             // Official OpenAI: direct connection, no proxy needed
             env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
@@ -172,9 +230,21 @@ impl EnvironmentInjector {
         }
 
         if let Some(model) = model {
-            env.insert("CODEX_MODEL".to_string(), model.to_string());
-            env.insert("OPENAI_DEFAULT_MODEL".to_string(), model.to_string());
-            env.insert("CODEX_MODEL_DEFAULT".to_string(), model.to_string());
+            // When using a router, pass the original model name so the catalog entry matches.
+            // The router translates it to the actual provider model via AIVO_CODEX_ROUTER_ACTUAL_MODEL.
+            // For direct OpenAI connections, map to a known OpenAI model so Codex CLI finds metadata.
+            let using_router = env.contains_key("AIVO_USE_CODEX_ROUTER")
+                || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER");
+            let codex_model = if using_router {
+                model.to_string()
+            } else {
+                map_model_for_codex_cli(model)
+            };
+            env.insert("CODEX_MODEL".to_string(), codex_model.clone());
+            env.insert("OPENAI_DEFAULT_MODEL".to_string(), codex_model.clone());
+            env.insert("CODEX_MODEL_DEFAULT".to_string(), codex_model.clone());
+            // Store the original model for the router to use with the provider
+            env.insert("AIVO_CODEX_ROUTER_ACTUAL_MODEL".to_string(), model.to_string());
         }
 
         env
