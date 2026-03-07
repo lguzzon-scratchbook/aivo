@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-aivo is a **Rust** CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini) with local API key management and secure storage.
+aivo is a **Rust** CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, and native APIs.
 
 ## Commands
 
@@ -82,16 +82,19 @@ SessionStore → EnvironmentInjector → AILauncher
   - Codex (non-OpenAI): uses placeholder `OPENAI_BASE_URL` + sets `AIVO_USE_CODEX_ROUTER=1` to trigger `CodexRouter`
   - Gemini (Google): `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL` (direct)
   - Gemini (non-Google): uses placeholder `GOOGLE_GEMINI_BASE_URL` + sets `AIVO_USE_GEMINI_ROUTER=1` to trigger `GeminiRouter`
+  - Claude (OpenAI-compatible): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_OPENAI_ROUTER=1` to trigger `OpenAIRouter`
 
 - **AnthropicRouter** (`anthropic_router.rs`) - Built-in HTTP proxy for OpenRouter. Intercepts Claude Code's `/v1/messages` and `/v1/chat/completions` requests, transforms model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`), and forwards to OpenRouter. Binds to a random port.
+
+- **OpenAIRouter** (`openai_router.rs`) - Built-in HTTP proxy for OpenAI-compatible providers. Intercepts Claude Code's `/v1/messages` requests (Anthropic format), converts to OpenAI Chat Completions format, and forwards to providers like Cloudflare Workers AI, Moonshot, DeepSeek, etc. Adds model prefixes (e.g., "@cf/" for Cloudflare) and handles providers requiring `reasoning_content` fields and max token capping (e.g., DeepSeek caps at 8192 tokens). Binds to a random port.
 
 - **CopilotRouter** (`copilot_router.rs`) - Built-in HTTP proxy for GitHub Copilot. Intercepts Claude Code's `/v1/messages` requests (Anthropic Messages format), converts to OpenAI Chat Completions format, and forwards to the Copilot API. Converts responses back to Anthropic format including SSE streaming. Uses `CopilotTokenManager` from `copilot_auth.rs` for token exchange and auto-refresh. Binds to a random port.
 
 - **CopilotAuth** (`copilot_auth.rs`) - GitHub Copilot authentication. Implements OAuth device flow using the VS Code Copilot client ID (`Iv1.b507a08c87ecfe98`). Manages Copilot token lifecycle: exchanges GitHub OAuth token → short-lived Copilot token via `api.github.com/copilot_internal/v2/token`, caches with expiry-based auto-refresh.
 
-- **CodexRouter** (`codex_router.rs`) - Built-in HTTP proxy for non-OpenAI providers. Strips unsupported built-in tool types (`computer_use`, `file_search`, `web_search`, `code_interpreter`) that most third-party providers reject. Converts between Codex CLI's Responses API (`/v1/responses`) and the Chat Completions API (`/v1/chat/completions`) for providers that only support the latter. Binds to a random port.
+- **CodexRouter** (`codex_router.rs`) - Built-in HTTP proxy for non-OpenAI providers. Strips unsupported built-in tool types (`computer_use`, `file_search`, `web_search`, `code_interpreter`) that most third-party providers reject. Converts between Codex CLI's Responses API (`/v1/responses`) and the Chat Completions API (`/v1/chat/completions`) for providers that only support the latter. Handles provider-specific features like model prefixes, actual model names (for Codex CLI compatibility), reasoning content fields, and max token capping. Binds to a random port.
 
-- **GeminiRouter** (`gemini_router.rs`) - Built-in HTTP proxy for non-Google providers. Converts Gemini CLI's native API format (`/v1beta/models/{model}:generateContent`) to OpenAI Chat Completions format, then converts the response back. Handles streaming, tool calls, function responses, and generation config. Binds to a random port.
+- **GeminiRouter** (`gemini_router.rs`) - Built-in HTTP proxy for non-Google providers. Converts Gemini CLI's native API format (`/v1beta/models/{model}:generateContent`) to OpenAI Chat Completions format, then converts the response back. Handles streaming, tool calls, function responses, and generation config. Supports provider-specific features like reasoning content fields, max token capping, and tool argument repair for schema validation issues. Binds to a random port.
 
 ### Command Handlers (`src/commands/`)
 
@@ -102,10 +105,12 @@ Each command receives injected services. Commands return exit codes for testing.
   - `list` - List all keys
   - `use <id|name>` - Activate a specific key
   - `add` - Add an API key interactively (`add copilot` triggers GitHub Copilot device flow)
+  - `add --name <name> --base-url <url> --key <api_key>` - Add a key non-interactively
   - `rm <id|name>` - Remove an API key
   - `cat <id|name>` - Display full key details
 - **run** - Launch AI tools with unified interface
 - **chat** - Interactive REPL with streaming responses. Supports OpenAI-compatible, Anthropic, and GitHub Copilot providers. Automatically transforms model names for OpenRouter compatibility (e.g., `claude-sonnet-4-6` → `claude-sonnet-4.6`).
+  - `chat -x` - One-shot chat mode: reads stdin as context, sends one message and exits
 - **models** - List available models from the active provider (cached for 1 hour, with `--refresh` to bypass)
 - **update** - Self-update with download progress display, cross-platform binary download from GitHub Releases
 
@@ -122,7 +127,7 @@ Single `ApiKey` struct with fields: `id`, `name`, `base_url`, `key`, `created_at
 - Unit tests in `#[cfg(test)]` modules within source files
 - Integration tests in `tests/` directory
 - Command handlers return exit codes for verification
-- **Test Coverage:** ~200 tests covering encryption, services, router logic, and command handlers
+- **Test Coverage:** ~200 tests covering encryption, services, router logic, and command handlers. Tests migrated inline to source files; tests directory removed.
 
 ## Build & Deployment
 
@@ -159,14 +164,10 @@ aivo/
 │       ├── copilot_router.rs       # Built-in proxy for Claude + GitHub Copilot
 │       ├── codex_router.rs         # Built-in proxy for Codex + non-OpenAI providers
 │       ├── gemini_router.rs        # Built-in proxy for Gemini + non-Google providers
+│       ├── openai_router.rs        # Built-in proxy for Claude + OpenAI-compatible providers
 │       └── models_cache.rs         # 1h file-backed cache for model lists
 ├── tests/
-│   ├── encryption_test.rs
-│   ├── encryption_property.rs
-│   ├── environment_injector_test.rs
-│   ├── errors_test.rs
-│   └── integration/
-│       └── cli_workflow_test.rs
+│   ├── (tests migrated inline to source files, tests directory removed)
 ├── Cargo.toml
 ├── Cargo.lock
 ├── CLAUDE.md                        # This file
@@ -190,7 +191,7 @@ All routers follow a consistent pattern:
 
 1. **Placeholder Base URL**: EnvironmentInjector sets a placeholder URL (e.g., `http://localhost:0`) and a flag environment variable (e.g., `AIVO_USE_ROUTER=1`)
 
-2. **Router Discovery**: The appropriate router (AnthropicRouter, CopilotRouter, CodexRouter, GeminiRouter) detects the flag and starts an HTTP server on a random available port
+2. **Router Discovery**: The appropriate router (AnthropicRouter, CopilotRouter, CodexRouter, GeminiRouter, OpenAIRouter) detects the flag and starts an HTTP server on a random available port
 
 3. **URL Replacement**: The router binds to the random port, then overwrites the placeholder base URL with the actual bound URL
 
@@ -200,6 +201,7 @@ All routers follow a consistent pattern:
 
 - **AnthropicRouter**: Converts model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) for OpenRouter compatibility
 - **CopilotRouter**: Converts between Anthropic Messages format and OpenAI Chat Completions format, handles SSE streaming
+- **OpenAIRouter**: Converts between Anthropic Messages format and OpenAI Chat Completions format, adds model prefixes, handles reasoning content and max token capping for OpenAI-compatible providers
 - **CodexRouter**: Strips unsupported tool types and converts between Responses API and Chat Completions API
 - **GeminiRouter**: Converts between Gemini native API format and OpenAI Chat Completions format
 
