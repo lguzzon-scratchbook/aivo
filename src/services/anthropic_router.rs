@@ -35,6 +35,13 @@ enum RouterResponse {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnthropicRoute {
+    Messages,
+    CountTokens,
+    ChatCompletions,
+}
+
 impl AnthropicRouter {
     pub fn new(config: AnthropicRouterConfig) -> Self {
         Self { config }
@@ -43,8 +50,7 @@ impl AnthropicRouter {
     /// Binds to a random available port and starts the router in the background.
     /// Returns the actual port number so callers can set ANTHROPIC_BASE_URL.
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
+        let (listener, port) = http_utils::bind_local_listener().await?;
         let config = self.config.clone();
         let handle = tokio::spawn(async move { run_router(listener, config).await });
         Ok((port, handle))
@@ -74,12 +80,19 @@ async fn run_router(
             let path = path.split('?').next().unwrap_or("");
             let method_is_post = request.starts_with("POST ");
 
-            let result = if method_is_post && is_count_tokens_path(path) {
-                handle_count_tokens_raw(&request, &config).await
-            } else if method_is_post && is_messages_path(path) {
-                handle_messages_raw(&request, &config).await
-            } else if method_is_post && is_chat_completions_path(path) {
-                handle_chat_completions_raw(&request, &config).await
+            let result = if method_is_post {
+                match AnthropicRoute::from_request_path(path) {
+                    Some(route) => forward_request(&request, &config, route).await,
+                    None => {
+                        let not_found = http_utils::http_response(
+                            404,
+                            "application/json",
+                            "{\"error\":\"Not found\"}",
+                        );
+                        let _ = socket.write_all(not_found.as_bytes()).await;
+                        return;
+                    }
+                }
             } else {
                 let not_found =
                     http_utils::http_response(404, "application/json", "{\"error\":\"Not found\"}");
@@ -100,16 +113,27 @@ async fn run_router(
     }
 }
 
-fn is_messages_path(path: &str) -> bool {
-    matches!(path, "/v1/messages" | "/messages")
-}
+impl AnthropicRoute {
+    fn from_request_path(path: &str) -> Option<Self> {
+        match path {
+            "/v1/messages" | "/messages" => Some(Self::Messages),
+            "/v1/messages/count_tokens" | "/messages/count_tokens" => Some(Self::CountTokens),
+            "/v1/chat/completions" | "/chat/completions" => Some(Self::ChatCompletions),
+            _ => None,
+        }
+    }
 
-fn is_chat_completions_path(path: &str) -> bool {
-    matches!(path, "/v1/chat/completions" | "/chat/completions")
-}
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::CountTokens => "messages/count_tokens",
+            Self::ChatCompletions => "chat/completions",
+        }
+    }
 
-fn is_count_tokens_path(path: &str) -> bool {
-    matches!(path, "/v1/messages/count_tokens" | "/messages/count_tokens")
+    fn patch_route(self) -> &'static str {
+        self.endpoint()
+    }
 }
 
 fn build_endpoint_url(base_url: &str, endpoint: &str) -> String {
@@ -121,21 +145,9 @@ fn build_endpoint_url(base_url: &str, endpoint: &str) -> String {
     }
 }
 
-fn status_reason_phrase(status: u16) -> &'static str {
-    reqwest::StatusCode::from_u16(status)
-        .ok()
-        .and_then(|s| s.canonical_reason())
-        .unwrap_or("OK")
-}
-
 async fn classify_upstream_response(response: reqwest::Response) -> Result<RouterResponse> {
     let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
+    let content_type = http_utils::response_content_type(&response);
 
     if content_type.contains("text/event-stream") {
         Ok(RouterResponse::Streaming {
@@ -165,13 +177,7 @@ async fn write_router_response(
             content_type,
             body,
         } => {
-            let headers = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                status,
-                status_reason_phrase(status),
-                content_type,
-                body.len()
-            );
+            let headers = http_utils::http_response_head(status, &content_type, body.len());
             socket.write_all(headers.as_bytes()).await?;
             socket.write_all(&body).await?;
         }
@@ -180,12 +186,7 @@ async fn write_router_response(
             content_type,
             mut upstream,
         } => {
-            let headers = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                status,
-                status_reason_phrase(status),
-                content_type
-            );
+            let headers = http_utils::http_chunked_response_head(status, &content_type);
             socket.write_all(headers.as_bytes()).await?;
 
             while let Some(chunk) = upstream.chunk().await? {
@@ -204,9 +205,10 @@ async fn write_router_response(
     Ok(())
 }
 
-async fn handle_messages_raw(
+async fn forward_request(
     request: &str,
     config: &Arc<AnthropicRouterConfig>,
+    route: AnthropicRoute,
 ) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
 
@@ -215,77 +217,15 @@ async fn handle_messages_raw(
         upstream_base_url: &config.upstream_base_url,
     };
     let pipeline = RouterPipeline::for_openrouter();
-    pipeline.patch_json("messages", &mut body, &ctx)?;
+    pipeline.patch_json(route.patch_route(), &mut body, &ctx)?;
 
     let client = router_http_client();
-    let url = build_endpoint_url(&config.upstream_base_url, "messages");
+    let url = build_endpoint_url(&config.upstream_base_url, route.endpoint());
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let auth_value = format!("Bearer {}", config.upstream_api_key);
     headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
-    pipeline.patch_headers("messages", &mut headers, &ctx)?;
-
-    let response = client
-        .post(&url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await?;
-
-    classify_upstream_response(response).await
-}
-
-async fn handle_count_tokens_raw(
-    request: &str,
-    config: &Arc<AnthropicRouterConfig>,
-) -> Result<RouterResponse> {
-    let body_str = http_utils::extract_request_body(request)?;
-
-    let mut body: Value = serde_json::from_str(body_str)?;
-    let ctx = RequestContext {
-        upstream_base_url: &config.upstream_base_url,
-    };
-    let pipeline = RouterPipeline::for_openrouter();
-    pipeline.patch_json("messages/count_tokens", &mut body, &ctx)?;
-
-    let client = router_http_client();
-    let url = build_endpoint_url(&config.upstream_base_url, "messages/count_tokens");
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let auth_value = format!("Bearer {}", config.upstream_api_key);
-    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
-    pipeline.patch_headers("messages/count_tokens", &mut headers, &ctx)?;
-
-    let response = client
-        .post(&url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await?;
-
-    classify_upstream_response(response).await
-}
-
-async fn handle_chat_completions_raw(
-    request: &str,
-    config: &Arc<AnthropicRouterConfig>,
-) -> Result<RouterResponse> {
-    let body_str = http_utils::extract_request_body(request)?;
-
-    let mut body: Value = serde_json::from_str(body_str)?;
-    let ctx = RequestContext {
-        upstream_base_url: &config.upstream_base_url,
-    };
-    let pipeline = RouterPipeline::for_openrouter();
-    pipeline.patch_json("chat/completions", &mut body, &ctx)?;
-
-    let client = router_http_client();
-    let url = build_endpoint_url(&config.upstream_base_url, "chat/completions");
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let auth_value = format!("Bearer {}", config.upstream_api_key);
-    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
-    pipeline.patch_headers("chat/completions", &mut headers, &ctx)?;
+    pipeline.patch_headers(route.patch_route(), &mut headers, &ctx)?;
 
     let response = client
         .post(&url)
@@ -394,10 +334,36 @@ mod tests {
 
     #[test]
     fn test_endpoint_path_matching() {
-        assert!(is_messages_path("/v1/messages"));
-        assert!(is_chat_completions_path("/v1/chat/completions"));
-        assert!(is_count_tokens_path("/v1/messages/count_tokens"));
-        assert!(!is_messages_path("/v1/messages/count_tokens"));
+        assert_eq!(
+            AnthropicRoute::from_request_path("/v1/messages"),
+            Some(AnthropicRoute::Messages)
+        );
+        assert_eq!(
+            AnthropicRoute::from_request_path("/v1/chat/completions"),
+            Some(AnthropicRoute::ChatCompletions)
+        );
+        assert_eq!(
+            AnthropicRoute::from_request_path("/v1/messages/count_tokens"),
+            Some(AnthropicRoute::CountTokens)
+        );
+        assert_eq!(AnthropicRoute::from_request_path("/v1/unknown"), None);
+    }
+
+    #[test]
+    fn test_route_metadata_matches_expected_endpoints() {
+        assert_eq!(AnthropicRoute::Messages.endpoint(), "messages");
+        assert_eq!(
+            AnthropicRoute::CountTokens.endpoint(),
+            "messages/count_tokens"
+        );
+        assert_eq!(
+            AnthropicRoute::ChatCompletions.endpoint(),
+            "chat/completions"
+        );
+        assert_eq!(
+            AnthropicRoute::CountTokens.patch_route(),
+            "messages/count_tokens"
+        );
     }
 
     #[test]

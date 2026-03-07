@@ -18,9 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::services::copilot_auth::{
-    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
-};
+use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -48,6 +46,11 @@ pub struct CodexRouter {
     config: CodexRouterConfig,
 }
 
+struct CodexRouterState {
+    config: Arc<CodexRouterConfig>,
+    client: Arc<reqwest::Client>,
+}
+
 impl CodexRouter {
     pub fn new(config: CodexRouterConfig) -> Self {
         Self { config }
@@ -56,57 +59,36 @@ impl CodexRouter {
     /// Binds to a random available port and starts the router in the background.
     /// Returns the actual port number so callers can set OPENAI_BASE_URL.
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        let config = self.config.clone();
-        let client = Arc::new(http_utils::router_http_client());
-        let handle = tokio::spawn(async move { run_router(listener, config, client).await });
+        let (listener, port) = http_utils::bind_local_listener().await?;
+        let state = CodexRouterState {
+            config: Arc::new(self.config.clone()),
+            client: Arc::new(http_utils::router_http_client()),
+        };
+        let handle = tokio::spawn(async move {
+            http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
+        });
         Ok((port, handle))
     }
 }
 
-async fn run_router(
-    listener: tokio::net::TcpListener,
-    config: CodexRouterConfig,
-    client: Arc<reqwest::Client>,
-) -> Result<()> {
-    let config = Arc::new(config);
+async fn handle_router_request(request: String, state: Arc<CodexRouterState>) -> String {
+    let path = http_utils::extract_request_path(&request);
 
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let config = config.clone();
-        let client = client.clone();
+    let is_api_path = matches!(
+        path.as_str(),
+        "/responses" | "/v1/responses" | "/chat/completions" | "/v1/chat/completions"
+    );
 
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-
-            let request_bytes = match http_utils::read_full_request(&mut socket).await {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-
-            let request = String::from_utf8_lossy(&request_bytes);
-            let path = http_utils::extract_request_path(&request);
-
-            let is_api_path = matches!(
-                path.as_str(),
-                "/responses" | "/v1/responses" | "/chat/completions" | "/v1/chat/completions"
-            );
-
-            let response = if is_api_path {
-                match handle_api_request(&path, &request, &config, client.as_ref()).await {
-                    Ok(r) => r,
-                    Err(_) => http_utils::http_error_response(500, "Internal Server Error"),
-                }
-            } else {
-                match forward_request(&path, &request, &config, client.as_ref()).await {
-                    Ok(r) => r,
-                    Err(_) => http_utils::http_error_response(502, "Bad Gateway"),
-                }
-            };
-
-            let _ = socket.write_all(response.as_bytes()).await;
-        });
+    if is_api_path {
+        match handle_api_request(&path, &request, &state.config, state.client.as_ref()).await {
+            Ok(r) => r,
+            Err(_) => http_utils::http_error_response(500, "Internal Server Error"),
+        }
+    } else {
+        match forward_request(&path, &request, &state.config, state.client.as_ref()).await {
+            Ok(r) => r,
+            Err(_) => http_utils::http_error_response(502, "Bad Gateway"),
+        }
     }
 }
 
@@ -133,35 +115,6 @@ async fn handle_api_request(
 // RESPONSES API PATH: convert request → chat completions → convert response back
 // =============================================================================
 
-/// Builds an authorized POST request builder for the upstream provider.
-///
-/// - Copilot mode: exchanges the GitHub token for a short-lived Copilot token and
-///   sets the Copilot-specific headers. The target URL is taken from the token
-///   manager's endpoint (ignoring `url`).
-/// - Normal mode: sets `Authorization: Bearer <api_key>` and POSTs to `url`.
-async fn authorized_post(
-    client: &reqwest::Client,
-    url: &str,
-    config: &CodexRouterConfig,
-) -> Result<reqwest::RequestBuilder> {
-    if let Some(ref tm) = config.copilot_token_manager {
-        let (token, api_endpoint) = tm.get_token().await?;
-        let copilot_url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
-        Ok(client
-            .post(&copilot_url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .header("Editor-Version", COPILOT_EDITOR_VERSION)
-            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
-            .header("Openai-Intent", COPILOT_OPENAI_INTENT))
-    } else {
-        Ok(client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json"))
-    }
-}
-
 /// Handles Responses API requests by converting to Chat Completions format,
 /// forwarding to the provider, and converting the response back to Responses
 /// API SSE format that the Codex CLI expects.
@@ -180,11 +133,16 @@ async fn handle_responses_api_via_chat(
     let chat_body = convert_responses_to_chat_request(body, config);
     let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
 
-    let response = authorized_post(client, &target_url, config)
-        .await?
-        .json(&chat_body)
-        .send()
-        .await?;
+    let response = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+    )
+    .await?
+    .json(&chat_body)
+    .send()
+    .await?;
 
     let status_code = response.status().as_u16();
     if status_code != 200 {
@@ -230,27 +188,18 @@ async fn handle_chat_completions_with_filter(
 
     let target_url = build_target_url(&config.target_base_url, path);
 
-    let response = authorized_post(client, &target_url, config)
-        .await?
-        .json(&body)
-        .send()
-        .await?;
+    let response = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+    )
+    .await?
+    .json(&body)
+    .send()
+    .await?;
 
-    let status_code = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let response_body = response.bytes().await?;
-    let body_str = String::from_utf8_lossy(&response_body);
-
-    Ok(http_utils::http_response(
-        status_code,
-        &content_type,
-        &body_str,
-    ))
+    http_utils::buffered_reqwest_to_http_response(response).await
 }
 
 // =============================================================================
@@ -268,28 +217,20 @@ async fn forward_request(
 
     let target_url = build_target_url(&config.target_base_url, path);
 
-    let mut req = authorized_post(client, &target_url, config).await?;
+    let mut req = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+    )
+    .await?;
 
     if !body_str.is_empty() {
         req = req.body(body_str.to_string());
     }
 
     let response = req.send().await?;
-    let status_code = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let response_body = response.bytes().await?;
-    let body_str = String::from_utf8_lossy(&response_body);
-
-    Ok(http_utils::http_response(
-        status_code,
-        &content_type,
-        &body_str,
-    ))
+    http_utils::buffered_reqwest_to_http_response(response).await
 }
 
 // =============================================================================

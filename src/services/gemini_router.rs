@@ -3,9 +3,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use crate::services::copilot_auth::{
-    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
-};
+use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
 
 #[derive(Clone)]
@@ -27,44 +25,33 @@ pub struct GeminiRouter {
     config: GeminiRouterConfig,
 }
 
+struct GeminiRouterState {
+    config: Arc<GeminiRouterConfig>,
+    client: Arc<reqwest::Client>,
+}
+
 impl GeminiRouter {
     pub fn new(config: GeminiRouterConfig) -> Self {
         Self { config }
     }
 
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        let config = self.config.clone();
-        let client = Arc::new(http_utils::router_http_client());
-        let handle = tokio::spawn(async move { run_router(listener, config, client).await });
+        let (listener, port) = http_utils::bind_local_listener().await?;
+        let state = GeminiRouterState {
+            config: Arc::new(self.config.clone()),
+            client: Arc::new(http_utils::router_http_client()),
+        };
+        let handle = tokio::spawn(async move {
+            http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
+        });
         Ok((port, handle))
     }
 }
 
-async fn run_router(
-    listener: tokio::net::TcpListener,
-    config: GeminiRouterConfig,
-    client: Arc<reqwest::Client>,
-) -> Result<()> {
-    let config = std::sync::Arc::new(config);
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let config = config.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let request_bytes = match http_utils::read_full_request(&mut socket).await {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-            let request = String::from_utf8_lossy(&request_bytes);
-            let response = match handle_request(&request, &config, &client).await {
-                Ok(r) => r,
-                Err(e) => http_utils::http_error_response(500, &e.to_string()),
-            };
-            let _ = socket.write_all(response.as_bytes()).await;
-        });
+async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -> String {
+    match handle_request(&request, &state.config, &state.client).await {
+        Ok(r) => r,
+        Err(e) => http_utils::http_error_response(500, &e.to_string()),
     }
 }
 
@@ -73,13 +60,12 @@ async fn handle_request(
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
 ) -> Result<String> {
-    let path = extract_path(request);
+    let path = http_utils::extract_request_path(request);
 
     match parse_gemini_path(&path) {
         Some((extracted_model, is_streaming)) => {
             let model = config.forced_model.clone().unwrap_or(extracted_model);
-            let body_str = extract_body(request);
-            let body: Value = serde_json::from_str(body_str.trim())?;
+            let body: Value = serde_json::from_str(http_utils::extract_request_body(request)?)?;
             let tool_schemas = extract_tool_schemas(&body);
             let openai_req = convert_gemini_to_openai(
                 &body,
@@ -108,29 +94,17 @@ async fn forward_to_provider(
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
 ) -> Result<Value> {
-    let response = if let Some(ref tm) = config.copilot_token_manager {
-        let (token, api_endpoint) = tm.get_token().await?;
-        let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
-        client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .header("Editor-Version", COPILOT_EDITOR_VERSION)
-            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
-            .header("Openai-Intent", COPILOT_OPENAI_INTENT)
-            .json(&openai_req)
-            .send()
-            .await?
-    } else {
-        let target_url = build_chat_completions_url(&config.target_base_url);
-        client
-            .post(&target_url)
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&openai_req)
-            .send()
-            .await?
-    };
+    let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
+    let response = http_utils::authorized_openai_post(
+        client.as_ref(),
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+    )
+    .await?
+    .json(&openai_req)
+    .send()
+    .await?;
 
     let status = response.status().as_u16();
     let body_text = response.text().await?;
@@ -140,23 +114,6 @@ async fn forward_to_provider(
     }
 
     Ok(serde_json::from_str(&body_text)?)
-}
-
-/// Constructs /v1/chat/completions URL, avoiding /v1/v1 duplication.
-fn build_chat_completions_url(base_url: &str) -> String {
-    http_utils::build_chat_completions_url(base_url)
-}
-
-fn extract_path(request: &str) -> String {
-    http_utils::extract_request_path(request)
-}
-
-fn extract_body(request: &str) -> &str {
-    request
-        .find("\r\n\r\n")
-        .map(|i| &request[i + 4..])
-        .unwrap_or("")
-        .trim_end_matches('\0')
 }
 
 /// Parses a Gemini API request path and extracts (model_name, is_streaming).
@@ -991,7 +948,7 @@ mod tests {
     #[test]
     fn test_build_chat_completions_url_with_v1() {
         assert_eq!(
-            build_chat_completions_url("https://ai-gateway.vercel.sh/v1"),
+            http_utils::build_chat_completions_url("https://ai-gateway.vercel.sh/v1"),
             "https://ai-gateway.vercel.sh/v1/chat/completions"
         );
     }
@@ -999,7 +956,7 @@ mod tests {
     #[test]
     fn test_build_chat_completions_url_without_v1() {
         assert_eq!(
-            build_chat_completions_url("https://example.com"),
+            http_utils::build_chat_completions_url("https://example.com"),
             "https://example.com/v1/chat/completions"
         );
     }

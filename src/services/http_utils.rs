@@ -2,9 +2,15 @@
 //!
 //! Provides common functions for reading HTTP requests from raw TCP streams,
 //! parsing headers, extracting bodies, and formatting responses.
-//! Used by: anthropic_router, copilot_router, codex_router, gemini_router.
+//! Used by: anthropic_router, openai_router, copilot_router, codex_router, gemini_router.
 
 use anyhow::Result;
+use std::future::Future;
+use std::sync::Arc;
+
+use crate::services::copilot_auth::{
+    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
+};
 
 /// Reads a complete HTTP request from a TCP stream: headers + full body (using Content-Length).
 pub async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
@@ -36,6 +42,72 @@ pub async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec
     }
 
     Ok(buf)
+}
+
+/// Binds a router listener to a random localhost port and returns the listener and port.
+pub async fn bind_local_listener() -> Result<(tokio::net::TcpListener, u16)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
+}
+
+/// Builds an authorized POST request for OpenAI-compatible upstreams.
+///
+/// In Copilot mode, exchanges the GitHub token for a short-lived Copilot token
+/// and targets the Copilot chat completions endpoint. Otherwise, posts directly
+/// to `target_url` with standard bearer auth.
+pub async fn authorized_openai_post(
+    client: &reqwest::Client,
+    target_url: &str,
+    api_key: &str,
+    copilot_token_manager: Option<&CopilotTokenManager>,
+) -> Result<reqwest::RequestBuilder> {
+    if let Some(tm) = copilot_token_manager {
+        let (token, api_endpoint) = tm.get_token().await?;
+        let copilot_url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
+        Ok(client
+            .post(&copilot_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT))
+    } else {
+        Ok(client
+            .post(target_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json"))
+    }
+}
+
+/// Runs a raw TCP HTTP router whose handler returns a complete text HTTP response.
+pub async fn run_text_router<State, Handler, Fut>(
+    listener: tokio::net::TcpListener,
+    state: Arc<State>,
+    handler: Handler,
+) -> Result<()>
+where
+    State: Send + Sync + 'static,
+    Handler: Fn(String, Arc<State>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = String> + Send + 'static,
+{
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let state = state.clone();
+        let handler = handler.clone();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            let request_bytes = match read_full_request(&mut socket).await {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let request = String::from_utf8_lossy(&request_bytes).into_owned();
+            let response = handler(request, state).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+    }
 }
 
 /// Finds the end of HTTP headers (the position of the first `\r\n\r\n`).
@@ -72,6 +144,26 @@ pub fn extract_request_path(request: &str) -> String {
     }
 }
 
+/// Returns true when the request is an HTTP POST whose path matches one of `paths`.
+pub fn is_post_path(request: &str, paths: &[&str]) -> bool {
+    if !request.starts_with("POST ") {
+        return false;
+    }
+    let path = extract_request_path(request);
+    let normalized_path = path.split('?').next().unwrap_or(path.as_str());
+    paths.contains(&normalized_path)
+}
+
+/// Extracts the effective Content-Type from an upstream response.
+pub fn response_content_type(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string()
+}
+
 /// Returns the standard HTTP reason phrase for common status codes.
 fn reason_phrase(status: u16) -> &'static str {
     match status {
@@ -106,16 +198,43 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// Formats an HTTP response with the correct status line, Content-Type, and body.
-pub fn http_response(status: u16, content_type: &str, body: &str) -> String {
+/// Formats the HTTP response head (status line + headers) without the body.
+pub fn http_response_head(status: u16, content_type: &str, content_length: usize) -> String {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         reason_phrase(status),
         content_type,
-        body.len(),
+        content_length
+    )
+}
+
+/// Formats the HTTP response head for chunked transfer encoding.
+pub fn http_chunked_response_head(status: u16, content_type: &str) -> String {
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        status,
+        reason_phrase(status),
+        content_type
+    )
+}
+
+/// Formats an HTTP response with the correct status line, Content-Type, and body.
+pub fn http_response(status: u16, content_type: &str, body: &str) -> String {
+    format!(
+        "{}{}",
+        http_response_head(status, content_type, body.len()),
         body
     )
+}
+
+/// Converts a buffered upstream response into a raw HTTP response string.
+pub async fn buffered_reqwest_to_http_response(response: reqwest::Response) -> Result<String> {
+    let status = response.status().as_u16();
+    let content_type = response_content_type(&response);
+    let body = response.bytes().await?;
+    let body = String::from_utf8_lossy(&body);
+    Ok(http_response(status, &content_type, &body))
 }
 
 /// Formats a JSON error response with the correct HTTP status line.
@@ -226,6 +345,26 @@ mod tests {
     }
 
     #[test]
+    fn test_is_post_path_matches_supported_path() {
+        let req = "POST /v1/messages HTTP/1.1\r\nHost: localhost";
+        assert!(is_post_path(req, &["/v1/messages", "/messages"]));
+    }
+
+    #[test]
+    fn test_is_post_path_ignores_query_string() {
+        let req = "POST /v1/messages?beta=true HTTP/1.1\r\nHost: localhost";
+        assert!(is_post_path(req, &["/v1/messages", "/messages"]));
+    }
+
+    #[test]
+    fn test_is_post_path_rejects_wrong_method_or_path() {
+        let get_req = "GET /v1/messages HTTP/1.1\r\nHost: localhost";
+        let other_req = "POST /health HTTP/1.1\r\nHost: localhost";
+        assert!(!is_post_path(get_req, &["/v1/messages"]));
+        assert!(!is_post_path(other_req, &["/v1/messages"]));
+    }
+
+    #[test]
     fn test_reason_phrase() {
         assert_eq!(reason_phrase(200), "OK");
         assert_eq!(reason_phrase(400), "Bad Request");
@@ -239,6 +378,24 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.contains("Content-Type: application/json"));
         assert!(resp.ends_with("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn test_http_response_head_format() {
+        let head = http_response_head(200, "application/json", 11);
+        assert_eq!(
+            head,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn test_http_chunked_response_head_format() {
+        let head = http_chunked_response_head(200, "text/event-stream");
+        assert_eq!(
+            head,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[test]

@@ -8,6 +8,12 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::services::anthropic_chat_request::{
+    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request,
+};
+use crate::services::anthropic_chat_response::{
+    OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
+};
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
@@ -23,49 +29,37 @@ pub struct CopilotRouter {
     config: CopilotRouterConfig,
 }
 
+struct CopilotRouterState {
+    token_manager: Arc<CopilotTokenManager>,
+    client: reqwest::Client,
+}
+
 impl CopilotRouter {
     pub fn new(config: CopilotRouterConfig) -> Self {
         Self { config }
     }
 
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        let token_manager = CopilotTokenManager::new(self.config.github_token.clone());
-        let client = http_utils::router_http_client();
-        let handle = tokio::spawn(async move { run_router(listener, token_manager, client).await });
+        let (listener, port) = http_utils::bind_local_listener().await?;
+        let state = CopilotRouterState {
+            token_manager: Arc::new(CopilotTokenManager::new(self.config.github_token.clone())),
+            client: http_utils::router_http_client(),
+        };
+        let handle = tokio::spawn(async move {
+            http_utils::run_text_router(listener, Arc::new(state), handle_copilot_request).await
+        });
         Ok((port, handle))
     }
 }
 
-async fn run_router(
-    listener: tokio::net::TcpListener,
-    token_manager: CopilotTokenManager,
-    client: reqwest::Client,
-) -> Result<()> {
-    let token_manager = Arc::new(token_manager);
-    let client = Arc::new(client);
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let tm = token_manager.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let request_bytes = match http_utils::read_full_request(&mut socket).await {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-            let request = String::from_utf8_lossy(&request_bytes);
-            let response = if request.contains("POST /v1/messages") {
-                match handle_messages(&request, &tm, &client).await {
-                    Ok(r) => r,
-                    Err(e) => http_utils::http_error_response(500, &e.to_string()),
-                }
-            } else {
-                http_utils::http_error_response(404, "Not found")
-            };
-            let _ = socket.write_all(response.as_bytes()).await;
-        });
+async fn handle_copilot_request(request: String, state: Arc<CopilotRouterState>) -> String {
+    if http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
+        match handle_messages(&request, &state.token_manager, &state.client).await {
+            Ok(r) => r,
+            Err(e) => http_utils::http_error_response(500, &e.to_string()),
+        }
+    } else {
+        http_utils::http_error_response(404, "Not found")
     }
 }
 
@@ -138,295 +132,32 @@ fn copilot_model_name(model: &str) -> String {
 // --- Request conversion: Anthropic Messages → OpenAI Chat Completions ---
 
 fn anthropic_to_openai(body: &Value) -> Value {
-    let mut messages: Vec<Value> = Vec::new();
-
-    // System message
-    if let Some(system) = body.get("system") {
-        let system_text = match system {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        };
-        if !system_text.is_empty() {
-            messages.push(json!({"role": "system", "content": system_text}));
-        }
-    }
-
-    // Convert messages
-    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
-        for msg in msgs {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = msg.get("content");
-
-            match content {
-                Some(Value::String(text)) => {
-                    messages.push(json!({"role": role, "content": text}));
-                }
-                Some(Value::Array(blocks)) => {
-                    convert_content_blocks(blocks, role, &mut messages);
-                }
-                _ => {
-                    messages.push(json!({"role": role, "content": ""}));
-                }
-            }
-        }
-    }
-
-    let raw_model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("claude-sonnet-4-20250514");
-    let model = copilot_model_name(raw_model);
-
-    let mut req = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-
-    // max_tokens
-    if let Some(mt) = body.get("max_tokens") {
-        req["max_tokens"] = mt.clone();
-    }
-
-    // temperature
-    if let Some(t) = body.get("temperature") {
-        req["temperature"] = t.clone();
-    }
-
-    // top_p
-    if let Some(tp) = body.get("top_p") {
-        req["top_p"] = tp.clone();
-    }
-
-    // stop_sequences → stop
-    if let Some(ss) = body.get("stop_sequences") {
-        req["stop"] = ss.clone();
-    }
-
-    // tools
-    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-        let openai_tools: Vec<Value> = tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name").cloned().unwrap_or_default(),
-                        "description": tool.get("description").cloned().unwrap_or(json!("")),
-                        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({})),
-                    }
-                })
-            })
-            .collect();
-        if !openai_tools.is_empty() {
-            req["tools"] = Value::Array(openai_tools);
-        }
-    }
-
-    // tool_choice: convert Anthropic format → OpenAI format
-    if let Some(tc) = body.get("tool_choice") {
-        match tc.get("type").and_then(|t| t.as_str()) {
-            Some("auto") => {
-                req["tool_choice"] = json!("auto");
-            }
-            Some("any") => {
-                req["tool_choice"] = json!("required");
-            }
-            Some("tool") => {
-                if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
-                    req["tool_choice"] = json!({"type": "function", "function": {"name": name}});
-                }
-            }
-            _ => {}
-        }
-    }
-
-    req
-}
-
-/// Converts Anthropic content blocks to OpenAI messages.
-fn convert_content_blocks(blocks: &[Value], role: &str, messages: &mut Vec<Value>) {
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
-    let mut tool_results: Vec<(String, String)> = Vec::new();
-
-    for block in blocks {
-        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        match block_type {
-            "text" => {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    text_parts.push(text.to_string());
-                }
-            }
-            "tool_use" => {
-                let id = block
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let input = block.get("input").cloned().unwrap_or(json!({}));
-                tool_calls.push(json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": serde_json::to_string(&input).unwrap_or_default(),
-                    }
-                }));
-            }
-            "tool_result" => {
-                let tool_use_id = block
-                    .get("tool_use_id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let content = match block.get("content") {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Array(parts)) => parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    _ => String::new(),
-                };
-                tool_results.push((tool_use_id, content));
-            }
-            _ => {}
-        }
-    }
-
-    if !tool_results.is_empty() {
-        // Tool results → individual tool messages
-        for (tool_use_id, content) in tool_results {
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_use_id,
-                "content": content,
-            }));
-        }
-    } else if !tool_calls.is_empty() {
-        // Assistant message with tool calls
-        let content = if text_parts.is_empty() {
-            Value::Null
-        } else {
-            Value::String(text_parts.join("\n"))
-        };
-        let mut msg = json!({"role": role, "tool_calls": tool_calls});
-        if !content.is_null() {
-            msg["content"] = content;
-        }
-        messages.push(msg);
-    } else {
-        // Plain text message
-        messages.push(json!({"role": role, "content": text_parts.join("\n")}));
-    }
+    convert_anthropic_to_openai_request(
+        body,
+        &AnthropicToOpenAIConfig {
+            default_model: "claude-sonnet-4-20250514",
+            preserve_stream: false,
+            model_transform: Some(copilot_model_name),
+            include_reasoning_content: false,
+            require_non_empty_reasoning_content: false,
+            stringify_other_tool_result_content: false,
+            fallback_tool_arguments_json: "",
+        },
+    )
 }
 
 // --- Response conversion: OpenAI Chat Completions → Anthropic Messages ---
 
 fn openai_to_anthropic(resp: &Value, model: &str) -> Value {
-    let choices = resp
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    // Merge all choices: Copilot may split text and tool_calls across multiple choices
-    let mut content: Vec<Value> = Vec::new();
-    let mut final_finish_reason = "stop";
-
-    for choice in &choices {
-        let message = choice.get("message").cloned().unwrap_or(json!({}));
-        let finish_reason = choice
-            .get("finish_reason")
-            .and_then(|r| r.as_str())
-            .unwrap_or("stop");
-
-        // tool_calls finish_reason takes priority
-        if finish_reason == "tool_calls" {
-            final_finish_reason = "tool_calls";
-        } else if final_finish_reason != "tool_calls" {
-            final_finish_reason = finish_reason;
-        }
-
-        // Text content
-        if let Some(text) = message.get("content").and_then(|c| c.as_str())
-            && !text.is_empty()
-        {
-            content.push(json!({"type": "text", "text": text}));
-        }
-
-        // Tool calls
-        if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
-            for tc in tool_calls {
-                let id = tc
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                let args_str = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("{}");
-                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-
-                content.push(json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input,
-                }));
-            }
-        }
-    }
-
-    let stop_reason = match final_finish_reason {
-        "stop" => "end_turn",
-        "tool_calls" => "tool_use",
-        "length" => "max_tokens",
-        "content_filter" => "end_turn",
-        _ => "end_turn",
-    };
-
-    // If no content at all, add empty text block
-    if content.is_empty() {
-        content.push(json!({"type": "text", "text": ""}));
-    }
-
-    let mut result = json!({
-        "id": resp.get("id").and_then(|i| i.as_str()).unwrap_or("msg_copilot"),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": model,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
-    });
-
-    // Usage
-    if let Some(usage) = resp.get("usage") {
-        result["usage"] = json!({
-            "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or(json!(0)),
-            "output_tokens": usage.get("completion_tokens").cloned().unwrap_or(json!(0)),
-        });
-    } else {
-        result["usage"] = json!({"input_tokens": 0, "output_tokens": 0});
-    }
-
-    result
+    convert_openai_to_anthropic_message(
+        resp,
+        &OpenAIToAnthropicConfig {
+            fallback_id: "msg_copilot",
+            model,
+            include_created: false,
+            usage_value_mode: UsageValueMode::PreserveJson,
+        },
+    )
 }
 
 /// Converts an OpenAI response to Anthropic SSE event stream.
@@ -669,55 +400,19 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_to_anthropic_text() {
+    fn test_openai_to_anthropic_uses_requested_model_and_preserves_usage_shape() {
         let resp = json!({
             "id": "chatcmpl-xxx",
+            "model": "ignored-provider-model",
             "choices": [{"message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            "usage": {"prompt_tokens": "5", "completion_tokens": 3, "total_tokens": 8}
         });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
-        assert_eq!(result["type"], "message");
-        assert_eq!(result["role"], "assistant");
-        assert_eq!(result["stop_reason"], "end_turn");
-        assert_eq!(result["content"][0]["type"], "text");
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4.6");
+        assert_eq!(result["id"], "chatcmpl-xxx");
+        assert_eq!(result["model"], "claude-sonnet-4.6");
         assert_eq!(result["content"][0]["text"], "Hello!");
-        assert_eq!(result["usage"]["input_tokens"], 5);
+        assert_eq!(result["usage"]["input_tokens"], "5");
         assert_eq!(result["usage"]["output_tokens"], 3);
-    }
-
-    #[test]
-    fn test_openai_to_anthropic_tool_calls() {
-        let resp = json!({
-            "id": "chatcmpl-xxx",
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call_abc",
-                        "type": "function",
-                        "function": {"name": "get_weather", "arguments": "{\"location\":\"SF\"}"}
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-        });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
-        assert_eq!(result["stop_reason"], "tool_use");
-        assert_eq!(result["content"][0]["type"], "tool_use");
-        assert_eq!(result["content"][0]["id"], "call_abc");
-        assert_eq!(result["content"][0]["name"], "get_weather");
-        assert_eq!(result["content"][0]["input"]["location"], "SF");
-    }
-
-    #[test]
-    fn test_openai_to_anthropic_length_finish() {
-        let resp = json!({
-            "choices": [{"message": {"content": "..."}, "finish_reason": "length"}],
-        });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
-        assert_eq!(result["stop_reason"], "max_tokens");
     }
 
     #[test]
@@ -768,40 +463,6 @@ mod tests {
             http_utils::extract_request_body(req).unwrap(),
             "{\"key\":\"val\"}"
         );
-    }
-
-    #[test]
-    fn test_openai_to_anthropic_multi_choice() {
-        // Copilot splits text and tool_calls into separate choices
-        let resp = json!({
-            "id": "chatcmpl-xxx",
-            "choices": [
-                {
-                    "finish_reason": "tool_calls",
-                    "message": {"content": "Let me check:", "role": "assistant"}
-                },
-                {
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "read_file", "arguments": "{\"path\":\"test.rs\"}"}
-                        }]
-                    }
-                }
-            ],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 20}
-        });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4.6");
-        let content = result["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "Let me check:");
-        assert_eq!(content[1]["type"], "tool_use");
-        assert_eq!(content[1]["name"], "read_file");
-        assert_eq!(result["stop_reason"], "tool_use");
     }
 
     #[test]
