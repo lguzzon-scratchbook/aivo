@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::services::copilot_auth::{
@@ -16,6 +17,10 @@ pub struct GeminiRouterConfig {
     pub forced_model: Option<String>,
     /// When Some, use Copilot token auth instead of api_key
     pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
+    /// Whether the provider requires `reasoning_content` on assistant tool-call turns
+    pub requires_reasoning_content: bool,
+    /// Cap applied to `max_tokens` before forwarding to the provider
+    pub max_tokens_cap: Option<u64>,
 }
 
 pub struct GeminiRouter {
@@ -76,7 +81,12 @@ async fn handle_request(
             let body_str = extract_body(request);
             let body: Value = serde_json::from_str(body_str.trim())?;
             let tool_schemas = extract_tool_schemas(&body);
-            let openai_req = convert_gemini_to_openai(&body, &model);
+            let openai_req = convert_gemini_to_openai(
+                &body,
+                &model,
+                config.requires_reasoning_content,
+                config.max_tokens_cap,
+            );
             let openai_response = forward_to_provider(openai_req, config, client).await?;
             let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
 
@@ -182,8 +192,15 @@ pub fn parse_gemini_path(path: &str) -> Option<(String, bool)> {
 }
 
 /// Converts a Gemini generateContent request body to OpenAI chat completions format.
-pub fn convert_gemini_to_openai(body: &Value, model: &str) -> Value {
+pub fn convert_gemini_to_openai(
+    body: &Value,
+    model: &str,
+    requires_reasoning_content: bool,
+    max_tokens_cap: Option<u64>,
+) -> Value {
     let mut messages: Vec<Value> = Vec::new();
+    let mut pending_tool_calls: HashMap<String, VecDeque<String>> = HashMap::new();
+    let mut tool_call_id_counts: HashMap<String, usize> = HashMap::new();
 
     // System instruction → system message
     if let Some(system_text) = body
@@ -212,7 +229,14 @@ pub fn convert_gemini_to_openai(body: &Value, model: &str) -> Value {
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
 
-            convert_parts_to_messages(parts, openai_role, &mut messages);
+            convert_parts_to_messages(
+                parts,
+                openai_role,
+                &mut messages,
+                requires_reasoning_content,
+                &mut pending_tool_calls,
+                &mut tool_call_id_counts,
+            );
         }
     }
 
@@ -258,7 +282,14 @@ pub fn convert_gemini_to_openai(body: &Value, model: &str) -> Value {
             req["temperature"] = t.clone();
         }
         if let Some(mt) = gc.get("maxOutputTokens") {
-            req["max_tokens"] = mt.clone();
+            let val = if let Some(cap) = max_tokens_cap {
+                mt.as_u64()
+                    .map(|n| serde_json::json!(n.min(cap)))
+                    .unwrap_or(mt.clone())
+            } else {
+                mt.clone()
+            };
+            req["max_tokens"] = val;
         }
         if let Some(tp) = gc.get("topP") {
             req["top_p"] = tp.clone();
@@ -308,7 +339,13 @@ fn repair_tool_call_args(
             if let Some(tool_calls) = choice["message"]["tool_calls"].as_array_mut() {
                 for tc in tool_calls.iter_mut() {
                     let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                    if let Some(schema) = schemas.get(&name) {
+                    let schema = schemas.get(&name).or_else(|| {
+                        schemas
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                            .map(|(_, v)| v)
+                    });
+                    if let Some(schema) = schema {
                         repair_single_tool_call(tc, schema);
                     }
                 }
@@ -359,14 +396,7 @@ fn repair_single_tool_call(tc: &mut Value, schema: &Value) {
         }
 
         // 2. Default: path-like string params default to current directory
-        let prop_type = schema
-            .get("properties")
-            .and_then(|p| p.get(req))
-            .and_then(|p| p.get("type"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
-        if prop_type == "string" && (req.contains("dir") || req.ends_with("_path") || req == "path")
-        {
+        if is_path_like_param(req) && schema_param_accepts_string(schema, req) {
             args.insert(req.clone(), Value::String(".".to_string()));
         }
     }
@@ -376,19 +406,85 @@ fn repair_single_tool_call(tc: &mut Value, schema: &Value) {
     );
 }
 
+fn is_path_like_param(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "path"
+        || n == "dir"
+        || n.ends_with("_path")
+        || n.ends_with("_dir")
+        || n.contains("dir_path")
+}
+
+fn schema_param_accepts_string(schema: &Value, name: &str) -> bool {
+    let prop = schema.get("properties").and_then(|p| p.get(name));
+    let Some(prop) = prop else {
+        // If schema doesn't expose the property shape, still repair path-like params.
+        return true;
+    };
+    if prop
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|t| t.eq_ignore_ascii_case("string"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if prop
+        .get("type")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter().any(|v| {
+                v.as_str()
+                    .map(|s| s.eq_ignore_ascii_case("string"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    for key in ["anyOf", "oneOf"] {
+        if prop
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("string"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn normalize_parameters(params: &Value) -> Value {
     if let Some(obj) = params.as_object()
-        && obj.contains_key("properties")
-        && !obj.contains_key("type")
+        && obj.get("type").and_then(|v| v.as_str()) != Some("object")
     {
         let mut normalized = obj.clone();
         normalized.insert("type".to_string(), serde_json::json!("object"));
+        if !normalized.contains_key("properties") {
+            normalized.insert("properties".to_string(), serde_json::json!({}));
+        }
         return Value::Object(normalized);
     }
     params.clone()
 }
 
-fn convert_parts_to_messages(parts: &[Value], openai_role: &str, messages: &mut Vec<Value>) {
+fn convert_parts_to_messages(
+    parts: &[Value],
+    openai_role: &str,
+    messages: &mut Vec<Value>,
+    requires_reasoning_content: bool,
+    pending_tool_calls: &mut HashMap<String, VecDeque<String>>,
+    tool_call_id_counts: &mut HashMap<String, usize>,
+) {
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
@@ -398,24 +494,36 @@ fn convert_parts_to_messages(parts: &[Value], openai_role: &str, messages: &mut 
             text_parts.push(text);
         } else if let Some(fc) = part.get("functionCall") {
             let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let call_id = extract_part_call_id(fc)
+                .map(|id| uniquify_tool_call_id(id.to_string(), tool_call_id_counts))
+                .unwrap_or_else(|| synthesize_tool_call_id(name, tool_call_id_counts));
+            queue_pending_tool_call_id(pending_tool_calls, name, call_id.clone());
             let args = fc
                 .get("args")
                 .map(|a| serde_json::to_string(a).unwrap_or_default())
                 .unwrap_or_default();
             tool_calls.push(serde_json::json!({
-                "id": format!("call_{}", name),
+                "id": call_id,
                 "type": "function",
                 "function": {"name": name, "arguments": args}
             }));
         } else if let Some(fr) = part.get("functionResponse") {
             let name = fr.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let call_id = extract_part_call_id(fr)
+                .and_then(|explicit_id| {
+                    take_pending_tool_call_id(pending_tool_calls, name, explicit_id)
+                        .or_else(|| pop_pending_tool_call_id(pending_tool_calls, name))
+                        .or_else(|| Some(explicit_id.to_string()))
+                })
+                .or_else(|| pop_pending_tool_call_id(pending_tool_calls, name))
+                .unwrap_or_else(|| synthesize_tool_call_id(name, tool_call_id_counts));
             let response = fr
                 .get("response")
                 .map(|r| serde_json::to_string(r).unwrap_or_default())
                 .unwrap_or_default();
             tool_results.push(serde_json::json!({
                 "role": "tool",
-                "tool_call_id": format!("call_{}", name),
+                "tool_call_id": call_id,
                 "content": response
             }));
         }
@@ -437,12 +545,113 @@ fn convert_parts_to_messages(parts: &[Value], openai_role: &str, messages: &mut 
         if msg["content"].is_null() {
             msg.as_object_mut().unwrap().remove("content");
         }
+        if openai_role == "assistant" && requires_reasoning_content {
+            let rc = if text_parts.is_empty() {
+                " "
+            } else {
+                &text_parts.join("\n")
+            };
+            msg["reasoning_content"] = Value::String(rc.to_string());
+        }
         messages.push(msg);
     } else {
         // Plain text message
         let content = text_parts.join("\n");
         messages.push(serde_json::json!({"role": openai_role, "content": content}));
     }
+}
+
+fn extract_part_call_id(part: &Value) -> Option<&str> {
+    for key in ["id", "call_id", "callId", "tool_call_id"] {
+        if let Some(id) = part.get(key).and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn synthesize_tool_call_id(
+    tool_name: &str,
+    tool_call_id_counts: &mut HashMap<String, usize>,
+) -> String {
+    let normalized_name: String = tool_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_name = if normalized_name.is_empty() {
+        "tool"
+    } else {
+        &normalized_name
+    };
+    uniquify_tool_call_id(format!("call_{}", safe_name), tool_call_id_counts)
+}
+
+fn uniquify_tool_call_id(
+    base_id: String,
+    tool_call_id_counts: &mut HashMap<String, usize>,
+) -> String {
+    let count = tool_call_id_counts.entry(base_id.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        base_id
+    } else {
+        format!("{}_{}", base_id, *count)
+    }
+}
+
+fn queue_pending_tool_call_id(
+    pending_tool_calls: &mut HashMap<String, VecDeque<String>>,
+    tool_name: &str,
+    call_id: String,
+) {
+    pending_tool_calls
+        .entry(tool_name.to_string())
+        .or_default()
+        .push_back(call_id);
+}
+
+fn pop_pending_tool_call_id(
+    pending_tool_calls: &mut HashMap<String, VecDeque<String>>,
+    tool_name: &str,
+) -> Option<String> {
+    let result = pending_tool_calls
+        .get_mut(tool_name)
+        .and_then(|queue| queue.pop_front());
+    if pending_tool_calls
+        .get(tool_name)
+        .is_some_and(|queue| queue.is_empty())
+    {
+        pending_tool_calls.remove(tool_name);
+    }
+    result
+}
+
+fn take_pending_tool_call_id(
+    pending_tool_calls: &mut HashMap<String, VecDeque<String>>,
+    tool_name: &str,
+    explicit_id: &str,
+) -> Option<String> {
+    let result = pending_tool_calls.get_mut(tool_name).and_then(|queue| {
+        queue
+            .iter()
+            .position(|id| id == explicit_id)
+            .and_then(|index| queue.remove(index))
+    });
+    if pending_tool_calls
+        .get(tool_name)
+        .is_some_and(|queue| queue.is_empty())
+    {
+        pending_tool_calls.remove(tool_name);
+    }
+    result
 }
 
 /// Converts an OpenAI chat completions response to Gemini generateContent response format.
@@ -563,7 +772,7 @@ mod tests {
                 {"role": "user", "parts": [{"text": "How are you?"}]}
             ]
         });
-        let result = convert_gemini_to_openai(&body, "google/gemini-2.0-flash");
+        let result = convert_gemini_to_openai(&body, "google/gemini-2.0-flash", false, None);
         assert_eq!(result["model"], "google/gemini-2.0-flash");
         let messages = result["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
@@ -581,7 +790,7 @@ mod tests {
             "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
             "systemInstruction": {"parts": [{"text": "You are helpful."}]}
         });
-        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash");
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
         let messages = result["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "You are helpful.");
@@ -598,7 +807,7 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }]}]
         });
-        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash");
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
@@ -622,6 +831,23 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_parameters_fixes_null_type() {
+        // Gemini CLI sometimes sends explicit "type": null — must be fixed to "object"
+        let params = serde_json::json!({"type": null, "properties": {"path": {"type": "string"}}});
+        let result = normalize_parameters(&params);
+        assert_eq!(result["type"], "object");
+    }
+
+    #[test]
+    fn test_normalize_parameters_fixes_null_type_without_properties() {
+        // Gemini CLI sends {"type": null} with no properties — must still fix to object
+        let params = serde_json::json!({"type": null});
+        let result = normalize_parameters(&params);
+        assert_eq!(result["type"], "object");
+        assert!(result["properties"].is_object());
+    }
+
+    #[test]
     fn test_convert_gemini_to_openai_tools_without_type_gets_normalized() {
         let body = serde_json::json!({
             "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
@@ -631,7 +857,24 @@ mod tests {
                 "parameters": {"properties": {"path": {"type": "string"}}}
             }]}]
         });
-        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash");
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let params = &result["tools"][0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_tools_null_type_gets_normalized() {
+        // Gemini CLI sends {"type": null} — must be fixed to object with empty properties
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "tools": [{"functionDeclarations": [{
+                "name": "list_directory",
+                "description": "List files",
+                "parameters": {"type": null}
+            }]}]
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
         let params = &result["tools"][0]["function"]["parameters"];
         assert_eq!(params["type"], "object");
         assert!(params["properties"].is_object());
@@ -643,10 +886,20 @@ mod tests {
             "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
             "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500, "topP": 0.9}
         });
-        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash");
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
         assert_eq!(result["temperature"], 0.7);
         assert_eq!(result["max_tokens"], 500);
         assert_eq!(result["top_p"], 0.9);
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_generation_config_caps_max_output_tokens() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "generationConfig": {"maxOutputTokens": 12000}
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, Some(8192));
+        assert_eq!(result["max_tokens"], 8192);
     }
 
     #[test]
@@ -733,6 +986,8 @@ mod tests {
             api_key: String::new(),
             forced_model: Some("gpt-4o".to_string()),
             copilot_token_manager: None,
+            requires_reasoning_content: false,
+            max_tokens_cap: None,
         };
         assert_eq!(config.forced_model, Some("gpt-4o".to_string()));
         assert!(config.copilot_token_manager.is_none());
@@ -745,6 +1000,8 @@ mod tests {
             api_key: "sk-test".to_string(),
             forced_model: None,
             copilot_token_manager: None,
+            requires_reasoning_content: false,
+            max_tokens_cap: None,
         };
         assert!(config.copilot_token_manager.is_none());
         assert!(config.forced_model.is_none());
@@ -763,7 +1020,7 @@ mod tests {
                 ]}
             ]
         });
-        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash");
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
         let messages = result["messages"].as_array().unwrap();
         // user message, assistant tool_call message, tool result message
         assert_eq!(messages.len(), 3);
@@ -773,5 +1030,120 @@ mod tests {
         assert_eq!(tc["function"]["name"], "get_weather");
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call_get_weather");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_repeated_tool_name_gets_unique_ids() {
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "Run twice"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "run_shell_command", "args": {"command": "pwd"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "run_shell_command", "response": {"stdout": "/tmp"}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "run_shell_command", "args": {"command": "ls"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "run_shell_command", "response": {"stdout": "file.txt"}}}
+                ]}
+            ]
+        });
+
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(
+            messages[1]["tool_calls"][0]["id"].as_str().unwrap_or(""),
+            "call_run_shell_command"
+        );
+        assert_eq!(
+            messages[2]["tool_call_id"].as_str().unwrap_or(""),
+            "call_run_shell_command"
+        );
+        assert_eq!(
+            messages[3]["tool_calls"][0]["id"].as_str().unwrap_or(""),
+            "call_run_shell_command_2"
+        );
+        assert_eq!(
+            messages[4]["tool_call_id"].as_str().unwrap_or(""),
+            "call_run_shell_command_2"
+        );
+    }
+
+    #[test]
+    fn test_repair_single_tool_call_fills_required_dir_path_for_anyof_string() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["dir_path"],
+            "properties": {
+                "dir_path": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}]
+                }
+            }
+        });
+        let mut tc = serde_json::json!({
+            "function": {
+                "name": "ReadFolder",
+                "arguments": "{}"
+            }
+        });
+        repair_single_tool_call(&mut tc, &schema);
+        let args: Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}"))
+                .unwrap_or_else(|_| serde_json::json!({}));
+        assert_eq!(args["dir_path"], ".");
+    }
+
+    #[test]
+    fn test_repair_single_tool_call_fills_required_dir_path_when_property_schema_missing() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["dir_path"]
+        });
+        let mut tc = serde_json::json!({
+            "function": {
+                "name": "ReadFolder",
+                "arguments": "{}"
+            }
+        });
+        repair_single_tool_call(&mut tc, &schema);
+        let args: Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}"))
+                .unwrap_or_else(|_| serde_json::json!({}));
+        assert_eq!(args["dir_path"], ".");
+    }
+
+    #[test]
+    fn test_repair_tool_call_args_matches_schema_name_case_insensitively() {
+        let mut schemas = std::collections::HashMap::new();
+        schemas.insert(
+            "readfolder".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "required": ["dir_path"],
+                "properties": {"dir_path": {"type": "string"}}
+            }),
+        );
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "ReadFolder",
+                            "arguments": "{}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let repaired = repair_tool_call_args(response, &schemas);
+        let args = repaired["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap_or("{}");
+        let args: Value = serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({}));
+        assert_eq!(args["dir_path"], ".");
     }
 }

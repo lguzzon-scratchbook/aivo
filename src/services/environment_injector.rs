@@ -146,6 +146,18 @@ impl EnvironmentInjector {
                     "1".to_string(),
                 );
             }
+            // DeepSeek reasoning models require reasoning_content round-tripped;
+            // all DeepSeek models cap max_tokens at 8192
+            if key.base_url.contains("deepseek.com") {
+                env.insert(
+                    "AIVO_OPENAI_ROUTER_REQUIRE_REASONING".to_string(),
+                    "1".to_string(),
+                );
+                env.insert(
+                    "AIVO_OPENAI_ROUTER_MAX_TOKENS_CAP".to_string(),
+                    "8192".to_string(),
+                );
+            }
         }
 
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
@@ -221,6 +233,18 @@ impl EnvironmentInjector {
                 env.insert(
                     "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
                     "1".to_string(),
+                );
+            }
+            // DeepSeek reasoning models require reasoning_content round-tripped;
+            // all DeepSeek models cap max_tokens at 8192
+            if key.base_url.contains("deepseek.com") {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
+                    "1".to_string(),
+                );
+                env.insert(
+                    "AIVO_CODEX_ROUTER_MAX_TOKENS_CAP".to_string(),
+                    "8192".to_string(),
                 );
             }
         } else {
@@ -300,6 +324,18 @@ impl EnvironmentInjector {
                 "AIVO_GEMINI_ROUTER_BASE_URL".to_string(),
                 key.base_url.clone(),
             );
+            // DeepSeek reasoning models require reasoning_content round-tripped;
+            // all DeepSeek models cap max_tokens at 8192
+            if key.base_url.contains("deepseek.com") {
+                env.insert(
+                    "AIVO_GEMINI_ROUTER_REQUIRE_REASONING".to_string(),
+                    "1".to_string(),
+                );
+                env.insert(
+                    "AIVO_GEMINI_ROUTER_MAX_TOKENS_CAP".to_string(),
+                    "8192".to_string(),
+                );
+            }
         }
 
         if let Some(model) = model {

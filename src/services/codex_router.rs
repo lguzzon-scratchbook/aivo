@@ -32,10 +32,16 @@ pub struct CodexRouterConfig {
     pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
     /// Optional model prefix to add (e.g., "@cf/" for Cloudflare)
     pub model_prefix: Option<String>,
-    /// Whether the provider requires `reasoning_content` on assistant tool-call turns (e.g., Moonshot)
+    /// Whether the provider requires a non-empty `reasoning_content` sentinel on assistant
+    /// tool-call turns even when the provider returned no reasoning text (e.g., Moonshot).
+    /// Auto-detection handles the normal case: if the provider returns `reasoning_content`
+    /// in a response it is always round-tripped, regardless of this flag.
     pub requires_reasoning_content: bool,
     /// The actual model name to use with the provider (e.g., "kimi-k2.5" while Codex CLI sees "gpt-4o")
     pub actual_model: Option<String>,
+    /// Cap applied to `max_tokens` / `max_output_tokens` before forwarding to the provider.
+    /// Use for providers with hard limits (e.g., DeepSeek: 8192).
+    pub max_tokens_cap: Option<u64>,
 }
 
 pub struct CodexRouter {
@@ -209,6 +215,11 @@ async fn handle_chat_completions_with_filter(
 ) -> Result<String> {
     let mut body = body.clone();
     filter_tools(&mut body);
+    apply_max_tokens_cap_to_fields(
+        &mut body,
+        config.max_tokens_cap,
+        &["max_tokens", "max_output_tokens"],
+    );
     if config.copilot_token_manager.is_none() {
         transform_model(
             &mut body,
@@ -398,6 +409,22 @@ pub fn is_responses_api_format(body: &Value) -> bool {
     body.get("input").and_then(|v| v.as_array()).is_some() && body.get("messages").is_none()
 }
 
+fn cap_token_value(v: &Value, cap: Option<u64>) -> Value {
+    if let Some(limit) = cap {
+        v.as_u64().map(|n| json!(n.min(limit))).unwrap_or(v.clone())
+    } else {
+        v.clone()
+    }
+}
+
+fn apply_max_tokens_cap_to_fields(body: &mut Value, cap: Option<u64>, fields: &[&str]) {
+    for field in fields {
+        if let Some(v) = body.get(*field).cloned() {
+            body[*field] = cap_token_value(&v, cap);
+        }
+    }
+}
+
 /// Converts an OpenAI Responses API request body to Chat Completions format.
 ///
 /// Handles all input item types:
@@ -531,7 +558,7 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
         .get("max_output_tokens")
         .or_else(|| body.get("max_tokens"))
     {
-        chat["max_tokens"] = v.clone();
+        chat["max_tokens"] = cap_token_value(v, config.max_tokens_cap);
     }
     for field in ["temperature", "top_p"] {
         if let Some(v) = body.get(field) {
@@ -703,11 +730,14 @@ pub fn convert_chat_response_to_responses_sse(
 
     let (content, tool_calls, reasoning_content) = extract_chat_response_payload(chat);
 
-    // Prepare reasoning_content for function_call items if provider requires it
-    let reasoning_for_tool = if requires_reasoning_content {
-        if !reasoning_content.is_empty() {
-            reasoning_content.clone()
-        } else if !content.is_empty() {
+    // Pass reasoning_content through to function_call output items so subsequent requests
+    // can round-trip it back. Auto-detected from provider response; no config flag needed.
+    // For providers that require a non-empty value even when none was returned (requires_reasoning_content),
+    // fall back to content or a single-space sentinel.
+    let reasoning_for_tool = if !reasoning_content.is_empty() {
+        reasoning_content.clone()
+    } else if requires_reasoning_content {
+        if !content.is_empty() {
             content.clone()
         } else {
             " ".to_string() // single-space sentinel satisfies non-empty requirement
@@ -755,13 +785,13 @@ pub fn convert_chat_response_to_responses_sse(
                 }),
             ));
 
-            // Build done_item with reasoning_content if required
+            // Build done_item with reasoning_content if the provider returned any
             let mut done_item = json!({
                 "id": item_id, "call_id": call_id,
                 "type": "function_call", "status": "completed",
                 "name": tc_name, "arguments": tc_args
             });
-            if requires_reasoning_content {
+            if !reasoning_for_tool.is_empty() {
                 done_item["reasoning_content"] = json!(reasoning_for_tool.clone());
             }
             sse.push_str(&sse_event(
@@ -777,7 +807,7 @@ pub fn convert_chat_response_to_responses_sse(
                 "type": "function_call", "status": "completed",
                 "name": tc_name, "arguments": tc_args
             });
-            if requires_reasoning_content {
+            if !reasoning_for_tool.is_empty() {
                 output_item["reasoning_content"] = json!(reasoning_for_tool.clone());
             }
             output_items.push(output_item);
@@ -1241,6 +1271,7 @@ mod tests {
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
+                max_tokens_cap: None,
             },
         );
 
@@ -1268,6 +1299,7 @@ mod tests {
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
+                max_tokens_cap: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1298,6 +1330,7 @@ mod tests {
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
+                max_tokens_cap: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1330,6 +1363,7 @@ mod tests {
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
+                max_tokens_cap: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1357,6 +1391,7 @@ mod tests {
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
+                max_tokens_cap: None,
             },
         );
         let tools = chat["tools"].as_array().unwrap();
@@ -1376,9 +1411,43 @@ mod tests {
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
+                max_tokens_cap: None,
             },
         );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
+    }
+
+    #[test]
+    fn test_convert_request_caps_max_output_tokens() {
+        let body = json!({
+            "model": "gpt-4o",
+            "input": [],
+            "max_output_tokens": 12000
+        });
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                copilot_token_manager: None,
+                model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
+                max_tokens_cap: Some(8192),
+            },
+        );
+        assert_eq!(chat["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_apply_max_tokens_cap_to_fields_caps_chat_completions_fields() {
+        let mut body = json!({
+            "max_tokens": 10000,
+            "max_output_tokens": 9000
+        });
+        apply_max_tokens_cap_to_fields(&mut body, Some(8192), &["max_tokens", "max_output_tokens"]);
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["max_output_tokens"], 8192);
     }
 
     // ── convert_chat_response_to_responses_sse ─────────────────────────────────
@@ -1590,6 +1659,7 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             actual_model: None,
+            max_tokens_cap: None,
         };
         assert!(config.copilot_token_manager.is_none());
     }
@@ -1606,6 +1676,7 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             actual_model: None,
+            max_tokens_cap: None,
         };
         // Non-copilot with non-openrouter URL: no transform
         let chat = convert_responses_to_chat_request(&body, &config);

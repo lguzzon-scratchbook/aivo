@@ -454,11 +454,15 @@ async fn start_openai_router(env: &HashMap<String, String>) -> Result<u16> {
         .get("AIVO_OPENAI_ROUTER_REQUIRE_REASONING")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let max_tokens_cap = env
+        .get("AIVO_OPENAI_ROUTER_MAX_TOKENS_CAP")
+        .and_then(|v| v.parse::<u64>().ok());
     let config = OpenAIRouterConfig {
         target_base_url: base_url,
         target_api_key: api_key,
         model_prefix,
         requires_reasoning_content,
+        max_tokens_cap,
     };
 
     let router = OpenAIRouter::new(config);
@@ -491,6 +495,9 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
         .map(|v| v == "1")
         .unwrap_or(false);
     let actual_model = env.get("AIVO_CODEX_ROUTER_ACTUAL_MODEL").cloned();
+    let max_tokens_cap = env
+        .get("AIVO_CODEX_ROUTER_MAX_TOKENS_CAP")
+        .and_then(|v| v.parse::<u64>().ok());
 
     let router = CodexRouter::new(CodexRouterConfig {
         target_base_url: base_url,
@@ -499,6 +506,7 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
         model_prefix,
         requires_reasoning_content,
         actual_model,
+        max_tokens_cap,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -523,11 +531,20 @@ async fn start_gemini_router(env: &HashMap<String, String>) -> Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_GEMINI_ROUTER_BASE_URL"))?
         .clone();
 
+    let requires_reasoning_content = env
+        .get("AIVO_GEMINI_ROUTER_REQUIRE_REASONING")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let max_tokens_cap = env
+        .get("AIVO_GEMINI_ROUTER_MAX_TOKENS_CAP")
+        .and_then(|v| v.parse::<u64>().ok());
     let router = GeminiRouter::new(GeminiRouterConfig {
         target_base_url: base_url,
         api_key,
         forced_model: None,
         copilot_token_manager: None,
+        requires_reasoning_content,
+        max_tokens_cap,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -564,6 +581,8 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         api_key: String::new(),
         forced_model,
         copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
+        requires_reasoning_content: false,
+        max_tokens_cap: None,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -611,6 +630,7 @@ async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16
         model_prefix: None,
         requires_reasoning_content: false,
         actual_model: None,
+        max_tokens_cap: None,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {

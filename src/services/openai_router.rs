@@ -25,6 +25,9 @@ pub struct OpenAIRouterConfig {
     pub model_prefix: Option<String>,
     /// Whether the provider requires `reasoning_content` on assistant tool-call turns (e.g., Moonshot)
     pub requires_reasoning_content: bool,
+    /// Cap applied to `max_tokens` before forwarding to the provider.
+    /// Use for providers with hard limits (e.g., DeepSeek: 8192).
+    pub max_tokens_cap: Option<u64>,
 }
 
 pub struct OpenAIRouter {
@@ -99,6 +102,7 @@ async fn handle_anthropic_to_openai(
 
     let body: Value = serde_json::from_str(body_str)?;
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content);
+    cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
 
     // Transform model name: add prefix if configured (e.g., "@cf/" for Cloudflare)
     if let Some(model) = simplified.get_mut("model")
@@ -266,6 +270,17 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value 
     }
 
     req
+}
+
+fn cap_max_tokens_field(body: &mut Value, cap: Option<u64>) {
+    let Some(limit) = cap else {
+        return;
+    };
+    if let Some(mt) = body.get("max_tokens").and_then(|v| v.as_u64())
+        && mt > limit
+    {
+        body["max_tokens"] = json!(limit);
+    }
 }
 
 fn convert_content_blocks(
@@ -996,6 +1011,20 @@ mod tests {
             req["tool_choice"],
             json!({"type": "function", "function": {"name": "read_file"}})
         );
+    }
+
+    #[test]
+    fn test_cap_max_tokens_field_caps_numeric_value() {
+        let mut req = json!({"model": "gpt-4o", "max_tokens": 12000});
+        cap_max_tokens_field(&mut req, Some(8192));
+        assert_eq!(req["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_cap_max_tokens_field_ignores_non_numeric_value() {
+        let mut req = json!({"model": "gpt-4o", "max_tokens": "12000"});
+        cap_max_tokens_field(&mut req, Some(8192));
+        assert_eq!(req["max_tokens"], "12000");
     }
 
     #[test]
