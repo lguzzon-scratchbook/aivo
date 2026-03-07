@@ -89,9 +89,7 @@ async fn main() {
     let exit_code = match command {
         Commands::Keys(keys_args) => {
             let command = KeysCommand::new(session_store);
-            let action = keys_args.action.as_deref();
-            let args: Vec<_> = keys_args.args.iter().map(|s| s.as_str()).collect();
-            command.execute(action, Some(&args)).await
+            command.execute(keys_args).await
         }
 
         Commands::Chat(chat_args) => {

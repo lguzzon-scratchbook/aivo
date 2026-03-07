@@ -3,6 +3,7 @@
  */
 use anyhow::Result;
 
+use crate::cli::KeysArgs;
 use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
@@ -35,6 +36,13 @@ pub struct KeysCommand {
     session_store: SessionStore,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct AddKeyOptions<'a> {
+    name: Option<&'a str>,
+    base_url: Option<&'a str>,
+    key: Option<&'a str>,
+}
+
 impl KeysCommand {
     /// Creates a new KeysCommand instance
     pub fn new(session_store: SessionStore) -> Self {
@@ -42,8 +50,19 @@ impl KeysCommand {
     }
 
     /// Executes the keys command with the specified action
-    pub async fn execute(&self, action: Option<&str>, args: Option<&[&str]>) -> ExitCode {
-        match self.execute_internal(action, args).await {
+    pub async fn execute(&self, keys_args: KeysArgs) -> ExitCode {
+        let action = keys_args.action.as_deref();
+        let args: Vec<_> = keys_args.args.iter().map(|s| s.as_str()).collect();
+        let add_options = AddKeyOptions {
+            name: keys_args.name.as_deref(),
+            base_url: keys_args.base_url.as_deref(),
+            key: keys_args.key.as_deref(),
+        };
+
+        match self
+            .execute_internal(action, Some(&args), add_options)
+            .await
+        {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -56,11 +75,15 @@ impl KeysCommand {
         &self,
         action: Option<&str>,
         args: Option<&[&str]>,
+        add_options: AddKeyOptions<'_>,
     ) -> Result<ExitCode> {
         let action = action.unwrap_or("list");
 
         match action {
-            "add" => self.add_key(args.and_then(|a| a.first().copied())).await,
+            "add" => {
+                self.add_key(args.and_then(|a| a.first().copied()), add_options)
+                    .await
+            }
             "list" => self.list_keys().await,
             "rm" => self.remove_key(args.and_then(|a| a.first().copied())).await,
             "use" => self.use_key(args.and_then(|a| a.first().copied())).await,
@@ -369,7 +392,11 @@ impl KeysCommand {
     }
 
     /// Interactively adds an API key
-    async fn add_key(&self, provided_name: Option<&str>) -> Result<ExitCode> {
+    async fn add_key(
+        &self,
+        provided_name: Option<&str>,
+        add_options: AddKeyOptions<'_>,
+    ) -> Result<ExitCode> {
         use std::io::{self, Write};
 
         fn read_line(prompt: &str) -> io::Result<String> {
@@ -380,11 +407,15 @@ impl KeysCommand {
             Ok(input.trim().to_string())
         }
 
-        let name = if let Some(n) = provided_name {
-            if n.is_empty() {
-                eprintln!("{} Name cannot be empty", style::red("Error:"));
-                return Ok(ExitCode::UserError);
-            }
+        if provided_name.is_some() && add_options.name.is_some() {
+            eprintln!(
+                "{} Specify the key name either positionally or with --name",
+                style::red("Error:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
+        let name = if let Some(n) = add_options.name.or(provided_name) {
             n.to_string()
         } else {
             let input = read_line("Name (e.g., my-openai-proxy): ")?;
@@ -395,27 +426,52 @@ impl KeysCommand {
             input
         };
 
-        // Shortcut: `aivo keys add copilot` skips all prompts
+        // Shortcut: `aivo keys add copilot` skips all prompts unless flags conflict.
         let base_url = if name == "copilot" {
-            "copilot".to_string()
-        } else {
-            loop {
-                let input = read_line("Base URL (e.g., http://localhost:8080 or 'copilot'): ")?;
-                if input == "copilot" {
-                    break input;
+            match add_options.base_url {
+                Some("copilot") | None => "copilot".to_string(),
+                Some(_) => {
+                    eprintln!(
+                        "{} Name 'copilot' is reserved for GitHub Copilot. Use a different name or omit --base-url.",
+                        style::red("Error:")
+                    );
+                    return Ok(ExitCode::UserError);
                 }
-                if input.starts_with("http://") || input.starts_with("https://") {
-                    break input;
+            }
+        } else {
+            let mut provided_base_url = add_options.base_url.map(str::to_string);
+            loop {
+                let value = if let Some(value) = provided_base_url.take() {
+                    value
+                } else {
+                    read_line("Base URL (e.g., http://localhost:8080 or 'copilot'): ")?
+                };
+                if value == "copilot"
+                    || value.starts_with("http://")
+                    || value.starts_with("https://")
+                {
+                    break value;
                 }
                 eprintln!(
                     "{} URL must start with http:// or https:// (or enter 'copilot' for GitHub Copilot)",
                     style::red("Error:")
                 );
+                if add_options.base_url.is_some() {
+                    return Ok(ExitCode::UserError);
+                }
             }
         };
 
         // GitHub Copilot: use device flow instead of manual key entry
         if base_url == "copilot" {
+            if add_options.key.is_some() {
+                eprintln!(
+                    "{} Do not pass --key for GitHub Copilot. Use 'aivo keys add copilot' to start device login.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+
             // Check for an existing Copilot key and prompt to replace
             let existing_keys = self.session_store.get_keys().await?;
             let existing_copilot_id =
@@ -467,7 +523,11 @@ impl KeysCommand {
             return Ok(ExitCode::Success);
         }
 
-        let key = read_line("API Key: ")?;
+        let key = if let Some(key) = add_options.key {
+            key.to_string()
+        } else {
+            read_line("API Key: ")?
+        };
         if key.is_empty() {
             eprintln!("{} API Key cannot be empty", style::red("Error:"));
             return Ok(ExitCode::UserError);
@@ -614,6 +674,24 @@ impl KeysCommand {
         println!("  rm <id|name>    {}", style::dim("- Remove an API key"));
         println!("  add [name]      {}", style::dim("- Add an API key"));
         println!("  edit <id|name>  {}", style::dim("- Edit an API key"));
+        println!();
+        println!("{}", style::bold("Add Flags:"));
+        println!("  --name <name>         {}", style::dim("- Set key name"));
+        println!(
+            "  --base-url <url>     {}",
+            style::dim("- Set provider base URL")
+        );
+        println!(
+            "  --key <api-key>       {}",
+            style::dim("- Set provider API key")
+        );
+        println!();
+        println!(
+            "  {}",
+            style::dim(
+                "Example: aivo keys add --name openrouter --base-url https://openrouter.ai/api/v1 --key sk-or-v1-..."
+            )
+        );
     }
 }
 
@@ -661,6 +739,17 @@ pub(crate) async fn prompt_select_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::KeysArgs;
+
+    fn keys_args(action: Option<&str>, args: &[&str]) -> KeysArgs {
+        KeysArgs {
+            action: action.map(str::to_string),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            name: None,
+            base_url: None,
+            key: None,
+        }
+    }
 
     #[test]
     fn test_keys_command_creation() {
@@ -674,7 +763,7 @@ mod tests {
         let config_path = temp_dir.path().join("config.json");
         let store = crate::services::session_store::SessionStore::with_path(config_path);
         let cmd = KeysCommand::new(store);
-        let code = cmd.execute(Some("edit"), Some(&[])).await;
+        let code = cmd.execute(keys_args(Some("edit"), &[])).await;
         assert_eq!(code, crate::errors::ExitCode::UserError);
     }
 
@@ -684,7 +773,7 @@ mod tests {
         let config_path = temp_dir.path().join("config.json");
         let store = crate::services::session_store::SessionStore::with_path(config_path);
         let cmd = KeysCommand::new(store);
-        let code = cmd.execute(Some("edit"), Some(&["nonexistent"])).await;
+        let code = cmd.execute(keys_args(Some("edit"), &["nonexistent"])).await;
         assert_eq!(code, crate::errors::ExitCode::UserError);
     }
 
@@ -695,7 +784,56 @@ mod tests {
         let store = crate::services::session_store::SessionStore::with_path(config_path);
         let cmd = KeysCommand::new(store);
         // No keys stored — should succeed (prints "No API keys found.")
-        let code = cmd.execute(Some("use"), Some(&[])).await;
+        let code = cmd.execute(keys_args(Some("use"), &[])).await;
         assert_eq!(code, crate::errors::ExitCode::Success);
+    }
+
+    #[tokio::test]
+    async fn test_add_key_with_flags() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store.clone());
+
+        let code = cmd
+            .execute(KeysArgs {
+                action: Some("add".to_string()),
+                args: Vec::new(),
+                name: Some("openrouter".to_string()),
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                key: Some("sk-or-v1-test".to_string()),
+            })
+            .await;
+
+        assert_eq!(code, crate::errors::ExitCode::Success);
+
+        let keys = store.get_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "openrouter");
+        assert_eq!(keys[0].base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(keys[0].key.as_str(), "sk-or-v1-test");
+
+        let active = store.get_active_key().await.unwrap().unwrap();
+        assert_eq!(active.id, keys[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_add_key_rejects_conflicting_name_sources() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+
+        let code = cmd
+            .execute(KeysArgs {
+                action: Some("add".to_string()),
+                args: vec!["positional-name".to_string()],
+                name: Some("flag-name".to_string()),
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                key: Some("sk-or-v1-test".to_string()),
+            })
+            .await;
+
+        assert_eq!(code, crate::errors::ExitCode::UserError);
     }
 }

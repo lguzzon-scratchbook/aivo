@@ -65,6 +65,18 @@ pub struct KeysArgs {
     /// Additional arguments for the action (e.g., key ID or name)
     #[arg(value_name = "ARGS", help = "Additional arguments for the action")]
     pub args: Vec<String>,
+
+    /// API key display name for `keys add`
+    #[arg(long, value_name = "NAME", value_parser = non_empty())]
+    pub name: Option<String>,
+
+    /// Provider base URL for `keys add`
+    #[arg(long = "base-url", value_name = "URL", value_parser = non_empty())]
+    pub base_url: Option<String>,
+
+    /// Provider API key for `keys add`
+    #[arg(long, value_name = "API_KEY", value_parser = non_empty())]
+    pub key: Option<String>,
 }
 
 /// Arguments for the run command
@@ -455,6 +467,35 @@ mod tests {
         let cli = Cli::try_parse_from(&args).unwrap();
         if let Some(Commands::Keys(keys_args)) = cli.command {
             assert_eq!(keys_args.action.as_deref(), Some("use"));
+            assert!(keys_args.args.is_empty());
+        } else {
+            panic!("Expected Keys command");
+        }
+    }
+
+    #[test]
+    fn test_keys_add_flags() {
+        let cli = Cli::try_parse_from([
+            "aivo",
+            "keys",
+            "add",
+            "--name",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-or-v1-test",
+        ])
+        .unwrap();
+
+        if let Some(Commands::Keys(keys_args)) = cli.command {
+            assert_eq!(keys_args.action.as_deref(), Some("add"));
+            assert_eq!(keys_args.name.as_deref(), Some("openrouter"));
+            assert_eq!(
+                keys_args.base_url.as_deref(),
+                Some("https://openrouter.ai/api/v1")
+            );
+            assert_eq!(keys_args.key.as_deref(), Some("sk-or-v1-test"));
             assert!(keys_args.args.is_empty());
         } else {
             panic!("Expected Keys command");

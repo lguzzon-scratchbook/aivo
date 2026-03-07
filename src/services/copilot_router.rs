@@ -159,7 +159,8 @@ fn explain_copilot_error(resp_body: &str) -> String {
     }
 
     if nested_code == Some("unsupported_api_for_model") {
-        let detail = nested_message.unwrap_or("the selected model is not available on Copilot chat/completions");
+        let detail = nested_message
+            .unwrap_or("the selected model is not available on Copilot chat/completions");
         return format!(
             "GitHub Copilot rejected the selected model because it is not available on the chat completions API ({detail}). This usually means a Codex/responses-only model such as `gpt-5.1-codex-mini` was selected. Switch to a chat-capable model with `/model`, or relaunch `aivo claude --model claude-sonnet-4`."
         );

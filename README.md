@@ -20,7 +20,7 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 
 ```bash
 # 1) Add a provider key (OpenRouter, Vercel AI Gateway, etc.)
-aivo keys add
+aivo keys add --name openrouter --base-url https://openrouter.ai/api/v1 --key sk-or-v1-...
 
 # 2) Launch your tool
 aivo claude
@@ -112,6 +112,7 @@ Use the provider base URL when adding a key; trailing `/v1` is handled automatic
 ```bash
 aivo keys            # list all keys
 aivo keys add        # add a new key (interactive)
+aivo keys add --name openrouter --base-url https://openrouter.ai/api/v1 --key sk-or-v1-...
 aivo keys use [id]   # switch active key
 aivo keys cat <id>   # show key details
 aivo keys rm <id>    # remove a key
