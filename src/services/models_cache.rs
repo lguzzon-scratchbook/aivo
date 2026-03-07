@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_TTL_SECS: u64 = 86400; // 24 hours
+const CACHE_TTL_SECS: u64 = 3600; // 1 hour
 
 #[derive(Serialize, Deserialize, Clone)]
 struct CacheEntry {

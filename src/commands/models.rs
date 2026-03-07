@@ -209,6 +209,12 @@ pub(crate) fn is_text_chat_model(id: &str) -> bool {
     true
 }
 
+/// Copilot's Claude/OpenAI chat routing uses the chat completions API.
+/// Exclude clearly responses-only Codex models that the endpoint rejects.
+fn is_copilot_chat_model(id: &str) -> bool {
+    is_text_chat_model(id) && !id.to_lowercase().contains("codex")
+}
+
 fn cloudflare_model_name(model: CloudflareModel) -> String {
     model
         .name
@@ -243,7 +249,7 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             .data
             .into_iter()
             .map(|m| m.id)
-            .filter(|id| is_text_chat_model(id))
+            .filter(|id| is_copilot_chat_model(id))
             .collect())
     } else if key.base_url.contains("generativelanguage.googleapis.com") {
         let url = format!("{}/v1beta/models?key={}", base, key.key.as_str());
@@ -453,6 +459,15 @@ mod tests {
         assert!(!is_text_chat_model("whisper-1"));
         assert!(!is_text_chat_model("gpt-image-1"));
         assert!(!is_text_chat_model("google/gemini-3.1-flash-image-preview"));
+    }
+
+    #[test]
+    fn test_is_copilot_chat_model_filters_codex_models() {
+        assert!(is_copilot_chat_model("gpt-4o"));
+        assert!(is_copilot_chat_model("claude-sonnet-4"));
+        assert!(!is_copilot_chat_model("gpt-5.1-codex-mini"));
+        assert!(!is_copilot_chat_model("gpt-5.3-codex"));
+        assert!(!is_copilot_chat_model("openai/gpt-5.1-codex-mini"));
     }
 
     #[test]

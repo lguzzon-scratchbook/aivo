@@ -65,7 +65,7 @@ aivo chat --model openai/gpt-4o
 aivo chat -x "hello"
 git diff --cached | aivo chat -x "Summarize these changes in one sentence"
 
-aivo models                      # cached for 24h
+aivo models                      # cached for 1h
 aivo models --refresh            # force-refresh
 ```
 

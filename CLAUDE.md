@@ -106,7 +106,7 @@ Each command receives injected services. Commands return exit codes for testing.
   - `cat <id|name>` - Display full key details
 - **run** - Launch AI tools with unified interface
 - **chat** - Interactive REPL with streaming responses. Supports OpenAI-compatible, Anthropic, and GitHub Copilot providers. Automatically transforms model names for OpenRouter compatibility (e.g., `claude-sonnet-4-6` → `claude-sonnet-4.6`).
-- **models** - List available models from the active provider (cached, with `--refresh` to bypass)
+- **models** - List available models from the active provider (cached for 1 hour, with `--refresh` to bypass)
 - **update** - Self-update with download progress display, cross-platform binary download from GitHub Releases
 
 ### Error Handling (`src/errors.rs`)
@@ -159,7 +159,7 @@ aivo/
 │       ├── copilot_router.rs       # Built-in proxy for Claude + GitHub Copilot
 │       ├── codex_router.rs         # Built-in proxy for Codex + non-OpenAI providers
 │       ├── gemini_router.rs        # Built-in proxy for Gemini + non-Google providers
-│       └── models_cache.rs         # 24h file-backed cache for model lists
+│       └── models_cache.rs         # 1h file-backed cache for model lists
 ├── tests/
 │   ├── encryption_test.rs
 │   ├── encryption_property.rs

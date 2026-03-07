@@ -105,7 +105,8 @@ async fn handle_messages(
     let resp_body = resp.text().await?;
 
     if status != 200 {
-        return Ok(http_utils::http_error_response(status, &resp_body));
+        let message = explain_copilot_error(&resp_body);
+        return Ok(http_utils::http_error_response(status, &message));
     }
 
     let openai_resp: Value = serde_json::from_str(&resp_body)?;
@@ -127,6 +128,47 @@ async fn handle_messages(
 /// Re-export for tests and internal use.
 fn copilot_model_name(model: &str) -> String {
     model_names::copilot_model_name(model)
+}
+
+fn explain_copilot_error(resp_body: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(resp_body).ok();
+    let outer_message = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let nested = outer_message.and_then(|message| serde_json::from_str::<Value>(message).ok());
+    let nested_error = nested.as_ref().and_then(|v| v.get("error"));
+    let nested_code = nested_error
+        .and_then(|v| v.get("code"))
+        .and_then(|v| v.as_str());
+    let nested_message = nested_error
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if nested_code == Some("model_max_prompt_tokens_exceeded") {
+        let detail = nested_message.unwrap_or("prompt token count exceeds the model limit");
+        return format!(
+            "GitHub Copilot rejected the Claude Code request because the prompt is too large for the selected model ({detail}). Claude Code includes a large built-in system and tool prompt, so this can fail even on a short message like \"hi\". Use a provider/model with a larger context window, or use `aivo chat`/`aivo codex` instead of Claude Code for Copilot-backed sessions."
+        );
+    }
+
+    if nested_code == Some("unsupported_api_for_model") {
+        let detail = nested_message.unwrap_or("the selected model is not available on Copilot chat/completions");
+        return format!(
+            "GitHub Copilot rejected the selected model because it is not available on the chat completions API ({detail}). This usually means a Codex/responses-only model such as `gpt-5.1-codex-mini` was selected. Switch to a chat-capable model with `/model`, or relaunch `aivo claude --model claude-sonnet-4`."
+        );
+    }
+
+    nested_message
+        .or(outer_message)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| resp_body.trim().to_string())
 }
 
 // --- Request conversion: Anthropic Messages → OpenAI Chat Completions ---
@@ -506,6 +548,49 @@ mod tests {
         let resp = http_utils::http_error_response(500, "test error");
         assert!(resp.contains("500"));
         assert!(resp.contains("test error"));
+    }
+
+    #[test]
+    fn test_explain_copilot_error_for_prompt_limit() {
+        let body = json!({
+            "error": {
+                "message": "{\"error\":{\"message\":\"prompt token count of 13524 exceeds the limit of 12288\",\"code\":\"model_max_prompt_tokens_exceeded\"}}\n"
+            }
+        })
+        .to_string();
+
+        let message = explain_copilot_error(&body);
+        assert!(message.contains("GitHub Copilot rejected the Claude Code request"));
+        assert!(message.contains("13524"));
+        assert!(message.contains("12288"));
+        assert!(message.contains("aivo chat"));
+    }
+
+    #[test]
+    fn test_explain_copilot_error_unwraps_nested_message() {
+        let body = json!({
+            "error": {
+                "message": "{\"error\":{\"message\":\"plain nested error\",\"code\":\"other_code\"}}\n"
+            }
+        })
+        .to_string();
+
+        assert_eq!(explain_copilot_error(&body), "plain nested error");
+    }
+
+    #[test]
+    fn test_explain_copilot_error_for_unsupported_api_model() {
+        let body = json!({
+            "error": {
+                "message": "{\"error\":{\"message\":\"model \\\"gpt-5.1-codex-mini\\\" is not accessible via the /chat/completions endpoint\",\"code\":\"unsupported_api_for_model\"}}\n"
+            }
+        })
+        .to_string();
+
+        let message = explain_copilot_error(&body);
+        assert!(message.contains("not available on the chat completions API"));
+        assert!(message.contains("gpt-5.1-codex-mini"));
+        assert!(message.contains("/model"));
     }
 
     #[test]
