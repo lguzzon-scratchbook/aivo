@@ -182,4 +182,55 @@ mod tests {
         );
         assert_eq!(err.exit_code(), ExitCode::AuthError);
     }
+
+    // Additional tests from tests/errors_test.rs
+    #[test]
+    fn test_cli_error_with_actionable_suggestion() {
+        let err = CLIError::new(
+            "Failed to connect to OpenRouter",
+            ErrorCategory::Network,
+            Some("HTTP 403: Invalid API key"),
+            Some("Check your key with `aivo keys cat <id>` or add a new key with `aivo keys add`"),
+        );
+        let display = err.to_string();
+        assert!(display.contains("Failed to connect"));
+        assert!(display.contains("403"));
+        assert!(display.contains("aivo keys cat"), "Error should suggest the 'keys cat' command");
+        assert!(display.contains("aivo keys add"), "Error should suggest the 'keys add' command");
+    }
+
+    #[test]
+    fn test_cli_error_no_details_or_suggestion() {
+        let err = CLIError::new(
+            "Simple error",
+            ErrorCategory::User,
+            None::<String>,
+            None::<String>,
+        );
+        let display = err.to_string();
+        assert_eq!(display, "Simple error");
+    }
+
+    #[test]
+    fn test_classify_error_network_timeout_by_message() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "request timeout");
+        let category = classify_error(&err);
+        assert_eq!(category, ErrorCategory::Network, "Should detect 'timeout' in message");
+    }
+
+    #[test]
+    fn test_get_exit_code() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let code = get_exit_code(&err);
+        assert_eq!(code, ExitCode::UserError);
+    }
+
+    #[test]
+    fn test_exit_code_display() {
+        assert_eq!(format!("{}", ExitCode::Success), "0");
+        assert_eq!(format!("{}", ExitCode::UserError), "1");
+        assert_eq!(format!("{}", ExitCode::NetworkError), "2");
+        assert_eq!(format!("{}", ExitCode::AuthError), "3");
+        assert_eq!(format!("{}", ExitCode::ToolExit(130)), "130");
+    }
 }

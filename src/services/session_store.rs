@@ -754,4 +754,79 @@ mod tests {
 
         assert_eq!(before.created_at, after.created_at);
     }
+
+    // Tests moved from tests/encryption_test.rs
+    #[test]
+    fn test_encryption_format() {
+        let plaintext = "test-api-key-12345";
+        let encrypted = encrypt(plaintext).unwrap();
+
+        // Should start with enc:
+        assert!(encrypted.starts_with(ENCRYPTION_MARKER));
+
+        // Should be base64 after marker
+        let data = &encrypted[ENCRYPTION_MARKER.len()..];
+        let decoded = BASE64.decode(data).unwrap();
+
+        // Format: 16 byte IV + ciphertext (includes 16 byte auth tag in aes-gcm)
+        // Minimum: 16 + 16 = 32 bytes, plus at least some ciphertext
+        assert!(decoded.len() >= 32, "Expected at least 32 bytes (IV + auth tag), got {}", decoded.len());
+    }
+
+    #[test]
+    fn test_encryption_roundtrip() {
+        let test_cases = [
+            "simple-key",
+            "key-with-special-chars-!@#$%",
+            "sk-ant-api03-test123",
+            "unicode-キー-测试",
+        ];
+
+        for plaintext in test_cases {
+            let encrypted = encrypt(plaintext).unwrap();
+            let decrypted = decrypt(&encrypted).unwrap();
+            assert_eq!(decrypted, plaintext);
+        }
+    }
+
+    #[test]
+    fn test_is_encrypted_detection() {
+        assert!(is_encrypted("enc:abc123"));
+        assert!(!is_encrypted("plain-text"));
+        assert!(!is_encrypted(""));
+        assert!(!is_encrypted("enc"));
+    }
+
+    // Tests moved from tests/encryption_property.rs
+    #[test]
+    fn test_encryption_never_panics() {
+        let inputs = [
+            "a",
+            "normal-key",
+            "key-with-symbols!@#",
+            "sk-test123456789",
+            "unicode-キー-测试",
+        ];
+
+        for input in inputs {
+            let encrypted = encrypt(input).expect("encryption should not fail");
+            assert!(is_encrypted(&encrypted));
+
+            let decrypted = decrypt(&encrypted).expect("decryption should not fail");
+            assert_eq!(decrypted, input);
+        }
+
+        // Empty string special case - returns empty without encryption
+        assert_eq!(encrypt("").unwrap(), "");
+    }
+
+    #[test]
+    fn test_double_encryption_idempotent() {
+        let key = "my-api-key";
+        let encrypted1 = encrypt(key).unwrap();
+        let encrypted2 = encrypt(&encrypted1).unwrap();
+
+        // Double encryption should return the same value
+        assert_eq!(encrypted1, encrypted2);
+    }
 }
