@@ -770,7 +770,11 @@ mod tests {
 
         // Format: 16 byte IV + ciphertext (includes 16 byte auth tag in aes-gcm)
         // Minimum: 16 + 16 = 32 bytes, plus at least some ciphertext
-        assert!(decoded.len() >= 32, "Expected at least 32 bytes (IV + auth tag), got {}", decoded.len());
+        assert!(
+            decoded.len() >= 32,
+            "Expected at least 32 bytes (IV + auth tag), got {}",
+            decoded.len()
+        );
     }
 
     #[test]

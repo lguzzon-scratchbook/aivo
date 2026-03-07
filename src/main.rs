@@ -114,7 +114,9 @@ async fn main() {
                 }
             };
             let command = ChatCommand::new(session_store, models_cache.clone());
-            command.execute(chat_args.model, key_override).await
+            command
+                .execute(chat_args.model, chat_args.execute, key_override)
+                .await
         }
 
         Commands::Run(run_args) => {

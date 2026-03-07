@@ -36,7 +36,7 @@ aivo claude
 | `aivo codex` | Run Codex |
 | `aivo gemini` | Run Gemini |
 | `aivo opencode` | Run OpenCode |
-| `aivo chat` | Interactive chat REPL |
+| `aivo chat` | Interactive chat REPL (or one-shot with `-x`) |
 | `aivo models` | List available models from active provider |
 | `aivo use [name]` | Switch active key |
 | `aivo keys add` | Add an API key |
@@ -54,6 +54,8 @@ aivo claude --key my-proxy       # use a specific saved key
 aivo claude --env DEBUG=true     # inject extra env vars
 
 aivo chat --model openai/gpt-4o  # chat with any model
+aivo chat -x "Summarize this repo in 3 bullets"  # one-shot chat, prints and exits
+git diff --cached | aivo chat -x "Summarize these changes in one sentence"  # stdin context + one-shot
 
 aivo models                      # list models (cached for 24h)
 aivo models --refresh            # force-refresh the model list

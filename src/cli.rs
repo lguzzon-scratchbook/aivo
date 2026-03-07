@@ -133,6 +133,10 @@ pub struct ChatArgs {
     /// Select API key by ID or name
     #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
     pub key: Option<String>,
+
+    /// Send one message, print response, then exit (non-interactive)
+    #[arg(short = 'x', long = "execute", value_name = "MESSAGE", value_parser = non_empty())]
+    pub execute: Option<String>,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE
@@ -560,6 +564,39 @@ mod tests {
         if let Some(Commands::Chat(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some("my-key".to_string()));
             assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_execute_short_flag() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.execute, Some("hello".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_execute_long_flag() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "--execute", "hello world"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.execute, Some("hello world".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_execute_with_model_and_key() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-x", "hi"])
+            .unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.key, Some("my-key".to_string()));
+            assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
+            assert_eq!(chat_args.execute, Some("hi".to_string()));
         } else {
             panic!("Expected Chat command");
         }

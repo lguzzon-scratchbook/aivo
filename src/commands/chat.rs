@@ -3,7 +3,7 @@
  * Tries OpenAI-compatible /v1/chat/completions first; falls back to
  * Anthropic's /v1/messages format if the provider returns 404/405.
  */
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -206,8 +206,13 @@ impl ChatCommand {
         model_names::transform_model_for_provider(base_url, model)
     }
 
-    pub async fn execute(&self, model: Option<String>, key_override: Option<ApiKey>) -> ExitCode {
-        match self.execute_internal(model, key_override).await {
+    pub async fn execute(
+        &self,
+        model: Option<String>,
+        one_shot: Option<String>,
+        key_override: Option<ApiKey>,
+    ) -> ExitCode {
+        match self.execute_internal(model, one_shot, key_override).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -219,6 +224,7 @@ impl ChatCommand {
     async fn execute_internal(
         &self,
         model_flag: Option<String>,
+        one_shot: Option<String>,
         key_override: Option<ApiKey>,
     ) -> Result<ExitCode> {
         let key = match key_override {
@@ -270,6 +276,50 @@ impl ChatCommand {
         };
         let mut model = Self::transform_model_for_provider(&key.base_url, &raw_model);
 
+        // Create once so its token cache is reused across messages in the session.
+        let copilot_tm = if key.base_url == "copilot" {
+            Some(CopilotTokenManager::new(key.key.as_str().to_string()))
+        } else {
+            None
+        };
+
+        if let Some(input) = one_shot {
+            let input = input.trim().to_string();
+            if input.is_empty() {
+                anyhow::bail!("Message for -x/--execute cannot be empty");
+            }
+
+            let stdin_context = read_stdin_if_piped()?;
+            let one_shot_input = compose_one_shot_prompt(&input, stdin_context.as_deref());
+
+            let history = vec![ChatMessage {
+                role: "user".to_string(),
+                content: one_shot_input,
+            }];
+            let mut format = ChatFormat::OpenAI;
+            let (spinning, spinner_handle) = style::start_spinner(None);
+            let result = send_message_turn(
+                &client,
+                &key,
+                copilot_tm.as_ref(),
+                &model,
+                &history,
+                &mut format,
+                &spinning,
+            )
+            .await;
+            stop_spinner(&spinning);
+            let _ = spinner_handle.await;
+
+            match result {
+                Ok(_) => {
+                    println!();
+                    return Ok(ExitCode::Success);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         eprintln!(
             "{} model: {} {}",
             style::success_symbol(),
@@ -285,13 +335,6 @@ impl ChatCommand {
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut format = ChatFormat::OpenAI;
         let prompt = format!("{} ", style::cyan(">"));
-
-        // Create once so its token cache is reused across messages in the session.
-        let copilot_tm = if key.base_url == "copilot" {
-            Some(CopilotTokenManager::new(key.key.as_str().to_string()))
-        } else {
-            None
-        };
 
         let mut rl = Editor::<ChatHelper, rustyline::history::DefaultHistory>::new()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -392,39 +435,16 @@ impl ChatCommand {
             let (spinning, spinner_handle) = style::start_spinner(None);
 
             // Stream response, auto-detecting provider format
-            let result = if let Some(ref tm) = copilot_tm {
-                send_copilot_request(&client, tm, &model, &history, &spinning).await
-            } else {
-                match format {
-                    ChatFormat::OpenAI => {
-                        match send_chat_request(&client, &key, &model, &history, &spinning).await {
-                            ok @ Ok(_) => ok,
-                            Err(e) if is_format_mismatch(&e) => {
-                                // Provider doesn't speak OpenAI format; try Anthropic
-                                match send_anthropic_request(
-                                    &client, &key, &model, &history, &spinning,
-                                )
-                                .await
-                                {
-                                    Ok(content) => {
-                                        eprintln!(
-                                            "{}",
-                                            style::dim("  (using Anthropic messages format)")
-                                        );
-                                        format = ChatFormat::Anthropic;
-                                        Ok(content)
-                                    }
-                                    Err(_) => Err(e), // both failed; report original error
-                                }
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    ChatFormat::Anthropic => {
-                        send_anthropic_request(&client, &key, &model, &history, &spinning).await
-                    }
-                }
-            };
+            let result = send_message_turn(
+                &client,
+                &key,
+                copilot_tm.as_ref(),
+                &model,
+                &history,
+                &mut format,
+                &spinning,
+            )
+            .await;
 
             stop_spinner(&spinning);
             let _ = spinner_handle.await;
@@ -472,7 +492,10 @@ impl ChatCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo chat [--model <model>]", style::bold("Usage:"));
+        println!(
+            "{} aivo chat [--model <model>] [-x <message>]",
+            style::bold("Usage:")
+        );
         println!();
         println!(
             "{}",
@@ -494,11 +517,82 @@ impl ChatCommand {
             style::cyan("-k, --key <id|name>"),
             style::dim("Select API key by ID or name")
         );
+        println!(
+            "  {}  {}",
+            style::cyan("-x, --execute <message>"),
+            style::dim("Send one message and exit (uses piped stdin as context)")
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo chat"));
         println!("  {}", style::dim("aivo chat --model gpt-4o"));
         println!("  {}", style::dim("aivo chat -m claude-sonnet-4-5"));
+        println!(
+            "  {}",
+            style::dim("aivo chat -x \"Explain Rust lifetimes\"")
+        );
+        println!(
+            "  {}",
+            style::dim("git diff --cached | aivo chat -x \"Summarize changes in one sentence\"")
+        );
+    }
+}
+
+async fn send_message_turn(
+    client: &Client,
+    key: &ApiKey,
+    copilot_tm: Option<&CopilotTokenManager>,
+    model: &str,
+    history: &[ChatMessage],
+    format: &mut ChatFormat,
+    spinning: &Arc<AtomicBool>,
+) -> Result<String> {
+    if let Some(tm) = copilot_tm {
+        return send_copilot_request(client, tm, model, history, spinning).await;
+    }
+
+    match format {
+        ChatFormat::OpenAI => {
+            match send_chat_request(client, key, model, history, spinning).await {
+                ok @ Ok(_) => ok,
+                Err(e) if is_format_mismatch(&e) => {
+                    // Provider doesn't speak OpenAI format; try Anthropic
+                    match send_anthropic_request(client, key, model, history, spinning).await {
+                        Ok(content) => {
+                            eprintln!("{}", style::dim("  (using Anthropic messages format)"));
+                            *format = ChatFormat::Anthropic;
+                            Ok(content)
+                        }
+                        Err(_) => Err(e), // both failed; report original error
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ChatFormat::Anthropic => {
+            send_anthropic_request(client, key, model, history, spinning).await
+        }
+    }
+}
+
+fn read_stdin_if_piped() -> Result<Option<String>> {
+    if io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    let mut buf = String::new();
+    io::stdin().read_to_string(&mut buf)?;
+    if buf.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(buf))
+    }
+}
+
+fn compose_one_shot_prompt(prompt: &str, stdin_context: Option<&str>) -> String {
+    match stdin_context.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(ctx) => format!("{prompt}\n\nContext from stdin:\n{ctx}"),
+        None => prompt.to_string(),
     }
 }
 
@@ -1237,6 +1331,26 @@ mod tests {
             }]
         });
         assert_eq!(extract_openai_message_content(&parts), "hello world");
+    }
+
+    #[test]
+    fn test_compose_one_shot_prompt_without_stdin() {
+        let out = compose_one_shot_prompt("Summarize in one sentence", None);
+        assert_eq!(out, "Summarize in one sentence");
+    }
+
+    #[test]
+    fn test_compose_one_shot_prompt_with_stdin_context() {
+        let out = compose_one_shot_prompt("Summarize in one sentence", Some("diff --git a b"));
+        assert!(out.contains("Summarize in one sentence"));
+        assert!(out.contains("Context from stdin:"));
+        assert!(out.contains("diff --git a b"));
+    }
+
+    #[test]
+    fn test_compose_one_shot_prompt_ignores_empty_stdin() {
+        let out = compose_one_shot_prompt("Summarize", Some("   \n  "));
+        assert_eq!(out, "Summarize");
     }
 
     #[test]
