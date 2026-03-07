@@ -1,9 +1,9 @@
 [package]
 name = "aivo"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2024"
 authors = ["yuanchuan"]
-description = "Run Claude Code via OpenRouter, Vercel AI Gateway, and more — with unified API key management."
+description = "Unified key management tool and protocol bridge for Claude Code, Codex, and Gemini."
 license = "MIT"
 repository = "https://github.com/yuanchuan/aivo"
 

@@ -1,6 +1,6 @@
 # aivo
 
-`aivo` is CLI tool for local key management and protocol bridge for Claude Code, Codex, Gemini, and OpenCode.
+Unified key management tool and protocol bridge for Claude Code, Codex, and Gemini.
 
 ## Install
 
