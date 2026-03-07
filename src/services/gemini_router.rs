@@ -283,7 +283,7 @@ pub fn convert_gemini_to_openai(
         }
         if let Some(mt) = gc.get("maxOutputTokens") {
             let val = if let Some(cap) = max_tokens_cap {
-                mt.as_u64()
+                parse_token_u64(mt)
                     .map(|n| serde_json::json!(n.min(cap)))
                     .unwrap_or(mt.clone())
             } else {
@@ -297,6 +297,11 @@ pub fn convert_gemini_to_openai(
     }
 
     req
+}
+
+fn parse_token_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 /// Converts Gemini content parts to one or more OpenAI messages.
@@ -900,6 +905,26 @@ mod tests {
         });
         let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, Some(8192));
         assert_eq!(result["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_generation_config_caps_string_max_output_tokens() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "generationConfig": {"maxOutputTokens": "12000"}
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, Some(8192));
+        assert_eq!(result["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_generation_config_keeps_invalid_string_max_output_tokens() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "generationConfig": {"maxOutputTokens": "oops"}
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, Some(8192));
+        assert_eq!(result["max_tokens"], "oops");
     }
 
     #[test]

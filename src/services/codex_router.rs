@@ -411,10 +411,17 @@ pub fn is_responses_api_format(body: &Value) -> bool {
 
 fn cap_token_value(v: &Value, cap: Option<u64>) -> Value {
     if let Some(limit) = cap {
-        v.as_u64().map(|n| json!(n.min(limit))).unwrap_or(v.clone())
+        parse_token_u64(v)
+            .map(|n| json!(n.min(limit)))
+            .unwrap_or(v.clone())
     } else {
         v.clone()
     }
+}
+
+fn parse_token_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 fn apply_max_tokens_cap_to_fields(body: &mut Value, cap: Option<u64>, fields: &[&str]) {
@@ -1440,10 +1447,43 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_request_caps_string_max_output_tokens() {
+        let body = json!({
+            "model": "gpt-4o",
+            "input": [],
+            "max_output_tokens": "12000"
+        });
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &CodexRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                copilot_token_manager: None,
+                model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
+                max_tokens_cap: Some(8192),
+            },
+        );
+        assert_eq!(chat["max_tokens"], 8192);
+    }
+
+    #[test]
     fn test_apply_max_tokens_cap_to_fields_caps_chat_completions_fields() {
         let mut body = json!({
             "max_tokens": 10000,
             "max_output_tokens": 9000
+        });
+        apply_max_tokens_cap_to_fields(&mut body, Some(8192), &["max_tokens", "max_output_tokens"]);
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["max_output_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_apply_max_tokens_cap_to_fields_caps_numeric_string_fields() {
+        let mut body = json!({
+            "max_tokens": "10000",
+            "max_output_tokens": "9000"
         });
         apply_max_tokens_cap_to_fields(&mut body, Some(8192), &["max_tokens", "max_output_tokens"]);
         assert_eq!(body["max_tokens"], 8192);

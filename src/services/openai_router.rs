@@ -276,11 +276,16 @@ fn cap_max_tokens_field(body: &mut Value, cap: Option<u64>) {
     let Some(limit) = cap else {
         return;
     };
-    if let Some(mt) = body.get("max_tokens").and_then(|v| v.as_u64())
+    if let Some(mt) = body.get("max_tokens").and_then(parse_token_u64)
         && mt > limit
     {
         body["max_tokens"] = json!(limit);
     }
+}
+
+fn parse_token_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 fn convert_content_blocks(
@@ -1021,10 +1026,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cap_max_tokens_field_ignores_non_numeric_value() {
+    fn test_cap_max_tokens_field_caps_numeric_string_value() {
         let mut req = json!({"model": "gpt-4o", "max_tokens": "12000"});
         cap_max_tokens_field(&mut req, Some(8192));
-        assert_eq!(req["max_tokens"], "12000");
+        assert_eq!(req["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_cap_max_tokens_field_ignores_non_numeric_string_value() {
+        let mut req = json!({"model": "gpt-4o", "max_tokens": "oops"});
+        cap_max_tokens_field(&mut req, Some(8192));
+        assert_eq!(req["max_tokens"], "oops");
     }
 
     #[test]
