@@ -2,7 +2,7 @@
 //!
 //! Provides common functions for reading HTTP requests from raw TCP streams,
 //! parsing headers, extracting bodies, and formatting responses.
-//! Used by: claude_code_router, copilot_router, codex_router, gemini_router.
+//! Used by: anthropic_router, copilot_router, codex_router, gemini_router.
 
 use anyhow::Result;
 

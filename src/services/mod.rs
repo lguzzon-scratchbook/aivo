@@ -2,7 +2,8 @@
 //! Provides session management and AI tool launching.
 
 pub mod ai_launcher;
-pub mod claude_code_router;
+pub mod anthropic_route_pipeline;
+pub mod anthropic_router;
 pub mod codex_router;
 pub mod copilot_auth;
 pub mod copilot_router;
@@ -17,7 +18,7 @@ pub mod system_env;
 
 #[allow(unused_imports)]
 pub use ai_launcher::{AILauncher, LaunchOptions, ToolConfig};
-pub use claude_code_router::{ClaudeCodeRouter, RouterConfig};
+pub use anthropic_router::{AnthropicRouter, AnthropicRouterConfig};
 pub use codex_router::{CodexRouter, CodexRouterConfig};
 pub use copilot_router::{CopilotRouter, CopilotRouterConfig};
 pub use environment_injector::EnvironmentInjector;

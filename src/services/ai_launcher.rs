@@ -125,9 +125,9 @@ impl AILauncher {
             self.env_injector
                 .merge(&tool_config.env_vars, options.env.as_ref(), options.debug);
 
-        // Start built-in router for OpenRouter + Claude, update ANTHROPIC_BASE_URL with actual port
+        // Start AnthropicRouter for OpenRouter + Claude, update ANTHROPIC_BASE_URL with actual port
         if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
-            let port = start_router(&env).await?;
+            let port = start_anthropic_router(&env).await?;
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{}", port),
@@ -405,9 +405,9 @@ impl AILauncher {
     }
 }
 
-/// Starts the built-in Claude Code Router and returns the port it bound to
-async fn start_router(env: &HashMap<String, String>) -> Result<u16> {
-    use crate::services::{ClaudeCodeRouter, RouterConfig};
+/// Starts the built-in AnthropicRouter and returns the port it bound to
+async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
+    use crate::services::{AnthropicRouter, AnthropicRouterConfig};
 
     let api_key = env
         .get("AIVO_ROUTER_API_KEY")
@@ -419,16 +419,16 @@ async fn start_router(env: &HashMap<String, String>) -> Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_ROUTER_BASE_URL"))?
         .clone();
 
-    let config = RouterConfig {
-        openrouter_base_url: base_url,
-        openrouter_api_key: api_key,
+    let config = AnthropicRouterConfig {
+        upstream_base_url: base_url,
+        upstream_api_key: api_key,
     };
 
-    let router = ClaudeCodeRouter::new(config);
+    let router = AnthropicRouter::new(config);
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: claude code router exited unexpectedly: {e}");
+            eprintln!("aivo: anthropic router exited unexpectedly: {e}");
         }
     });
     Ok(port)

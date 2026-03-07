@@ -77,13 +77,13 @@ SessionStore → EnvironmentInjector → AILauncher
 - **EnvironmentInjector** (`environment_injector.rs`) - Configures tool-specific environment variables. Includes model name transformation for OpenRouter compatibility (converts hyphenated versions like `claude-sonnet-4-6` to dotted format `claude-sonnet-4.6`):
   - Claude (direct): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` (empty), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` and related model env vars (optional)
   - Claude (Copilot): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_COPILOT_ROUTER=1` to trigger `CopilotRouter`
-  - Claude (OpenRouter): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_ROUTER=1` to trigger `ClaudeCodeRouter`
+  - Claude (OpenRouter): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_ROUTER=1` to trigger `AnthropicRouter`
   - Codex (OpenAI): `OPENAI_API_KEY`, `OPENAI_BASE_URL` (direct)
   - Codex (non-OpenAI): uses placeholder `OPENAI_BASE_URL` + sets `AIVO_USE_CODEX_ROUTER=1` to trigger `CodexRouter`
   - Gemini (Google): `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL` (direct)
   - Gemini (non-Google): uses placeholder `GOOGLE_GEMINI_BASE_URL` + sets `AIVO_USE_GEMINI_ROUTER=1` to trigger `GeminiRouter`
 
-- **ClaudeCodeRouter** (`claude_code_router.rs`) - Built-in HTTP proxy for OpenRouter. Intercepts Claude Code's `/v1/messages` and `/v1/chat/completions` requests, transforms model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`), and forwards to OpenRouter. Binds to a random port.
+- **AnthropicRouter** (`anthropic_router.rs`) - Built-in HTTP proxy for OpenRouter. Intercepts Claude Code's `/v1/messages` and `/v1/chat/completions` requests, transforms model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`), and forwards to OpenRouter. Binds to a random port.
 
 - **CopilotRouter** (`copilot_router.rs`) - Built-in HTTP proxy for GitHub Copilot. Intercepts Claude Code's `/v1/messages` requests (Anthropic Messages format), converts to OpenAI Chat Completions format, and forwards to the Copilot API. Converts responses back to Anthropic format including SSE streaming. Uses `CopilotTokenManager` from `copilot_auth.rs` for token exchange and auto-refresh. Binds to a random port.
 
@@ -154,7 +154,7 @@ aivo/
 │       ├── session_store.rs         # Key persistence & AES-256-GCM encryption
 │       ├── environment_injector.rs  # Tool-specific env configuration
 │       ├── ai_launcher.rs          # Process spawning & signal forwarding
-│       ├── claude_code_router.rs   # Built-in proxy for Claude + OpenRouter
+│       ├── anthropic_router.rs     # Built-in proxy for Claude + OpenRouter
 │       ├── copilot_auth.rs         # GitHub Copilot OAuth device flow & token management
 │       ├── copilot_router.rs       # Built-in proxy for Claude + GitHub Copilot
 │       ├── codex_router.rs         # Built-in proxy for Codex + non-OpenAI providers
@@ -190,7 +190,7 @@ All routers follow a consistent pattern:
 
 1. **Placeholder Base URL**: EnvironmentInjector sets a placeholder URL (e.g., `http://localhost:0`) and a flag environment variable (e.g., `AIVO_USE_ROUTER=1`)
 
-2. **Router Discovery**: The appropriate router (ClaudeCodeRouter, CopilotRouter, CodexRouter, GeminiRouter) detects the flag and starts an HTTP server on a random available port
+2. **Router Discovery**: The appropriate router (AnthropicRouter, CopilotRouter, CodexRouter, GeminiRouter) detects the flag and starts an HTTP server on a random available port
 
 3. **URL Replacement**: The router binds to the random port, then overwrites the placeholder base URL with the actual bound URL
 
@@ -198,7 +198,7 @@ All routers follow a consistent pattern:
 
 ### Router-Specific Transformations
 
-- **ClaudeCodeRouter**: Converts model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) for OpenRouter compatibility
+- **AnthropicRouter**: Converts model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) for OpenRouter compatibility
 - **CopilotRouter**: Converts between Anthropic Messages format and OpenAI Chat Completions format, handles SSE streaming
 - **CodexRouter**: Strips unsupported tool types and converts between Responses API and Chat Completions API
 - **GeminiRouter**: Converts between Gemini native API format and OpenAI Chat Completions format

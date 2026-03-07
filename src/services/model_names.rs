@@ -6,7 +6,7 @@
 //! - Anthropic: `claude-sonnet-4-6` (hyphens)
 //!
 //! This module consolidates the version conversion logic that was previously
-//! duplicated across claude_code_router, copilot_router, and chat.rs.
+//! duplicated across Anthropic router code, copilot_router, and chat.rs.
 
 /// Converts Claude model version separators from hyphens to dots.
 ///

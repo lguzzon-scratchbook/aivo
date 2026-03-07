@@ -1,24 +1,25 @@
 /**
- * Built-in Claude Code Router service
+ * Built-in Anthropic-compatible Router service
  *
- * Acts as an HTTP proxy that intercepts Claude Code requests and routes them
+ * Acts as an HTTP proxy that intercepts Claude requests and routes them
  * to OpenRouter, handling all necessary API transformations.
  */
 use anyhow::Result;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
 use crate::services::http_utils::{self, router_http_client};
-use crate::services::model_names::transform_model_for_provider;
 
 #[derive(Clone)]
-pub struct RouterConfig {
-    pub openrouter_base_url: String,
-    pub openrouter_api_key: String,
+pub struct AnthropicRouterConfig {
+    pub upstream_base_url: String,
+    pub upstream_api_key: String,
 }
 
-pub struct ClaudeCodeRouter {
-    config: RouterConfig,
+pub struct AnthropicRouter {
+    config: AnthropicRouterConfig,
 }
 
 enum RouterResponse {
@@ -34,8 +35,8 @@ enum RouterResponse {
     },
 }
 
-impl ClaudeCodeRouter {
-    pub fn new(config: RouterConfig) -> Self {
+impl AnthropicRouter {
+    pub fn new(config: AnthropicRouterConfig) -> Self {
         Self { config }
     }
 
@@ -50,7 +51,10 @@ impl ClaudeCodeRouter {
     }
 }
 
-async fn run_router(listener: tokio::net::TcpListener, config: RouterConfig) -> Result<()> {
+async fn run_router(
+    listener: tokio::net::TcpListener,
+    config: AnthropicRouterConfig,
+) -> Result<()> {
     let config = Arc::new(config);
 
     loop {
@@ -114,14 +118,6 @@ fn build_endpoint_url(base_url: &str, endpoint: &str) -> String {
         format!("{}/{}", base, endpoint.trim_start_matches('/'))
     } else {
         format!("{}/v1/{}", base, endpoint.trim_start_matches('/'))
-    }
-}
-
-fn maybe_transform_model(body: &mut Value, base_url: &str) {
-    if let Some(model) = body.get_mut("model")
-        && let Some(model_str) = model.as_str()
-    {
-        *model = Value::String(transform_model_for_provider(base_url, model_str));
     }
 }
 
@@ -208,23 +204,30 @@ async fn write_router_response(
     Ok(())
 }
 
-async fn handle_messages_raw(request: &str, config: &Arc<RouterConfig>) -> Result<RouterResponse> {
+async fn handle_messages_raw(
+    request: &str,
+    config: &Arc<AnthropicRouterConfig>,
+) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
-    maybe_transform_model(&mut body, &config.openrouter_base_url);
+    let ctx = RequestContext {
+        upstream_base_url: &config.upstream_base_url,
+    };
+    let pipeline = RouterPipeline::for_openrouter();
+    pipeline.patch_json("messages", &mut body, &ctx)?;
 
     let client = router_http_client();
-    let url = build_endpoint_url(&config.openrouter_base_url, "messages");
+    let url = build_endpoint_url(&config.upstream_base_url, "messages");
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let auth_value = format!("Bearer {}", config.upstream_api_key);
+    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
+    pipeline.patch_headers("messages", &mut headers, &ctx)?;
 
     let response = client
         .post(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", config.openrouter_api_key),
-        )
-        .header("Content-Type", "application/json")
-        .header("anthropic-version", "2023-06-01")
+        .headers(headers)
         .json(&body)
         .send()
         .await?;
@@ -234,24 +237,28 @@ async fn handle_messages_raw(request: &str, config: &Arc<RouterConfig>) -> Resul
 
 async fn handle_count_tokens_raw(
     request: &str,
-    config: &Arc<RouterConfig>,
+    config: &Arc<AnthropicRouterConfig>,
 ) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
-    maybe_transform_model(&mut body, &config.openrouter_base_url);
+    let ctx = RequestContext {
+        upstream_base_url: &config.upstream_base_url,
+    };
+    let pipeline = RouterPipeline::for_openrouter();
+    pipeline.patch_json("messages/count_tokens", &mut body, &ctx)?;
 
     let client = router_http_client();
-    let url = build_endpoint_url(&config.openrouter_base_url, "messages/count_tokens");
+    let url = build_endpoint_url(&config.upstream_base_url, "messages/count_tokens");
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let auth_value = format!("Bearer {}", config.upstream_api_key);
+    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
+    pipeline.patch_headers("messages/count_tokens", &mut headers, &ctx)?;
 
     let response = client
         .post(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", config.openrouter_api_key),
-        )
-        .header("Content-Type", "application/json")
-        .header("anthropic-version", "2023-06-01")
+        .headers(headers)
         .json(&body)
         .send()
         .await?;
@@ -261,23 +268,28 @@ async fn handle_count_tokens_raw(
 
 async fn handle_chat_completions_raw(
     request: &str,
-    config: &Arc<RouterConfig>,
+    config: &Arc<AnthropicRouterConfig>,
 ) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
-    maybe_transform_model(&mut body, &config.openrouter_base_url);
+    let ctx = RequestContext {
+        upstream_base_url: &config.upstream_base_url,
+    };
+    let pipeline = RouterPipeline::for_openrouter();
+    pipeline.patch_json("chat/completions", &mut body, &ctx)?;
 
     let client = router_http_client();
-    let url = build_endpoint_url(&config.openrouter_base_url, "chat/completions");
+    let url = build_endpoint_url(&config.upstream_base_url, "chat/completions");
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let auth_value = format!("Bearer {}", config.upstream_api_key);
+    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
+    pipeline.patch_headers("chat/completions", &mut headers, &ctx)?;
 
     let response = client
         .post(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", config.openrouter_api_key),
-        )
-        .header("Content-Type", "application/json")
+        .headers(headers)
         .json(&body)
         .send()
         .await?;
@@ -288,7 +300,9 @@ async fn handle_chat_completions_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::model_names::{normalize_claude_version, transform_model_for_openrouter};
+    use crate::services::model_names::{
+        normalize_claude_version, transform_model_for_openrouter, transform_model_for_provider,
+    };
 
     #[test]
     fn test_transform_openrouter_adds_prefix_and_normalizes() {

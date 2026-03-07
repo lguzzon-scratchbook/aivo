@@ -80,7 +80,7 @@ impl EnvironmentInjector {
     /// Sets ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY from the key.
     /// Disables nonessential traffic.
     /// When model is provided, sets ANTHROPIC_MODEL and related env vars for Claude Code routing.
-    /// For OpenRouter, uses Claude Code Router if available, otherwise applies model name transformation.
+    /// For OpenRouter, uses AnthropicRouter if available, otherwise applies model name transformation.
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
