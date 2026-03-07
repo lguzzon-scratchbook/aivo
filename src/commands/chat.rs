@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use crate::tui::FuzzySelect;
 use anyhow::Result;
-use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use rustyline::{
     Context, Editor, Helper,
@@ -340,7 +339,7 @@ impl ChatCommand {
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         rl.set_helper(Some(ChatHelper::new()));
 
-        let history_path: PathBuf = dirs::home_dir()
+        let history_path: PathBuf = crate::services::system_env::home_dir()
             .map(|p| p.join(".config").join("aivo").join("chat_history"))
             .unwrap_or_else(|| PathBuf::from(".config/aivo/chat_history"));
         if let Ok(data) = std::fs::read_to_string(&history_path)
@@ -701,7 +700,7 @@ async fn send_chat_request(
         stream: true,
     };
 
-    let response = send_with_retry(|| {
+    let mut response = send_with_retry(|| {
         client
             .post(&url)
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
@@ -729,12 +728,10 @@ async fn send_chat_request(
     let mut line_buf = String::new();
     let mut done = false;
 
-    let mut stream = response.bytes_stream();
     while !done {
-        let Some(chunk) = stream.next().await else {
+        let Some(chunk) = response.chunk().await? else {
             break;
         };
-        let chunk = chunk?;
         let text = String::from_utf8_lossy(&chunk);
         line_buf.push_str(&text);
 
@@ -852,7 +849,7 @@ async fn send_copilot_request(
         stream: true,
     };
 
-    let response = send_with_retry(|| {
+    let mut response = send_with_retry(|| {
         client
             .post(&url)
             .header("Authorization", format!("Bearer {}", copilot_token))
@@ -880,12 +877,10 @@ async fn send_copilot_request(
     let mut line_buf = String::new();
     let mut done = false;
 
-    let mut stream = response.bytes_stream();
     while !done {
-        let Some(chunk) = stream.next().await else {
+        let Some(chunk) = response.chunk().await? else {
             break;
         };
-        let chunk = chunk?;
         let text = String::from_utf8_lossy(&chunk);
         line_buf.push_str(&text);
 
@@ -1050,7 +1045,7 @@ async fn send_anthropic_request(
         "stream": true,
     });
 
-    let response = send_with_retry(|| {
+    let mut response = send_with_retry(|| {
         client
             .post(&url)
             // Send both auth headers: gateways vary on which they accept
@@ -1077,9 +1072,7 @@ async fn send_anthropic_request(
     let mut full_content = String::new();
     let mut line_buf = String::new();
 
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    while let Some(chunk) = response.chunk().await? {
         let text = String::from_utf8_lossy(&chunk);
         line_buf.push_str(&text);
 

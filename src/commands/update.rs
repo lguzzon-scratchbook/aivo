@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::errors::ExitCode;
 use crate::style;
@@ -313,7 +313,7 @@ impl UpdateCommand {
 
     /// Downloads and installs the update
     async fn install_update(&self, download_url: &str, expected_sha256: &str) -> Result<()> {
-        let response = self
+        let mut response = self
             .github_request(download_url)
             .timeout(std::time::Duration::from_secs(600)) // 10 minutes
             .send()
@@ -327,21 +327,32 @@ impl UpdateCommand {
 
         let total_size = response.content_length().unwrap_or(0);
 
-        // Stream the download with progress updates
-        let mut bytes = Vec::with_capacity(total_size as usize);
-        let mut stream = response.bytes_stream();
-        use std::io::Write;
+        // Determine install path
+        let exec_path = get_install_path()?;
+        let tmp_path = exec_path.with_extension("tmp");
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Error reading download stream")?;
-            bytes.extend_from_slice(&chunk);
+        // Stream the download directly to file with incremental hashing
+        let mut hasher = Sha256::new();
+        let mut downloaded: u64 = 0;
+        let mut file = tokio::fs::File::create(&tmp_path)
+            .await
+            .with_context(|| format!("Failed to create temporary file at {:?}", tmp_path))?;
+
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Error reading download stream")?
+        {
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed to write to temporary file at {:?}", tmp_path))?;
+            downloaded += chunk.len() as u64;
 
             if total_size > 0 {
-                let downloaded = bytes.len() as f64;
-                let total = total_size as f64;
-                let mb = downloaded / 1024.0 / 1024.0;
-                let total_mb = total / 1024.0 / 1024.0;
-                let percent = (downloaded / total) * 100.0;
+                let mb = downloaded as f64 / 1024.0 / 1024.0;
+                let total_mb = total_size as f64 / 1024.0 / 1024.0;
+                let percent = (downloaded as f64 / total_size as f64) * 100.0;
                 eprint!(
                     "\r  {} {:.1}/{:.1} MB ({:.0}%)",
                     style::dim("Downloading:"),
@@ -349,15 +360,19 @@ impl UpdateCommand {
                     total_mb,
                     percent
                 );
-                std::io::stderr().flush().ok();
             }
+        }
+        if let Err(e) = file.flush().await {
+            tokio::fs::remove_file(&tmp_path).await.ok();
+            return Err(e.into());
         }
         if total_size > 0 {
             eprintln!(); // newline after progress
         }
 
-        let actual_sha256 = sha256_hex(&bytes);
+        let actual_sha256 = format!("{:x}", hasher.finalize());
         if actual_sha256 != expected_sha256 {
+            tokio::fs::remove_file(&tmp_path).await.ok();
             return Err(anyhow::anyhow!(
                 "Checksum verification failed for downloaded update"
             ));
@@ -368,27 +383,22 @@ impl UpdateCommand {
             style::green("verified")
         );
 
-        // Determine install path
-        let exec_path = get_install_path()?;
-
-        // Write to a temporary file first, then atomically rename
-        let tmp_path = exec_path.with_extension("tmp");
-        tokio::fs::write(&tmp_path, &bytes)
-            .await
-            .with_context(|| format!("Failed to write temporary binary to {:?}", tmp_path))?;
-
         // Make executable (Unix only)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let permissions = std::fs::Permissions::from_mode(0o755);
-            tokio::fs::set_permissions(&tmp_path, permissions).await?;
+            if let Err(e) = tokio::fs::set_permissions(&tmp_path, permissions).await {
+                tokio::fs::remove_file(&tmp_path).await.ok();
+                return Err(e.into());
+            }
         }
 
         // Atomically replace the old binary
-        tokio::fs::rename(&tmp_path, &exec_path)
-            .await
-            .with_context(|| format!("Failed to replace binary at {:?}", exec_path))?;
+        if let Err(e) = tokio::fs::rename(&tmp_path, &exec_path).await {
+            tokio::fs::remove_file(&tmp_path).await.ok();
+            return Err(e).with_context(|| format!("Failed to replace binary at {:?}", exec_path));
+        }
 
         println!("  {} {}", style::dim("Installed to:"), exec_path.display());
 
@@ -576,13 +586,6 @@ fn parse_checksum_text(text: &str, binary_name: &str) -> Option<String> {
     }
 
     fallback_hash
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    format!("{:x}", digest)
 }
 
 /// Gets the expected binary asset name for the current platform/arch

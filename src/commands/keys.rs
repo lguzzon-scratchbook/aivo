@@ -2,13 +2,24 @@
  * KeysCommand handler for managing API keys.
  */
 use anyhow::Result;
-use dialoguer::Confirm;
 
 use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
+
+/// Reads a confirmation from stdin (y/yes for true, anything else for false).
+fn confirm(prompt: &str) -> std::io::Result<bool> {
+    print!("{} [y/N]: ", prompt);
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
 
 /// Creates a safe preview of an API key, handling short keys without panicking.
 fn key_preview(key: &str) -> String {
@@ -563,10 +574,7 @@ impl KeysCommand {
         println!("URL: {}", style::dim(&key_to_remove.base_url));
         println!();
 
-        let confirmed = Confirm::new()
-            .with_prompt(format!("Remove \"{}\"?", key_to_remove.name))
-            .default(false)
-            .interact()?;
+        let confirmed = confirm(&format!("Remove \"{}\"?", key_to_remove.name))?;
 
         if !confirmed {
             println!("{}", style::dim("Cancelled."));

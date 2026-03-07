@@ -45,7 +45,7 @@ pub enum ErrorCategory {
 }
 
 /// CLI error with category for exit code mapping.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct CLIError {
     message: String,
@@ -97,6 +97,8 @@ impl fmt::Display for CLIError {
         Ok(())
     }
 }
+
+impl std::error::Error for CLIError {}
 
 /// Classifies an error into a category based on message patterns.
 #[allow(dead_code)]

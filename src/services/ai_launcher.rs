@@ -362,14 +362,16 @@ impl AILauncher {
             _ = sigint.recv() => {
                 // Forward SIGINT to child
                 if let Some(id) = child_id {
-                    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(id as i32), nix::sys::signal::SIGINT);
+                    // SAFETY: `kill` does not dereference pointers; pid/signal values are plain integers.
+                    let _ = unsafe { libc::kill(id as i32, libc::SIGINT) };
                 }
                 child.wait().await.map(|s| s.code().unwrap_or(130)) // 128 + SIGINT (2)
             }
             _ = sigterm.recv() => {
                 // Forward SIGTERM to child
                 if let Some(id) = child_id {
-                    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(id as i32), nix::sys::signal::SIGTERM);
+                    // SAFETY: `kill` does not dereference pointers; pid/signal values are plain integers.
+                    let _ = unsafe { libc::kill(id as i32, libc::SIGTERM) };
                 }
                 child.wait().await.map(|s| s.code().unwrap_or(143)) // 128 + SIGTERM (15)
             }

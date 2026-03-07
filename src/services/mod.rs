@@ -13,6 +13,7 @@ pub mod model_names;
 pub mod models_cache;
 pub mod openai_router;
 pub mod session_store;
+pub mod system_env;
 
 #[allow(unused_imports)]
 pub use ai_launcher::{AILauncher, LaunchOptions, ToolConfig};

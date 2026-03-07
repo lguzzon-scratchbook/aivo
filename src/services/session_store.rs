@@ -1,7 +1,7 @@
 use aes::Aes256;
 use aes_gcm::{
     AesGcm,
-    aead::{Aead, KeyInit, generic_array::GenericArray},
+    aead::{Aead, KeyInit, consts::U16, generic_array::GenericArray},
 };
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -16,10 +16,10 @@ use std::collections::{HashMap, HashSet};
  * Stores credentials in ~/.config/aivo/config.json with AES-256-GCM encryption.
  */
 use std::path::PathBuf;
-use typenum::U16;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::errors::{CLIError, ErrorCategory};
+use crate::services::system_env;
 
 /// Marker to identify encrypted values
 pub const ENCRYPTION_MARKER: &str = "enc:";
@@ -124,8 +124,8 @@ impl StoredConfig {
 /// Derives an encryption key from machine-specific information.
 /// Uses username and home directory to create a consistent key per machine.
 fn derive_key() -> SecretKey {
-    let username = whoami::username();
-    let homedir: String = dirs::home_dir()
+    let username = system_env::username().unwrap_or_default();
+    let homedir: String = system_env::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let machine_data = format!("{}:{}", username, homedir);
@@ -230,7 +230,7 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new() -> Self {
-        let config_dir = dirs::home_dir()
+        let config_dir = system_env::home_dir()
             .map(|p| p.join(".config").join("aivo"))
             .unwrap_or_else(|| PathBuf::from(".config/aivo"));
         let config_path = config_dir.join("config.json");
