@@ -452,7 +452,6 @@ async fn start_openai_router(env: &HashMap<String, String>) -> Result<u16> {
         .get("AIVO_OPENAI_ROUTER_REQUIRE_REASONING")
         .map(|v| v == "1")
         .unwrap_or(false);
-
     let config = OpenAIRouterConfig {
         target_base_url: base_url,
         target_api_key: api_key,

@@ -71,10 +71,7 @@ async fn run_openai_router(
             let response = if request.starts_with("POST /v1/messages") {
                 match handle_anthropic_to_openai(&request, &config).await {
                     Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Router error: {}", e);
-                        http_utils::http_error_response(500, "Internal Server Error")
-                    }
+                    Err(e) => http_utils::http_error_response(500, &e.to_string()),
                 }
             } else {
                 http_utils::http_response(404, "application/json", "{\"error\":\"Not found\"}")
