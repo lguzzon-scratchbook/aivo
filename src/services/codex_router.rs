@@ -345,7 +345,10 @@ fn transform_model_str(model: &str, base_url: &str, model_prefix: Option<&str>) 
 fn map_model_for_codex_cli(model: &str) -> String {
     // OpenAI models pass through unchanged
     let model_lower = model.to_lowercase();
-    if model_lower.starts_with("gpt-") || model_lower.starts_with("o1") || model_lower.starts_with("o3") {
+    if model_lower.starts_with("gpt-")
+        || model_lower.starts_with("o1")
+        || model_lower.starts_with("o3")
+    {
         return model.to_string();
     }
 
@@ -883,10 +886,10 @@ fn extract_chat_response_payload(chat: &Value) -> (String, Vec<Value>, String) {
                 text_parts.push(text);
             }
             // Extract reasoning_content if present (Moonshot, etc.)
-            if let Some(reasoning) = message.get("reasoning_content").and_then(|r| r.as_str()) {
-                if !reasoning.is_empty() {
-                    reasoning_parts.push(reasoning.to_string());
-                }
+            if let Some(reasoning) = message.get("reasoning_content").and_then(|r| r.as_str())
+                && !reasoning.is_empty()
+            {
+                reasoning_parts.push(reasoning.to_string());
             }
             if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
                 tool_calls.extend(tcs.iter().cloned());

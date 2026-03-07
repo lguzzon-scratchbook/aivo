@@ -195,8 +195,14 @@ mod tests {
         let display = err.to_string();
         assert!(display.contains("Failed to connect"));
         assert!(display.contains("403"));
-        assert!(display.contains("aivo keys cat"), "Error should suggest the 'keys cat' command");
-        assert!(display.contains("aivo keys add"), "Error should suggest the 'keys add' command");
+        assert!(
+            display.contains("aivo keys cat"),
+            "Error should suggest the 'keys cat' command"
+        );
+        assert!(
+            display.contains("aivo keys add"),
+            "Error should suggest the 'keys add' command"
+        );
     }
 
     #[test]
@@ -213,14 +219,18 @@ mod tests {
 
     #[test]
     fn test_classify_error_network_timeout_by_message() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "request timeout");
+        let err = std::io::Error::other("request timeout");
         let category = classify_error(&err);
-        assert_eq!(category, ErrorCategory::Network, "Should detect 'timeout' in message");
+        assert_eq!(
+            category,
+            ErrorCategory::Network,
+            "Should detect 'timeout' in message"
+        );
     }
 
     #[test]
     fn test_get_exit_code() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let err = std::io::Error::other("test");
         let code = get_exit_code(&err);
         assert_eq!(code, ExitCode::UserError);
     }

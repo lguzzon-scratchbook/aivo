@@ -244,7 +244,10 @@ impl EnvironmentInjector {
             env.insert("OPENAI_DEFAULT_MODEL".to_string(), codex_model.clone());
             env.insert("CODEX_MODEL_DEFAULT".to_string(), codex_model.clone());
             // Store the original model for the router to use with the provider
-            env.insert("AIVO_CODEX_ROUTER_ACTUAL_MODEL".to_string(), model.to_string());
+            env.insert(
+                "AIVO_CODEX_ROUTER_ACTUAL_MODEL".to_string(),
+                model.to_string(),
+            );
         }
 
         env
@@ -504,7 +507,7 @@ mod tests {
             env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
             Some(&"1".to_string())
         );
-        assert!(env.get("AIVO_USE_OPENAI_ROUTER").is_none());
+        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
     }
 
     #[test]
@@ -706,7 +709,7 @@ mod tests {
             env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
             Some(&"https://api.moonshot.cn/v1".to_string())
         );
-        assert!(env.get("AIVO_OPENAI_ROUTER_MODEL_PREFIX").is_none());
+        assert!(!env.contains_key("AIVO_OPENAI_ROUTER_MODEL_PREFIX"));
         assert_eq!(
             env.get("AIVO_OPENAI_ROUTER_REQUIRE_REASONING"),
             Some(&"1".to_string())
@@ -756,7 +759,7 @@ mod tests {
             env.get("OPENAI_API_KEY"),
             Some(&"sk-test-key-12345".to_string())
         );
-        assert!(env.get("AIVO_USE_CODEX_ROUTER").is_none());
+        assert!(!env.contains_key("AIVO_USE_CODEX_ROUTER"));
     }
 
     #[test]
@@ -833,7 +836,7 @@ mod tests {
             env.get("GEMINI_API_KEY"),
             Some(&"sk-test-key-12345".to_string())
         );
-        assert!(env.get("GEMINI_MODEL").is_none());
+        assert!(!env.contains_key("GEMINI_MODEL"));
     }
 
     #[test]
@@ -853,7 +856,7 @@ mod tests {
         let mut key = test_key();
         key.base_url = "https://generativelanguage.googleapis.com/".to_string();
         let env = injector.for_gemini(&key, None);
-        assert!(env.get("AIVO_USE_GEMINI_ROUTER").is_none());
+        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&"https://generativelanguage.googleapis.com/".to_string())
@@ -909,8 +912,8 @@ mod tests {
             Some(&"http://127.0.0.1:0".to_string())
         );
         assert_eq!(env.get("GEMINI_API_KEY"), Some(&"copilot".to_string()));
-        assert!(env.get("AIVO_USE_GEMINI_ROUTER").is_none());
-        assert!(env.get("AIVO_GEMINI_COPILOT_FORCED_MODEL").is_none());
+        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
+        assert!(!env.contains_key("AIVO_GEMINI_COPILOT_FORCED_MODEL"));
     }
 
     #[test]
@@ -1089,7 +1092,7 @@ mod tests {
             Some(&"copilot".to_string())
         );
         // Should NOT set OpenRouter router
-        assert!(env.get("AIVO_USE_ROUTER").is_none());
+        assert!(!env.contains_key("AIVO_USE_ROUTER"));
         // Model should still be set
         assert_eq!(
             env.get("ANTHROPIC_MODEL"),
@@ -1117,7 +1120,7 @@ mod tests {
             Some(&"sk-test-key-12345".to_string())
         );
         // Should NOT set the regular codex router
-        assert!(env.get("AIVO_USE_CODEX_ROUTER").is_none());
+        assert!(!env.contains_key("AIVO_USE_CODEX_ROUTER"));
     }
 
     #[test]

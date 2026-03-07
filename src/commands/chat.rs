@@ -7,11 +7,12 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use crate::tui::FuzzySelect;
 use anyhow::Result;
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use rustyline::{
     Context, Editor, Helper,
     completion::{Completer, Pair},
@@ -41,6 +42,8 @@ const CMD_MODEL_ARG: &str = "/model ";
 /// Maximum number of messages to keep in chat history.
 /// When exceeded, the oldest messages are dropped (keeping any system message).
 const MAX_HISTORY_MESSAGES: usize = 50;
+/// Retry budget for transient HTTP failures.
+const MAX_REQUEST_ATTEMPTS: usize = 3;
 
 struct ChatHelper {
     commands: Vec<&'static str>,
@@ -111,7 +114,7 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -232,7 +235,7 @@ impl ChatCommand {
             },
         };
 
-        let client = Client::new();
+        let client = crate::services::http_utils::router_http_client();
 
         let mut raw_model = match self.resolve_model(&key.id, model_flag).await? {
             Some(m) => m,
@@ -504,6 +507,86 @@ fn stop_spinner(spinning: &Arc<AtomicBool>) {
     style::stop_spinner(spinning);
 }
 
+/// Returns the SSE payload for a `data:` line.
+/// Accepts both `data: {...}` and `data:{...}`.
+fn sse_data_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("data:").map(str::trim_start)
+}
+
+/// Extracts assistant text from OpenAI-compatible non-streaming chat responses.
+fn extract_openai_message_content(body: &serde_json::Value) -> String {
+    if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
+        return content.to_string();
+    }
+
+    // Some providers return content as an array of typed parts.
+    body["choices"][0]["message"]["content"]
+        .as_array()
+        .iter()
+        .flat_map(|parts| parts.iter())
+        .filter_map(|part| {
+            part.get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| part.get("content").and_then(|v| v.as_str()))
+        })
+        .collect()
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
+
+fn should_retry_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<&reqwest::header::HeaderValue>) -> Duration {
+    if let Some(seconds) = retry_after
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.min(30));
+    }
+    let exp = 250u64.saturating_mul(1u64 << (attempt.saturating_sub(1).min(4)));
+    Duration::from_millis(exp.min(4000))
+}
+
+async fn send_with_retry<F>(mut build_request: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+        match build_request().send().await {
+            Ok(response) => {
+                if should_retry_status(response.status()) && attempt < MAX_REQUEST_ATTEMPTS {
+                    let delay = retry_delay(
+                        attempt,
+                        response.headers().get(reqwest::header::RETRY_AFTER),
+                    );
+                    let _ = response.bytes().await;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(err) => {
+                if should_retry_error(&err) && attempt < MAX_REQUEST_ATTEMPTS {
+                    tokio::time::sleep(retry_delay(attempt, None)).await;
+                    continue;
+                }
+                last_err = Some(err.into());
+                break;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Request failed")))
+}
+
 /// Sends a chat completion request and prints the response.
 /// Tries streaming first; falls back to non-streaming if the server returns a 5xx error.
 /// Returns the full assistant message content.
@@ -524,14 +607,15 @@ async fn send_chat_request(
         stream: true,
     };
 
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", key.key.as_str()))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
-        .json(&request)
-        .send()
-        .await?;
+    let response = send_with_retry(|| {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+            .json(&request)
+    })
+    .await?;
 
     // If the server can't handle streaming, fall back to non-streaming.
     // Note: 404 is NOT included here — it means wrong endpoint, not streaming unsupported.
@@ -549,9 +633,13 @@ async fn send_chat_request(
 
     let mut full_content = String::new();
     let mut line_buf = String::new();
+    let mut done = false;
 
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    while !done {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
         let chunk = chunk?;
         let text = String::from_utf8_lossy(&chunk);
         line_buf.push_str(&text);
@@ -560,8 +648,9 @@ async fn send_chat_request(
             let line = line_buf[..pos].trim_end_matches('\r').to_string();
             line_buf = line_buf[pos + 1..].to_string();
 
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = sse_data_payload(&line) {
                 if data.trim() == "[DONE]" {
+                    done = true;
                     break;
                 }
                 if let Some(content) = parse_sse_chunk(data) {
@@ -574,16 +663,32 @@ async fn send_chat_request(
         }
     }
 
-    // If we got no streaming data, the response might be non-streaming JSON
-    if full_content.is_empty()
-        && !line_buf.is_empty()
-        && let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line_buf)
-        && let Some(content) = resp["choices"][0]["message"]["content"].as_str()
-    {
-        stop_spinner(spinning);
-        print!("{}", content);
-        io::stdout().flush()?;
-        full_content = content.to_string();
+    let tail = line_buf.trim();
+    if !tail.is_empty() {
+        if let Some(data) = sse_data_payload(tail) {
+            if data.trim() != "[DONE]"
+                && let Some(content) = parse_sse_chunk(data)
+            {
+                stop_spinner(spinning);
+                print!("{}", content);
+                io::stdout().flush()?;
+                full_content.push_str(&content);
+            }
+        } else if full_content.is_empty()
+            && let Ok(resp) = serde_json::from_str::<serde_json::Value>(tail)
+        {
+            let content = extract_openai_message_content(&resp);
+            if !content.is_empty() {
+                stop_spinner(spinning);
+                print!("{}", content);
+                io::stdout().flush()?;
+                full_content = content;
+            }
+        }
+    }
+
+    if full_content.is_empty() {
+        return send_non_streaming(client, &url, key, model, messages, spinning).await;
     }
 
     Ok(full_content)
@@ -604,14 +709,15 @@ async fn send_non_streaming(
         stream: false,
     };
 
-    let response = client
-        .post(url)
-        .header("Authorization", format!("Bearer {}", key.key.as_str()))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
-        .json(&request)
-        .send()
-        .await?;
+    let response = send_with_retry(|| {
+        client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+            .json(&request)
+    })
+    .await?;
 
     if !response.status().is_success() {
         stop_spinner(spinning);
@@ -621,10 +727,12 @@ async fn send_non_streaming(
     }
 
     let body: serde_json::Value = response.json().await?;
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let content = extract_openai_message_content(&body);
+
+    if content.is_empty() {
+        stop_spinner(spinning);
+        anyhow::bail!("Provider returned an empty response");
+    }
 
     stop_spinner(spinning);
     print!("{}", content);
@@ -650,16 +758,22 @@ async fn send_copilot_request(
         stream: true,
     };
 
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", copilot_token))
-        .header("Content-Type", "application/json")
-        .header("Editor-Version", COPILOT_EDITOR_VERSION)
-        .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
-        .header("Openai-Intent", COPILOT_OPENAI_INTENT)
-        .json(&request)
-        .send()
-        .await?;
+    let response = send_with_retry(|| {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", copilot_token))
+            .header("Content-Type", "application/json")
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .json(&request)
+    })
+    .await?;
+
+    if response.status().is_server_error() {
+        return send_copilot_non_streaming(client, &url, &copilot_token, model, messages, spinning)
+            .await;
+    }
 
     if !response.status().is_success() {
         stop_spinner(spinning);
@@ -670,9 +784,13 @@ async fn send_copilot_request(
 
     let mut full_content = String::new();
     let mut line_buf = String::new();
+    let mut done = false;
 
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    while !done {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
         let chunk = chunk?;
         let text = String::from_utf8_lossy(&chunk);
         line_buf.push_str(&text);
@@ -681,8 +799,9 @@ async fn send_copilot_request(
             let line = line_buf[..pos].trim_end_matches('\r').to_string();
             line_buf = line_buf[pos + 1..].to_string();
 
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = sse_data_payload(&line) {
                 if data.trim() == "[DONE]" {
+                    done = true;
                     break;
                 }
                 if let Some(content) = parse_sse_chunk(data) {
@@ -695,18 +814,84 @@ async fn send_copilot_request(
         }
     }
 
-    if full_content.is_empty()
-        && !line_buf.is_empty()
-        && let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line_buf)
-        && let Some(content) = resp["choices"][0]["message"]["content"].as_str()
-    {
-        stop_spinner(spinning);
-        print!("{}", content);
-        io::stdout().flush()?;
-        full_content = content.to_string();
+    let tail = line_buf.trim();
+    if !tail.is_empty() {
+        if let Some(data) = sse_data_payload(tail) {
+            if data.trim() != "[DONE]"
+                && let Some(content) = parse_sse_chunk(data)
+            {
+                stop_spinner(spinning);
+                print!("{}", content);
+                io::stdout().flush()?;
+                full_content.push_str(&content);
+            }
+        } else if full_content.is_empty()
+            && let Ok(resp) = serde_json::from_str::<serde_json::Value>(tail)
+        {
+            let content = extract_openai_message_content(&resp);
+            if !content.is_empty() {
+                stop_spinner(spinning);
+                print!("{}", content);
+                io::stdout().flush()?;
+                full_content = content;
+            }
+        }
+    }
+
+    if full_content.is_empty() {
+        return send_copilot_non_streaming(client, &url, &copilot_token, model, messages, spinning)
+            .await;
     }
 
     Ok(full_content)
+}
+
+async fn send_copilot_non_streaming(
+    client: &Client,
+    url: &str,
+    copilot_token: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+) -> Result<String> {
+    let request = ChatRequest {
+        model: model.to_string(),
+        messages: messages.to_vec(),
+        stream: false,
+    };
+
+    let response = send_with_retry(|| {
+        client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", copilot_token))
+            .header("Content-Type", "application/json")
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .json(&request)
+    })
+    .await?;
+
+    if !response.status().is_success() {
+        stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let body: serde_json::Value = response.json().await?;
+    let content = extract_openai_message_content(&body);
+
+    if content.is_empty() {
+        stop_spinner(spinning);
+        anyhow::bail!("Provider returned an empty response");
+    }
+
+    stop_spinner(spinning);
+    print!("{}", content);
+    io::stdout().flush()?;
+
+    Ok(content)
 }
 
 /// Parses a single SSE data chunk and extracts the content delta
@@ -743,8 +928,13 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_messages: usize) {
 /// Returns true when the error indicates the endpoint doesn't exist,
 /// meaning we should try a different API format.
 fn is_format_mismatch(e: &anyhow::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("404") || msg.contains("405")
+    let msg = e.to_string().to_lowercase();
+    msg.contains("404")
+        || msg.contains("405")
+        || (msg.contains("not found")
+            && (msg.contains("endpoint") || msg.contains("route") || msg.contains("path")))
+        || (msg.contains("method not allowed")
+            && (msg.contains("endpoint") || msg.contains("route") || msg.contains("path")))
 }
 
 /// Sends a request using Anthropic's native /v1/messages API.
@@ -766,17 +956,18 @@ async fn send_anthropic_request(
         "stream": true,
     });
 
-    let response = client
-        .post(&url)
-        // Send both auth headers: gateways vary on which they accept
-        .header("Authorization", format!("Bearer {}", key.key.as_str()))
-        .header("x-api-key", key.key.as_str())
-        .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
-        .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
-        .json(&request)
-        .send()
-        .await?;
+    let response = send_with_retry(|| {
+        client
+            .post(&url)
+            // Send both auth headers: gateways vary on which they accept
+            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+            .header("x-api-key", key.key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+            .json(&request)
+    })
+    .await?;
 
     if response.status().is_server_error() || response.status() == reqwest::StatusCode::NOT_FOUND {
         return send_anthropic_non_streaming(client, &url, key, model, messages, spinning).await;
@@ -802,7 +993,7 @@ async fn send_anthropic_request(
             let line = line_buf[..pos].trim_end_matches('\r').to_string();
             line_buf = line_buf[pos + 1..].to_string();
 
-            if let Some(data) = line.strip_prefix("data: ")
+            if let Some(data) = sse_data_payload(&line)
                 && let Some(text) = parse_anthropic_chunk(data)
             {
                 stop_spinner(spinning);
@@ -810,6 +1001,18 @@ async fn send_anthropic_request(
                 io::stdout().flush()?;
                 full_content.push_str(&text);
             }
+        }
+    }
+
+    if full_content.is_empty() {
+        let tail = line_buf.trim();
+        if let Some(data) = sse_data_payload(tail)
+            && let Some(text) = parse_anthropic_chunk(data)
+        {
+            stop_spinner(spinning);
+            print!("{}", text);
+            io::stdout().flush()?;
+            full_content.push_str(&text);
         }
     }
 
@@ -837,17 +1040,18 @@ async fn send_anthropic_non_streaming(
         "stream": false,
     });
 
-    let response = client
-        .post(url)
-        // Send both auth headers: gateways vary on which they accept
-        .header("Authorization", format!("Bearer {}", key.key.as_str()))
-        .header("x-api-key", key.key.as_str())
-        .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
-        .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
-        .json(&request)
-        .send()
-        .await?;
+    let response = send_with_retry(|| {
+        client
+            .post(url)
+            // Send both auth headers: gateways vary on which they accept
+            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+            .header("x-api-key", key.key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+            .json(&request)
+    })
+    .await?;
 
     if !response.status().is_success() {
         stop_spinner(spinning);
@@ -1004,6 +1208,45 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_data_payload_with_optional_space() {
+        assert_eq!(
+            sse_data_payload(r#"data: {"choices":[]}"#),
+            Some(r#"{"choices":[]}"#)
+        );
+        assert_eq!(
+            sse_data_payload(r#"data:{"choices":[]}"#),
+            Some(r#"{"choices":[]}"#)
+        );
+    }
+
+    #[test]
+    fn test_extract_openai_message_content_string_and_parts() {
+        let text = serde_json::json!({
+            "choices": [{"message": {"content": "hello"}}]
+        });
+        assert_eq!(extract_openai_message_content(&text), "hello");
+
+        let parts = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type":"text", "text":"hello "},
+                        {"type":"text", "text":"world"}
+                    ]
+                }
+            }]
+        });
+        assert_eq!(extract_openai_message_content(&parts), "hello world");
+    }
+
+    #[test]
+    fn test_should_retry_status() {
+        assert!(should_retry_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_retry_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!should_retry_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
     fn test_chat_message_serialization() {
         let msg = ChatMessage {
             role: "user".to_string(),
@@ -1046,6 +1289,12 @@ mod tests {
     #[test]
     fn test_is_format_mismatch_405() {
         let e = anyhow::anyhow!("API returned 405 Method Not Allowed");
+        assert!(is_format_mismatch(&e));
+    }
+
+    #[test]
+    fn test_is_format_mismatch_endpoint_text() {
+        let e = anyhow::anyhow!("route not found for requested endpoint");
         assert!(is_format_mismatch(&e));
     }
 
