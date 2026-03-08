@@ -46,6 +46,7 @@ aivo claude
 | `aivo opencode` | Run OpenCode |
 | `aivo chat` | Interactive chat REPL (or one-shot with `-x`) |
 | `aivo models` | List available models from active provider |
+| `aivo serve` | Start a local OpenAI-compatible API server |
 | `aivo use [name]` | Switch active key |
 | `aivo keys add` | Add an API key |
 | `aivo keys` | List all keys |
@@ -67,6 +68,9 @@ git diff --cached | aivo chat -x "Summarize these changes in one sentence"
 
 aivo models                      # cached for 1h
 aivo models --refresh            # force-refresh
+
+aivo serve                       # start on default port 24860
+aivo serve --port 8080           # start on custom port
 ```
 
 
