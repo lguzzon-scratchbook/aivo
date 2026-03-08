@@ -111,6 +111,7 @@ impl KeysCommand {
             return Ok(ExitCode::Success);
         }
 
+        println!();
         for key in &keys {
             let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
             let active_indicator = if is_active {

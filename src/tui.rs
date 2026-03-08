@@ -1,5 +1,4 @@
 use console::{Key, Term};
-use std::io::Write as _;
 
 impl Default for FuzzySelect {
     fn default() -> Self {
@@ -38,17 +37,16 @@ impl FuzzySelect {
     }
 
     pub fn interact_opt(self) -> std::io::Result<Option<usize>> {
-        let mut term = Term::stderr();
+        let term = Term::stderr();
+        term.hide_cursor()?;
 
-        // Setup initial state
         let mut query = String::new();
         let mut selection = self.default.min(self.items.len().saturating_sub(1));
         let mut page_start = 0;
         let page_size = 10;
+        let mut lines_drawn = 0usize;
 
         loop {
-            // Filter items based on query
-            // Store (original_index, item_string)
             let filtered: Vec<(usize, &String)> = self
                 .items
                 .iter()
@@ -58,101 +56,98 @@ impl FuzzySelect {
 
             let count = filtered.len();
 
-            // Adjust selection if out of bounds (e.g. after filtering)
             if selection >= count {
                 selection = count.saturating_sub(1);
             }
 
-            // Calculate visible range for pagination
-            // Ensure selection is visible
             if selection < page_start {
                 page_start = selection;
             } else if selection >= page_start + page_size {
                 page_start = selection.saturating_sub(page_size).saturating_add(1);
             }
 
-            // Ensure page_start is valid
             if page_start > count.saturating_sub(1) {
                 page_start = count.saturating_sub(1);
             }
 
             let end_idx = (page_start + page_size).min(count);
 
-            // Save cursor position before drawing
-            term.write_all(b"\x1b7")?;
+            // Clear previously drawn lines by moving up and erasing
+            if lines_drawn > 0 {
+                term.move_cursor_up(lines_drawn)?;
+                term.clear_to_end_of_screen()?;
+            }
 
-            // Draw prompt and query
             term.write_line(&format!("{}: {}", crate::style::bold(&self.prompt), query))?;
+            lines_drawn = 1;
 
             if count == 0 {
                 term.write_line(&format!("  {}", crate::style::dim("(no matches)")))?;
+                lines_drawn += 1;
             } else {
                 for (i, (_, item)) in filtered.iter().enumerate().take(end_idx).skip(page_start) {
                     let is_selected = i == selection;
-
                     let symbol = if is_selected {
                         crate::style::cyan(">")
                     } else {
                         " ".to_string()
                     };
-
                     let styled_item = if is_selected {
                         crate::style::cyan(item)
                     } else {
                         crate::style::dim(item)
                     };
-
                     term.write_line(&format!("{} {}", symbol, styled_item))?;
+                    lines_drawn += 1;
                 }
             }
 
-            // Wait for input
             let key = match term.read_key() {
                 Ok(key) => key,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    // Ctrl-C pressed - restore cursor and clear before exiting
-                    let _ = term.write_all(b"\x1b8\x1b[0J");
+                    let _ = term.move_cursor_up(lines_drawn);
+                    let _ = term.clear_to_end_of_screen();
                     let _ = term.show_cursor();
                     return Ok(None);
                 }
                 Err(e) => {
-                    let _ = term.write_all(b"\x1b8\x1b[0J");
+                    let _ = term.move_cursor_up(lines_drawn);
+                    let _ = term.clear_to_end_of_screen();
                     let _ = term.show_cursor();
                     return Err(e);
                 }
             };
 
-            // Restore cursor and clear to end of screen for next redraw or exit
-            term.write_all(b"\x1b8\x1b[0J")?;
-
             match key {
                 Key::ArrowUp | Key::Char('\x10') => {
-                    // Ctrl-P
                     if selection > 0 {
                         selection -= 1;
                     } else if count > 0 {
-                        selection = count - 1; // Wrap around
+                        selection = count - 1;
                     }
                 }
                 Key::ArrowDown | Key::Char('\x0e') => {
-                    // Ctrl-N
                     if count > 0 {
                         if selection < count - 1 {
                             selection += 1;
                         } else {
-                            selection = 0; // Wrap around
+                            selection = 0;
                         }
                     }
                 }
                 Key::Enter => {
-                    let _ = term.show_cursor();
+                    term.move_cursor_up(lines_drawn)?;
+                    term.clear_to_end_of_screen()?;
+                    term.show_cursor()?;
                     if count > 0 {
                         return Ok(Some(filtered[selection].0));
                     }
                     return Ok(None);
                 }
                 Key::Escape => {
-                    let _ = term.show_cursor();
+                    term.move_cursor_up(lines_drawn)?;
+                    term.clear_to_end_of_screen()?;
+                    term.show_cursor()?;
                     return Ok(None);
                 }
                 Key::Backspace => {
