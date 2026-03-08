@@ -14,7 +14,10 @@ pub mod gemini_router;
 pub mod http_utils;
 pub mod model_names;
 pub mod models_cache;
+pub mod openai_anthropic_bridge;
+pub mod openai_gemini_bridge;
 pub mod openai_router;
+pub mod provider_protocol;
 pub mod session_store;
 pub mod system_env;
 

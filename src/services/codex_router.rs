@@ -20,6 +20,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
+use crate::services::openai_anthropic_bridge::{
+    OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
+    convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
+};
+use crate::services::openai_gemini_bridge::{
+    OpenAIToGeminiConfig, build_google_generate_content_url,
+    convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
+    openai_chat_model,
+};
+use crate::services::provider_protocol::ProviderProtocol;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -27,6 +37,7 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct CodexRouterConfig {
     pub target_base_url: String,
     pub api_key: String,
+    pub target_protocol: ProviderProtocol,
     pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
     /// Optional model prefix to add (e.g., "@cf/" for Cloudflare)
     pub model_prefix: Option<String>,
@@ -44,6 +55,11 @@ pub struct CodexRouterConfig {
 
 pub struct CodexRouter {
     config: CodexRouterConfig,
+}
+
+enum ForwardedChatResponse {
+    Success(Value),
+    HttpError { status: u16, body: String },
 }
 
 struct CodexRouterState {
@@ -131,27 +147,13 @@ async fn handle_responses_api_via_chat(
         .unwrap_or("gpt-4o")
         .to_string();
     let chat_body = convert_responses_to_chat_request(body, config);
-    let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
-
-    let response = http_utils::authorized_openai_post(
-        client,
-        &target_url,
-        &config.api_key,
-        config.copilot_token_manager.as_deref(),
-    )
-    .await?
-    .json(&chat_body)
-    .send()
-    .await?;
-
-    let status_code = response.status().as_u16();
-    if status_code != 200 {
-        let err_body = response.text().await?;
-        return Ok(http_utils::http_json_response(status_code, &err_body));
-    }
-
-    let response_text = response.text().await?;
-    let chat_response = parse_provider_response(&response_text)?;
+    let chat_response = match forward_openai_chat_request(&chat_body, config, client, false).await?
+    {
+        ForwardedChatResponse::Success(value) => value,
+        ForwardedChatResponse::HttpError { status, body } => {
+            return Ok(http_utils::http_json_response(status, &body));
+        }
+    };
     let sse = convert_chat_response_to_responses_sse(
         &chat_response,
         config.requires_reasoning_content,
@@ -172,6 +174,10 @@ async fn handle_chat_completions_with_filter(
     client: &reqwest::Client,
 ) -> Result<String> {
     let mut body = body.clone();
+    let requested_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     filter_tools(&mut body);
     apply_max_tokens_cap_to_fields(
         &mut body,
@@ -186,20 +192,38 @@ async fn handle_chat_completions_with_filter(
         );
     }
 
-    let target_url = build_target_url(&config.target_base_url, path);
+    if config.target_protocol == ProviderProtocol::Openai {
+        let target_url = build_target_url(&config.target_base_url, path);
+        let response = http_utils::authorized_openai_post(
+            client,
+            &target_url,
+            &config.api_key,
+            config.copilot_token_manager.as_deref(),
+        )
+        .await?
+        .json(&body)
+        .send()
+        .await?;
 
-    let response = http_utils::authorized_openai_post(
-        client,
-        &target_url,
-        &config.api_key,
-        config.copilot_token_manager.as_deref(),
-    )
-    .await?
-    .json(&body)
-    .send()
-    .await?;
+        return http_utils::buffered_reqwest_to_http_response(response).await;
+    }
 
-    http_utils::buffered_reqwest_to_http_response(response).await
+    let chat_response =
+        match forward_openai_chat_request(&body, config, client, requested_stream).await? {
+            ForwardedChatResponse::Success(value) => value,
+            ForwardedChatResponse::HttpError { status, body } => {
+                return Ok(http_utils::http_json_response(status, &body));
+            }
+        };
+    if requested_stream {
+        let sse = convert_openai_chat_response_to_sse(&chat_response);
+        Ok(http_utils::http_response(200, "text/event-stream", &sse))
+    } else {
+        Ok(http_utils::http_json_response(
+            200,
+            &serde_json::to_string(&chat_response)?,
+        ))
+    }
 }
 
 // =============================================================================
@@ -231,6 +255,110 @@ async fn forward_request(
 
     let response = req.send().await?;
     http_utils::buffered_reqwest_to_http_response(response).await
+}
+
+async fn forward_openai_chat_request(
+    body: &Value,
+    config: &Arc<CodexRouterConfig>,
+    client: &reqwest::Client,
+    force_non_streaming: bool,
+) -> Result<ForwardedChatResponse> {
+    match config.target_protocol {
+        ProviderProtocol::Openai => {
+            let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
+            let response = http_utils::authorized_openai_post(
+                client,
+                &target_url,
+                &config.api_key,
+                config.copilot_token_manager.as_deref(),
+            )
+            .await?
+            .json(body)
+            .send()
+            .await?;
+
+            let status_code = response.status().as_u16();
+            let response_text = response.text().await?;
+            if status_code != 200 {
+                return Ok(ForwardedChatResponse::HttpError {
+                    status: status_code,
+                    body: response_text,
+                });
+            }
+            Ok(ForwardedChatResponse::Success(parse_provider_response(
+                &response_text,
+            )?))
+        }
+        ProviderProtocol::Anthropic => {
+            let mut anthropic_body = convert_openai_chat_to_anthropic_request(
+                body,
+                &OpenAIToAnthropicChatConfig {
+                    default_model: "claude-sonnet-4-5",
+                },
+            );
+            if force_non_streaming {
+                anthropic_body["stream"] = json!(false);
+            }
+            let target_url = build_target_url(&config.target_base_url, "/v1/messages");
+            let response = client
+                .post(&target_url)
+                .header("Authorization", format!("Bearer {}", config.api_key))
+                .header("x-api-key", config.api_key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&anthropic_body)
+                .send()
+                .await?;
+
+            let status_code = response.status().as_u16();
+            let response_text = response.text().await?;
+            if status_code != 200 {
+                return Ok(ForwardedChatResponse::HttpError {
+                    status: status_code,
+                    body: response_text,
+                });
+            }
+            let anthropic_response: Value = serde_json::from_str(&response_text)?;
+            Ok(ForwardedChatResponse::Success(
+                convert_anthropic_to_openai_chat_response(
+                    &anthropic_response,
+                    body.get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("gpt-4o"),
+                ),
+            ))
+        }
+        ProviderProtocol::Google => {
+            let google_body = convert_openai_chat_to_gemini_request(
+                body,
+                &OpenAIToGeminiConfig {
+                    default_model: "gemini-2.5-pro",
+                },
+            );
+            let model = openai_chat_model(body, "gemini-2.5-pro");
+            let target_url = build_google_generate_content_url(&config.target_base_url, &model);
+            let response = client
+                .post(&target_url)
+                .header("x-goog-api-key", config.api_key.as_str())
+                .header("Content-Type", "application/json")
+                .json(&google_body)
+                .send()
+                .await?;
+
+            let status_code = response.status().as_u16();
+            let response_text = response.text().await?;
+            if status_code != 200 {
+                return Ok(ForwardedChatResponse::HttpError {
+                    status: status_code,
+                    body: response_text,
+                });
+            }
+            let google_response: Value = serde_json::from_str(&response_text)?;
+            Ok(ForwardedChatResponse::Success(
+                convert_gemini_to_openai_chat_response(&google_response, &model),
+            ))
+        }
+    }
 }
 
 // =============================================================================
@@ -1215,6 +1343,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://ai-gateway.vercel.sh/v1".to_string(),
                 api_key: "sk-test".to_string(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1243,6 +1372,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1274,6 +1404,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1307,6 +1438,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1335,6 +1467,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1355,6 +1488,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://openrouter.ai/api/v1".to_string(),
                 api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1377,6 +1511,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1399,6 +1534,7 @@ mod tests {
             &CodexRouterConfig {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1636,6 +1772,7 @@ mod tests {
         let config = CodexRouterConfig {
             target_base_url: "https://api.example.com".to_string(),
             api_key: "sk-test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
             copilot_token_manager: None,
             model_prefix: None,
             requires_reasoning_content: false,
@@ -1652,6 +1789,7 @@ mod tests {
         let config = CodexRouterConfig {
             target_base_url: String::new(),
             api_key: String::new(),
+            target_protocol: ProviderProtocol::Openai,
             // Simulate copilot mode by checking the None branch is the no-transform path
             copilot_token_manager: None,
             model_prefix: None,

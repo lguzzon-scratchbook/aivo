@@ -20,6 +20,13 @@ use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
 };
 use crate::services::http_utils::{self, router_http_client};
+use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
+use crate::services::openai_gemini_bridge::{
+    OpenAIToGeminiConfig, build_google_generate_content_url,
+    convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
+    openai_chat_model,
+};
+use crate::services::provider_protocol::ProviderProtocol;
 
 #[derive(Clone)]
 pub struct OpenAIRouterConfig {
@@ -27,6 +34,8 @@ pub struct OpenAIRouterConfig {
     pub target_base_url: String,
     /// API key for the target provider
     pub target_api_key: String,
+    /// The upstream protocol spoken by the provider.
+    pub target_protocol: ProviderProtocol,
     /// Optional model prefix to add (e.g., "@cf/" for Cloudflare)
     pub model_prefix: Option<String>,
     /// Whether the provider requires `reasoning_content` on assistant tool-call turns (e.g., Moonshot)
@@ -97,7 +106,7 @@ async fn run_router(listener: tokio::net::TcpListener, state: OpenAIRouterState)
                 return;
             }
 
-            let response = match handle_anthropic_to_openai(&request, &config, &client).await {
+            let response = match handle_anthropic_to_upstream(&request, &config, &client).await {
                 Ok(response) => response,
                 Err(e) => {
                     let error = http_utils::http_error_response(500, &e.to_string());
@@ -141,7 +150,7 @@ fn apply_model_prefix(model: &str, prefix: Option<&str>) -> String {
 }
 
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
-async fn handle_anthropic_to_openai(
+async fn handle_anthropic_to_upstream(
     request: &str,
     config: &Arc<OpenAIRouterConfig>,
     client: &reqwest::Client,
@@ -151,6 +160,10 @@ async fn handle_anthropic_to_openai(
     let body: Value = serde_json::from_str(body_str)?;
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content);
     cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
+    let requested_stream = simplified
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Transform model name: add prefix if configured (e.g., "@cf/" for Cloudflare)
     if let Some(model) = simplified.get_mut("model")
@@ -162,46 +175,93 @@ async fn handle_anthropic_to_openai(
         ));
     }
 
-    let url = http_utils::build_chat_completions_url(&config.target_base_url);
+    match config.target_protocol {
+        ProviderProtocol::Google => {
+            simplified["stream"] = json!(false);
+            let model = openai_chat_model(&simplified, "gemini-2.5-pro");
+            let google_body = convert_openai_chat_to_gemini_request(
+                &simplified,
+                &OpenAIToGeminiConfig {
+                    default_model: "gemini-2.5-pro",
+                },
+            );
+            let url = build_google_generate_content_url(&config.target_base_url, &model);
+            let response = client
+                .post(&url)
+                .header("x-goog-api-key", config.target_api_key.as_str())
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "aivo-router/1.0")
+                .json(&google_body)
+                .send()
+                .await?;
 
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.target_api_key))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", "aivo-router/1.0")
-        .json(&simplified)
-        .send()
-        .await?;
+            let status_code = response.status().as_u16();
+            let response_body = response.text().await?;
+            if status_code >= 400 {
+                return Ok(RouterResponse::Buffered {
+                    status: status_code,
+                    content_type: "application/json".to_string(),
+                    body: response_body.into_bytes(),
+                });
+            }
 
-    let status_code = response.status().as_u16();
-    // Check Content-Type header before consuming body to reliably detect streaming responses
-    let is_streaming = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.contains("text/event-stream"))
-        .unwrap_or(false);
-    let response_body = response.text().await?;
+            let google_response: Value = serde_json::from_str(&response_body)?;
+            let openai_response = convert_gemini_to_openai_chat_response(&google_response, &model);
+            if requested_stream {
+                let openai_sse = convert_openai_chat_response_to_sse(&openai_response);
+                let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
+                Ok(RouterResponse::Buffered {
+                    status: 200,
+                    content_type: "text/event-stream".to_string(),
+                    body: anthropic_sse.into_bytes(),
+                })
+            } else {
+                Ok(RouterResponse::Buffered {
+                    status: 200,
+                    content_type: "application/json".to_string(),
+                    body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?
+                        .into_bytes(),
+                })
+            }
+        }
+        _ => {
+            let url = http_utils::build_chat_completions_url(&config.target_base_url);
+            let response = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", config.target_api_key))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "aivo-router/1.0")
+                .json(&simplified)
+                .send()
+                .await?;
 
-    // Preserve the previous buffered SSE conversion path for Claude Code compatibility.
-    // Some providers omit the SSE content type, so keep the body-prefix fallback too.
-    if status_code == 200 && (is_streaming || response_body.starts_with("data:")) {
-        let anthropic_sse = convert_openai_sse_to_anthropic(&response_body, status_code)?;
-        return Ok(RouterResponse::Buffered {
-            status: 200,
-            content_type: "text/event-stream".to_string(),
-            body: anthropic_sse.into_bytes(),
-        });
+            let status_code = response.status().as_u16();
+            let is_streaming = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.contains("text/event-stream"))
+                .unwrap_or(false);
+            let response_body = response.text().await?;
+
+            if status_code == 200 && (is_streaming || response_body.starts_with("data:")) {
+                let anthropic_sse = convert_openai_sse_to_anthropic(&response_body, status_code)?;
+                return Ok(RouterResponse::Buffered {
+                    status: 200,
+                    content_type: "text/event-stream".to_string(),
+                    body: anthropic_sse.into_bytes(),
+                });
+            }
+
+            let anthropic_response = convert_openai_to_anthropic(&response_body, status_code)?;
+
+            Ok(RouterResponse::Buffered {
+                status: status_code,
+                content_type: "application/json".to_string(),
+                body: anthropic_response.into_bytes(),
+            })
+        }
     }
-
-    // Non-streaming: convert JSON response
-    let anthropic_response = convert_openai_to_anthropic(&response_body, status_code)?;
-
-    Ok(RouterResponse::Buffered {
-        status: status_code,
-        content_type: "application/json".to_string(),
-        body: anthropic_response.into_bytes(),
-    })
 }
 
 fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value {

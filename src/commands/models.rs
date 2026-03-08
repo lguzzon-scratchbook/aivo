@@ -13,6 +13,7 @@ use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, CopilotTokenManager,
 };
 use crate::services::models_cache::ModelsCache;
+use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
@@ -128,7 +129,7 @@ impl ModelsCommand {
         println!(
             "{}",
             style::dim(
-                "Calls /v1/models (OpenAI-compatible), /v1beta/models (Google), or /ai/models/search (Cloudflare)."
+                "Calls /v1/models (OpenAI/Anthropic-compatible), /v1beta/models (Google), or /ai/models/search (Cloudflare)."
             )
         );
         println!();
@@ -251,10 +252,11 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             .map(|m| m.id)
             .filter(|id| is_copilot_chat_model(id))
             .collect())
-    } else if key.base_url.contains("generativelanguage.googleapis.com") {
-        let url = format!("{}/v1beta/models?key={}", base, key.key.as_str());
+    } else if detect_provider_protocol(&key.base_url) == ProviderProtocol::Google {
+        let url = build_google_models_url(base);
         let response = client
             .get(&url)
+            .header("x-goog-api-key", key.key.as_str())
             .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .send()
             .await?;
@@ -281,6 +283,32 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                     .unwrap_or(&m.name)
                     .to_string()
             })
+            .collect())
+    } else if detect_provider_protocol(&key.base_url) == ProviderProtocol::Anthropic {
+        let url = format!(
+            "{}/models",
+            normalize_base_url(&key.base_url).trim_end_matches('/')
+        );
+        let response = client
+            .get(&url)
+            .header("x-api-key", key.key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("API returned {} — {}", status, body);
+        }
+
+        let resp: OpenAIModelsResponse = response.json().await?;
+        Ok(resp
+            .data
+            .into_iter()
+            .map(|m| m.id)
+            .filter(|id| is_text_chat_model(id))
             .collect())
     } else if let Some(cloudflare_base) = cloudflare_ai_base(base) {
         let auth = format!("Bearer {}", key.key.as_str());
@@ -377,6 +405,17 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
     }
 }
 
+fn build_google_models_url(base_url: &str) -> String {
+    let base = normalize_base_url(base_url).trim_end_matches('/');
+    if base.ends_with("/v1beta") || base.ends_with("/v1") {
+        format!("{}/models", base)
+    } else if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{}/v1beta/models", base)
+    }
+}
+
 /// Fetches the model list (cache-first) with a spinner for network fetches,
 /// filtered to text-chat models only. Used by chat and run commands for the
 /// interactive model picker.
@@ -423,6 +462,10 @@ mod tests {
             id: "1".to_string(),
             name: "test".to_string(),
             base_url: url.to_string(),
+            claude_protocol: None,
+            gemini_protocol: None,
+            codex_mode: None,
+            opencode_mode: None,
             key: Zeroizing::new("sk-test".to_string()),
             created_at: "2026-01-01".to_string(),
         }

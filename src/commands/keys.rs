@@ -374,8 +374,30 @@ impl KeysCommand {
 
         let updated = self
             .session_store
-            .update_key(&key.id, &name, &base_url, &api_key)
+            .update_key(
+                &key.id,
+                &name,
+                &base_url,
+                if base_url == key.base_url {
+                    key.claude_protocol
+                } else {
+                    None
+                },
+                &api_key,
+            )
             .await?;
+
+        if updated && base_url != key.base_url {
+            let _ = self
+                .session_store
+                .set_key_gemini_protocol(&key.id, None)
+                .await?;
+            let _ = self.session_store.set_key_codex_mode(&key.id, None).await?;
+            let _ = self
+                .session_store
+                .set_key_opencode_mode(&key.id, None)
+                .await?;
+        }
 
         if !updated {
             eprintln!("{} Key no longer exists", style::red("Error:"));
@@ -501,7 +523,10 @@ impl KeysCommand {
                 self.session_store.delete_key(&old_id).await?;
             }
 
-            let id = self.session_store.add_key(&name, "copilot", &token).await?;
+            let id = self
+                .session_store
+                .add_key_with_protocol(&name, "copilot", None, &token)
+                .await?;
             self.session_store.set_active_key(&id).await?;
 
             println!();
@@ -535,7 +560,10 @@ impl KeysCommand {
 
         println!();
 
-        let id = self.session_store.add_key(&name, &base_url, &key).await?;
+        let id = self
+            .session_store
+            .add_key_with_protocol(&name, &base_url, None, &key)
+            .await?;
         self.session_store.set_active_key(&id).await?;
 
         println!(
@@ -685,7 +713,6 @@ impl KeysCommand {
             "  --key <api-key>       {}",
             style::dim("- Set provider API key")
         );
-        println!();
         println!(
             "  {}",
             style::dim(
@@ -799,9 +826,9 @@ mod tests {
             .execute(KeysArgs {
                 action: Some("add".to_string()),
                 args: Vec::new(),
-                name: Some("openrouter".to_string()),
-                base_url: Some("https://openrouter.ai/api/v1".to_string()),
-                key: Some("sk-or-v1-test".to_string()),
+                name: Some("minimax".to_string()),
+                base_url: Some("https://api.minimax.io/anthropic".to_string()),
+                key: Some("sk-minimax-test".to_string()),
             })
             .await;
 
@@ -809,9 +836,10 @@ mod tests {
 
         let keys = store.get_keys().await.unwrap();
         assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].name, "openrouter");
-        assert_eq!(keys[0].base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(keys[0].key.as_str(), "sk-or-v1-test");
+        assert_eq!(keys[0].name, "minimax");
+        assert_eq!(keys[0].base_url, "https://api.minimax.io/anthropic");
+        assert_eq!(keys[0].claude_protocol, None);
+        assert_eq!(keys[0].key.as_str(), "sk-minimax-test");
 
         let active = store.get_active_key().await.unwrap().unwrap();
         assert_eq!(active.id, keys[0].id);

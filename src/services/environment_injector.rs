@@ -6,7 +6,12 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::services::session_store::ApiKey;
+use crate::services::provider_protocol::{
+    ProviderProtocol, detect_provider_protocol, is_anthropic_endpoint,
+};
+use crate::services::session_store::{
+    ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
+};
 
 /// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
 /// This prevents the "Model metadata not found" warning from Codex CLI.
@@ -66,8 +71,35 @@ pub struct EnvironmentInjector;
 impl EnvironmentInjector {
     /// Returns true when the URL points to a native Anthropic endpoint that speaks
     /// the Anthropic Messages API directly (no format conversion needed).
-    fn is_anthropic_native_endpoint(base_url: &str) -> bool {
-        base_url.contains("api.anthropic.com")
+    ///
+    /// This includes Anthropic's official API plus provider-hosted Anthropic-compatible
+    /// bases such as MiniMax's `/anthropic` endpoint.
+    fn use_direct_anthropic_for_claude(key: &ApiKey) -> bool {
+        match key.claude_protocol {
+            Some(ClaudeProviderProtocol::Anthropic) => true,
+            Some(ClaudeProviderProtocol::Openai | ClaudeProviderProtocol::Google) => false,
+            None => is_anthropic_endpoint(&key.base_url),
+        }
+    }
+
+    fn use_direct_openai_for_codex(key: &ApiKey) -> bool {
+        match key.codex_mode {
+            Some(OpenAICompatibilityMode::Direct) => true,
+            Some(OpenAICompatibilityMode::Router) => false,
+            None => key.base_url.contains("api.openai.com"),
+        }
+    }
+
+    fn use_google_native_for_gemini(key: &ApiKey) -> bool {
+        match key.gemini_protocol {
+            Some(GeminiProviderProtocol::Google) => true,
+            Some(GeminiProviderProtocol::Openai | GeminiProviderProtocol::Anthropic) => false,
+            None => detect_provider_protocol(&key.base_url) == ProviderProtocol::Google,
+        }
+    }
+
+    fn use_router_for_opencode(key: &ApiKey) -> bool {
+        matches!(key.opencode_mode, Some(OpenAICompatibilityMode::Router))
     }
 
     /// Creates a new EnvironmentInjector
@@ -107,7 +139,7 @@ impl EnvironmentInjector {
             env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_ROUTER_API_KEY".to_string(), key.key.to_string());
             env.insert("AIVO_ROUTER_BASE_URL".to_string(), key.base_url.to_string());
-        } else if Self::is_anthropic_native_endpoint(&key.base_url) {
+        } else if Self::use_direct_anthropic_for_claude(key) {
             // Direct connection — native Anthropic API (api.anthropic.com).
             // Claude Code appends /v1/messages itself, so strip any trailing /v1 to avoid doubling.
             let base_url = key.base_url.trim_end_matches('/');
@@ -116,7 +148,7 @@ impl EnvironmentInjector {
             env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
         } else {
             // All other endpoints are assumed to be OpenAI-compatible providers.
-            // Use OpenAIRouter to convert Anthropic Messages format → OpenAI Chat Completions.
+            // Use OpenAIRouter to convert Anthropic Messages format → upstream provider protocol.
             // Placeholder URL - AI launcher overwrites with the actual random port after binding.
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -131,6 +163,10 @@ impl EnvironmentInjector {
             env.insert(
                 "AIVO_OPENAI_ROUTER_BASE_URL".to_string(),
                 key.base_url.to_string(),
+            );
+            env.insert(
+                "AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                detect_provider_protocol(&key.base_url).as_str().to_string(),
             );
             // Cloudflare Workers AI requires a "@cf/" model prefix
             if key.base_url.contains("cloudflare.com") {
@@ -207,7 +243,7 @@ impl EnvironmentInjector {
             env.insert("OPENAI_API_KEY".to_string(), "copilot".to_string());
             env.insert("AIVO_USE_CODEX_COPILOT_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
-        } else if !key.base_url.contains("api.openai.com") {
+        } else if !Self::use_direct_openai_for_codex(key) {
             // Non-OpenAI provider: use CodexRouter to strip unsupported tool types
             // Placeholder URL - AI launcher overwrites with the actual random port after binding
             env.insert(
@@ -220,6 +256,10 @@ impl EnvironmentInjector {
             env.insert(
                 "AIVO_CODEX_ROUTER_BASE_URL".to_string(),
                 key.base_url.clone(),
+            );
+            env.insert(
+                "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                detect_provider_protocol(&key.base_url).as_str().to_string(),
             );
             // Cloudflare Workers AI requires a "@cf/" model prefix
             if key.base_url.contains("cloudflare.com") {
@@ -303,7 +343,7 @@ impl EnvironmentInjector {
                     m.to_string(),
                 );
             }
-        } else if key.base_url.contains("generativelanguage.googleapis.com") {
+        } else if Self::use_google_native_for_gemini(key) {
             // Native Google endpoint: connect directly
             env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), key.base_url.clone());
             env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());
@@ -323,6 +363,10 @@ impl EnvironmentInjector {
             env.insert(
                 "AIVO_GEMINI_ROUTER_BASE_URL".to_string(),
                 key.base_url.clone(),
+            );
+            env.insert(
+                "AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                detect_provider_protocol(&key.base_url).as_str().to_string(),
             );
             // DeepSeek reasoning models require reasoning_content round-tripped;
             // all DeepSeek models cap max_tokens at 8192
@@ -366,6 +410,40 @@ impl EnvironmentInjector {
             );
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
             ("http://127.0.0.1:0".to_string(), "copilot".to_string())
+        } else if Self::use_router_for_opencode(key) {
+            env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_CODEX_ROUTER_API_KEY".to_string(), key.key.to_string());
+            env.insert(
+                "AIVO_CODEX_ROUTER_BASE_URL".to_string(),
+                key.base_url.clone(),
+            );
+            env.insert(
+                "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                detect_provider_protocol(&key.base_url).as_str().to_string(),
+            );
+            if key.base_url.contains("cloudflare.com") {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_MODEL_PREFIX".to_string(),
+                    "@cf/".to_string(),
+                );
+            }
+            if key.base_url.contains("moonshot.cn") || key.base_url.contains("moonshot.ai") {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
+                    "1".to_string(),
+                );
+            }
+            if key.base_url.contains("deepseek.com") {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
+                    "1".to_string(),
+                );
+                env.insert(
+                    "AIVO_CODEX_ROUTER_MAX_TOKENS_CAP".to_string(),
+                    "8192".to_string(),
+                );
+            }
+            ("http://127.0.0.1:0".to_string(), key.key.to_string())
         } else {
             (key.base_url.clone(), key.key.to_string())
         };
@@ -514,17 +592,18 @@ mod tests {
     use super::*;
 
     fn test_key() -> ApiKey {
-        ApiKey::new(
+        ApiKey::new_with_protocol(
             "a1b2".to_string(),
             "test-key".to_string(),
             "http://localhost:8080".to_string(),
+            None,
             "sk-test-key-12345".to_string(),
         )
     }
 
     #[test]
     fn test_for_claude_anthropic_native_direct() {
-        // api.anthropic.com is the only URL that bypasses all routers
+        // Official Anthropic endpoints bypass all routers.
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.anthropic.com/v1".to_string();
@@ -544,6 +623,69 @@ mod tests {
             Some(&"1".to_string())
         );
         assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_claude_minimax_anthropic_endpoint_direct() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.minimax.io/anthropic".to_string();
+        let env = injector.for_claude(&key, Some("MiniMax-M1"));
+
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"https://api.minimax.io/anthropic".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN"),
+            Some(&"sk-test-key-12345".to_string())
+        );
+        assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&"MiniMax-M1".to_string()));
+        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_claude_minimax_anthropic_v1_endpoint_direct() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.minimax.io/anthropic/v1".to_string();
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"https://api.minimax.io/anthropic".to_string())
+        );
+        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_claude_protocol_override_anthropic_direct() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.example.com/v1".to_string();
+        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        let env = injector.for_claude(&key, Some("claude-sonnet-4-6"));
+
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"https://api.example.com".to_string())
+        );
+        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_claude_protocol_override_openai_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.minimax.io/anthropic".to_string();
+        key.claude_protocol = Some(ClaudeProviderProtocol::Openai);
+        let env = injector.for_claude(&key, Some("MiniMax-M1"));
+
+        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            Some(&"https://api.minimax.io/anthropic".to_string())
+        );
     }
 
     #[test]
@@ -900,6 +1042,21 @@ mod tests {
     }
 
     #[test]
+    fn test_for_gemini_protocol_override_google_direct() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.example.com".to_string();
+        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        let env = injector.for_gemini(&key, None);
+
+        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&"https://api.example.com".to_string())
+        );
+    }
+
+    #[test]
     fn test_for_gemini_non_google_uses_router() {
         let injector = EnvironmentInjector::new();
         let key = test_key(); // base_url = http://localhost:8080 (non-Google)
@@ -1093,6 +1250,31 @@ mod tests {
             "http://127.0.0.1:0"
         );
         assert_eq!(config["provider"]["aivo"]["options"]["apiKey"], "copilot");
+    }
+
+    #[test]
+    fn test_for_opencode_router_uses_placeholder_url() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.opencode_mode = Some(OpenAICompatibilityMode::Router);
+        let env = injector.for_opencode(&key, Some("gpt-4o"), None);
+
+        assert_eq!(env.get("AIVO_USE_OPENCODE_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            Some(&"http://localhost:8080".to_string())
+        );
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(
+            config["provider"]["aivo"]["options"]["baseURL"],
+            "http://127.0.0.1:0"
+        );
+        assert_eq!(
+            config["provider"]["aivo"]["options"]["apiKey"],
+            "sk-test-key-12345"
+        );
     }
 
     #[test]

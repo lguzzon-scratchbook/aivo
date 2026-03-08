@@ -5,11 +5,17 @@ use std::sync::Arc;
 
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
+use crate::services::openai_anthropic_bridge::{
+    OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
+    convert_openai_chat_to_anthropic_request,
+};
+use crate::services::provider_protocol::ProviderProtocol;
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
     pub target_base_url: String,
     pub api_key: String,
+    pub upstream_protocol: ProviderProtocol,
     /// When set, overrides the model name extracted from the URL path (used for Copilot mode
     /// since Gemini model names like `gemini-2.0-flash` are not available on Copilot).
     pub forced_model: Option<String>,
@@ -94,26 +100,64 @@ async fn forward_to_provider(
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
 ) -> Result<Value> {
-    let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
-    let response = http_utils::authorized_openai_post(
-        client.as_ref(),
-        &target_url,
-        &config.api_key,
-        config.copilot_token_manager.as_deref(),
-    )
-    .await?
-    .json(&openai_req)
-    .send()
-    .await?;
+    match config.upstream_protocol {
+        ProviderProtocol::Anthropic => {
+            let mut anthropic_req = convert_openai_chat_to_anthropic_request(
+                &openai_req,
+                &OpenAIToAnthropicChatConfig {
+                    default_model: "claude-sonnet-4-5",
+                },
+            );
+            anthropic_req["stream"] = serde_json::json!(false);
+            let target_url = http_utils::build_target_url(&config.target_base_url, "/v1/messages");
+            let response = client
+                .post(&target_url)
+                .header("Authorization", format!("Bearer {}", config.api_key))
+                .header("x-api-key", config.api_key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&anthropic_req)
+                .send()
+                .await?;
 
-    let status = response.status().as_u16();
-    let body_text = response.text().await?;
+            let status = response.status().as_u16();
+            let body_text = response.text().await?;
+            if status != 200 {
+                anyhow::bail!("Provider error {}: {}", status, body_text);
+            }
 
-    if status != 200 {
-        anyhow::bail!("Provider error {}: {}", status, body_text);
+            let anthropic_response: Value = serde_json::from_str(&body_text)?;
+            Ok(convert_anthropic_to_openai_chat_response(
+                &anthropic_response,
+                openai_req
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("gemini-2.5-pro"),
+            ))
+        }
+        _ => {
+            let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
+            let response = http_utils::authorized_openai_post(
+                client.as_ref(),
+                &target_url,
+                &config.api_key,
+                config.copilot_token_manager.as_deref(),
+            )
+            .await?
+            .json(&openai_req)
+            .send()
+            .await?;
+
+            let status = response.status().as_u16();
+            let body_text = response.text().await?;
+
+            if status != 200 {
+                anyhow::bail!("Provider error {}: {}", status, body_text);
+            }
+
+            Ok(serde_json::from_str(&body_text)?)
+        }
     }
-
-    Ok(serde_json::from_str(&body_text)?)
 }
 
 /// Parses a Gemini API request path and extracts (model_name, is_streaming).
@@ -966,6 +1010,7 @@ mod tests {
         let config = GeminiRouterConfig {
             target_base_url: String::new(),
             api_key: String::new(),
+            upstream_protocol: ProviderProtocol::Openai,
             forced_model: Some("gpt-4o".to_string()),
             copilot_token_manager: None,
             requires_reasoning_content: false,
@@ -980,6 +1025,7 @@ mod tests {
         let config = GeminiRouterConfig {
             target_base_url: "https://example.com".to_string(),
             api_key: "sk-test".to_string(),
+            upstream_protocol: ProviderProtocol::Openai,
             forced_model: None,
             copilot_token_manager: None,
             requires_reasoning_content: false,

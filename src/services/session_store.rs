@@ -67,12 +67,65 @@ const ITERATIONS: u32 = 100;
 const ITERATIONS: u32 = 100_000;
 
 /// API key stored on user's machine
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeProviderProtocol {
+    Anthropic,
+    Openai,
+    Google,
+}
+
+impl ClaudeProviderProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+            Self::Google => "google",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GeminiProviderProtocol {
+    Google,
+    Openai,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAICompatibilityMode {
+    Direct,
+    Router,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiKey {
     pub id: String,
     pub name: String,
     #[serde(rename = "baseUrl")]
     pub base_url: String,
+    #[serde(
+        rename = "claudeProtocol",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_protocol: Option<ClaudeProviderProtocol>,
+    #[serde(
+        rename = "geminiProtocol",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gemini_protocol: Option<GeminiProviderProtocol>,
+    #[serde(rename = "codexMode", default, skip_serializing_if = "Option::is_none")]
+    pub codex_mode: Option<OpenAICompatibilityMode>,
+    #[serde(
+        rename = "opencodeMode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub opencode_mode: Option<OpenAICompatibilityMode>,
     #[serde(with = "zeroizing_string")]
     pub key: Zeroizing<String>,
     #[serde(rename = "createdAt")]
@@ -80,11 +133,21 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
-    pub fn new(id: String, name: String, base_url: String, key: String) -> Self {
+    pub fn new_with_protocol(
+        id: String,
+        name: String,
+        base_url: String,
+        claude_protocol: Option<ClaudeProviderProtocol>,
+        key: String,
+    ) -> Self {
         Self {
             id,
             name,
             base_url,
+            claude_protocol,
+            gemini_protocol: None,
+            codex_mode: None,
+            opencode_mode: None,
             key: Zeroizing::new(key),
             created_at: Utc::now().to_rfc3339(),
         }
@@ -395,8 +458,14 @@ impl SessionStore {
         self.decrypt_keys(&parsed)
     }
 
-    /// Adds a new API key and returns its generated ID
-    pub async fn add_key(&self, name: &str, base_url: &str, key: &str) -> Result<String> {
+    /// Adds a new API key with an optional explicit Claude protocol.
+    pub async fn add_key_with_protocol(
+        &self,
+        name: &str,
+        base_url: &str,
+        claude_protocol: Option<ClaudeProviderProtocol>,
+        key: &str,
+    ) -> Result<String> {
         let _lock = self.acquire_config_lock()?;
         let mut config = self.load_unlocked().await?;
 
@@ -417,10 +486,11 @@ impl SessionStore {
             }
         };
 
-        config.api_keys.push(ApiKey::new(
+        config.api_keys.push(ApiKey::new_with_protocol(
             id.clone(),
             name.to_string(),
             base_url.to_string(),
+            claude_protocol,
             key.to_string(),
         ));
 
@@ -465,6 +535,7 @@ impl SessionStore {
         id: &str,
         name: &str,
         base_url: &str,
+        claude_protocol: Option<ClaudeProviderProtocol>,
         key: &str,
     ) -> Result<bool> {
         let _lock = self.acquire_config_lock()?;
@@ -472,7 +543,73 @@ impl SessionStore {
         if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
             entry.name = name.to_string();
             entry.base_url = base_url.to_string();
+            entry.claude_protocol = claude_protocol;
             entry.key = Zeroizing::new(key.to_string());
+            self.save_unlocked(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Persists the learned Claude protocol for an existing key.
+    pub async fn set_key_claude_protocol(
+        &self,
+        id: &str,
+        claude_protocol: Option<ClaudeProviderProtocol>,
+    ) -> Result<bool> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            entry.claude_protocol = claude_protocol;
+            self.save_unlocked(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn set_key_gemini_protocol(
+        &self,
+        id: &str,
+        gemini_protocol: Option<GeminiProviderProtocol>,
+    ) -> Result<bool> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            entry.gemini_protocol = gemini_protocol;
+            self.save_unlocked(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn set_key_codex_mode(
+        &self,
+        id: &str,
+        codex_mode: Option<OpenAICompatibilityMode>,
+    ) -> Result<bool> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            entry.codex_mode = codex_mode;
+            self.save_unlocked(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn set_key_opencode_mode(
+        &self,
+        id: &str,
+        opencode_mode: Option<OpenAICompatibilityMode>,
+    ) -> Result<bool> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            entry.opencode_mode = opencode_mode;
             self.save_unlocked(&config).await?;
             Ok(true)
         } else {
@@ -622,7 +759,7 @@ mod tests {
 
         // Add a key
         let id = store
-            .add_key("my-key", "http://localhost:8080", "sk-test123")
+            .add_key_with_protocol("my-key", "http://localhost:8080", None, "sk-test123")
             .await
             .unwrap();
         assert_eq!(id.len(), 4);
@@ -632,6 +769,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].name, "my-key");
         assert_eq!(keys[0].base_url, "http://localhost:8080");
+        assert_eq!(keys[0].claude_protocol, None);
 
         // Set as active
         store.set_active_key(&id).await.unwrap();
@@ -652,7 +790,7 @@ mod tests {
         let store = SessionStore::with_path(config_path.clone());
 
         let id = store
-            .add_key("test", "http://localhost", "sk-secret-12345")
+            .add_key_with_protocol("test", "http://localhost", None, "sk-secret-12345")
             .await
             .unwrap();
 
@@ -673,7 +811,7 @@ mod tests {
         let store = SessionStore::with_path(config_path);
 
         let id = store
-            .add_key("my-key", "http://localhost:8080", "sk-test")
+            .add_key_with_protocol("my-key", "http://localhost:8080", None, "sk-test")
             .await
             .unwrap();
         store.set_active_key(&id).await.unwrap();
@@ -693,7 +831,7 @@ mod tests {
         let store = SessionStore::with_path(config_path);
 
         let id = store
-            .add_key("my-key", "http://localhost:8080", "sk-test")
+            .add_key_with_protocol("my-key", "http://localhost:8080", None, "sk-test")
             .await
             .unwrap();
 
@@ -709,7 +847,7 @@ mod tests {
         let store = SessionStore::with_path(config_path);
 
         let id = store
-            .add_key("my-key", "http://localhost:8080", "sk-test")
+            .add_key_with_protocol("my-key", "http://localhost:8080", None, "sk-test")
             .await
             .unwrap();
 
@@ -735,11 +873,11 @@ mod tests {
         let store = SessionStore::with_path(config_path);
 
         store
-            .add_key("same-name", "http://localhost:8080", "sk-test1")
+            .add_key_with_protocol("same-name", "http://localhost:8080", None, "sk-test1")
             .await
             .unwrap();
         store
-            .add_key("same-name", "http://localhost:9090", "sk-test2")
+            .add_key_with_protocol("same-name", "http://localhost:9090", None, "sk-test2")
             .await
             .unwrap();
 
@@ -789,12 +927,18 @@ mod tests {
         let store = SessionStore::with_path(config_path);
 
         let id = store
-            .add_key("original", "http://localhost:8080", "sk-old")
+            .add_key_with_protocol("original", "http://localhost:8080", None, "sk-old")
             .await
             .unwrap();
 
         let updated = store
-            .update_key(&id, "renamed", "https://new.example.com", "sk-new")
+            .update_key(
+                &id,
+                "renamed",
+                "https://new.example.com",
+                Some(ClaudeProviderProtocol::Anthropic),
+                "sk-new",
+            )
             .await
             .unwrap();
         assert!(updated);
@@ -802,6 +946,7 @@ mod tests {
         let key = store.get_key_by_id(&id).await.unwrap().unwrap();
         assert_eq!(key.name, "renamed");
         assert_eq!(key.base_url, "https://new.example.com");
+        assert_eq!(key.claude_protocol, Some(ClaudeProviderProtocol::Anthropic));
         assert_eq!(key.key.as_str(), "sk-new");
         assert_eq!(key.id, id);
     }
@@ -813,7 +958,7 @@ mod tests {
         let store = SessionStore::with_path(config_path);
 
         let updated = store
-            .update_key("nonexistent", "name", "http://example.com", "sk-key")
+            .update_key("nonexistent", "name", "http://example.com", None, "sk-key")
             .await
             .unwrap();
         assert!(!updated);
@@ -826,18 +971,146 @@ mod tests {
         let store = SessionStore::with_path(config_path);
 
         let id = store
-            .add_key("orig", "http://localhost", "sk-test")
+            .add_key_with_protocol("orig", "http://localhost", None, "sk-test")
             .await
             .unwrap();
         let before = store.get_key_by_id(&id).await.unwrap().unwrap();
 
         store
-            .update_key(&id, "new-name", "http://localhost", "sk-test")
+            .update_key(&id, "new-name", "http://localhost", None, "sk-test")
             .await
             .unwrap();
         let after = store.get_key_by_id(&id).await.unwrap().unwrap();
 
         assert_eq!(before.created_at, after.created_at);
+    }
+
+    #[tokio::test]
+    async fn test_add_key_with_claude_protocol_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol(
+                "minimax",
+                "https://api.minimax.io/anthropic",
+                Some(ClaudeProviderProtocol::Anthropic),
+                "sk-test",
+            )
+            .await
+            .unwrap();
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.claude_protocol, Some(ClaudeProviderProtocol::Anthropic));
+    }
+
+    #[tokio::test]
+    async fn test_set_key_claude_protocol_updates_existing_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .set_key_claude_protocol(&id, Some(ClaudeProviderProtocol::Openai))
+                .await
+                .unwrap()
+        );
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.claude_protocol, Some(ClaudeProviderProtocol::Openai));
+    }
+
+    #[tokio::test]
+    async fn test_set_key_gemini_protocol_updates_existing_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .set_key_gemini_protocol(&id, Some(GeminiProviderProtocol::Google))
+                .await
+                .unwrap()
+        );
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.gemini_protocol, Some(GeminiProviderProtocol::Google));
+    }
+
+    #[tokio::test]
+    async fn test_set_key_codex_mode_updates_existing_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .set_key_codex_mode(&id, Some(OpenAICompatibilityMode::Router))
+                .await
+                .unwrap()
+        );
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.codex_mode, Some(OpenAICompatibilityMode::Router));
+    }
+
+    #[tokio::test]
+    async fn test_set_key_opencode_mode_updates_existing_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .set_key_opencode_mode(&id, Some(OpenAICompatibilityMode::Router))
+                .await
+                .unwrap()
+        );
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.opencode_mode, Some(OpenAICompatibilityMode::Router));
+    }
+
+    #[tokio::test]
+    async fn test_load_legacy_config_without_claude_protocol() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let plaintext = encrypt("sk-test").unwrap();
+        let legacy_config = format!(
+            r#"{{"api_keys":[{{"id":"aaaa","name":"legacy","baseUrl":"http://example.com","key":"{}","createdAt":"2024-01-01T00:00:00Z"}}],"active_key_id":"aaaa"}}"#,
+            plaintext
+        );
+        tokio::fs::write(&config_path, legacy_config.as_bytes())
+            .await
+            .unwrap();
+
+        let store = SessionStore::with_path(config_path);
+        let key = store.get_active_key().await.unwrap().unwrap();
+        assert_eq!(key.name, "legacy");
+        assert_eq!(key.claude_protocol, None);
+        assert_eq!(key.key.as_str(), "sk-test");
     }
 
     // Tests moved from tests/encryption_test.rs
