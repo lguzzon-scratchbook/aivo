@@ -623,7 +623,7 @@ impl SessionStore {
                 format!("Key {} not found", id),
                 ErrorCategory::User,
                 None::<String>,
-                Some("Run 'aivo keys list' to see available keys"),
+                Some("Run 'aivo keys' to see available keys"),
             )
             .into());
         }
@@ -651,7 +651,7 @@ impl SessionStore {
                 format!("API key \"{}\" not found", id_or_name),
                 ErrorCategory::User,
                 None::<String>,
-                Some("Run 'aivo keys list' to see available keys"),
+                Some("Run 'aivo keys' to see available keys"),
             )
             .into()),
             1 => Ok(name_matches[0].clone()),
@@ -662,7 +662,7 @@ impl SessionStore {
                 ),
                 ErrorCategory::User,
                 None::<String>,
-                Some("Run 'aivo keys list' to see key IDs"),
+                Some("Run 'aivo keys' to see key IDs"),
             )
             .into()),
         }

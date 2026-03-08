@@ -382,7 +382,7 @@ fn print_help() {
     println!(
         "  {}   {}",
         style::cyan("keys [action]"),
-        style::dim("Manage API keys (list, use, rm, add, cat)")
+        style::dim("Manage API keys (use, rm, add, cat, edit)")
     );
     println!(
         "  {}      {}",

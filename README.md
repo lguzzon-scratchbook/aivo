@@ -48,7 +48,7 @@ aivo claude
 | `aivo models` | List available models from active provider |
 | `aivo use [name]` | Switch active key |
 | `aivo keys add` | Add an API key |
-| `aivo keys list` | List all keys |
+| `aivo keys` | List all keys |
 | `aivo update` | Update `aivo` |
 
 All extra flags pass through to the underlying tool:
@@ -116,6 +116,7 @@ aivo keys add --name openrouter --base-url https://openrouter.ai/api/v1 --key sk
 aivo keys use [id]   # switch active key
 aivo keys cat <id>   # show key details
 aivo keys rm <id>    # remove a key
+aivo keys edit <id>  # edit a key
 ```
 
 Keys are encrypted in `~/.config/aivo/config.json` (AES-256-GCM, machine-specific key derivation).

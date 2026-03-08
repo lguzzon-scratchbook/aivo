@@ -102,12 +102,13 @@ Each command receives injected services. Commands return exit codes for testing.
 
 **Available Commands:**
 - **keys** - API key management:
-  - `list` - List all keys
-  - `use <id|name>` - Activate a specific key
+  - `(no action)` - List all keys
+  - `use [id|name]` - Activate a specific key
   - `add` - Add an API key interactively (`add copilot` triggers GitHub Copilot device flow)
   - `add --name <name> --base-url <url> --key <api_key>` - Add a key non-interactively
-  - `rm <id|name>` - Remove an API key
-  - `cat <id|name>` - Display full key details
+  - `rm [id|name]` - Remove an API key
+  - `cat [id|name]` - Display full key details
+  - `edit [id|name]` - Edit an API key
 - **run** - Launch AI tools with unified interface
 - **chat** - Interactive REPL with streaming responses. Supports OpenAI-compatible, Anthropic, and GitHub Copilot providers. Automatically transforms model names for OpenRouter compatibility (e.g., `claude-sonnet-4-6` → `claude-sonnet-4.6`).
   - `chat -x` - One-shot chat mode: reads stdin as context, sends one message and exits

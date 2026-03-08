@@ -166,12 +166,12 @@ mod tests {
             "Key not found",
             ErrorCategory::User,
             Some("No key matching 'foo' was found"),
-            Some("Run 'aivo keys list' to see available keys"),
+            Some("Run 'aivo keys' to see available keys"),
         );
         let display = err.to_string();
         assert!(display.contains("Key not found"));
         assert!(display.contains("No key matching 'foo' was found"));
-        assert!(display.contains("Run 'aivo keys list'"));
+        assert!(display.contains("Run 'aivo keys'"));
     }
 
     #[test]

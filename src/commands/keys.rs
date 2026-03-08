@@ -10,7 +10,14 @@ use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
-/// Reads a confirmation from stdin (y/yes for true, anything else for false).
+enum KeySelection {
+    Key(ApiKey),
+    Cancelled,
+    Empty,
+    NotFound,
+}
+
+// Reads a confirmation from stdin (y/yes for true, anything else for false).
 fn confirm(prompt: &str) -> std::io::Result<bool> {
     print!("{} [y/N]: ", prompt);
     std::io::Write::flush(&mut std::io::stdout())?;
@@ -22,7 +29,7 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
     ))
 }
 
-/// Creates a safe preview of an API key, handling short keys without panicking.
+// Creates a safe preview of an API key, handling short keys without panicking.
 fn key_preview(key: &str) -> String {
     if key.len() <= 10 {
         format!("{}...", &key[..3.min(key.len())])
@@ -31,7 +38,6 @@ fn key_preview(key: &str) -> String {
     }
 }
 
-/// KeysCommand provides management of API keys
 pub struct KeysCommand {
     session_store: SessionStore,
 }
@@ -77,19 +83,17 @@ impl KeysCommand {
         args: Option<&[&str]>,
         add_options: AddKeyOptions<'_>,
     ) -> Result<ExitCode> {
-        let action = action.unwrap_or("list");
-
         match action {
-            "add" => {
+            None => self.list_keys().await,
+            Some("add") => {
                 self.add_key(args.and_then(|a| a.first().copied()), add_options)
                     .await
             }
-            "list" => self.list_keys().await,
-            "rm" => self.remove_key(args.and_then(|a| a.first().copied())).await,
-            "use" => self.use_key(args.and_then(|a| a.first().copied())).await,
-            "cat" => self.cat_key(args.and_then(|a| a.first().copied())).await,
-            "edit" => self.edit_key(args.and_then(|a| a.first().copied())).await,
-            _ => {
+            Some("rm") => self.remove_key(args.and_then(|a| a.first().copied())).await,
+            Some("use") => self.use_key(args.and_then(|a| a.first().copied())).await,
+            Some("cat") => self.cat_key(args.and_then(|a| a.first().copied())).await,
+            Some("edit") => self.edit_key(args.and_then(|a| a.first().copied())).await,
+            Some(action) => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
                 Self::print_help();
                 Ok(ExitCode::UserError)
@@ -129,89 +133,25 @@ impl KeysCommand {
 
     /// Activates a specific API key by ID or name
     async fn use_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
-        // No argument — show interactive selector
-        let Some(key_id_or_name) = key_id_or_name else {
-            let all_keys = self.session_store.get_keys().await?;
-            if all_keys.is_empty() {
-                println!("{}", style::dim("No API keys found."));
-                return Ok(ExitCode::Success);
-            }
-            let active_key = self.session_store.get_active_key().await?;
-            let active_idx = active_key
-                .and_then(|ak| all_keys.iter().position(|k| k.id == ak.id))
-                .unwrap_or(0);
-            let result = prompt_select_key(
-                &self.session_store,
-                &all_keys,
+        match self
+            .resolve_key_selection(
+                key_id_or_name,
                 "Select a key to activate",
-                active_idx,
+                "No API keys found.",
             )
-            .await?;
-            if result.is_none() {
-                println!("{}", style::dim("Cancelled."));
+            .await?
+        {
+            KeySelection::Key(key) => {
+                self.activate_key(&key).await?;
+                Ok(ExitCode::Success)
             }
-            return Ok(ExitCode::Success);
-        };
-
-        let all_keys = self.session_store.get_keys().await?;
-
-        // Try exact ID match first
-        if let Some(key) = all_keys.iter().find(|k| k.id == key_id_or_name) {
-            self.activate_key(key).await?;
-            return Ok(ExitCode::Success);
+            KeySelection::Cancelled => {
+                println!("{}", style::dim("Cancelled."));
+                Ok(ExitCode::Success)
+            }
+            KeySelection::Empty => Ok(ExitCode::Success),
+            KeySelection::NotFound => Ok(ExitCode::UserError),
         }
-
-        // Try name match
-        let name_matches: Vec<_> = all_keys
-            .iter()
-            .filter(|k| k.name == key_id_or_name)
-            .collect();
-
-        if name_matches.is_empty() {
-            eprintln!(
-                "{} API key \"{}\" not found",
-                style::red("Error:"),
-                key_id_or_name
-            );
-            eprintln!();
-            eprintln!(
-                "{}",
-                style::dim("Run 'aivo keys list' to see available keys.")
-            );
-            return Ok(ExitCode::UserError);
-        }
-
-        if name_matches.len() == 1 {
-            self.activate_key(name_matches[0]).await?;
-            return Ok(ExitCode::Success);
-        }
-
-        // Multiple matches - interactive selection
-        println!(
-            "{} Multiple keys found with name \"{}\":",
-            style::yellow("Note:"),
-            key_id_or_name
-        );
-
-        let choices: Vec<_> = name_matches
-            .iter()
-            .map(|k| format!("{} - {} - {}", k.id, k.base_url, key_preview(&k.key)))
-            .collect();
-
-        let selection = FuzzySelect::new()
-            .with_prompt("Select a key")
-            .items(&choices)
-            .default(0)
-            .interact_opt()
-            .ok()
-            .flatten();
-
-        if let Some(idx) = selection {
-            self.activate_key(name_matches[idx]).await?;
-        } else {
-            println!("{}", style::dim("Cancelled."));
-        }
-        Ok(ExitCode::Success)
     }
 
     /// Activates a key and prints confirmation
@@ -229,44 +169,25 @@ impl KeysCommand {
 
     /// Displays details for a specific API key
     async fn cat_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
-        let key_id_or_name = match key_id_or_name {
-            Some(k) => k,
-            None => {
-                eprintln!("{} Missing key ID or name", style::red("Error:"));
-                eprintln!();
-                eprintln!("{}", style::dim("Usage: aivo keys cat <key-id-or-name>"));
-                return Ok(ExitCode::UserError);
+        match self
+            .resolve_key_selection(
+                key_id_or_name,
+                "Select a key to inspect",
+                "No API keys found.",
+            )
+            .await?
+        {
+            KeySelection::Key(key) => {
+                self.display_key_details(&key);
+                Ok(ExitCode::Success)
             }
-        };
-
-        let all_keys = self.session_store.get_keys().await?;
-
-        if let Some(key) = all_keys.iter().find(|k| k.id == key_id_or_name) {
-            self.display_key_details(key);
-            return Ok(ExitCode::Success);
+            KeySelection::Cancelled => {
+                println!("{}", style::dim("Cancelled."));
+                Ok(ExitCode::Success)
+            }
+            KeySelection::Empty => Ok(ExitCode::Success),
+            KeySelection::NotFound => Ok(ExitCode::UserError),
         }
-
-        // Try name match
-        let name_matches: Vec<_> = all_keys
-            .iter()
-            .filter(|k| k.name == key_id_or_name)
-            .collect();
-        if name_matches.len() == 1 {
-            self.display_key_details(name_matches[0]);
-            return Ok(ExitCode::Success);
-        }
-
-        eprintln!(
-            "{} API key \"{}\" not found",
-            style::red("Error:"),
-            key_id_or_name
-        );
-        eprintln!();
-        eprintln!(
-            "{}",
-            style::dim("Run 'aivo keys list' to see available keys.")
-        );
-        Ok(ExitCode::UserError)
     }
 
     /// Displays key details
@@ -282,31 +203,17 @@ impl KeysCommand {
     async fn edit_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
         use std::io::{self, Write};
 
-        let key_id_or_name = match key_id_or_name {
-            Some(k) => k,
-            None => {
-                eprintln!("{} Missing key ID or name", style::red("Error:"));
-                eprintln!();
-                eprintln!("{}", style::dim("Usage: aivo keys edit <key-id-or-name>"));
-                return Ok(ExitCode::UserError);
-            }
-        };
-
         let key = match self
-            .session_store
-            .resolve_key_by_id_or_name(key_id_or_name)
-            .await
+            .resolve_key_selection(key_id_or_name, "Select a key to edit", "No API keys found.")
+            .await?
         {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                eprintln!();
-                eprintln!(
-                    "{}",
-                    style::dim("Run 'aivo keys list' to see available keys.")
-                );
-                return Ok(ExitCode::UserError);
+            KeySelection::Key(key) => key,
+            KeySelection::Cancelled => {
+                println!("{}", style::dim("Cancelled."));
+                return Ok(ExitCode::Success);
             }
+            KeySelection::Empty => return Ok(ExitCode::Success),
+            KeySelection::NotFound => return Ok(ExitCode::UserError),
         };
 
         println!("{}", style::bold("Edit API Key"));
@@ -588,74 +495,21 @@ impl KeysCommand {
 
     /// Removes an API key by ID or name
     async fn remove_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
-        let key_id_or_name = match key_id_or_name {
-            Some(k) => k,
-            None => {
-                eprintln!("{} Missing key ID or name", style::red("Error:"));
-                eprintln!();
-                eprintln!("{}", style::dim("Usage: aivo keys rm <key-id-or-name>"));
-                return Ok(ExitCode::UserError);
+        let key_to_remove = match self
+            .resolve_key_selection(
+                key_id_or_name,
+                "Select a key to remove",
+                "No keys to remove.",
+            )
+            .await?
+        {
+            KeySelection::Key(key) => key,
+            KeySelection::Cancelled => {
+                println!("{}", style::dim("Cancelled."));
+                return Ok(ExitCode::Success);
             }
-        };
-
-        let keys = self.session_store.get_keys().await?;
-
-        if keys.is_empty() {
-            println!("{}", style::dim("No keys to remove."));
-            return Ok(ExitCode::Success);
-        }
-
-        // Try exact ID match
-        let key_to_remove = if let Some(key) = keys.iter().find(|k| k.id == key_id_or_name) {
-            key.clone()
-        } else {
-            // Try name match
-            let name_matches: Vec<_> = keys.iter().filter(|k| k.name == key_id_or_name).collect();
-
-            if name_matches.is_empty() {
-                eprintln!(
-                    "{} Key \"{}\" not found",
-                    style::red("Error:"),
-                    key_id_or_name
-                );
-                eprintln!();
-                eprintln!(
-                    "{}",
-                    style::dim("Run 'aivo keys list' to see available keys.")
-                );
-                return Ok(ExitCode::UserError);
-            }
-
-            if name_matches.len() == 1 {
-                name_matches[0].clone()
-            } else {
-                // Multiple matches - interactive selection
-                println!(
-                    "{} Multiple keys found with name \"{}\":",
-                    style::yellow("Note:"),
-                    key_id_or_name
-                );
-
-                let choices: Vec<_> = name_matches
-                    .iter()
-                    .map(|k| format!("{} - {} - {}", k.id, k.base_url, key_preview(&k.key)))
-                    .collect();
-
-                let selection = FuzzySelect::new()
-                    .with_prompt("Select a key to remove")
-                    .items(&choices)
-                    .default(0)
-                    .interact_opt()
-                    .ok()
-                    .flatten();
-
-                if let Some(idx) = selection {
-                    name_matches[idx].clone()
-                } else {
-                    eprintln!("{} Invalid selection", style::red("Error:"));
-                    return Ok(ExitCode::UserError);
-                }
-            }
+            KeySelection::Empty => return Ok(ExitCode::Success),
+            KeySelection::NotFound => return Ok(ExitCode::UserError),
         };
 
         // Show confirmation
@@ -684,47 +538,96 @@ impl KeysCommand {
         }
     }
 
-    /// Shows usage information
+    async fn resolve_key_selection(
+        &self,
+        key_id_or_name: Option<&str>,
+        prompt: &str,
+        empty_message: &str,
+    ) -> Result<KeySelection> {
+        let all_keys = self.session_store.get_keys().await?;
+
+        if all_keys.is_empty() {
+            println!("{}", style::dim(empty_message));
+            return Ok(KeySelection::Empty);
+        }
+
+        let Some(key_id_or_name) = key_id_or_name else {
+            let active_key = self.session_store.get_active_key().await?;
+            let default_idx = active_key
+                .and_then(|ak| all_keys.iter().position(|k| k.id == ak.id))
+                .unwrap_or(0);
+            return Ok(match prompt_pick_key(&all_keys, prompt, default_idx)? {
+                Some(key) => KeySelection::Key(key),
+                None => KeySelection::Cancelled,
+            });
+        };
+
+        if let Some(key) = all_keys.iter().find(|k| k.id == key_id_or_name) {
+            return Ok(KeySelection::Key(key.clone()));
+        }
+
+        let name_matches: Vec<ApiKey> = all_keys
+            .iter()
+            .filter(|k| k.name == key_id_or_name)
+            .cloned()
+            .collect();
+
+        match name_matches.len() {
+            0 => {
+                eprintln!(
+                    "{} API key \"{}\" not found",
+                    style::red("Error:"),
+                    key_id_or_name
+                );
+                eprintln!();
+                eprintln!("{}", style::dim("Run 'aivo keys' to see available keys."));
+                Ok(KeySelection::NotFound)
+            }
+            1 => Ok(KeySelection::Key(name_matches[0].clone())),
+            _ => {
+                println!(
+                    "{} Multiple keys found with name \"{}\":",
+                    style::yellow("Note:"),
+                    key_id_or_name
+                );
+                Ok(match prompt_pick_key(&name_matches, prompt, 0)? {
+                    Some(key) => KeySelection::Key(key),
+                    None => KeySelection::Cancelled,
+                })
+            }
+        }
+    }
+
+    // Shows usage information.
     pub fn print_help() {
+        let print_row = |label: &str, description: &str| {
+            println!("  {:<18} {}", label, style::dim(description));
+        };
+
         println!("{}", style::bold("Usage: aivo keys [action]"));
         println!();
         println!("{}", style::bold("Actions:"));
-        println!(
-            "  list            {}",
-            style::dim("- List all API keys (default)")
-        );
-        println!(
-            "  use <id|name>   {}",
-            style::dim("- Activate a specific API key")
-        );
-        println!(
-            "  cat <id|name>   {}",
-            style::dim("- Display details for a key")
-        );
-        println!("  rm <id|name>    {}", style::dim("- Remove an API key"));
-        println!("  add [name]      {}", style::dim("- Add an API key"));
-        println!("  edit <id|name>  {}", style::dim("- Edit an API key"));
+        print_row("(no action)", "- List all API keys");
+        print_row("use [id|name]", "- Activate a specific API key");
+        print_row("cat [id|name]", "- Display details for a key");
+        print_row("rm [id|name]", "- Remove an API key");
+        print_row("add [name]", "- Add an API key");
+        print_row("edit [id|name]", "- Edit an API key");
         println!();
         println!("{}", style::bold("Add Flags:"));
-        println!("  --name <name>         {}", style::dim("- Set key name"));
-        println!(
-            "  --base-url <url>     {}",
-            style::dim("- Set provider base URL")
-        );
-        println!(
-            "  --key <api-key>       {}",
-            style::dim("- Set provider API key")
-        );
+        print_row("--name <name>", "- Set key name");
+        print_row("--base-url <url>", "- Set provider base URL");
+        print_row("--key <api-key>", "- Set provider API key");
         println!(
             "  {}",
             style::dim(
-                "Example: aivo keys add --name openrouter --base-url https://openrouter.ai/api/v1 --key sk-or-v1-..."
+                "Example: aivo keys add --name abc --base-url https://example.io --key sk-..."
             )
         );
     }
 }
 
-/// Formats an API key as a choice string for interactive selectors.
+// Formats an API key as a choice string for interactive selectors.
 pub(crate) fn format_key_choice(key: &ApiKey) -> String {
     format!(
         "{}  {}  {}",
@@ -734,23 +637,28 @@ pub(crate) fn format_key_choice(key: &ApiKey) -> String {
     )
 }
 
-/// Prompts the user to select a key from the given list and activates it.
-/// Returns `Ok(Some(key))` if selected, `Ok(None)` if cancelled.
-pub(crate) async fn prompt_select_key(
-    session_store: &SessionStore,
-    keys: &[ApiKey],
-    prompt: &str,
-    default: usize,
-) -> Result<Option<ApiKey>> {
+// Prompts the user to select a key from the given list.
+fn prompt_pick_key(keys: &[ApiKey], prompt: &str, default: usize) -> Result<Option<ApiKey>> {
     let choices: Vec<String> = keys.iter().map(format_key_choice).collect();
     let selection = FuzzySelect::new()
         .with_prompt(prompt)
         .items(&choices)
         .default(default)
         .interact_opt()?;
-    match selection {
-        Some(idx) => {
-            let key = &keys[idx];
+    Ok(selection.map(|idx| keys[idx].clone()))
+}
+
+// Prompts the user to select a key from the given list and activates it.
+// Returns `Ok(Some(key))` if selected, `Ok(None)` if cancelled.
+#[allow(dead_code)]
+pub(crate) async fn prompt_select_key(
+    session_store: &SessionStore,
+    keys: &[ApiKey],
+    prompt: &str,
+    default: usize,
+) -> Result<Option<ApiKey>> {
+    match prompt_pick_key(keys, prompt, default)? {
+        Some(key) => {
             session_store.set_active_key(&key.id).await?;
             let preview = key_preview(&key.key);
             eprintln!(
@@ -759,7 +667,7 @@ pub(crate) async fn prompt_select_key(
                 style::cyan(key.display_name()),
                 style::dim(&preview)
             );
-            Ok(Some(key.clone()))
+            Ok(Some(key))
         }
         None => Ok(None),
     }
@@ -793,7 +701,7 @@ mod tests {
         let store = crate::services::session_store::SessionStore::with_path(config_path);
         let cmd = KeysCommand::new(store);
         let code = cmd.execute(keys_args(Some("edit"), &[])).await;
-        assert_eq!(code, crate::errors::ExitCode::UserError);
+        assert_eq!(code, crate::errors::ExitCode::Success);
     }
 
     #[tokio::test]
@@ -801,6 +709,15 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         let store = crate::services::session_store::SessionStore::with_path(config_path);
+        store
+            .add_key_with_protocol(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                None,
+                "sk-test",
+            )
+            .await
+            .unwrap();
         let cmd = KeysCommand::new(store);
         let code = cmd.execute(keys_args(Some("edit"), &["nonexistent"])).await;
         assert_eq!(code, crate::errors::ExitCode::UserError);
@@ -815,6 +732,36 @@ mod tests {
         // No keys stored — should succeed (prints "No API keys found.")
         let code = cmd.execute(keys_args(Some("use"), &[])).await;
         assert_eq!(code, crate::errors::ExitCode::Success);
+    }
+
+    #[tokio::test]
+    async fn test_cat_key_no_arg_no_keys() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+        let code = cmd.execute(keys_args(Some("cat"), &[])).await;
+        assert_eq!(code, crate::errors::ExitCode::Success);
+    }
+
+    #[tokio::test]
+    async fn test_remove_key_no_arg_no_keys() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+        let code = cmd.execute(keys_args(Some("rm"), &[])).await;
+        assert_eq!(code, crate::errors::ExitCode::Success);
+    }
+
+    #[tokio::test]
+    async fn test_keys_list_action_is_rejected() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+        let code = cmd.execute(keys_args(Some("list"), &[])).await;
+        assert_eq!(code, crate::errors::ExitCode::UserError);
     }
 
     #[tokio::test]
