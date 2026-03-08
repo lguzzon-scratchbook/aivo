@@ -51,10 +51,6 @@ enum RouterResponse {
         content_type: String,
         body: Vec<u8>,
     },
-    Streaming {
-        status: u16,
-        upstream: reqwest::Response,
-    },
 }
 
 impl OpenAIRouter {
@@ -131,42 +127,8 @@ async fn write_router_response(
             socket.write_all(headers.as_bytes()).await?;
             socket.write_all(&body).await?;
         }
-        RouterResponse::Streaming {
-            status,
-            mut upstream,
-        } => {
-            let headers = http_utils::http_chunked_response_head(status, "text/event-stream");
-            socket.write_all(headers.as_bytes()).await?;
-
-            let mut converter = OpenAIStreamConverter::new();
-            while let Some(chunk) = upstream.chunk().await? {
-                if chunk.is_empty() {
-                    continue;
-                }
-                let converted = converter.push_bytes(&chunk)?;
-                write_chunk(socket, converted.as_bytes()).await?;
-            }
-
-            let final_chunk = converter.finish()?;
-            write_chunk(socket, final_chunk.as_bytes()).await?;
-            socket.write_all(b"0\r\n\r\n").await?;
-        }
     }
 
-    Ok(())
-}
-
-async fn write_chunk(socket: &mut tokio::net::TcpStream, chunk: &[u8]) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    if chunk.is_empty() {
-        return Ok(());
-    }
-
-    let chunk_len = format!("{:X}\r\n", chunk.len());
-    socket.write_all(chunk_len.as_bytes()).await?;
-    socket.write_all(chunk).await?;
-    socket.write_all(b"\r\n").await?;
     Ok(())
 }
 
@@ -219,19 +181,11 @@ async fn handle_anthropic_to_openai(
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
-
-    if status_code == 200 && is_streaming {
-        return Ok(RouterResponse::Streaming {
-            status: status_code,
-            upstream: response,
-        });
-    }
-
     let response_body = response.text().await?;
 
-    // Some providers incorrectly omit the SSE content type. Preserve support for them by
-    // falling back to buffered conversion when the body clearly contains SSE frames.
-    if status_code == 200 && response_body.starts_with("data:") {
+    // Preserve the previous buffered SSE conversion path for Claude Code compatibility.
+    // Some providers omit the SSE content type, so keep the body-prefix fallback too.
+    if status_code == 200 && (is_streaming || response_body.starts_with("data:")) {
         let anthropic_sse = convert_openai_sse_to_anthropic(&response_body, status_code)?;
         return Ok(RouterResponse::Buffered {
             status: 200,
