@@ -97,12 +97,18 @@ pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let spinning = Arc::new(AtomicBool::new(true));
     let spinning_clone = spinning.clone();
     let label = label.unwrap_or("").to_string();
+    let first_frame = "\u{280b}";
+
+    // Paint the first frame synchronously so short operations still show feedback.
+    eprint!("\r{}{}", dim(first_frame), label);
+    let _ = io::stderr().flush();
+
     let handle = tokio::task::spawn_blocking(move || {
         let frames = [
             "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
             "\u{2827}", "\u{2807}", "\u{280f}",
         ];
-        let mut i = 0;
+        let mut i = 1;
         while spinning_clone.load(Ordering::Relaxed) {
             eprint!("\r{}{}", dim(frames[i % frames.len()]), label);
             let _ = io::stderr().flush();

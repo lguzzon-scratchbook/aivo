@@ -6,6 +6,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
@@ -104,7 +105,14 @@ impl ModelsCommand {
         };
 
         let client = Client::new();
-        let mut models = fetch_models_cached(&client, &key, &self.cache, refresh).await?;
+        let mut models = fetch_models_with_spinner(
+            &client,
+            &key,
+            &self.cache,
+            refresh,
+            Some(" Fetching models..."),
+        )
+        .await?;
         models.sort();
 
         eprintln!(
@@ -426,13 +434,34 @@ pub(crate) async fn fetch_models_for_select(
     key: &ApiKey,
     cache: &ModelsCache,
 ) -> Vec<String> {
-    let (spinning, spinner_handle) = style::start_spinner(None);
-    let list = fetch_models_cached(client, key, cache, false)
+    let list = fetch_models_with_spinner(client, key, cache, false, None)
         .await
         .unwrap_or_default();
+    list
+}
+
+pub(crate) async fn fetch_models_with_spinner(
+    client: &Client,
+    key: &ApiKey,
+    cache: &ModelsCache,
+    bypass_cache: bool,
+    label: Option<&str>,
+) -> Result<Vec<String>> {
+    let should_spin = bypass_cache || cache.get(&key.base_url).await.is_none();
+    if !should_spin {
+        return fetch_models_cached(client, key, cache, bypass_cache).await;
+    }
+
+    let started_at = Instant::now();
+    let (spinning, spinner_handle) = style::start_spinner(label);
+    let result = fetch_models_cached(client, key, cache, bypass_cache).await;
+    let min_visible = Duration::from_millis(350);
+    if let Some(remaining) = min_visible.checked_sub(started_at.elapsed()) {
+        tokio::time::sleep(remaining).await;
+    }
     style::stop_spinner(&spinning);
     let _ = spinner_handle.await;
-    list
+    result
 }
 
 /// Cache-aware wrapper around `fetch_models`.

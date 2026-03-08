@@ -118,12 +118,13 @@ Use `aivo keys` to view your saved providers and `aivo use` to switch between th
 
 ```bash
 make build
+make build-debug
 make test
 make clippy
 make check
 
-# only when packaging or benchmarking the final binary
-make build --release
+# build the final optimized binary explicitly
+make build-release
 ```
 
 ## License
