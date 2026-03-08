@@ -403,10 +403,7 @@ impl KeysCommand {
                     };
                     let input = read_line(&prompt)?;
                     if input.is_empty() {
-                        match detected_url {
-                            Some(default) => default.to_string(),
-                            None => String::new(),
-                        }
+                        detected_url.unwrap_or("").to_string()
                     } else {
                         input
                     }
