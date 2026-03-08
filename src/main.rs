@@ -352,7 +352,7 @@ async fn print_active_key(session_store: &SessionStore) {
         "  {} {}  {}  {}",
         style::bullet_symbol(),
         style::cyan(&id_padded),
-        active_key.name,
+        active_key.display_name(),
         style::dim(&active_key.base_url)
     );
 }

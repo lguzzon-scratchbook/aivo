@@ -285,7 +285,7 @@ impl AILauncher {
         eprintln!(
             "  {} Using key: {} {}",
             style::success_symbol(),
-            style::cyan(&key.name),
+            style::cyan(key.display_name()),
             style::dim(format!("({})", key.base_url))
         );
     }

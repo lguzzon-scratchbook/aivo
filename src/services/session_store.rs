@@ -152,6 +152,14 @@ impl ApiKey {
             created_at: Utc::now().to_rfc3339(),
         }
     }
+
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
 }
 
 /// Stored configuration
@@ -721,7 +729,7 @@ impl SessionStore {
         for key in &mut decrypted.api_keys {
             if is_encrypted(&key.key) {
                 let plaintext = decrypt(&key.key)
-                    .with_context(|| format!("failed to decrypt key '{}'", key.name))?;
+                    .with_context(|| format!("failed to decrypt key '{}'", key.display_name()))?;
                 key.key = Zeroizing::new(plaintext);
             }
         }
@@ -949,6 +957,19 @@ mod tests {
         assert_eq!(key.claude_protocol, Some(ClaudeProviderProtocol::Anthropic));
         assert_eq!(key.key.as_str(), "sk-new");
         assert_eq!(key.id, id);
+    }
+
+    #[test]
+    fn test_api_key_display_name_falls_back_to_id() {
+        let key = ApiKey::new_with_protocol(
+            "1a2b".to_string(),
+            String::new(),
+            "https://example.com".to_string(),
+            None,
+            "sk-test".to_string(),
+        );
+
+        assert_eq!(key.display_name(), "1a2b");
     }
 
     #[tokio::test]

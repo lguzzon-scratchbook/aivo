@@ -119,7 +119,7 @@ impl KeysCommand {
                 "  {} {}  {}  {}",
                 active_indicator,
                 style::cyan(&id_padded),
-                key.name,
+                key.display_name(),
                 style::dim(&key.base_url)
             );
         }
@@ -221,7 +221,7 @@ impl KeysCommand {
         println!(
             "{} Activated key: {} {}",
             style::success_symbol(),
-            style::cyan(&key.name),
+            style::cyan(key.display_name()),
             style::dim(&preview)
         );
         Ok(())
@@ -272,7 +272,7 @@ impl KeysCommand {
     /// Displays key details
     fn display_key_details(&self, key: &ApiKey) {
         println!();
-        println!("Name:     {}", style::cyan(&key.name));
+        println!("Name:     {}", style::cyan(key.display_name()));
         println!("Base URL: {}", style::blue(&key.base_url));
         println!("API Key:  {}", style::yellow(&*key.key));
         println!();
@@ -323,17 +323,17 @@ impl KeysCommand {
         }
 
         // Name
-        let name = loop {
-            let input = read_line_with_default(&format!("Name [{}]: ", key.name))?;
-            let value = if input.is_empty() {
+        let current_name = if key.name.is_empty() {
+            format!("unnamed; shown as {}", key.id)
+        } else {
+            key.name.clone()
+        };
+        let name = {
+            let input = read_line_with_default(&format!("Name [{}]: ", current_name))?;
+            if input.is_empty() {
                 key.name.clone()
             } else {
                 input
-            };
-            if value.is_empty() {
-                eprintln!("{} Name cannot be empty", style::red("Error:"));
-            } else {
-                break value;
             }
         };
 
@@ -407,7 +407,7 @@ impl KeysCommand {
         println!(
             "{} Updated key: {}",
             style::success_symbol(),
-            style::cyan(&name)
+            style::cyan(if name.is_empty() { &key.id } else { &name })
         );
 
         Ok(ExitCode::Success)
@@ -440,12 +440,7 @@ impl KeysCommand {
         let name = if let Some(n) = add_options.name.or(provided_name) {
             n.to_string()
         } else {
-            let input = read_line("Name (e.g., my-openai-proxy): ")?;
-            if input.is_empty() {
-                eprintln!("{} Name cannot be empty", style::red("Error:"));
-                return Ok(ExitCode::UserError);
-            }
-            input
+            read_line("Name (optional): ")?
         };
 
         // Shortcut: `aivo keys add copilot` skips all prompts unless flags conflict.
@@ -468,10 +463,17 @@ impl KeysCommand {
                 } else {
                     read_line("Base URL (e.g., http://localhost:8080 or 'copilot'): ")?
                 };
-                if value == "copilot"
-                    || value.starts_with("http://")
-                    || value.starts_with("https://")
-                {
+                if value == "copilot" {
+                    eprintln!(
+                        "{} GitHub Copilot login requires the explicit shortcut 'aivo keys add copilot'.",
+                        style::red("Error:")
+                    );
+                    if add_options.base_url.is_some() {
+                        return Ok(ExitCode::UserError);
+                    }
+                    continue;
+                }
+                if value.starts_with("http://") || value.starts_with("https://") {
                     break value;
                 }
                 eprintln!(
@@ -569,7 +571,7 @@ impl KeysCommand {
         println!(
             "{} Added and activated key: {}",
             style::success_symbol(),
-            style::cyan(&name)
+            style::cyan(if name.is_empty() { &id } else { &name })
         );
         println!("  {}", style::dim(format!("ID: {}", id)));
         println!("  {}", style::dim(format!("Base URL: {}", base_url)));
@@ -662,7 +664,7 @@ impl KeysCommand {
         println!("URL: {}", style::dim(&key_to_remove.base_url));
         println!();
 
-        let confirmed = confirm(&format!("Remove \"{}\"?", key_to_remove.name))?;
+        let confirmed = confirm(&format!("Remove \"{}\"?", key_to_remove.display_name()))?;
 
         if !confirmed {
             println!("{}", style::dim("Cancelled."));
@@ -673,7 +675,7 @@ impl KeysCommand {
             println!(
                 "{} Removed key: {}",
                 style::success_symbol(),
-                style::cyan(&key_to_remove.name)
+                style::cyan(key_to_remove.display_name())
             );
             Ok(ExitCode::Success)
         } else {
@@ -727,7 +729,7 @@ pub(crate) fn format_key_choice(key: &ApiKey) -> String {
     format!(
         "{}  {}  {}",
         style::cyan(format!("{:<4}", key.id)),
-        key.name,
+        key.display_name(),
         style::dim(&key.base_url)
     )
 }
@@ -754,7 +756,7 @@ pub(crate) async fn prompt_select_key(
             eprintln!(
                 "{} Activated key: {} {}",
                 style::success_symbol(),
-                style::cyan(&key.name),
+                style::cyan(key.display_name()),
                 style::dim(&preview)
             );
             Ok(Some(key.clone()))
@@ -863,5 +865,69 @@ mod tests {
             .await;
 
         assert_eq!(code, crate::errors::ExitCode::UserError);
+    }
+
+    #[tokio::test]
+    async fn test_add_key_without_name_uses_empty_stored_name() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store.clone());
+
+        let code = cmd
+            .execute(KeysArgs {
+                action: Some("add".to_string()),
+                args: Vec::new(),
+                name: None,
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                key: Some("sk-or-v1-test".to_string()),
+            })
+            .await;
+
+        assert_eq!(code, crate::errors::ExitCode::Success);
+
+        let keys = store.get_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "");
+        assert_eq!(keys[0].display_name(), keys[0].id);
+
+        let active = store.get_active_key().await.unwrap().unwrap();
+        assert_eq!(active.id, keys[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_add_key_rejects_copilot_base_url_without_copilot_name() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+
+        let code = cmd
+            .execute(KeysArgs {
+                action: Some("add".to_string()),
+                args: Vec::new(),
+                name: None,
+                base_url: Some("copilot".to_string()),
+                key: None,
+            })
+            .await;
+
+        assert_eq!(code, crate::errors::ExitCode::UserError);
+    }
+
+    #[test]
+    fn test_format_key_choice_uses_id_for_unnamed_keys() {
+        let key = ApiKey::new_with_protocol(
+            "1a2b".to_string(),
+            String::new(),
+            "https://openrouter.ai/api/v1".to_string(),
+            None,
+            "sk-test".to_string(),
+        );
+
+        let choice = format_key_choice(&key);
+
+        assert!(choice.contains("1a2b"));
+        assert!(choice.contains("https://openrouter.ai/api/v1"));
     }
 }
