@@ -119,13 +119,22 @@ impl KeysCommand {
                 style::empty_bullet_symbol()
             };
             let id_padded = format!("{:<4}", key.id);
-            println!(
-                "  {} {}  {}  {}",
-                active_indicator,
-                style::cyan(&id_padded),
-                key.display_name(),
-                style::dim(&key.base_url)
-            );
+            if key.name.is_empty() {
+                println!(
+                    "  {} {}  {}",
+                    active_indicator,
+                    style::cyan(&id_padded),
+                    style::dim(&key.base_url)
+                );
+            } else {
+                println!(
+                    "  {} {}  {}  {}",
+                    active_indicator,
+                    style::cyan(&id_padded),
+                    key.name,
+                    style::dim(&key.base_url)
+                );
+            }
         }
 
         Ok(ExitCode::Success)
@@ -346,6 +355,8 @@ impl KeysCommand {
 
         let name = if let Some(n) = add_options.name.or(provided_name) {
             n.to_string()
+        } else if add_options.base_url.is_some() && add_options.key.is_some() {
+            String::new()
         } else {
             read_line("Name (optional): ")?
         };
@@ -368,7 +379,7 @@ impl KeysCommand {
                 let value = if let Some(value) = provided_base_url.take() {
                     value
                 } else {
-                    read_line("Base URL (e.g., http://localhost:8080 or 'copilot'): ")?
+                    read_line("Base URL (e.g., https://api.openai.com/v1): ")?
                 };
                 if value == "copilot" {
                     eprintln!(
