@@ -48,6 +48,9 @@ pub enum Commands {
     /// List available models from the active provider
     Models(ModelsArgs),
 
+    /// Serve an OpenAI-compatible API that proxies to the active provider
+    Serve(ServeArgs),
+
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
 }
@@ -127,6 +130,18 @@ pub struct ModelsArgs {
     pub refresh: bool,
 }
 
+/// Arguments for the serve command
+#[derive(Args, Debug, Clone)]
+pub struct ServeArgs {
+    /// Port to listen on
+    #[arg(short = 'p', long, default_value_t = 24860)]
+    pub port: u16,
+
+    /// Select API key by ID or name
+    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
+    pub key: Option<String>,
+}
+
 /// Arguments for the update command
 #[derive(Args, Debug, Clone)]
 pub struct UpdateArgs {
@@ -168,7 +183,7 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
 /// Get the list of valid commands
 #[allow(dead_code)]
 pub fn get_valid_commands() -> Vec<&'static str> {
-    vec!["update", "keys", "run", "chat", "models", "use"]
+    vec!["update", "keys", "run", "chat", "models", "serve", "use"]
 }
 
 /// Check if a command is a passthrough command (passes all args to underlying tool)

@@ -15,7 +15,7 @@ mod tui;
 mod version;
 
 use cli::{Cli, Commands};
-use commands::{ChatCommand, KeysCommand, ModelsCommand, RunCommand, UpdateCommand};
+use commands::{ChatCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand, UpdateCommand};
 use errors::ExitCode;
 use services::session_store::ApiKey;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
@@ -58,6 +58,9 @@ async fn main() {
             }
             Some(Commands::Models(_)) => {
                 ModelsCommand::print_help();
+            }
+            Some(Commands::Serve(_)) => {
+                ServeCommand::print_help();
             }
             Some(Commands::Update(_)) => {
                 UpdateCommand::print_help();
@@ -275,6 +278,25 @@ async fn main() {
             command.execute(key_override, models_args.refresh).await
         }
 
+        Commands::Serve(serve_args) => {
+            let key_override = if let Some(ref key_id_or_name) = serve_args.key {
+                match session_store
+                    .resolve_key_by_id_or_name(key_id_or_name)
+                    .await
+                {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        process::exit(ExitCode::UserError.code());
+                    }
+                }
+            } else {
+                None
+            };
+            let command = ServeCommand::new(session_store);
+            command.execute(serve_args.port, key_override).await
+        }
+
         Commands::Update(update_args) => match UpdateCommand::new() {
             Ok(command) => command.execute(update_args.force).await,
             Err(e) => {
@@ -393,6 +415,11 @@ fn print_help() {
         "  {}          {}",
         style::cyan("models"),
         style::dim("List available models from the active provider")
+    );
+    println!(
+        "  {}           {}",
+        style::cyan("serve"),
+        style::dim("Start a local OpenAI-compatible API server")
     );
     println!(
         "  {}          {}",

@@ -18,6 +18,7 @@ pub mod openai_anthropic_bridge;
 pub mod openai_gemini_bridge;
 pub mod openai_router;
 pub mod provider_protocol;
+pub mod serve_router;
 pub mod session_store;
 pub mod system_env;
 
@@ -30,5 +31,7 @@ pub use environment_injector::EnvironmentInjector;
 pub use gemini_router::{GeminiRouter, GeminiRouterConfig};
 pub use models_cache::ModelsCache;
 pub use openai_router::{OpenAIRouter, OpenAIRouterConfig};
+#[allow(unused_imports)]
+pub use serve_router::{ServeRouter, ServeRouterConfig};
 #[allow(unused_imports)]
 pub use session_store::{ApiKey, SessionStore};

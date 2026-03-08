@@ -53,16 +53,18 @@ fn detect_base_url(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
     let providers: &[(&str, &str)] = &[
         ("openrouter", "https://openrouter.ai/api/v1"),
-        ("vercel",     "https://ai-gateway.vercel.sh/v1"),
-        ("fireworks",  "https://api.fireworks.ai/inference/v1"),
-        ("minimax",    "https://api.minimax.io/anthropic"),
-        ("deepseek",   "https://api.deepseek.com/v1"),
-        ("moonshot",   "https://api.moonshot.cn/v1"),
-        ("groq",       "https://api.groq.com/openai/v1"),
-        ("xai",        "https://api.x.ai/v1"),
-        ("mistral",    "https://api.mistral.ai/v1"),
+        ("vercel", "https://ai-gateway.vercel.sh/v1"),
+        ("fireworks", "https://api.fireworks.ai/inference/v1"),
+        ("minimax", "https://api.minimax.io/anthropic"),
+        ("deepseek", "https://api.deepseek.com/v1"),
+        ("moonshot", "https://api.moonshot.cn/v1"),
+        ("groq", "https://api.groq.com/openai/v1"),
+        ("xai", "https://api.x.ai/v1"),
+        ("mistral", "https://api.mistral.ai/v1"),
     ];
-    providers.iter().find_map(|(kw, url)| lower.contains(kw).then_some(*url))
+    providers
+        .iter()
+        .find_map(|(kw, url)| lower.contains(kw).then_some(*url))
 }
 
 impl KeysCommand {
@@ -902,28 +904,67 @@ mod tests {
 
     #[test]
     fn test_detect_base_url_exact_match() {
-        assert_eq!(detect_base_url("openrouter"), Some("https://openrouter.ai/api/v1"));
-        assert_eq!(detect_base_url("deepseek"), Some("https://api.deepseek.com/v1"));
-        assert_eq!(detect_base_url("groq"), Some("https://api.groq.com/openai/v1"));
-        assert_eq!(detect_base_url("mistral"), Some("https://api.mistral.ai/v1"));
+        assert_eq!(
+            detect_base_url("openrouter"),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(
+            detect_base_url("deepseek"),
+            Some("https://api.deepseek.com/v1")
+        );
+        assert_eq!(
+            detect_base_url("groq"),
+            Some("https://api.groq.com/openai/v1")
+        );
+        assert_eq!(
+            detect_base_url("mistral"),
+            Some("https://api.mistral.ai/v1")
+        );
         assert_eq!(detect_base_url("xai"), Some("https://api.x.ai/v1"));
-        assert_eq!(detect_base_url("fireworks"), Some("https://api.fireworks.ai/inference/v1"));
-        assert_eq!(detect_base_url("moonshot"), Some("https://api.moonshot.cn/v1"));
-        assert_eq!(detect_base_url("minimax"), Some("https://api.minimax.io/anthropic"));
-        assert_eq!(detect_base_url("vercel"), Some("https://ai-gateway.vercel.sh/v1"));
+        assert_eq!(
+            detect_base_url("fireworks"),
+            Some("https://api.fireworks.ai/inference/v1")
+        );
+        assert_eq!(
+            detect_base_url("moonshot"),
+            Some("https://api.moonshot.cn/v1")
+        );
+        assert_eq!(
+            detect_base_url("minimax"),
+            Some("https://api.minimax.io/anthropic")
+        );
+        assert_eq!(
+            detect_base_url("vercel"),
+            Some("https://ai-gateway.vercel.sh/v1")
+        );
     }
 
     #[test]
     fn test_detect_base_url_case_insensitive() {
-        assert_eq!(detect_base_url("OpenRouter"), Some("https://openrouter.ai/api/v1"));
-        assert_eq!(detect_base_url("GROQ"), Some("https://api.groq.com/openai/v1"));
-        assert_eq!(detect_base_url("DeepSeek"), Some("https://api.deepseek.com/v1"));
+        assert_eq!(
+            detect_base_url("OpenRouter"),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(
+            detect_base_url("GROQ"),
+            Some("https://api.groq.com/openai/v1")
+        );
+        assert_eq!(
+            detect_base_url("DeepSeek"),
+            Some("https://api.deepseek.com/v1")
+        );
     }
 
     #[test]
     fn test_detect_base_url_substring() {
-        assert_eq!(detect_base_url("my-openrouter-key"), Some("https://openrouter.ai/api/v1"));
-        assert_eq!(detect_base_url("work_groq"), Some("https://api.groq.com/openai/v1"));
+        assert_eq!(
+            detect_base_url("my-openrouter-key"),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(
+            detect_base_url("work_groq"),
+            Some("https://api.groq.com/openai/v1")
+        );
     }
 
     #[test]
