@@ -12,8 +12,50 @@ use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 
+const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum RequestReadError {
+    Io(std::io::Error),
+    HeaderTooLarge,
+    BodyTooLarge { limit: usize },
+    UnsupportedTransferEncoding,
+    IncompleteHeaders,
+}
+
+impl std::fmt::Display for RequestReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "I/O error while reading HTTP request: {err}"),
+            Self::HeaderTooLarge => write!(
+                f,
+                "HTTP request headers exceed {} bytes",
+                MAX_REQUEST_HEADER_BYTES
+            ),
+            Self::BodyTooLarge { limit } => {
+                write!(f, "HTTP request body exceeds {limit} bytes")
+            }
+            Self::UnsupportedTransferEncoding => {
+                write!(f, "unsupported HTTP Transfer-Encoding: chunked")
+            }
+            Self::IncompleteHeaders => write!(f, "incomplete HTTP request headers"),
+        }
+    }
+}
+
+impl std::error::Error for RequestReadError {}
+
+impl From<std::io::Error> for RequestReadError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
 /// Reads a complete HTTP request from a TCP stream: headers + full body (using Content-Length).
-pub async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+pub async fn read_full_request(
+    socket: &mut tokio::net::TcpStream,
+) -> std::result::Result<Vec<u8>, RequestReadError> {
     use tokio::io::AsyncReadExt;
 
     let mut buf = Vec::with_capacity(65536); // 64KB initial capacity
@@ -26,19 +68,19 @@ pub async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Result<Vec
         }
         buf.extend_from_slice(&tmp[..n]);
 
-        if let Some(header_end) = find_header_end(&buf) {
-            let headers = String::from_utf8_lossy(&buf[..header_end]);
-            let content_length = parse_content_length(&headers).unwrap_or(0);
-            let body_read = buf.len() - (header_end + 4);
-
-            if body_read < content_length {
-                let remaining = content_length - body_read;
-                let mut body_buf = vec![0u8; remaining];
+        if let Some(expected_len) = inspect_request_buffer(&mut buf)? {
+            while buf.len() < expected_len {
+                let remaining = expected_len - buf.len();
+                let mut body_buf = vec![0u8; remaining.min(tmp.len())];
                 socket.read_exact(&mut body_buf).await?;
                 buf.extend_from_slice(&body_buf);
             }
             break;
         }
+    }
+
+    if inspect_request_buffer(&mut buf)?.is_none() && !buf.is_empty() {
+        return Err(RequestReadError::IncompleteHeaders);
     }
 
     Ok(buf)
@@ -101,7 +143,11 @@ where
 
             let request_bytes = match read_full_request(&mut socket).await {
                 Ok(b) => b,
-                Err(_) => return,
+                Err(err) => {
+                    let response = http_request_read_error_response(&err);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
             };
             let request = String::from_utf8_lossy(&request_bytes).into_owned();
             let response = handler(request, state).await;
@@ -115,13 +161,65 @@ pub fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (header_name, value) = line.split_once(':')?;
+        if header_name.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
 /// Parses Content-Length from HTTP headers (case-insensitive).
 pub fn parse_content_length(headers: &str) -> Option<usize> {
-    headers
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
+    header_value(headers, "content-length").and_then(|v| v.parse().ok())
+}
+
+fn has_chunked_transfer_encoding(headers: &str) -> bool {
+    header_value(headers, "transfer-encoding")
+        .map(|value| {
+            value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+        })
+        .unwrap_or(false)
+}
+
+fn inspect_request_buffer(
+    buf: &mut Vec<u8>,
+) -> std::result::Result<Option<usize>, RequestReadError> {
+    let Some(header_end) = find_header_end(buf) else {
+        if buf.len() > MAX_REQUEST_HEADER_BYTES {
+            return Err(RequestReadError::HeaderTooLarge);
+        }
+        return Ok(None);
+    };
+
+    let header_bytes = header_end + 4;
+    if header_bytes > MAX_REQUEST_HEADER_BYTES {
+        return Err(RequestReadError::HeaderTooLarge);
+    }
+
+    let headers = String::from_utf8_lossy(&buf[..header_end]);
+    if has_chunked_transfer_encoding(&headers) {
+        return Err(RequestReadError::UnsupportedTransferEncoding);
+    }
+
+    let content_length = parse_content_length(&headers).unwrap_or(0);
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return Err(RequestReadError::BodyTooLarge {
+            limit: MAX_REQUEST_BODY_BYTES,
+        });
+    }
+
+    let expected_len = header_bytes + content_length;
+    if buf.len() > expected_len {
+        buf.truncate(expected_len);
+    }
+
+    Ok(Some(expected_len))
 }
 
 /// Extracts the HTTP request body (everything after the blank line separator).
@@ -179,6 +277,7 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -248,6 +347,19 @@ pub fn http_error_response(status: u16, message: &str) -> String {
     http_response(status, "application/json", &body)
 }
 
+pub fn http_request_read_error_response(error: &RequestReadError) -> String {
+    match error {
+        RequestReadError::HeaderTooLarge | RequestReadError::BodyTooLarge { .. } => {
+            http_error_response(413, &error.to_string())
+        }
+        RequestReadError::UnsupportedTransferEncoding => {
+            http_error_response(400, &error.to_string())
+        }
+        RequestReadError::IncompleteHeaders => http_error_response(400, &error.to_string()),
+        RequestReadError::Io(_) => http_error_response(400, &error.to_string()),
+    }
+}
+
 /// Constructs a target URL, avoiding `/v1` duplication when base already ends with `/v1`.
 pub fn build_target_url(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
@@ -313,6 +425,50 @@ mod tests {
     fn test_parse_content_length_missing() {
         let headers = "POST /v1 HTTP/1.1\r\nHost: localhost";
         assert_eq!(parse_content_length(headers), None);
+    }
+
+    #[test]
+    fn test_has_chunked_transfer_encoding() {
+        let headers = "POST /v1 HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\nHost: localhost";
+        assert!(has_chunked_transfer_encoding(headers));
+    }
+
+    #[test]
+    fn test_inspect_request_buffer_rejects_large_header() {
+        let mut buf = vec![b'a'; MAX_REQUEST_HEADER_BYTES + 1];
+        let err = inspect_request_buffer(&mut buf).unwrap_err();
+        assert!(matches!(err, RequestReadError::HeaderTooLarge));
+    }
+
+    #[test]
+    fn test_inspect_request_buffer_rejects_large_body() {
+        let mut buf = format!(
+            "POST /v1 HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY_BYTES + 1
+        )
+        .into_bytes();
+        let err = inspect_request_buffer(&mut buf).unwrap_err();
+        assert!(matches!(err, RequestReadError::BodyTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_inspect_request_buffer_rejects_chunked_requests() {
+        let mut buf =
+            b"POST /v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n".to_vec();
+        let err = inspect_request_buffer(&mut buf).unwrap_err();
+        assert!(matches!(err, RequestReadError::UnsupportedTransferEncoding));
+    }
+
+    #[test]
+    fn test_inspect_request_buffer_truncates_to_content_length() {
+        let mut buf =
+            b"POST /v1 HTTP/1.1\r\nContent-Length: 4\r\n\r\ntestEXTRA_TRAILING_BYTES".to_vec();
+        let expected_len = inspect_request_buffer(&mut buf).unwrap().unwrap();
+        assert_eq!(expected_len, buf.len());
+        assert_eq!(
+            std::str::from_utf8(&buf).unwrap(),
+            "POST /v1 HTTP/1.1\r\nContent-Length: 4\r\n\r\ntest"
+        );
     }
 
     #[test]
@@ -409,6 +565,12 @@ mod tests {
         let resp = http_error_response(404, "Not found");
         assert!(resp.contains("404 Not Found"));
         assert!(resp.contains("Not found"));
+    }
+
+    #[test]
+    fn test_http_request_read_error_response_uses_413_for_size_limits() {
+        let resp = http_request_read_error_response(&RequestReadError::BodyTooLarge { limit: 123 });
+        assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
     }
 
     #[test]

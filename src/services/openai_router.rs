@@ -40,6 +40,23 @@ pub struct OpenAIRouter {
     config: OpenAIRouterConfig,
 }
 
+struct OpenAIRouterState {
+    config: Arc<OpenAIRouterConfig>,
+    client: reqwest::Client,
+}
+
+enum RouterResponse {
+    Buffered {
+        status: u16,
+        content_type: String,
+        body: Vec<u8>,
+    },
+    Streaming {
+        status: u16,
+        upstream: reqwest::Response,
+    },
+}
+
 impl OpenAIRouter {
     pub fn new(config: OpenAIRouterConfig) -> Self {
         Self { config }
@@ -49,24 +66,108 @@ impl OpenAIRouter {
     /// Returns the actual port number so callers can set ANTHROPIC_BASE_URL.
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
-        let config = self.config.clone();
-        let handle = tokio::spawn(async move {
-            http_utils::run_text_router(listener, Arc::new(config), handle_openai_request).await
-        });
+        let state = OpenAIRouterState {
+            config: Arc::new(self.config.clone()),
+            client: router_http_client(),
+        };
+        let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, handle))
     }
 }
 
-async fn handle_openai_request(request: String, config: Arc<OpenAIRouterConfig>) -> String {
-    // Route Anthropic /v1/messages to OpenAI /v1/chat/completions
-    if http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
-        match handle_anthropic_to_openai(&request, &config).await {
-            Ok(r) => r,
-            Err(e) => http_utils::http_error_response(500, &e.to_string()),
-        }
-    } else {
-        http_utils::http_response(404, "application/json", "{\"error\":\"Not found\"}")
+async fn run_router(listener: tokio::net::TcpListener, state: OpenAIRouterState) -> Result<()> {
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let config = state.config.clone();
+        let client = state.client.clone();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            let request_bytes = match http_utils::read_full_request(&mut socket).await {
+                Ok(b) => b,
+                Err(err) => {
+                    let response = http_utils::http_request_read_error_response(&err);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+            };
+            let request = String::from_utf8_lossy(&request_bytes).into_owned();
+
+            if !http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
+                let not_found =
+                    http_utils::http_response(404, "application/json", "{\"error\":\"Not found\"}");
+                let _ = socket.write_all(not_found.as_bytes()).await;
+                return;
+            }
+
+            let response = match handle_anthropic_to_openai(&request, &config, &client).await {
+                Ok(response) => response,
+                Err(e) => {
+                    let error = http_utils::http_error_response(500, &e.to_string());
+                    let _ = socket.write_all(error.as_bytes()).await;
+                    return;
+                }
+            };
+
+            let _ = write_router_response(&mut socket, response).await;
+        });
     }
+}
+
+async fn write_router_response(
+    socket: &mut tokio::net::TcpStream,
+    response: RouterResponse,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    match response {
+        RouterResponse::Buffered {
+            status,
+            content_type,
+            body,
+        } => {
+            let headers = http_utils::http_response_head(status, &content_type, body.len());
+            socket.write_all(headers.as_bytes()).await?;
+            socket.write_all(&body).await?;
+        }
+        RouterResponse::Streaming {
+            status,
+            mut upstream,
+        } => {
+            let headers = http_utils::http_chunked_response_head(status, "text/event-stream");
+            socket.write_all(headers.as_bytes()).await?;
+
+            let mut converter = OpenAIStreamConverter::new();
+            while let Some(chunk) = upstream.chunk().await? {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let converted = converter.push_bytes(&chunk)?;
+                write_chunk(socket, converted.as_bytes()).await?;
+            }
+
+            let final_chunk = converter.finish()?;
+            write_chunk(socket, final_chunk.as_bytes()).await?;
+            socket.write_all(b"0\r\n\r\n").await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn write_chunk(socket: &mut tokio::net::TcpStream, chunk: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    if chunk.is_empty() {
+        return Ok(());
+    }
+
+    let chunk_len = format!("{:X}\r\n", chunk.len());
+    socket.write_all(chunk_len.as_bytes()).await?;
+    socket.write_all(chunk).await?;
+    socket.write_all(b"\r\n").await?;
+    Ok(())
 }
 
 /// Apply an optional prefix to a model name, skipping if the prefix is already present.
@@ -81,7 +182,8 @@ fn apply_model_prefix(model: &str, prefix: Option<&str>) -> String {
 async fn handle_anthropic_to_openai(
     request: &str,
     config: &Arc<OpenAIRouterConfig>,
-) -> Result<String> {
+    client: &reqwest::Client,
+) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
 
     let body: Value = serde_json::from_str(body_str)?;
@@ -98,14 +200,7 @@ async fn handle_anthropic_to_openai(
         ));
     }
 
-    // Build target URL
-    let client = router_http_client();
-    let base = config.target_base_url.trim_end_matches('/');
-    let url = if base.ends_with("/v1") {
-        format!("{}/chat/completions", base)
-    } else {
-        format!("{}/v1/chat/completions", base)
-    };
+    let url = http_utils::build_chat_completions_url(&config.target_base_url);
 
     let response = client
         .post(&url)
@@ -124,26 +219,35 @@ async fn handle_anthropic_to_openai(
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
+
+    if status_code == 200 && is_streaming {
+        return Ok(RouterResponse::Streaming {
+            status: status_code,
+            upstream: response,
+        });
+    }
+
     let response_body = response.text().await?;
 
-    // Check if streaming (header check is primary; body prefix is a fallback for providers
-    // that don't set Content-Type correctly)
-    if status_code == 200 && (is_streaming || response_body.starts_with("data:")) {
-        // Convert OpenAI SSE stream to Anthropic SSE stream (text + tool_calls)
+    // Some providers incorrectly omit the SSE content type. Preserve support for them by
+    // falling back to buffered conversion when the body clearly contains SSE frames.
+    if status_code == 200 && response_body.starts_with("data:") {
         let anthropic_sse = convert_openai_sse_to_anthropic(&response_body, status_code)?;
-        return Ok(format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{}",
-            anthropic_sse
-        ));
+        return Ok(RouterResponse::Buffered {
+            status: 200,
+            content_type: "text/event-stream".to_string(),
+            body: anthropic_sse.into_bytes(),
+        });
     }
 
     // Non-streaming: convert JSON response
     let anthropic_response = convert_openai_to_anthropic(&response_body, status_code)?;
 
-    Ok(http_utils::http_json_response(
-        status_code,
-        &anthropic_response,
-    ))
+    Ok(RouterResponse::Buffered {
+        status: status_code,
+        content_type: "application/json".to_string(),
+        body: anthropic_response.into_bytes(),
+    })
 }
 
 fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value {
@@ -410,72 +514,131 @@ fn finalize_stream_message(
     );
 }
 
-/// Convert OpenAI SSE streaming response to Anthropic SSE format.
-fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Result<String> {
-    if status_code >= 400 {
-        return Ok(format!("data: {}\n\ndata: [DONE]\n\n", response_body));
+struct OpenAIStreamConverter {
+    pending: Vec<u8>,
+    message_started: bool,
+    finished: bool,
+    block_count: usize,
+    text_block_idx: Option<usize>,
+    tool_blocks: HashMap<usize, StreamToolBlock>,
+    message_id: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    saw_tool_use: bool,
+}
+
+impl OpenAIStreamConverter {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            message_started: false,
+            finished: false,
+            block_count: 0,
+            text_block_idx: None,
+            tool_blocks: HashMap::new(),
+            message_id: "msg".to_string(),
+            model: "claude".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            saw_tool_use: false,
+        }
     }
 
-    let mut sse_output = String::new();
-    let mut message_started = false;
-    let mut finished = false;
+    fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
+        self.pending.extend_from_slice(chunk);
 
-    let mut block_count = 0usize;
-    let mut text_block_idx: Option<usize> = None;
-    let mut tool_blocks: HashMap<usize, StreamToolBlock> = HashMap::new();
-
-    let mut message_id = "msg".to_string();
-    let mut model = "claude".to_string();
-    let mut input_tokens = 0u64;
-    let mut output_tokens = 0u64;
-    let mut saw_tool_use = false;
-
-    for line in response_body.lines() {
-        if !line.starts_with("data: ") {
-            continue;
+        let mut output = String::new();
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
+            self.pending.drain(..=pos);
+            self.process_line(line.trim_end_matches('\r'), &mut output)?;
         }
 
-        let data = line.strip_prefix("data: ").unwrap_or("");
+        Ok(output)
+    }
+
+    fn finish(&mut self) -> Result<String> {
+        let mut output = String::new();
+
+        if !self.pending.is_empty() {
+            let line = String::from_utf8_lossy(&self.pending).into_owned();
+            self.pending.clear();
+            self.process_line(line.trim_end_matches('\r'), &mut output)?;
+        }
+
+        if !self.finished && self.message_started {
+            let fallback_stop = if self.saw_tool_use {
+                "tool_use"
+            } else {
+                "end_turn"
+            };
+            finalize_stream_message(
+                &mut output,
+                &mut self.message_started,
+                &self.message_id,
+                &self.model,
+                self.input_tokens,
+                self.output_tokens,
+                &mut self.text_block_idx,
+                &mut self.tool_blocks,
+                fallback_stop,
+            );
+            self.finished = true;
+        }
+
+        Ok(output)
+    }
+
+    fn process_line(&mut self, line: &str, output: &mut String) -> Result<()> {
+        let Some(data) = line.strip_prefix("data: ") else {
+            return Ok(());
+        };
+
         if data == "[DONE]" {
-            if !finished {
-                let fallback_stop = if saw_tool_use { "tool_use" } else { "end_turn" };
+            if !self.finished {
+                let fallback_stop = if self.saw_tool_use {
+                    "tool_use"
+                } else {
+                    "end_turn"
+                };
                 finalize_stream_message(
-                    &mut sse_output,
-                    &mut message_started,
-                    &message_id,
-                    &model,
-                    input_tokens,
-                    output_tokens,
-                    &mut text_block_idx,
-                    &mut tool_blocks,
+                    output,
+                    &mut self.message_started,
+                    &self.message_id,
+                    &self.model,
+                    self.input_tokens,
+                    self.output_tokens,
+                    &mut self.text_block_idx,
+                    &mut self.tool_blocks,
                     fallback_stop,
                 );
-                finished = true;
+                self.finished = true;
             }
-            continue;
+            return Ok(());
         }
 
         let chunk = match serde_json::from_str::<Value>(data) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => return Ok(()),
         };
 
         if let Some(v) = chunk.get("id").and_then(|v| v.as_str())
             && !v.is_empty()
         {
-            message_id = v.to_string();
+            self.message_id = v.to_string();
         }
         if let Some(v) = chunk.get("model").and_then(|v| v.as_str())
             && !v.is_empty()
         {
-            model = v.to_string();
+            self.model = v.to_string();
         }
         if let Some(usage) = chunk.get("usage") {
             if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                input_tokens = v;
+                self.input_tokens = v;
             }
             if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-                output_tokens = v;
+                self.output_tokens = v;
             }
         }
 
@@ -487,23 +650,22 @@ fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Res
         for choice in choices {
             let delta = choice.get("delta").cloned().unwrap_or(json!({}));
 
-            // Text delta
             if let Some(text) = delta.get("content").and_then(|v| v.as_str())
                 && !text.is_empty()
             {
                 ensure_message_start(
-                    &mut sse_output,
-                    &mut message_started,
-                    &message_id,
-                    &model,
-                    input_tokens,
+                    output,
+                    &mut self.message_started,
+                    &self.message_id,
+                    &self.model,
+                    self.input_tokens,
                 );
-                if text_block_idx.is_none() {
-                    let idx = block_count;
-                    block_count += 1;
-                    text_block_idx = Some(idx);
+                if self.text_block_idx.is_none() {
+                    let idx = self.block_count;
+                    self.block_count += 1;
+                    self.text_block_idx = Some(idx);
                     append_sse_event(
-                        &mut sse_output,
+                        output,
                         "content_block_start",
                         json!({
                             "type": "content_block_start",
@@ -516,11 +678,11 @@ fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Res
                     );
                 }
                 append_sse_event(
-                    &mut sse_output,
+                    output,
                     "content_block_delta",
                     json!({
                         "type": "content_block_delta",
-                        "index": text_block_idx.unwrap_or(0),
+                        "index": self.text_block_idx.unwrap_or(0),
                         "delta": {
                             "type": "text_delta",
                             "text": text
@@ -529,42 +691,40 @@ fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Res
                 );
             }
 
-            // OpenAI legacy function_call delta
             if let Some(function_call) = delta.get("function_call") {
                 ensure_message_start(
-                    &mut sse_output,
-                    &mut message_started,
-                    &message_id,
-                    &model,
-                    input_tokens,
+                    output,
+                    &mut self.message_started,
+                    &self.message_id,
+                    &self.model,
+                    self.input_tokens,
                 );
                 emit_tool_delta(
-                    &mut sse_output,
-                    &mut block_count,
-                    &mut tool_blocks,
+                    output,
+                    &mut self.block_count,
+                    &mut self.tool_blocks,
                     0,
                     function_call.get("id").and_then(|v| v.as_str()),
                     function_call.get("name").and_then(|v| v.as_str()),
                     function_call.get("arguments").and_then(|v| v.as_str()),
-                    &mut saw_tool_use,
+                    &mut self.saw_tool_use,
                 );
             }
 
-            // OpenAI modern tool_calls delta (possibly split by index across chunks)
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 ensure_message_start(
-                    &mut sse_output,
-                    &mut message_started,
-                    &message_id,
-                    &model,
-                    input_tokens,
+                    output,
+                    &mut self.message_started,
+                    &self.message_id,
+                    &self.model,
+                    self.input_tokens,
                 );
                 for tc in tool_calls {
                     let openai_idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     emit_tool_delta(
-                        &mut sse_output,
-                        &mut block_count,
-                        &mut tool_blocks,
+                        output,
+                        &mut self.block_count,
+                        &mut self.tool_blocks,
                         openai_idx,
                         tc.get("id").and_then(|v| v.as_str()),
                         tc.get("function")
@@ -573,31 +733,43 @@ fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Res
                         tc.get("function")
                             .and_then(|f| f.get("arguments"))
                             .and_then(|v| v.as_str()),
-                        &mut saw_tool_use,
+                        &mut self.saw_tool_use,
                     );
                 }
             }
 
-            if !finished
+            if !self.finished
                 && let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str())
                 && !finish_reason.is_empty()
             {
                 finalize_stream_message(
-                    &mut sse_output,
-                    &mut message_started,
-                    &message_id,
-                    &model,
-                    input_tokens,
-                    output_tokens,
-                    &mut text_block_idx,
-                    &mut tool_blocks,
+                    output,
+                    &mut self.message_started,
+                    &self.message_id,
+                    &self.model,
+                    self.input_tokens,
+                    self.output_tokens,
+                    &mut self.text_block_idx,
+                    &mut self.tool_blocks,
                     map_openai_finish_reason(finish_reason),
                 );
-                finished = true;
+                self.finished = true;
             }
         }
+
+        Ok(())
+    }
+}
+
+/// Convert OpenAI SSE streaming response to Anthropic SSE format.
+fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Result<String> {
+    if status_code >= 400 {
+        return Ok(format!("data: {}\n\ndata: [DONE]\n\n", response_body));
     }
 
+    let mut converter = OpenAIStreamConverter::new();
+    let mut sse_output = converter.push_bytes(response_body.as_bytes())?;
+    sse_output.push_str(&converter.finish()?);
     Ok(sse_output)
 }
 
@@ -793,6 +965,35 @@ data: [DONE]\n";
         assert!(result.contains("\"type\":\"input_json_delta\""));
         assert!(result.contains("\"partial_json\":\"{\\\"path\\\":\\\".\\\"}\""));
         assert!(result.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    #[test]
+    fn test_openai_stream_converter_handles_split_chunks() {
+        let mut converter = OpenAIStreamConverter::new();
+        let mut output = String::new();
+
+        output.push_str(
+            &converter
+                .push_bytes(b"data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hel")
+                .unwrap(),
+        );
+        output.push_str(
+            &converter
+                .push_bytes(b"lo\"},\"finish_reason\":null}]}\n")
+                .unwrap(),
+        );
+        output.push_str(
+            &converter
+                .push_bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":2}}\n")
+                .unwrap(),
+        );
+        output.push_str(&converter.push_bytes(b"data: [DONE]\n").unwrap());
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"text\":\"hello\""));
+        assert!(output.contains("\"text\":\" world\""));
+        assert!(output.contains("\"stop_reason\":\"end_turn\""));
+        assert_eq!(output.matches("event: message_stop").count(), 1);
     }
 
     #[test]

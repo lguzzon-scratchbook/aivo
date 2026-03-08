@@ -22,6 +22,11 @@ pub struct AnthropicRouter {
     config: AnthropicRouterConfig,
 }
 
+struct AnthropicRouterState {
+    config: Arc<AnthropicRouterConfig>,
+    client: reqwest::Client,
+}
+
 enum RouterResponse {
     Buffered {
         status: u16,
@@ -51,28 +56,31 @@ impl AnthropicRouter {
     /// Returns the actual port number so callers can set ANTHROPIC_BASE_URL.
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
-        let config = self.config.clone();
-        let handle = tokio::spawn(async move { run_router(listener, config).await });
+        let state = AnthropicRouterState {
+            config: Arc::new(self.config.clone()),
+            client: router_http_client(),
+        };
+        let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, handle))
     }
 }
 
-async fn run_router(
-    listener: tokio::net::TcpListener,
-    config: AnthropicRouterConfig,
-) -> Result<()> {
-    let config = Arc::new(config);
-
+async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterState) -> Result<()> {
     loop {
         let (mut socket, _) = listener.accept().await?;
-        let config = config.clone();
+        let config = state.config.clone();
+        let client = state.client.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
 
             let request_bytes = match http_utils::read_full_request(&mut socket).await {
                 Ok(b) => b,
-                Err(_) => return,
+                Err(err) => {
+                    let response = http_utils::http_request_read_error_response(&err);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
             };
 
             let request = String::from_utf8_lossy(&request_bytes);
@@ -82,7 +90,7 @@ async fn run_router(
 
             let result = if method_is_post {
                 match AnthropicRoute::from_request_path(path) {
-                    Some(route) => forward_request(&request, &config, route).await,
+                    Some(route) => forward_request(&request, &config, &client, route).await,
                     None => {
                         let not_found = http_utils::http_response(
                             404,
@@ -208,6 +216,7 @@ async fn write_router_response(
 async fn forward_request(
     request: &str,
     config: &Arc<AnthropicRouterConfig>,
+    client: &reqwest::Client,
     route: AnthropicRoute,
 ) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
@@ -219,7 +228,6 @@ async fn forward_request(
     let pipeline = RouterPipeline::for_openrouter();
     pipeline.patch_json(route.patch_route(), &mut body, &ctx)?;
 
-    let client = router_http_client();
     let url = build_endpoint_url(&config.upstream_base_url, route.endpoint());
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));

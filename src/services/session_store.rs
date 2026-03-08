@@ -11,6 +11,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 /**
  * SessionStore service for managing credential persistence.
  * Stores credentials in ~/.config/aivo/config.json with AES-256-GCM encryption.
@@ -228,6 +229,26 @@ pub struct SessionStore {
     config_dir: PathBuf,
 }
 
+#[cfg(unix)]
+struct ConfigLockGuard {
+    _file: std::fs::File,
+}
+
+#[cfg(not(unix))]
+struct ConfigLockGuard;
+
+#[cfg(unix)]
+impl Drop for ConfigLockGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the file descriptor remains valid for the lifetime of the guard.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         let config_dir = system_env::home_dir()
@@ -254,9 +275,64 @@ impl SessionStore {
         }
     }
 
+    fn lock_path(&self) -> PathBuf {
+        self.config_dir.join("config.lock")
+    }
+
+    fn acquire_config_lock(&self) -> Result<ConfigLockGuard> {
+        if !self.config_dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(&self.config_dir).with_context(|| {
+                format!("Failed to create config directory: {:?}", self.config_dir)
+            })?;
+        }
+
+        let lock_path = self.lock_path();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open config lock file: {:?}", lock_path))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            loop {
+                // SAFETY: the file descriptor stays open for the guard lifetime.
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if rc == 0 {
+                    break;
+                }
+
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err).with_context(|| {
+                        format!("Failed to acquire config lock: {:?}", lock_path)
+                    });
+                }
+            }
+
+            Ok(ConfigLockGuard { _file: file })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(ConfigLockGuard)
+        }
+    }
+
     /// Saves config to the config file.
     /// Uses atomic write (write to temp file then rename) to prevent corruption.
+    #[allow(dead_code)]
     pub async fn save(&self, config: &StoredConfig) -> Result<()> {
+        let _lock = self.acquire_config_lock()?;
+        self.save_unlocked(config).await
+    }
+
+    async fn save_unlocked(&self, config: &StoredConfig) -> Result<()> {
         tokio::fs::create_dir_all(&self.config_dir)
             .await
             .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
@@ -295,6 +371,10 @@ impl SessionStore {
 
     /// Loads config from the config file
     pub async fn load(&self) -> Result<StoredConfig> {
+        self.load_unlocked().await
+    }
+
+    async fn load_unlocked(&self) -> Result<StoredConfig> {
         let data = match tokio::fs::read_to_string(&self.config_path).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -317,7 +397,8 @@ impl SessionStore {
 
     /// Adds a new API key and returns its generated ID
     pub async fn add_key(&self, name: &str, base_url: &str, key: &str) -> Result<String> {
-        let mut config = self.load().await?;
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
 
         let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
         let id = {
@@ -343,7 +424,7 @@ impl SessionStore {
             key.to_string(),
         ));
 
-        self.save(&config).await?;
+        self.save_unlocked(&config).await?;
         Ok(id)
     }
 
@@ -361,7 +442,8 @@ impl SessionStore {
 
     /// Deletes an API key by ID
     pub async fn delete_key(&self, id: &str) -> Result<bool> {
-        let mut config = self.load().await?;
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
         let initial_len = config.api_keys.len();
         config.api_keys.retain(|k| k.id != id);
 
@@ -370,7 +452,7 @@ impl SessionStore {
                 config.active_key_id = None;
             }
             config.chat_models.remove(id);
-            self.save(&config).await?;
+            self.save_unlocked(&config).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -385,12 +467,13 @@ impl SessionStore {
         base_url: &str,
         key: &str,
     ) -> Result<bool> {
-        let mut config = self.load().await?;
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
         if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
             entry.name = name.to_string();
             entry.base_url = base_url.to_string();
             entry.key = Zeroizing::new(key.to_string());
-            self.save(&config).await?;
+            self.save_unlocked(&config).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -399,7 +482,8 @@ impl SessionStore {
 
     /// Sets the currently active API key
     pub async fn set_active_key(&self, id: &str) -> Result<()> {
-        let mut config = self.load().await?;
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
 
         if !config.api_keys.iter().any(|k| k.id == id) {
             return Err(CLIError::new(
@@ -412,7 +496,7 @@ impl SessionStore {
         }
 
         config.active_key_id = Some(id.to_string());
-        self.save(&config).await
+        self.save_unlocked(&config).await
     }
 
     /// Resolves an API key by ID or name.
@@ -475,11 +559,12 @@ impl SessionStore {
 
     /// Saves the chat model for a specific API key
     pub async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
-        let mut config = self.load().await?;
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
         config
             .chat_models
             .insert(key_id.to_string(), model.to_string());
-        self.save(&config).await
+        self.save_unlocked(&config).await
     }
 
     /// Encrypts API keys before saving

@@ -1,15 +1,23 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 const CACHE_TTL_SECS: u64 = 3600; // 1 hour
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct CacheEntry {
     models: Vec<String>,
     fetched_at: u64,
+}
+
+#[derive(Debug, Default)]
+struct CacheState {
+    loaded: bool,
+    entries: HashMap<String, CacheEntry>,
 }
 
 /// Disk cache for model lists keyed by base_url.
@@ -17,6 +25,7 @@ struct CacheEntry {
 #[derive(Debug, Clone)]
 pub struct ModelsCache {
     cache_path: PathBuf,
+    state: Arc<RwLock<CacheState>>,
 }
 
 impl ModelsCache {
@@ -24,19 +33,45 @@ impl ModelsCache {
         let cache_path = crate::services::system_env::home_dir()
             .map(|p| p.join(".config").join("aivo").join("models-cache.json"))
             .unwrap_or_else(|| PathBuf::from(".config/aivo/models-cache.json"));
-        Self { cache_path }
+        Self {
+            cache_path,
+            state: Arc::new(RwLock::new(CacheState::default())),
+        }
     }
 
     #[cfg(test)]
     pub fn with_path(cache_path: PathBuf) -> Self {
-        Self { cache_path }
+        Self {
+            cache_path,
+            state: Arc::new(RwLock::new(CacheState::default())),
+        }
     }
 
-    /// Returns cached models for `base_url` if present and not expired.
-    pub async fn get(&self, base_url: &str) -> Option<Vec<String>> {
-        let data = tokio::fs::read_to_string(&self.cache_path).await.ok()?;
-        let map: HashMap<String, CacheEntry> = serde_json::from_str(&data).ok()?;
-        let entry = map.get(base_url)?;
+    async fn ensure_loaded(&self) {
+        {
+            let state = self.state.read().await;
+            if state.loaded {
+                return;
+            }
+        }
+
+        let entries = Self::read_disk_cache(&self.cache_path).await;
+        let mut state = self.state.write().await;
+        if !state.loaded {
+            state.entries = entries;
+            state.loaded = true;
+        }
+    }
+
+    async fn read_disk_cache(cache_path: &PathBuf) -> HashMap<String, CacheEntry> {
+        tokio::fs::read_to_string(cache_path)
+            .await
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
+    }
+
+    fn fresh_models(entry: &CacheEntry) -> Option<Vec<String>> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         if now.saturating_sub(entry.fetched_at) < CACHE_TTL_SECS {
             Some(entry.models.clone())
@@ -45,28 +80,35 @@ impl ModelsCache {
         }
     }
 
+    /// Returns cached models for `base_url` if present and not expired.
+    pub async fn get(&self, base_url: &str) -> Option<Vec<String>> {
+        self.ensure_loaded().await;
+        let state = self.state.read().await;
+        state.entries.get(base_url).and_then(Self::fresh_models)
+    }
+
     /// Writes models for `base_url` into the cache file.
     /// Silently ignores write errors.
     pub async fn set(&self, base_url: &str, models: Vec<String>) {
-        let mut map: HashMap<String, CacheEntry> = tokio::fs::read_to_string(&self.cache_path)
-            .await
-            .ok()
-            .and_then(|data| serde_json::from_str(&data).ok())
-            .unwrap_or_default();
+        self.ensure_loaded().await;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        map.insert(
-            base_url.to_string(),
-            CacheEntry {
-                models,
-                fetched_at: now,
-            },
-        );
+        let json = {
+            let mut state = self.state.write().await;
+            state.entries.insert(
+                base_url.to_string(),
+                CacheEntry {
+                    models,
+                    fetched_at: now,
+                },
+            );
+            serde_json::to_string_pretty(&state.entries).ok()
+        };
 
-        if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Some(json) = json {
             if let Some(parent) = self.cache_path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
@@ -134,5 +176,33 @@ mod tests {
         .await
         .unwrap();
         assert!(cache.get("https://api.example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_cache_serves_from_memory_after_disk_changes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models-cache.json");
+        let entry = serde_json::json!({
+            "https://api.example.com": {
+                "models": ["gpt-4o"],
+                "fetched_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+            }
+        });
+        tokio::fs::write(&path, serde_json::to_string(&entry).unwrap())
+            .await
+            .unwrap();
+
+        let cache = ModelsCache::with_path(path.clone());
+        assert_eq!(
+            cache.get("https://api.example.com").await,
+            Some(vec!["gpt-4o".to_string()])
+        );
+
+        tokio::fs::write(&path, b"broken now").await.unwrap();
+
+        assert_eq!(
+            cache.get("https://api.example.com").await,
+            Some(vec!["gpt-4o".to_string()])
+        );
     }
 }
