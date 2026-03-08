@@ -49,7 +49,6 @@ struct AddKeyOptions<'a> {
     key: Option<&'a str>,
 }
 
-#[allow(dead_code)]
 fn detect_base_url(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
     let providers: &[(&str, &str)] = &[
@@ -392,12 +391,25 @@ impl KeysCommand {
                 }
             }
         } else {
+            let detected_url = detect_base_url(&name);
             let mut provided_base_url = add_options.base_url.map(str::to_string);
             loop {
                 let value = if let Some(value) = provided_base_url.take() {
                     value
                 } else {
-                    read_line("Base URL (e.g., https://api.openai.com/v1): ")?
+                    let prompt = match detected_url {
+                        Some(default) => format!("Base URL [{}]: ", default),
+                        None => "Base URL (e.g., https://api.openai.com/v1): ".to_string(),
+                    };
+                    let input = read_line(&prompt)?;
+                    if input.is_empty() {
+                        match detected_url {
+                            Some(default) => default.to_string(),
+                            None => String::new(),
+                        }
+                    } else {
+                        input
+                    }
                 };
                 if value == "copilot" {
                     eprintln!(
