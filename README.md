@@ -1,6 +1,6 @@
 # aivo
 
-Unified key management tool and protocol bridge for Claude Code, Codex, and Gemini.
+Unified key management and protocol bridge tool for Claude Code, Codex, and Gemini.
 
 ## Install
 
@@ -20,7 +20,7 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 
 ```bash
 # 1) Add a provider key (OpenRouter, Vercel AI Gateway, etc.)
-aivo keys add --name openrouter --base-url https://openrouter.ai/api/v1 --key sk-or-v1-...
+aivo keys add
 
 # 2) Launch your tool
 aivo claude
@@ -69,103 +69,61 @@ aivo models                      # cached for 1h
 aivo models --refresh            # force-refresh
 ```
 
-## Provider Compatibility
-
-### OpenRouter
-
-Add your key with base URL `https://openrouter.ai/api/v1`.
-
-```bash
-aivo claude --model claude-sonnet-4-6   # model name auto-conversion
-aivo chat --model openai/gpt-4o-mini
-```
-
-### Vercel AI Gateway
-
-Add your key with base URL `https://ai-gateway.vercel.sh/v1`.
-
-```bash
-aivo claude
-aivo chat --model claude-sonnet-4-6
-```
-
-### GitHub Copilot
-
-Use your existing Copilot subscription to run Claude Code (no separate Anthropic API key required).
-
-```bash
-aivo keys add copilot         # GitHub device-flow login
-aivo claude
-aivo models
-aivo chat --model claude-sonnet-4.6
-```
-
-### Other Providers
-
-Any Anthropic-compatible provider works with `aivo claude`.
-Any OpenAI-compatible provider works with `aivo chat` and `aivo codex`.
-
-Use the provider base URL when adding a key; trailing `/v1` is handled automatically.
 
 ## Key Management
 
 ```bash
-aivo keys            # list all keys
-aivo keys add        # add a new key (interactive)
-aivo keys add --name openrouter --base-url https://openrouter.ai/api/v1 --key sk-or-v1-...
-aivo keys use [id]   # switch active key
-aivo keys cat <id>   # show key details
-aivo keys rm <id>    # remove a key
-aivo keys edit <id>  # edit a key
+aivo keys       # list all keys
+aivo keys add   # add a new key (interactive)
+aivo keys use   # switch active key
+aivo keys cat   # show key details
+aivo keys rm    # remove a key
+aivo keys edit  # edit a key
 ```
 
-Keys are encrypted in `~/.config/aivo/config.json` (AES-256-GCM, machine-specific key derivation).
+### Adding popular providers
+
+```bash
+# OpenRouter
+aivo keys add --base-url=https://openrouter.ai/api/v1 --key=xxx
+
+# Vercel AI Gateway
+aivo keys add --base-url=https://ai-gateway.vercel.sh/v1 --key=xxx
+
+# DeepSeek
+aivo keys add --base-url=https://api.deepseek.com --key=xxx
+
+# Fireworks
+aivo keys add --base-url=https://api.fireworks.ai/inference --key=xxx
+
+# MiniMax
+aivo keys add --base-url=https://api.minimax.io/anthropic --key=xxx
+
+# Moonshot
+aivo keys add --base-url=https://api.moonshot.ai/v1 --key=xxx
+
+# Cloudflare Workers AI
+aivo keys add --base-url=https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1 --key=xxx
+```
+
+Use `aivo keys` to view your saved providers and `aivo use` to switch between them.
 
 ## How It Works
 
 1. **Encrypted storage**: API keys are encrypted locally in `~/.config/aivo/config.json`.
 2. **Env injection**: `aivo` injects provider-specific env vars (`ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, etc.) only for the launched process.
 3. **Protocol translation**: built-in local routing smooths over API incompatibilities across providers.
-4. **Native terminal behavior**: tools run as child processes with proper signal forwarding (`SIGINT`, `SIGTERM`).
-
-## Prerequisites
-
-Install Claude Code:
-
-**macOS (Homebrew)**
-```bash
-brew install claude
-```
-
-**All platforms (npm)**
-```bash
-npm install -g @anthropic-ai/claude-code
-```
-
-For Codex, Gemini, and OpenCode:
-
-**macOS (Homebrew)**
-```bash
-brew install openai/codex
-brew tap google-gemini/gemini-cli && brew install gemini-cli
-```
-
-**All platforms (npm)**
-```bash
-npm install -g @openai/codex
-npm install -g @google/gemini-cli
-```
 
 ## Development
 
 ```bash
-cargo build
-cargo test
-cargo clippy
-cargo check
+make build
+make test
+make clippy
+make check
 
 # only when packaging or benchmarking the final binary
-cargo build --release
+make build --release
 ```
 
 ## License
