@@ -48,6 +48,20 @@ test-fast-crypto = []
 [dev-dependencies]
 tempfile = "3.0"
 
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = true
+
+[profile.test.package."*"]
+debug = false
+
 [profile.release]
 opt-level = "z"     # Optimize for size instead of speed
 lto = true

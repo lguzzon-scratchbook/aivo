@@ -159,10 +159,13 @@ npm install -g @google/gemini-cli
 ## Development
 
 ```bash
-cargo build --release
+cargo build
 cargo test
 cargo clippy
 cargo check
+
+# only when packaging or benchmarking the final binary
+cargo build --release
 ```
 
 ## License
