@@ -132,7 +132,7 @@ async fn handle_models(state: &ServeState) -> Result<String> {
     let models = fetch_models(&state.client, &state.key).await?;
     let data: Vec<Value> = models
         .into_iter()
-        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "aivo"}))
+        .map(|id| json!({"id": id, "object": "model", "owned_by": "aivo"}))
         .collect();
     let resp = json!({"object": "list", "data": data});
     Ok(http_utils::http_response(
