@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
+use crate::services::model_names::select_model_for_protocol;
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
     convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
@@ -185,6 +186,12 @@ async fn handle_chat_completions_with_filter(
         &["max_tokens", "max_output_tokens"],
     );
     if config.copilot_token_manager.is_none() {
+        let selected_model = select_model_for_protocol(
+            body.get("model").and_then(|v| v.as_str()),
+            config.actual_model.as_deref(),
+            config.target_protocol,
+        );
+        body["model"] = Value::String(selected_model);
         transform_model(
             &mut body,
             &config.target_base_url,
@@ -603,22 +610,23 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
     // Apply model name transform (e.g. openai/ prefix for OpenRouter)
     // Skip transform when using Copilot — model names pass through unchanged
     // If actual_model is set, use that (it was set by environment injector)
-    let model = if let Some(ref actual) = config.actual_model {
-        Value::String(actual.clone())
-    } else {
-        body.get("model").cloned().unwrap_or(Value::Null)
-    };
+    let selected_model = select_model_for_protocol(
+        body.get("model").and_then(|v| v.as_str()),
+        config.actual_model.as_deref(),
+        config.target_protocol,
+    );
     let model = if config.copilot_token_manager.is_none() {
-        match model.as_str() {
-            Some(s) => Value::String(transform_model_str(
-                s,
+        if config.target_protocol == ProviderProtocol::Openai {
+            Value::String(transform_model_str(
+                &selected_model,
                 &config.target_base_url,
                 config.model_prefix.as_deref(),
-            )),
-            None => model,
+            ))
+        } else {
+            Value::String(selected_model)
         }
     } else {
-        model
+        Value::String(selected_model)
     };
 
     let mut chat = json!({

@@ -20,6 +20,7 @@ use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
 };
 use crate::services::http_utils::{self, router_http_client};
+use crate::services::model_names::select_model_for_protocol;
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::{
     OpenAIToGeminiConfig, build_google_generate_content_url,
@@ -165,8 +166,16 @@ async fn handle_anthropic_to_upstream(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let selected_model = select_model_for_protocol(
+        simplified.get("model").and_then(|v| v.as_str()),
+        None,
+        config.target_protocol,
+    );
+    simplified["model"] = Value::String(selected_model);
+
     // Transform model name: add prefix if configured (e.g., "@cf/" for Cloudflare)
-    if let Some(model) = simplified.get_mut("model")
+    if config.target_protocol == ProviderProtocol::Openai
+        && let Some(model) = simplified.get_mut("model")
         && let Some(model_str) = model.as_str()
     {
         *model = Value::String(apply_model_prefix(

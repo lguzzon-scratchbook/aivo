@@ -344,20 +344,20 @@ impl AILauncher {
 
         let preferred = preferred_codex_mode(&key.base_url);
         let first = key.codex_mode.unwrap_or(preferred);
-        let mode = match first {
-            OpenAICompatibilityMode::Direct => {
-                match probe_openai_responses_compatibility(&key).await {
-                    ClaudeProtocolProbeOutcome::Supported => OpenAICompatibilityMode::Direct,
-                    ClaudeProtocolProbeOutcome::Unsupported => OpenAICompatibilityMode::Router,
-                    ClaudeProtocolProbeOutcome::Inconclusive => first,
-                }
-            }
-            OpenAICompatibilityMode::Router => OpenAICompatibilityMode::Router,
+        let (mode, decisive) = match first {
+            OpenAICompatibilityMode::Direct => match probe_openai_responses_compatibility(&key)
+                .await
+            {
+                ClaudeProtocolProbeOutcome::Supported => (OpenAICompatibilityMode::Direct, true),
+                ClaudeProtocolProbeOutcome::Unsupported => (OpenAICompatibilityMode::Router, true),
+                ClaudeProtocolProbeOutcome::Inconclusive => (first, false),
+            },
+            OpenAICompatibilityMode::Router => (OpenAICompatibilityMode::Router, false),
         };
 
         if key.codex_mode != Some(mode) {
             key.codex_mode = Some(mode);
-            if persist {
+            if decisive && persist {
                 let _ = self
                     .session_store
                     .set_key_codex_mode(&key.id, Some(mode))
@@ -410,18 +410,18 @@ impl AILauncher {
 
         let preferred = preferred_opencode_mode(&key.base_url);
         let first = key.opencode_mode.unwrap_or(preferred);
-        let mode = match first {
+        let (mode, decisive) = match first {
             OpenAICompatibilityMode::Direct => match probe_openai_chat_compatibility(&key).await {
-                ClaudeProtocolProbeOutcome::Supported => OpenAICompatibilityMode::Direct,
-                ClaudeProtocolProbeOutcome::Unsupported => OpenAICompatibilityMode::Router,
-                ClaudeProtocolProbeOutcome::Inconclusive => first,
+                ClaudeProtocolProbeOutcome::Supported => (OpenAICompatibilityMode::Direct, true),
+                ClaudeProtocolProbeOutcome::Unsupported => (OpenAICompatibilityMode::Router, true),
+                ClaudeProtocolProbeOutcome::Inconclusive => (first, false),
             },
-            OpenAICompatibilityMode::Router => OpenAICompatibilityMode::Router,
+            OpenAICompatibilityMode::Router => (OpenAICompatibilityMode::Router, false),
         };
 
         if key.opencode_mode != Some(mode) {
             key.opencode_mode = Some(mode);
-            if persist {
+            if decisive && persist {
                 let _ = self
                     .session_store
                     .set_key_opencode_mode(&key.id, Some(mode))

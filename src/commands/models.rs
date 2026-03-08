@@ -12,6 +12,7 @@ use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, CopilotTokenManager,
 };
+use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use crate::services::session_store::{ApiKey, SessionStore};
@@ -285,10 +286,7 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             })
             .collect())
     } else if detect_provider_protocol(&key.base_url) == ProviderProtocol::Anthropic {
-        let url = format!(
-            "{}/models",
-            normalize_base_url(&key.base_url).trim_end_matches('/')
-        );
+        let url = build_anthropic_models_url(&key.base_url);
         let response = client
             .get(&url)
             .header("x-api-key", key.key.as_str())
@@ -414,6 +412,10 @@ fn build_google_models_url(base_url: &str) -> String {
     } else {
         format!("{}/v1beta/models", base)
     }
+}
+
+fn build_anthropic_models_url(base_url: &str) -> String {
+    http_utils::build_target_url(base_url, "/v1/models")
 }
 
 /// Fetches the model list (cache-first) with a spinner for network fetches,
@@ -553,6 +555,18 @@ mod tests {
         assert_eq!(
             cloudflare_model_name(model),
             "01564c52-8717-47dc-8efd-907a2ca18301".to_string()
+        );
+    }
+
+    #[test]
+    fn build_anthropic_models_url_preserves_v1_path() {
+        assert_eq!(
+            build_anthropic_models_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/models"
+        );
+        assert_eq!(
+            build_anthropic_models_url("https://api.minimax.io/anthropic"),
+            "https://api.minimax.io/anthropic/v1/models"
         );
     }
 

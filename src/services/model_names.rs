@@ -8,6 +8,8 @@
 //! This module consolidates the version conversion logic that was previously
 //! duplicated across Anthropic router code, copilot_router, and chat.rs.
 
+use crate::services::provider_protocol::ProviderProtocol;
+
 /// Converts Claude model version separators from hyphens to dots.
 ///
 /// Examples:
@@ -114,6 +116,55 @@ pub fn copilot_model_name(model: &str) -> String {
     base.to_string()
 }
 
+pub fn default_model_for_protocol(protocol: ProviderProtocol) -> &'static str {
+    match protocol {
+        ProviderProtocol::Openai => "gpt-4o",
+        ProviderProtocol::Anthropic => "claude-sonnet-4-5",
+        ProviderProtocol::Google => "gemini-2.5-pro",
+    }
+}
+
+pub fn select_model_for_protocol(
+    requested_model: Option<&str>,
+    explicit_model: Option<&str>,
+    target_protocol: ProviderProtocol,
+) -> String {
+    if let Some(model) = explicit_model.filter(|model| !model.trim().is_empty()) {
+        return model.to_string();
+    }
+
+    match requested_model.filter(|model| !model.trim().is_empty()) {
+        Some(model) => match infer_model_protocol(model) {
+            Some(protocol) if protocol != target_protocol => {
+                default_model_for_protocol(target_protocol).to_string()
+            }
+            _ => model.to_string(),
+        },
+        None => default_model_for_protocol(target_protocol).to_string(),
+    }
+}
+
+fn infer_model_protocol(model: &str) -> Option<ProviderProtocol> {
+    let lower = model.to_ascii_lowercase();
+    let name_only = lower.split('/').next_back().unwrap_or(&lower);
+
+    if name_only.contains("claude") {
+        Some(ProviderProtocol::Anthropic)
+    } else if name_only.contains("gemini") {
+        Some(ProviderProtocol::Google)
+    } else if name_only.starts_with("gpt-")
+        || name_only.starts_with("o1")
+        || name_only.starts_with("o3")
+        || name_only.starts_with("o4")
+        || name_only.starts_with("chatgpt")
+        || name_only.contains("codex")
+    {
+        Some(ProviderProtocol::Openai)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +248,49 @@ mod tests {
         assert_eq!(copilot_model_name("claude-sonnet-4"), "claude-sonnet-4");
         assert_eq!(copilot_model_name("claude-sonnet-4-6"), "claude-sonnet-4.6");
         assert_eq!(copilot_model_name("gpt-4o"), "gpt-4o");
+    }
+
+    #[test]
+    fn test_select_model_for_protocol_keeps_provider_native_models() {
+        assert_eq!(
+            select_model_for_protocol(Some("MiniMax-M1"), None, ProviderProtocol::Anthropic),
+            "MiniMax-M1"
+        );
+        assert_eq!(
+            select_model_for_protocol(
+                Some("google/gemini-2.5-pro"),
+                None,
+                ProviderProtocol::Google
+            ),
+            "google/gemini-2.5-pro"
+        );
+    }
+
+    #[test]
+    fn test_select_model_for_protocol_remaps_cross_protocol_defaults() {
+        assert_eq!(
+            select_model_for_protocol(Some("gpt-5-codex"), None, ProviderProtocol::Anthropic),
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(
+            select_model_for_protocol(Some("claude-sonnet-4-5"), None, ProviderProtocol::Google),
+            "gemini-2.5-pro"
+        );
+        assert_eq!(
+            select_model_for_protocol(Some("gemini-2.0-flash"), None, ProviderProtocol::Openai),
+            "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn test_select_model_for_protocol_prefers_explicit_model() {
+        assert_eq!(
+            select_model_for_protocol(
+                Some("gpt-5-codex"),
+                Some("claude-3-opus"),
+                ProviderProtocol::Anthropic
+            ),
+            "claude-3-opus"
+        );
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
+use crate::services::model_names::select_model_for_protocol;
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
     convert_openai_chat_to_anthropic_request,
@@ -73,12 +74,18 @@ async fn handle_request(
             let model = config.forced_model.clone().unwrap_or(extracted_model);
             let body: Value = serde_json::from_str(http_utils::extract_request_body(request)?)?;
             let tool_schemas = extract_tool_schemas(&body);
-            let openai_req = convert_gemini_to_openai(
+            let mut openai_req = convert_gemini_to_openai(
                 &body,
                 &model,
                 config.requires_reasoning_content,
                 config.max_tokens_cap,
             );
+            let selected_model = select_model_for_protocol(
+                openai_req.get("model").and_then(|v| v.as_str()),
+                None,
+                config.upstream_protocol,
+            );
+            openai_req["model"] = serde_json::json!(selected_model);
             let openai_response = forward_to_provider(openai_req, config, client).await?;
             let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
 

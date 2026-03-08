@@ -102,6 +102,24 @@ impl EnvironmentInjector {
         matches!(key.opencode_mode, Some(OpenAICompatibilityMode::Router))
     }
 
+    fn routed_protocol_for_claude(key: &ApiKey) -> ProviderProtocol {
+        match key.claude_protocol {
+            Some(ClaudeProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
+            Some(ClaudeProviderProtocol::Openai) => ProviderProtocol::Openai,
+            Some(ClaudeProviderProtocol::Google) => ProviderProtocol::Google,
+            None => detect_provider_protocol(&key.base_url),
+        }
+    }
+
+    fn routed_protocol_for_gemini(key: &ApiKey) -> ProviderProtocol {
+        match key.gemini_protocol {
+            Some(GeminiProviderProtocol::Google) => ProviderProtocol::Google,
+            Some(GeminiProviderProtocol::Openai) => ProviderProtocol::Openai,
+            Some(GeminiProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
+            None => detect_provider_protocol(&key.base_url),
+        }
+    }
+
     /// Creates a new EnvironmentInjector
     pub fn new() -> Self {
         Self
@@ -147,8 +165,8 @@ impl EnvironmentInjector {
             env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.to_string());
             env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
         } else {
-            // All other endpoints are assumed to be OpenAI-compatible providers.
-            // Use OpenAIRouter to convert Anthropic Messages format → upstream provider protocol.
+            // Route Anthropic-format clients through the compatibility router for
+            // OpenAI-compatible and Google-native upstreams.
             // Placeholder URL - AI launcher overwrites with the actual random port after binding.
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -166,7 +184,7 @@ impl EnvironmentInjector {
             );
             env.insert(
                 "AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                detect_provider_protocol(&key.base_url).as_str().to_string(),
+                Self::routed_protocol_for_claude(key).as_str().to_string(),
             );
             // Cloudflare Workers AI requires a "@cf/" model prefix
             if key.base_url.contains("cloudflare.com") {
@@ -366,7 +384,7 @@ impl EnvironmentInjector {
             );
             env.insert(
                 "AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                detect_provider_protocol(&key.base_url).as_str().to_string(),
+                Self::routed_protocol_for_gemini(key).as_str().to_string(),
             );
             // DeepSeek reasoning models require reasoning_content round-tripped;
             // all DeepSeek models cap max_tokens at 8192
@@ -685,6 +703,20 @@ mod tests {
         assert_eq!(
             env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
             Some(&"https://api.minimax.io/anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_claude_router_uses_learned_protocol_override() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://example.com/custom".to_string();
+        key.claude_protocol = Some(ClaudeProviderProtocol::Google);
+
+        let env = injector.for_claude(&key, None);
+        assert_eq!(
+            env.get("AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"google".to_string())
         );
     }
 
@@ -1053,6 +1085,20 @@ mod tests {
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&"https://api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_gemini_router_uses_learned_protocol_override() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://example.com/custom".to_string();
+        key.gemini_protocol = Some(GeminiProviderProtocol::Anthropic);
+
+        let env = injector.for_gemini(&key, None);
+        assert_eq!(
+            env.get("AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"anthropic".to_string())
         );
     }
 
