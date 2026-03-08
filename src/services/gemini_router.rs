@@ -555,8 +555,10 @@ fn convert_parts_to_messages(
             "content": if content_str.is_empty() { Value::Null } else { Value::String(content_str) },
             "tool_calls": tool_calls,
         });
-        if msg["content"].is_null() {
-            msg.as_object_mut().unwrap().remove("content");
+        if msg["content"].is_null()
+            && let Some(obj) = msg.as_object_mut()
+        {
+            obj.remove("content");
         }
         if openai_role == "assistant" && requires_reasoning_content {
             let rc = if text_parts.is_empty() {
