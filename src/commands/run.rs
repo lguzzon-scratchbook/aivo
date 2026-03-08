@@ -9,6 +9,7 @@ use reqwest::Client;
 use crate::commands::models::fetch_models_for_select;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
+use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::ApiKey;
 use crate::style;
@@ -136,7 +137,7 @@ impl RunCommand {
 
         // Resolve model: only triggered when --model flag is present
         let picker_was_requested = model.as_ref().is_some_and(|m| m.is_empty());
-        let client = Client::new();
+        let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
             let result = self.resolve_model(&client, key, model).await?;
             // If user explicitly opened the picker (--model with no value) and cancelled, exit

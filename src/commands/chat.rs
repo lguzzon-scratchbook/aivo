@@ -307,7 +307,7 @@ impl ChatCommand {
                 &spinning,
             )
             .await;
-            stop_spinner(&spinning);
+            style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
 
             match result {
@@ -445,7 +445,7 @@ impl ChatCommand {
             )
             .await;
 
-            stop_spinner(&spinning);
+            style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
             match result {
                 Ok(assistant_content) => {
@@ -595,11 +595,6 @@ fn compose_one_shot_prompt(prompt: &str, stdin_context: Option<&str>) -> String 
     }
 }
 
-/// Stops the spinner and clears its character from the line.
-fn stop_spinner(spinning: &Arc<AtomicBool>) {
-    style::stop_spinner(spinning);
-}
-
 /// Returns the SSE payload for a `data:` line.
 /// Accepts both `data: {...}` and `data:{...}`.
 fn sse_data_payload(line: &str) -> Option<&str> {
@@ -718,7 +713,7 @@ async fn send_chat_request(
     }
 
     if !response.status().is_success() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("API returned {} — {}", status, body);
@@ -745,7 +740,7 @@ async fn send_chat_request(
                     break;
                 }
                 if let Some(content) = parse_sse_chunk(data) {
-                    stop_spinner(spinning);
+                    style::stop_spinner(spinning);
                     print!("{}", content);
                     io::stdout().flush()?;
                     full_content.push_str(&content);
@@ -760,7 +755,7 @@ async fn send_chat_request(
             if data.trim() != "[DONE]"
                 && let Some(content) = parse_sse_chunk(data)
             {
-                stop_spinner(spinning);
+                style::stop_spinner(spinning);
                 print!("{}", content);
                 io::stdout().flush()?;
                 full_content.push_str(&content);
@@ -770,7 +765,7 @@ async fn send_chat_request(
         {
             let content = extract_openai_message_content(&resp);
             if !content.is_empty() {
-                stop_spinner(spinning);
+                style::stop_spinner(spinning);
                 print!("{}", content);
                 io::stdout().flush()?;
                 full_content = content;
@@ -811,7 +806,7 @@ async fn send_non_streaming(
     .await?;
 
     if !response.status().is_success() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("API returned {} — {}", status, body);
@@ -821,11 +816,11 @@ async fn send_non_streaming(
     let content = extract_openai_message_content(&body);
 
     if content.is_empty() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         anyhow::bail!("Provider returned an empty response");
     }
 
-    stop_spinner(spinning);
+    style::stop_spinner(spinning);
     print!("{}", content);
     io::stdout().flush()?;
 
@@ -867,7 +862,7 @@ async fn send_copilot_request(
     }
 
     if !response.status().is_success() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("API returned {} — {}", status, body);
@@ -894,7 +889,7 @@ async fn send_copilot_request(
                     break;
                 }
                 if let Some(content) = parse_sse_chunk(data) {
-                    stop_spinner(spinning);
+                    style::stop_spinner(spinning);
                     print!("{}", content);
                     io::stdout().flush()?;
                     full_content.push_str(&content);
@@ -909,7 +904,7 @@ async fn send_copilot_request(
             if data.trim() != "[DONE]"
                 && let Some(content) = parse_sse_chunk(data)
             {
-                stop_spinner(spinning);
+                style::stop_spinner(spinning);
                 print!("{}", content);
                 io::stdout().flush()?;
                 full_content.push_str(&content);
@@ -919,7 +914,7 @@ async fn send_copilot_request(
         {
             let content = extract_openai_message_content(&resp);
             if !content.is_empty() {
-                stop_spinner(spinning);
+                style::stop_spinner(spinning);
                 print!("{}", content);
                 io::stdout().flush()?;
                 full_content = content;
@@ -962,7 +957,7 @@ async fn send_copilot_non_streaming(
     .await?;
 
     if !response.status().is_success() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("API returned {} — {}", status, body);
@@ -972,11 +967,11 @@ async fn send_copilot_non_streaming(
     let content = extract_openai_message_content(&body);
 
     if content.is_empty() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         anyhow::bail!("Provider returned an empty response");
     }
 
-    stop_spinner(spinning);
+    style::stop_spinner(spinning);
     print!("{}", content);
     io::stdout().flush()?;
 
@@ -1063,7 +1058,7 @@ async fn send_anthropic_request(
     }
 
     if !response.status().is_success() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("API returned {} — {}", status, body);
@@ -1083,7 +1078,7 @@ async fn send_anthropic_request(
             if let Some(data) = sse_data_payload(&line)
                 && let Some(text) = parse_anthropic_chunk(data)
             {
-                stop_spinner(spinning);
+                style::stop_spinner(spinning);
                 print!("{}", text);
                 io::stdout().flush()?;
                 full_content.push_str(&text);
@@ -1096,7 +1091,7 @@ async fn send_anthropic_request(
         if let Some(data) = sse_data_payload(tail)
             && let Some(text) = parse_anthropic_chunk(data)
         {
-            stop_spinner(spinning);
+            style::stop_spinner(spinning);
             print!("{}", text);
             io::stdout().flush()?;
             full_content.push_str(&text);
@@ -1141,7 +1136,7 @@ async fn send_anthropic_non_streaming(
     .await?;
 
     if !response.status().is_success() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("API returned {} — {}", status, body);
@@ -1159,11 +1154,11 @@ async fn send_anthropic_non_streaming(
         .collect();
 
     if content.is_empty() {
-        stop_spinner(spinning);
+        style::stop_spinner(spinning);
         anyhow::bail!("Provider returned an empty response");
     }
 
-    stop_spinner(spinning);
+    style::stop_spinner(spinning);
     print!("{}", content);
     io::stdout().flush()?;
 

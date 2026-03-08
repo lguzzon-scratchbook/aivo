@@ -104,7 +104,7 @@ impl ModelsCommand {
             },
         };
 
-        let client = Client::new();
+        let client = http_utils::router_http_client();
         let mut models = fetch_models_with_spinner(
             &client,
             &key,
@@ -434,10 +434,9 @@ pub(crate) async fn fetch_models_for_select(
     key: &ApiKey,
     cache: &ModelsCache,
 ) -> Vec<String> {
-    let list = fetch_models_with_spinner(client, key, cache, false, None)
+    fetch_models_with_spinner(client, key, cache, false, None)
         .await
-        .unwrap_or_default();
-    list
+        .unwrap_or_default()
 }
 
 pub(crate) async fn fetch_models_with_spinner(

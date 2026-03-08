@@ -96,7 +96,7 @@ pub fn empty_bullet_symbol() -> String {
 pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let spinning = Arc::new(AtomicBool::new(true));
     let spinning_clone = spinning.clone();
-    let label = label.unwrap_or("").to_string();
+    let label = label.map(str::to_owned).unwrap_or_default();
     let first_frame = "\u{280b}";
 
     // Paint the first frame synchronously so short operations still show feedback.
