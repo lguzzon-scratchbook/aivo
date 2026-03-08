@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -49,6 +49,8 @@ mod zeroizing_string {
 const IV_LENGTH: usize = 16;
 const SALT_LENGTH: usize = 32;
 const KEY_LENGTH: usize = 32;
+const KEY_ID_LENGTH: usize = 4;
+const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
 
 /// Wrapper for encryption keys that automatically zeroizes on drop
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -478,21 +480,7 @@ impl SessionStore {
         let mut config = self.load_unlocked().await?;
 
         let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
-        let id = {
-            let mut attempts = 0;
-            loop {
-                let id = format!("{:04x}", rand::random::<u16>());
-                if !existing_ids.contains(&id) {
-                    break id;
-                }
-                attempts += 1;
-                if attempts >= 1000 {
-                    anyhow::bail!(
-                        "Failed to generate unique key ID after 1000 attempts. Consider removing unused keys."
-                    );
-                }
-            }
-        };
+        let id = generate_key_id(&existing_ids)?;
 
         config.api_keys.push(ApiKey::new_with_protocol(
             id.clone(),
@@ -735,6 +723,27 @@ impl SessionStore {
         }
         Ok(decrypted)
     }
+}
+
+fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..1000 {
+        let id: String = (0..KEY_ID_LENGTH)
+            .map(|_| {
+                let idx = rng.gen_range(0..KEY_ID_ALPHABET.len());
+                KEY_ID_ALPHABET[idx] as char
+            })
+            .collect();
+
+        if !existing_ids.contains(&id) {
+            return Ok(id);
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to generate unique key ID after 1000 attempts. Consider removing unused keys."
+    );
 }
 
 impl Default for SessionStore {
@@ -1024,6 +1033,25 @@ mod tests {
 
         let key = store.get_key_by_id(&id).await.unwrap().unwrap();
         assert_eq!(key.claude_protocol, Some(ClaudeProviderProtocol::Anthropic));
+    }
+
+    #[tokio::test]
+    async fn test_generated_key_id_excludes_ambiguous_characters() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert_eq!(id.len(), KEY_ID_LENGTH);
+        assert!(!id.contains('0'));
+        assert!(!id.contains('1'));
+        assert!(!id.contains('l'));
+        assert!(!id.contains('o'));
+        assert!(id.chars().all(|c| KEY_ID_ALPHABET.contains(&(c as u8))));
     }
 
     #[tokio::test]
