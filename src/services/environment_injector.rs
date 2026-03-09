@@ -13,6 +13,54 @@ use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
 };
 
+/// Provider-specific routing quirks inferred from the base URL.
+///
+/// Some providers have non-standard requirements that cannot be expressed through
+/// the `ClaudeProviderProtocol` / `OpenAICompatibilityMode` enums alone.  Rather
+/// than scattering `base_url.contains(...)` checks throughout every `for_*` method
+/// this struct centralises the detection in one place.
+struct ProviderQuirks {
+    /// Cloudflare Workers AI requires a `@cf/` prefix on all model names.
+    pub model_prefix: Option<&'static str>,
+    /// Provider requires `reasoning_content` to be round-tripped on assistant turns
+    /// (Moonshot, DeepSeek reasoning models).
+    pub requires_reasoning_content: bool,
+    /// Hard upper bound on `max_tokens` imposed by the provider (e.g. DeepSeek = 8192).
+    pub max_tokens_cap: Option<u64>,
+}
+
+impl ProviderQuirks {
+    fn for_base_url(base_url: &str) -> Self {
+        let model_prefix = if base_url.contains("cloudflare.com") {
+            Some("@cf/")
+        } else {
+            None
+        };
+        let requires_reasoning_content =
+            base_url.contains("moonshot.cn") || base_url.contains("moonshot.ai")
+            || base_url.contains("deepseek.com");
+        let max_tokens_cap = if base_url.contains("deepseek.com") {
+            Some(8192)
+        } else {
+            None
+        };
+        Self { model_prefix, requires_reasoning_content, max_tokens_cap }
+    }
+
+    /// Injects the quirk env vars into `env` using the given key prefix (e.g. `"AIVO_OPENAI_ROUTER"`).
+    fn inject(&self, env: &mut std::collections::HashMap<String, String>, prefix: &str) {
+        if let Some(pfx) = self.model_prefix {
+            env.insert(format!("{prefix}_MODEL_PREFIX"), pfx.to_string());
+        }
+        if self.requires_reasoning_content {
+            env.insert(format!("{prefix}_REQUIRE_REASONING"), "1".to_string());
+        }
+        if let Some(cap) = self.max_tokens_cap {
+            env.insert(format!("{prefix}_MAX_TOKENS_CAP"), cap.to_string());
+        }
+    }
+}
+
 /// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
 /// This prevents the "Model metadata not found" warning from Codex CLI.
 fn map_model_for_codex_cli(model: &str) -> String {
@@ -186,34 +234,8 @@ impl EnvironmentInjector {
                 "AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 Self::routed_protocol_for_claude(key).as_str().to_string(),
             );
-            // Cloudflare Workers AI requires a "@cf/" model prefix
-            if key.base_url.contains("cloudflare.com") {
-                env.insert(
-                    "AIVO_OPENAI_ROUTER_MODEL_PREFIX".to_string(),
-                    "@cf/".to_string(),
-                );
-            }
-            // Moonshot requires non-empty reasoning_content on assistant tool-call turns
-            if key.base_url.contains("moonshot.cn") || key.base_url.contains("moonshot.ai") {
-                env.insert(
-                    "AIVO_OPENAI_ROUTER_REQUIRE_REASONING".to_string(),
-                    "1".to_string(),
-                );
-            }
-            // DeepSeek reasoning models require reasoning_content round-tripped;
-            // all DeepSeek models cap max_tokens at 8192
-            if key.base_url.contains("deepseek.com") {
-                env.insert(
-                    "AIVO_OPENAI_ROUTER_REQUIRE_REASONING".to_string(),
-                    "1".to_string(),
-                );
-                env.insert(
-                    "AIVO_OPENAI_ROUTER_MAX_TOKENS_CAP".to_string(),
-                    "8192".to_string(),
-                );
-            }
+            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_OPENAI_ROUTER");
         }
-
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
         env.insert(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
@@ -279,32 +301,7 @@ impl EnvironmentInjector {
                 "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 detect_provider_protocol(&key.base_url).as_str().to_string(),
             );
-            // Cloudflare Workers AI requires a "@cf/" model prefix
-            if key.base_url.contains("cloudflare.com") {
-                env.insert(
-                    "AIVO_CODEX_ROUTER_MODEL_PREFIX".to_string(),
-                    "@cf/".to_string(),
-                );
-            }
-            // Moonshot requires reasoning_content on assistant tool-call turns
-            if key.base_url.contains("moonshot.cn") {
-                env.insert(
-                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
-                    "1".to_string(),
-                );
-            }
-            // DeepSeek reasoning models require reasoning_content round-tripped;
-            // all DeepSeek models cap max_tokens at 8192
-            if key.base_url.contains("deepseek.com") {
-                env.insert(
-                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
-                    "1".to_string(),
-                );
-                env.insert(
-                    "AIVO_CODEX_ROUTER_MAX_TOKENS_CAP".to_string(),
-                    "8192".to_string(),
-                );
-            }
+            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_CODEX_ROUTER");
         } else {
             // Official OpenAI: direct connection, no proxy needed
             env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
@@ -386,18 +383,7 @@ impl EnvironmentInjector {
                 "AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 Self::routed_protocol_for_gemini(key).as_str().to_string(),
             );
-            // DeepSeek reasoning models require reasoning_content round-tripped;
-            // all DeepSeek models cap max_tokens at 8192
-            if key.base_url.contains("deepseek.com") {
-                env.insert(
-                    "AIVO_GEMINI_ROUTER_REQUIRE_REASONING".to_string(),
-                    "1".to_string(),
-                );
-                env.insert(
-                    "AIVO_GEMINI_ROUTER_MAX_TOKENS_CAP".to_string(),
-                    "8192".to_string(),
-                );
-            }
+            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_GEMINI_ROUTER");
         }
 
         if let Some(model) = model {
@@ -439,28 +425,7 @@ impl EnvironmentInjector {
                 "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 detect_provider_protocol(&key.base_url).as_str().to_string(),
             );
-            if key.base_url.contains("cloudflare.com") {
-                env.insert(
-                    "AIVO_CODEX_ROUTER_MODEL_PREFIX".to_string(),
-                    "@cf/".to_string(),
-                );
-            }
-            if key.base_url.contains("moonshot.cn") || key.base_url.contains("moonshot.ai") {
-                env.insert(
-                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
-                    "1".to_string(),
-                );
-            }
-            if key.base_url.contains("deepseek.com") {
-                env.insert(
-                    "AIVO_CODEX_ROUTER_REQUIRE_REASONING".to_string(),
-                    "1".to_string(),
-                );
-                env.insert(
-                    "AIVO_CODEX_ROUTER_MAX_TOKENS_CAP".to_string(),
-                    "8192".to_string(),
-                );
-            }
+            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_CODEX_ROUTER");
             ("http://127.0.0.1:0".to_string(), key.key.to_string())
         } else {
             (key.base_url.clone(), key.key.to_string())

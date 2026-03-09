@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 
 const CACHE_TTL_SECS: u64 = 3600; // 1 hour
 
@@ -14,18 +14,17 @@ struct CacheEntry {
     fetched_at: u64,
 }
 
-#[derive(Debug, Default)]
-struct CacheState {
-    loaded: bool,
-    entries: HashMap<String, CacheEntry>,
-}
-
 /// Disk cache for model lists keyed by base_url.
 /// Stored at ~/.config/aivo/models-cache.json as plaintext JSON.
+///
+/// The disk file is read at most once per process lifetime via `OnceCell`;
+/// concurrent callers wait on the same initialisation rather than each
+/// reading the file independently.
 #[derive(Debug, Clone)]
 pub struct ModelsCache {
     cache_path: PathBuf,
-    state: Arc<RwLock<CacheState>>,
+    /// Initialised exactly once (first call to `get` or `set`).
+    entries: Arc<OnceCell<RwLock<HashMap<String, CacheEntry>>>>,
 }
 
 impl ModelsCache {
@@ -35,7 +34,7 @@ impl ModelsCache {
             .unwrap_or_else(|| PathBuf::from(".config/aivo/models-cache.json"));
         Self {
             cache_path,
-            state: Arc::new(RwLock::new(CacheState::default())),
+            entries: Arc::new(OnceCell::new()),
         }
     }
 
@@ -43,24 +42,18 @@ impl ModelsCache {
     pub fn with_path(cache_path: PathBuf) -> Self {
         Self {
             cache_path,
-            state: Arc::new(RwLock::new(CacheState::default())),
+            entries: Arc::new(OnceCell::new()),
         }
     }
 
-    async fn ensure_loaded(&self) {
-        {
-            let state = self.state.read().await;
-            if state.loaded {
-                return;
-            }
-        }
-
-        let entries = Self::read_disk_cache(&self.cache_path).await;
-        let mut state = self.state.write().await;
-        if !state.loaded {
-            state.entries = entries;
-            state.loaded = true;
-        }
+    /// Returns the initialised entries map, loading from disk exactly once.
+    async fn entries(&self) -> &RwLock<HashMap<String, CacheEntry>> {
+        self.entries
+            .get_or_init(|| async {
+                let entries = Self::read_disk_cache(&self.cache_path).await;
+                RwLock::new(entries)
+            })
+            .await
     }
 
     async fn read_disk_cache(cache_path: &PathBuf) -> HashMap<String, CacheEntry> {
@@ -82,30 +75,30 @@ impl ModelsCache {
 
     /// Returns cached models for `base_url` if present and not expired.
     pub async fn get(&self, base_url: &str) -> Option<Vec<String>> {
-        self.ensure_loaded().await;
-        let state = self.state.read().await;
-        state.entries.get(base_url).and_then(Self::fresh_models)
+        let entries = self.entries().await;
+        let state = entries.read().await;
+        state.get(base_url).and_then(Self::fresh_models)
     }
 
     /// Writes models for `base_url` into the cache file.
     /// Silently ignores write errors.
     pub async fn set(&self, base_url: &str, models: Vec<String>) {
-        self.ensure_loaded().await;
+        let entries = self.entries().await;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let json = {
-            let mut state = self.state.write().await;
-            state.entries.insert(
+            let mut state = entries.write().await;
+            state.insert(
                 base_url.to_string(),
                 CacheEntry {
                     models,
                     fetched_at: now,
                 },
             );
-            serde_json::to_string_pretty(&state.entries).ok()
+            serde_json::to_string_pretty(&*state).ok()
         };
 
         if let Some(json) = json {

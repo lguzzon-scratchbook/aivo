@@ -655,9 +655,14 @@ impl SessionStore {
             .await
             .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
 
-        let encrypted = self.encrypt_keys(config)?;
+        // Encrypt only the api_keys vec (avoids cloning the full config which may
+        // include large chat session history).
+        let encrypted_keys = self.encrypt_keys(config)?;
+        let mut serializable = serde_json::to_value(config).context("Failed to serialize config")?;
+        serializable["api_keys"] =
+            serde_json::to_value(&encrypted_keys).context("Failed to serialize encrypted keys")?;
         let data =
-            serde_json::to_string_pretty(&encrypted).context("Failed to serialize config")?;
+            serde_json::to_string_pretty(&serializable).context("Failed to serialize config")?;
 
         // Write to a temp file first, then atomically rename to prevent partial writes
         let tmp_path = self.config_path.with_extension("json.tmp");
@@ -797,21 +802,28 @@ impl SessionStore {
         }
     }
 
+    /// Internal helper: load config, apply `f` to the key with `id`, save, and return whether
+    /// the key was found.
+    async fn update_key_field(&self, id: &str, f: impl FnOnce(&mut ApiKey)) -> Result<bool> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            f(entry);
+            self.save_unlocked(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Persists the learned Claude protocol for an existing key.
     pub async fn set_key_claude_protocol(
         &self,
         id: &str,
         claude_protocol: Option<ClaudeProviderProtocol>,
     ) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
-        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
-            entry.claude_protocol = claude_protocol;
-            self.save_unlocked(&config).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.update_key_field(id, |entry| entry.claude_protocol = claude_protocol)
+            .await
     }
 
     pub async fn set_key_gemini_protocol(
@@ -819,15 +831,8 @@ impl SessionStore {
         id: &str,
         gemini_protocol: Option<GeminiProviderProtocol>,
     ) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
-        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
-            entry.gemini_protocol = gemini_protocol;
-            self.save_unlocked(&config).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.update_key_field(id, |entry| entry.gemini_protocol = gemini_protocol)
+            .await
     }
 
     pub async fn set_key_codex_mode(
@@ -835,15 +840,8 @@ impl SessionStore {
         id: &str,
         codex_mode: Option<OpenAICompatibilityMode>,
     ) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
-        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
-            entry.codex_mode = codex_mode;
-            self.save_unlocked(&config).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.update_key_field(id, |entry| entry.codex_mode = codex_mode)
+            .await
     }
 
     pub async fn set_key_opencode_mode(
@@ -851,15 +849,8 @@ impl SessionStore {
         id: &str,
         opencode_mode: Option<OpenAICompatibilityMode>,
     ) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
-        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
-            entry.opencode_mode = opencode_mode;
-            self.save_unlocked(&config).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.update_key_field(id, |entry| entry.opencode_mode = opencode_mode)
+            .await
     }
 
     /// Sets the currently active API key
@@ -1115,14 +1106,16 @@ impl SessionStore {
     }
 
     /// Encrypts API keys before saving
-    fn encrypt_keys(&self, config: &StoredConfig) -> Result<StoredConfig> {
-        let mut encrypted = config.clone();
-        for key in &mut encrypted.api_keys {
+    /// Encrypts API keys before saving.
+    /// Only clones the `api_keys` vec (not the full config) to keep allocation minimal.
+    fn encrypt_keys(&self, config: &StoredConfig) -> Result<Vec<ApiKey>> {
+        let mut encrypted_keys = config.api_keys.clone();
+        for key in &mut encrypted_keys {
             if !is_encrypted(&key.key) {
                 key.key = Zeroizing::new(encrypt(&key.key)?);
             }
         }
-        Ok(encrypted)
+        Ok(encrypted_keys)
     }
 
     /// Decrypts API keys after loading

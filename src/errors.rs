@@ -46,7 +46,6 @@ pub enum ErrorCategory {
 
 /// CLI error with category for exit code mapping.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct CLIError {
     message: String,
     category: ErrorCategory,
@@ -54,7 +53,6 @@ pub struct CLIError {
     suggestion: Option<String>,
 }
 
-#[allow(dead_code)]
 impl CLIError {
     pub fn new(
         message: impl Into<String>,
@@ -71,11 +69,13 @@ impl CLIError {
     }
 
     /// Returns the error category for exit code mapping.
+    #[allow(dead_code)]
     pub fn category(&self) -> ErrorCategory {
         self.category
     }
 
     /// Returns the exit code for this error.
+    #[allow(dead_code)]
     pub fn exit_code(&self) -> ExitCode {
         match self.category {
             ErrorCategory::User => ExitCode::UserError,
