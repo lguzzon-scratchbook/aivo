@@ -1,6 +1,6 @@
 # aivo
 
-Unified key management and protocol bridge tool for Claude Code, Codex, and Gemini.
+Run Claude Code, Codex, and Gemini CLI across multiple providers.
 
 ## Install
 
@@ -29,7 +29,7 @@ aivo claude
 aivo claude --model moonshotai/kimi-k2.5
 ```
 
-Use GitHub Copilot subscription in claude code
+Use your GitHub Copilot subscription
 
 ```bash
 aivo keys add copilot
@@ -139,11 +139,35 @@ aivo keys add --base-url=https://api.cloudflare.com/client/v4/accounts/<id>/ai/v
 
 Use `aivo keys` to view your saved providers and `aivo use` to switch between them.
 
-## How It Works
+## Multiple Providers
 
-1. **Encrypted storage**: API keys are encrypted locally in `~/.config/aivo/config.json`.
-2. **Env injection**: `aivo` injects provider-specific env vars (`ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, etc.) only for the launched process.
-3. **Protocol translation**: built-in local routing smooths over API incompatibilities across providers.
+Save multiple keys and switch between them on the fly:
+
+```bash
+# save a few providers
+aivo keys add --name=openrouter --base-url=https://openrouter.ai/api/v1 --key=xxx
+aivo keys add --name=groq --base-url=https://api.groq.com/openai/v1 --key=xxx
+aivo keys add copilot
+
+# switch active provider
+aivo use openrouter
+
+# or use a specific key for a single run
+aivo claude --key groq
+aivo claude --key copilot
+```
+
+## Local API Server
+
+`aivo serve` exposes your active provider as a local OpenAI-compatible endpoint — useful for MCP servers, scripts, or any tool that speaks the OpenAI API:
+
+```bash
+aivo serve                  # listens on http://127.0.0.1:24860
+aivo serve --port 8080      # custom port
+aivo serve --key openrouter # serve a specific saved key
+```
+
+Then point any OpenAI client at `http://127.0.0.1:24860`.
 
 ## Development
 

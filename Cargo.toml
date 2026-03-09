@@ -3,7 +3,7 @@ name = "aivo"
 version = "0.7.0"
 edition = "2024"
 authors = ["yuanchuan"]
-description = "Unified key management and protocol bridge tool for Claude Code, Codex, and Gemini."
+description = "Run Claude Code, Codex, and Gemini CLI across multiple providers"
 license = "MIT"
 repository = "https://github.com/yuanchuan/aivo"
 
