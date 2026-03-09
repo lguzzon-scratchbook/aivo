@@ -1,13 +1,13 @@
 /**
  * KeysCommand handler for managing API keys.
  */
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::cli::KeysArgs;
 use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
-use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::session_store::{self, ApiKey, SessionStore};
 use crate::style;
 
 enum KeySelection {
@@ -583,57 +583,67 @@ impl KeysCommand {
         prompt: &str,
         empty_message: &str,
     ) -> Result<KeySelection> {
-        let all_keys = self.session_store.get_keys().await?;
+        // Load without decrypting — only metadata is needed for selection.
+        let (all_keys, active_key_id) =
+            self.session_store.get_keys_and_active_id_info().await?;
 
         if all_keys.is_empty() {
             println!("{}", style::dim(empty_message));
             return Ok(KeySelection::Empty);
         }
 
-        let Some(key_id_or_name) = key_id_or_name else {
-            let active_key = self.session_store.get_active_key().await?;
-            let default_idx = active_key
-                .and_then(|ak| all_keys.iter().position(|k| k.id == ak.id))
+        let selected = if let Some(key_id_or_name) = key_id_or_name {
+            if let Some(key) = all_keys.iter().find(|k| k.id == key_id_or_name) {
+                Some(key.clone())
+            } else {
+                let name_matches: Vec<ApiKey> = all_keys
+                    .iter()
+                    .filter(|k| k.name == key_id_or_name)
+                    .cloned()
+                    .collect();
+
+                match name_matches.len() {
+                    0 => {
+                        eprintln!(
+                            "{} API key \"{}\" not found",
+                            style::red("Error:"),
+                            key_id_or_name
+                        );
+                        eprintln!();
+                        eprintln!("{}", style::dim("Run 'aivo keys' to see available keys."));
+                        return Ok(KeySelection::NotFound);
+                    }
+                    1 => Some(name_matches[0].clone()),
+                    _ => {
+                        println!(
+                            "{} Multiple keys found with name \"{}\":",
+                            style::yellow("Note:"),
+                            key_id_or_name
+                        );
+                        prompt_pick_key(&name_matches, prompt, 0)?
+                    }
+                }
+            }
+        } else {
+            let default_idx = active_key_id
+                .and_then(|id| all_keys.iter().position(|k| k.id == id))
                 .unwrap_or(0);
-            return Ok(match prompt_pick_key(&all_keys, prompt, default_idx)? {
-                Some(key) => KeySelection::Key(key),
-                None => KeySelection::Cancelled,
-            });
+            prompt_pick_key(&all_keys, prompt, default_idx)?
         };
 
-        if let Some(key) = all_keys.iter().find(|k| k.id == key_id_or_name) {
-            return Ok(KeySelection::Key(key.clone()));
-        }
-
-        let name_matches: Vec<ApiKey> = all_keys
-            .iter()
-            .filter(|k| k.name == key_id_or_name)
-            .cloned()
-            .collect();
-
-        match name_matches.len() {
-            0 => {
-                eprintln!(
-                    "{} API key \"{}\" not found",
-                    style::red("Error:"),
-                    key_id_or_name
-                );
-                eprintln!();
-                eprintln!("{}", style::dim("Run 'aivo keys' to see available keys."));
-                Ok(KeySelection::NotFound)
+        // Decrypt only the selected key's secret.
+        match selected {
+            Some(mut key) => {
+                if session_store::is_encrypted(&key.key) {
+                    let plaintext = session_store::decrypt(&key.key)
+                        .with_context(|| {
+                            format!("failed to decrypt key '{}'", key.display_name())
+                        })?;
+                    key.key = zeroize::Zeroizing::new(plaintext);
+                }
+                Ok(KeySelection::Key(key))
             }
-            1 => Ok(KeySelection::Key(name_matches[0].clone())),
-            _ => {
-                println!(
-                    "{} Multiple keys found with name \"{}\":",
-                    style::yellow("Note:"),
-                    key_id_or_name
-                );
-                Ok(match prompt_pick_key(&name_matches, prompt, 0)? {
-                    Some(key) => KeySelection::Key(key),
-                    None => KeySelection::Cancelled,
-                })
-            }
+            None => Ok(KeySelection::Cancelled),
         }
     }
 
