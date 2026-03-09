@@ -1,55 +1,37 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
-aivo is a **Rust** CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, and native APIs.
+`aivo` is a Rust CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, and native APIs.
 
-## Commands
+> [!IMPORTANT]
+> **Rebuild before testing**: After code changes, always run `cargo build --release && cargo install --path .` before testing the binary. Never test a stale build.
+
+## Build & Test
 
 ```bash
-# Build
-cargo build --release  # Compile optimized binary to target/release/aivo
-cargo build --release --target <target>  # Cross-compile for specific platform
-
-# Test
-cargo test             # Run all tests (~200 tests)
-cargo test --release   # Run tests on release build
-
-# Format
-cargo fmt              # Format code (always run before committing)
-
-# Check
-cargo clippy           # Lint with clippy
-cargo check            # Quick type check
+cargo build --release   # Compile optimized binary to target/release/aivo
+cargo test              # Run all tests (~400 tests)
+cargo clippy            # Lint (fix all warnings before committing)
+cargo fmt               # Format code (run before committing)
 ```
-
-## Development Workflow
-
-After making code changes to CLI tools or binaries, always rebuild and reinstall before testing. Run `cargo build --release && cargo install --path .` (or equivalent) to avoid testing stale binaries.
-
-## Testing & Quality
-
-This project uses Rust as the primary language. Run `cargo clippy` before committing and fix all warnings. Run `cargo test` after any code changes and ensure all tests pass before committing.
 
 ## Git Conventions
 
-Always use squash merge when merging branches to main. Never use fast-forward merge. Command: `git merge --squash <branch> && git commit`
-
-## Code Review
-
-For code reviews, be concise and deliver findings quickly. Do not extensively explore the entire codebase before providing review feedback. Focus on the diff and immediate context only.
+Always squash merge to main. Never fast-forward. Command: `git merge --squash <branch> && git commit`
 
 ## CLI / UX Conventions
 
-When formatting CLI help text, pay close attention to alignment, spacing, bracket style, and description consistency. Match existing patterns exactly rather than inventing new formatting.
+> [!NOTE]
+> When formatting CLI help text, pay close attention to alignment, spacing, bracket style, and description consistency. Match existing patterns exactly rather than inventing new formatting.
+
+## Code Review
+
+Be concise and deliver findings quickly. Focus on the diff and immediate context only — do not explore the entire codebase first.
 
 ## Architecture
 
-### Entry Point & Dependency Injection
-
-`src/main.rs` initializes all services and injects them into command handlers:
+`src/main.rs` initializes all services via dependency injection:
 
 ```
 SessionStore → EnvironmentInjector → AILauncher
@@ -57,155 +39,65 @@ SessionStore → EnvironmentInjector → AILauncher
              Command Handlers
 ```
 
-### CLI Structure
+### Source Layout
 
-`src/cli.rs` - Command parsing with clap, handles:
-- Help/version display
-- Unknown command detection
-- Argument validation and routing
+#### `src/`
 
-`src/style.rs` - Terminal styling with console crate
-`src/version.rs` - Version management from CARGO_PKG_VERSION
-`src/errors.rs` - Centralized error classification with context-specific suggestions
+| File            | Purpose                                               |
+| --------------- | ----------------------------------------------------- |
+| `main.rs`       | Entry point, dependency injection, command dispatch   |
+| `cli.rs`        | Argument parsing with clap                            |
+| `errors.rs`     | Error classification, exit codes (0/1/2/3), suggestions |
+| `style.rs`      | Terminal styling with console crate                   |
+| `tui.rs`        | Custom TUI components (FuzzySelect)                   |
+| `version.rs`    | Version constant from `CARGO_PKG_VERSION`             |
 
-### Service Layer (`src/services/`)
+#### `src/commands/`
 
-- **SessionStore** (`session_store.rs`) - Persists API keys to `~/.config/aivo/config.json` with AES-256-GCM encryption. Machine-specific key derivation using username + home directory.
+| File        | Purpose                                                    |
+| ----------- | ---------------------------------------------------------- |
+| `run.rs`    | Launch AI tools; falls back to `start` flow when no tool given |
+| `start.rs`  | Interactive remembered-start flow (key + tool + model picker) |
+| `chat.rs`   | Interactive chat REPL with streaming responses             |
+| `keys.rs`   | API key management (add, rm, use, edit, cat, list)         |
+| `models.rs` | List available models from active provider (1h cache)      |
+| `serve.rs`  | Local OpenAI-compatible API server                         |
+| `update.rs` | Self-update via GitHub Releases                            |
 
-- **AILauncher** (`ai_launcher.rs`) - Spawns AI tool processes (claude, codex, gemini) with environment injection using tokio. Forwards signals (SIGINT, SIGTERM) and inherits stdio for interactive passthrough. Injects `--teammate-mode in-process` for Claude to ensure single-window mode. Starts the appropriate built-in router when needed, then overwrites the placeholder base URL with the actual bound port.
+#### `src/services/`
 
-- **EnvironmentInjector** (`environment_injector.rs`) - Configures tool-specific environment variables. Includes model name transformation for OpenRouter compatibility (converts hyphenated versions like `claude-sonnet-4-6` to dotted format `claude-sonnet-4.6`):
-  - Claude (direct): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` (empty), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `ANTHROPIC_MODEL` and related model env vars (optional)
-  - Claude (Copilot): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_COPILOT_ROUTER=1` to trigger `CopilotRouter`
-  - Claude (OpenRouter): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_ROUTER=1` to trigger `AnthropicRouter`
-  - Codex (OpenAI): `OPENAI_API_KEY`, `OPENAI_BASE_URL` (direct)
-  - Codex (non-OpenAI): uses placeholder `OPENAI_BASE_URL` + sets `AIVO_USE_CODEX_ROUTER=1` to trigger `CodexRouter`
-  - Gemini (Google): `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL` (direct)
-  - Gemini (non-Google): uses placeholder `GOOGLE_GEMINI_BASE_URL` + sets `AIVO_USE_GEMINI_ROUTER=1` to trigger `GeminiRouter`
-  - Claude (OpenAI-compatible): uses placeholder `ANTHROPIC_BASE_URL` + sets `AIVO_USE_OPENAI_ROUTER=1` to trigger `OpenAIRouter`
-
-- **AnthropicRouter** (`anthropic_router.rs`) - Built-in HTTP proxy for OpenRouter. Intercepts Claude Code's `/v1/messages` and `/v1/chat/completions` requests, transforms model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`), and forwards to OpenRouter. Binds to a random port.
-
-- **OpenAIRouter** (`openai_router.rs`) - Built-in HTTP proxy for OpenAI-compatible providers. Intercepts Claude Code's `/v1/messages` requests (Anthropic format), converts to OpenAI Chat Completions format, and forwards to providers like Cloudflare Workers AI, Moonshot, DeepSeek, etc. Adds model prefixes (e.g., "@cf/" for Cloudflare) and handles providers requiring `reasoning_content` fields and max token capping (e.g., DeepSeek caps at 8192 tokens). Binds to a random port.
-
-- **CopilotRouter** (`copilot_router.rs`) - Built-in HTTP proxy for GitHub Copilot. Intercepts Claude Code's `/v1/messages` requests (Anthropic Messages format), converts to OpenAI Chat Completions format, and forwards to the Copilot API. Converts responses back to Anthropic format including SSE streaming. Uses `CopilotTokenManager` from `copilot_auth.rs` for token exchange and auto-refresh. Binds to a random port.
-
-- **CopilotAuth** (`copilot_auth.rs`) - GitHub Copilot authentication. Implements OAuth device flow using the VS Code Copilot client ID (`Iv1.b507a08c87ecfe98`). Manages Copilot token lifecycle: exchanges GitHub OAuth token → short-lived Copilot token via `api.github.com/copilot_internal/v2/token`, caches with expiry-based auto-refresh.
-
-- **CodexRouter** (`codex_router.rs`) - Built-in HTTP proxy for non-OpenAI providers. Strips unsupported built-in tool types (`computer_use`, `file_search`, `web_search`, `code_interpreter`) that most third-party providers reject. Converts between Codex CLI's Responses API (`/v1/responses`) and the Chat Completions API (`/v1/chat/completions`) for providers that only support the latter. Handles provider-specific features like model prefixes, actual model names (for Codex CLI compatibility), reasoning content fields, and max token capping. Binds to a random port.
-
-- **GeminiRouter** (`gemini_router.rs`) - Built-in HTTP proxy for non-Google providers. Converts Gemini CLI's native API format (`/v1beta/models/{model}:generateContent`) to OpenAI Chat Completions format, then converts the response back. Handles streaming, tool calls, function responses, and generation config. Supports provider-specific features like reasoning content fields, max token capping, and tool argument repair for schema validation issues. Binds to a random port.
-
-### Command Handlers (`src/commands/`)
-
-Each command receives injected services. Commands return exit codes for testing.
-
-**Available Commands:**
-- **keys** - API key management:
-  - `(no action)` - List all keys
-  - `use [id|name]` - Activate a specific key
-  - `add` - Add an API key interactively (`add copilot` triggers GitHub Copilot device flow)
-  - `add --name <name> --base-url <url> --key <api_key>` - Add a key non-interactively
-  - `rm [id|name]` - Remove an API key
-  - `cat [id|name]` - Display full key details
-  - `edit [id|name]` - Edit an API key
-- **run** - Launch AI tools with unified interface
-- **chat** - Interactive REPL with streaming responses. Supports OpenAI-compatible, Anthropic, and GitHub Copilot providers. Automatically transforms model names for OpenRouter compatibility (e.g., `claude-sonnet-4-6` → `claude-sonnet-4.6`).
-  - `chat -x` - One-shot chat mode: reads stdin as context, sends one message and exits
-- **models** - List available models from the active provider (cached for 1 hour, with `--refresh` to bypass)
-- **update** - Self-update with download progress display, cross-platform binary download from GitHub Releases
-
-### Error Handling (`src/errors.rs`)
-
-Exit codes: 0=success, 1=user error, 2=network, 3=auth. Errors are classified by pattern matching and formatted with suggestions.
+| File                          | Purpose                                                                 |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `session_store.rs`            | Key persistence, AES-256-GCM encryption, chat sessions, directory starts, usage stats |
+| `ai_launcher.rs`              | Process spawning, signal forwarding (SIGINT/SIGTERM), stdio passthrough |
+| `environment_injector.rs`     | Tool-specific env var configuration, placeholder URL + router flag injection |
+| `provider_protocol.rs`        | Protocol detection from base URL                                        |
+| `model_names.rs`              | Model name transformations (e.g. `claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) |
+| `anthropic_router.rs`         | Proxy for Claude + OpenRouter                                           |
+| `openai_router.rs`            | Proxy for Claude + OpenAI-compatible providers                          |
+| `copilot_router.rs`           | Proxy for Claude/Codex/Gemini + GitHub Copilot                          |
+| `copilot_auth.rs`             | GitHub Copilot OAuth device flow and token refresh                      |
+| `codex_router.rs`             | Proxy for Codex + non-OpenAI providers (Responses API → Chat Completions) |
+| `gemini_router.rs`            | Proxy for Gemini + non-Google providers (Gemini format → Chat Completions) |
+| `serve_router.rs`             | Shared router server scaffolding                                        |
+| `http_utils.rs`               | Shared HTTP utilities (request parsing, header extraction, SSE)        |
+| `openai_anthropic_bridge.rs`  | Anthropic Messages ↔ OpenAI Chat Completions conversion                 |
+| `openai_gemini_bridge.rs`     | Gemini native ↔ OpenAI Chat Completions conversion                      |
+| `anthropic_route_pipeline.rs` | Shared pipeline for Anthropic-format router requests                    |
+| `anthropic_chat_request.rs`   | Anthropic chat request types                                            |
+| `anthropic_chat_response.rs`  | Anthropic chat response types                                           |
+| `models_cache.rs`             | 1-hour file-backed cache for model lists                                |
+| `system_env.rs`               | System environment helpers (CWD, home dir, etc.)                        |
 
 ### Data Model
 
-Single `ApiKey` struct with fields: `id`, `name`, `base_url`, `key`, `created_at`. Keys are stored encrypted in a `StoredConfig` containing `api_keys: Vec<ApiKey>` and `active_key_id: Option<String>`. The sentinel `base_url` value `"copilot"` identifies GitHub Copilot keys.
+`ApiKey`: `id`, `name`, `base_url`, `key`, `created_at`. Stored AES-256-GCM encrypted in `~/.config/aivo/config.json`. The sentinel `base_url` value `"copilot"` identifies GitHub Copilot keys.
 
-## Testing Patterns
+### Exit Codes
 
-- Unit tests in `#[cfg(test)]` modules within source files
-- Integration tests in `tests/` directory
-- Command handlers return exit codes for verification
-- **Test Coverage:** ~200 tests covering encryption, services, router logic, and command handlers. Tests migrated inline to source files; tests directory removed.
-
-## Build & Deployment
-
-- **Runtime:** Rust (native binary)
-- **Build:** `cargo build --release` creates optimized binary at `target/release/aivo`
-- **Cross-platform:** Supports linux/darwin x64/arm64, windows x64
-
-## Project Structure
-
-```
-aivo/
-├── src/
-│   ├── cli.rs                       # CLI argument parsing (clap)
-│   ├── main.rs                      # Main entry point with dependency injection
-│   ├── lib.rs                       # Library exports for testing
-│   ├── version.rs                   # Version constant
-│   ├── style.rs                     # Terminal styling with console crate
-│   ├── tui.rs                       # Custom TUI components (FuzzySelect)
-│   ├── errors.rs                    # Centralized error handling & exit codes
-│   ├── commands/
-│   │   ├── mod.rs
-│   │   ├── chat.rs                  # Interactive chat REPL
-│   │   ├── keys.rs                  # API key management
-│   │   ├── models.rs                # List available models from provider
-│   │   ├── run.rs                   # Unified AI tool launcher
-│   │   └── update.rs               # Self-update via GitHub Releases
-│   └── services/
-│       ├── mod.rs
-│       ├── session_store.rs         # Key persistence & AES-256-GCM encryption
-│       ├── environment_injector.rs  # Tool-specific env configuration
-│       ├── ai_launcher.rs          # Process spawning & signal forwarding
-│       ├── anthropic_router.rs     # Built-in proxy for Claude + OpenRouter
-│       ├── copilot_auth.rs         # GitHub Copilot OAuth device flow & token management
-│       ├── copilot_router.rs       # Built-in proxy for Claude + GitHub Copilot
-│       ├── codex_router.rs         # Built-in proxy for Codex + non-OpenAI providers
-│       ├── gemini_router.rs        # Built-in proxy for Gemini + non-Google providers
-│       ├── openai_router.rs        # Built-in proxy for Claude + OpenAI-compatible providers
-│       └── models_cache.rs         # 1h file-backed cache for model lists
-├── tests/
-│   ├── (tests migrated inline to source files, tests directory removed)
-├── Cargo.toml
-├── Cargo.lock
-├── CLAUDE.md                        # This file
-├── README.md
-└── LICENSE
-```
-
-## Encryption & Security
-
-**AES-256-GCM Encryption:**
-- API keys encrypted with AES-256-GCM using machine-specific derivation
-- Key derivation: PBKDF2 with SHA-256, 100k iterations
-- Salt derived from HMAC of machine data (username + home directory)
-- 16-byte IV and 16-byte auth tag
-
-## Router Architecture
-
-### Built-in Proxy Pattern
-
-All routers follow a consistent pattern:
-
-1. **Placeholder Base URL**: EnvironmentInjector sets a placeholder URL (e.g., `http://localhost:0`) and a flag environment variable (e.g., `AIVO_USE_ROUTER=1`)
-
-2. **Router Discovery**: The appropriate router (AnthropicRouter, CopilotRouter, CodexRouter, GeminiRouter, OpenAIRouter) detects the flag and starts an HTTP server on a random available port
-
-3. **URL Replacement**: The router binds to the random port, then overwrites the placeholder base URL with the actual bound URL
-
-4. **Request Interception**: The router intercepts requests from the AI tool and forwards them to the target provider with necessary transformations
-
-### Router-Specific Transformations
-
-- **AnthropicRouter**: Converts model names (`claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) for OpenRouter compatibility
-- **CopilotRouter**: Converts between Anthropic Messages format and OpenAI Chat Completions format, handles SSE streaming
-- **OpenAIRouter**: Converts between Anthropic Messages format and OpenAI Chat Completions format, adds model prefixes, handles reasoning content and max token capping for OpenAI-compatible providers
-- **CodexRouter**: Strips unsupported tool types and converts between Responses API and Chat Completions API
-- **GeminiRouter**: Converts between Gemini native API format and OpenAI Chat Completions format
-
-### Signal Handling
-
-AILauncher forwards SIGINT and SIGTERM signals to spawned processes and inherits stdio for interactive passthrough, ensuring proper cleanup and user experience.
+| Code | Meaning    |
+| ---- | ---------- |
+| `0`  | Success    |
+| `1`  | User error |
+| `2`  | Network    |
+| `3`  | Auth       |
