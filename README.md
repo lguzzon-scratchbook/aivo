@@ -29,7 +29,7 @@ aivo claude
 aivo claude --model moonshotai/kimi-k2.5
 ```
 
-Use GitHub Copilot in claude code
+Use GitHub Copilot subscription in claude code
 
 ```bash
 aivo keys add copilot
@@ -87,26 +87,53 @@ aivo keys edit  # edit a key
 
 ### Adding popular providers
 
+**OpenRouter**
 ```bash
-# OpenRouter
 aivo keys add --base-url=https://openrouter.ai/api/v1 --key=xxx
+```
 
-# Vercel AI Gateway
+**Vercel AI Gateway**
+```bash
 aivo keys add --base-url=https://ai-gateway.vercel.sh/v1 --key=xxx
+```
 
-# DeepSeek
-aivo keys add --base-url=https://api.deepseek.com --key=xxx
+**DeepSeek**
+```bash
+aivo keys add --base-url=https://api.deepseek.com/v1 --key=xxx
+```
 
-# Fireworks
-aivo keys add --base-url=https://api.fireworks.ai/inference --key=xxx
+**Fireworks**
+```bash
+aivo keys add --base-url=https://api.fireworks.ai/inference/v1 --key=xxx
+```
 
-# MiniMax
+**MiniMax**
+```bash
 aivo keys add --base-url=https://api.minimax.io/anthropic --key=xxx
+```
 
-# Moonshot
-aivo keys add --base-url=https://api.moonshot.ai/v1 --key=xxx
+**Moonshot**
+```bash
+aivo keys add --base-url=https://api.moonshot.cn/v1 --key=xxx
+```
 
-# Cloudflare Workers AI
+**Groq**
+```bash
+aivo keys add --base-url=https://api.groq.com/openai/v1 --key=xxx
+```
+
+**xAI (Grok)**
+```bash
+aivo keys add --base-url=https://api.x.ai/v1 --key=xxx
+```
+
+**Mistral**
+```bash
+aivo keys add --base-url=https://api.mistral.ai/v1 --key=xxx
+```
+
+**Cloudflare Workers AI**
+```bash
 aivo keys add --base-url=https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1 --key=xxx
 ```
 
