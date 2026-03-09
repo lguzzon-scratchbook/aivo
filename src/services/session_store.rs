@@ -512,7 +512,12 @@ struct ConfigLockGuard {
     _file: std::fs::File,
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+struct ConfigLockGuard {
+    _file: std::fs::File,
+}
+
+#[cfg(not(any(unix, windows)))]
 struct ConfigLockGuard;
 
 #[cfg(unix)]
@@ -523,6 +528,20 @@ impl Drop for ConfigLockGuard {
         // SAFETY: the file descriptor remains valid for the lifetime of the guard.
         unsafe {
             libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConfigLockGuard {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+
+        // SAFETY: the handle stays valid for the guard lifetime; UnlockFile is safe to call
+        // on a handle previously locked with LockFileEx.
+        unsafe {
+            UnlockFile(self._file.as_raw_handle() as isize, 0, 0, u32::MAX, u32::MAX);
         }
     }
 }
@@ -595,10 +614,31 @@ impl SessionStore {
             Ok(ConfigLockGuard { _file: file })
         }
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = file;
             Ok(ConfigLockGuard)
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::BOOL;
+            use windows_sys::Win32::Storage::FileSystem::{
+                LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
+            };
+
+            let handle = file.as_raw_handle() as isize;
+            let mut overlapped = unsafe { std::mem::zeroed() };
+            // SAFETY: handle is valid; we own `file` for the guard's lifetime.
+            let rc: BOOL = unsafe {
+                LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, u32::MAX, u32::MAX, &mut overlapped)
+            };
+            if rc == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("Failed to acquire config lock: {:?}", lock_path));
+            }
+            Ok(ConfigLockGuard { _file: file })
         }
     }
 
@@ -910,8 +950,8 @@ impl SessionStore {
     }
 
     pub async fn get_directory_start(&self, cwd: &str) -> Result<Option<DirectoryStartRecord>> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        // Fast path: shared read — load() acquires and releases the lock internally.
+        let config = self.load().await?;
         let Some(record) = config.directory_starts.get(cwd).cloned() else {
             return Ok(None);
         };
@@ -921,12 +961,15 @@ impl SessionStore {
             .iter()
             .any(|key| key.id == record.key_id && key.base_url == record.base_url);
         if key_is_valid {
-            Ok(Some(record))
-        } else {
-            config.directory_starts.remove(cwd);
-            self.save_unlocked(&config).await?;
-            Ok(None)
+            return Ok(Some(record));
         }
+
+        // Slow path: stale record — re-acquire exclusive lock, reload, remove, save.
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        config.directory_starts.remove(cwd);
+        self.save_unlocked(&config).await?;
+        Ok(None)
     }
 
     pub async fn set_directory_start(

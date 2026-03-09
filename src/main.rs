@@ -131,83 +131,18 @@ async fn main() {
             // Re-extract aivo flags from passthrough args that clap's trailing_var_arg
             // may have swallowed (e.g. `aivo run claude --agent-name foo --model opus`
             // puts --model into args instead of parsing it as an aivo flag).
-            let mut model = run_args.model;
-            let mut key_flag = run_args.key;
-
-            // We'll accumulate remaining args as we process
-            let mut remaining_args: Vec<String> = Vec::new();
-
-            // Clap may incorrectly consume a flag as model's value (e.g. -m --resume
-            // gets parsed with model="--resume"). Check if model/key looks like a flag
-            // and if so, treat it as if -m/-k had no value and move the consumed value
-            // back to remaining_args so it gets passed to the AI tool.
-            if let Some(m) = model.take() {
-                if m.starts_with('-') {
-                    model = Some(String::new());
-                    remaining_args.push(m);
-                } else {
-                    model = Some(m);
-                }
-            }
-            if let Some(k) = key_flag.take() {
-                if k.starts_with('-') {
-                    key_flag = None;
-                    remaining_args.push(k);
-                } else {
-                    key_flag = Some(k);
-                }
-            }
-
-            let mut debug = run_args.debug;
-            let mut env_strings = run_args.envs;
-            let mut i = 0;
-            let args = &run_args.args;
-            while i < args.len() {
-                let arg = &args[i];
-                if let Some(value) = arg.strip_prefix("--model=") {
-                    if !value.is_empty() && model.is_none() {
-                        model = Some(value.to_string());
-                    } else {
-                        remaining_args.push(arg.clone());
-                    }
-                } else if (arg == "--model" || arg == "-m") && model.is_none() {
-                    if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                        model = Some(args[i + 1].clone());
-                        i += 1;
-                    } else {
-                        // --model with no value in passthrough args → trigger picker
-                        model = Some(String::new());
-                    }
-                } else if let Some(value) = arg.strip_prefix("--key=") {
-                    if !value.is_empty() && key_flag.is_none() {
-                        key_flag = Some(value.to_string());
-                    } else {
-                        remaining_args.push(arg.clone());
-                    }
-                } else if (arg == "--key" || arg == "-k") && key_flag.is_none() {
-                    if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                        key_flag = Some(args[i + 1].clone());
-                        i += 1;
-                    } else {
-                        remaining_args.push(arg.clone());
-                    }
-                } else if arg == "--debug" {
-                    debug = true;
-                } else if let Some(value) = arg
-                    .strip_prefix("--env=")
-                    .or_else(|| arg.strip_prefix("-e="))
-                {
-                    if !value.is_empty() {
-                        env_strings.push(value.to_string());
-                    }
-                } else if (arg == "--env" || arg == "-e") && i + 1 < args.len() {
-                    env_strings.push(args[i + 1].clone());
-                    i += 1;
-                } else {
-                    remaining_args.push(arg.clone());
-                }
-                i += 1;
-            }
+            let extracted = extract_aivo_flags(
+                run_args.model,
+                run_args.key,
+                run_args.debug,
+                run_args.envs,
+                &run_args.args,
+            );
+            let model = extracted.model;
+            let key_flag = extracted.key_flag;
+            let debug = extracted.debug;
+            let env_strings = extracted.env_strings;
+            let remaining_args = extracted.remaining_args;
 
             if run_args.tool.is_none() {
                 if !remaining_args.is_empty() {
@@ -481,4 +416,263 @@ fn print_version() {
         style::cyan("aivo"),
         style::dim(format!("v{}", version::VERSION))
     );
+}
+
+/// Result of extracting aivo-specific flags from clap's trailing passthrough args.
+struct ExtractedFlags {
+    model: Option<String>,
+    key_flag: Option<String>,
+    debug: bool,
+    env_strings: Vec<String>,
+    remaining_args: Vec<String>,
+}
+
+/// Extracts aivo-owned flags (`--model`/`-m`, `--key`/`-k`, `--debug`, `--env`/`-e`) from
+/// the passthrough `args` slice that clap's `trailing_var_arg` may have swallowed.
+///
+/// Flags already parsed by clap are supplied via `initial_*` parameters so that the
+/// function produces a single consistent view regardless of where clap stopped.
+fn extract_aivo_flags(
+    initial_model: Option<String>,
+    initial_key: Option<String>,
+    initial_debug: bool,
+    initial_envs: Vec<String>,
+    passthrough_args: &[String],
+) -> ExtractedFlags {
+    // Clap may have consumed a following flag as the value of -m/-k (e.g. `-m --resume`
+    // gives model="--resume"). Detect and undo that by pushing the flag-like value back.
+    let mut model = match initial_model {
+        Some(m) if m.starts_with('-') => {
+            // Will be pushed into remaining_args below via the passthrough loop seed
+            // but we need it back in the stream — handled after the loop.
+            Some((true, m)) // (is_flag_lookalike, value)
+        }
+        Some(m) => Some((false, m)),
+        None => None,
+    };
+    let mut key_flag = match initial_key {
+        Some(k) if k.starts_with('-') => Some((true, k)),
+        Some(k) => Some((false, k)),
+        None => None,
+    };
+
+    let mut debug = initial_debug;
+    let mut env_strings = initial_envs;
+    let mut remaining_args: Vec<String> = Vec::new();
+
+    // Flush flag-lookalike values back into remaining_args before processing passthrough.
+    if let Some((true, ref v)) = model {
+        remaining_args.push(v.clone());
+        model = Some((false, String::new())); // empty → picker
+    }
+    if let Some((true, ref v)) = key_flag {
+        remaining_args.push(v.clone());
+        key_flag = None;
+    }
+
+    let mut model: Option<String> = model.map(|(_, v)| v);
+    let mut key_flag: Option<String> = key_flag.map(|(_, v)| v);
+
+    let mut i = 0;
+    while i < passthrough_args.len() {
+        let arg = &passthrough_args[i];
+        if let Some(value) = arg.strip_prefix("--model=") {
+            if !value.is_empty() && model.is_none() {
+                model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if (arg == "--model" || arg == "-m") && model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                // --model with no value → trigger interactive picker
+                model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--key=") {
+            if !value.is_empty() && key_flag.is_none() {
+                key_flag = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if (arg == "--key" || arg == "-k") && key_flag.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                key_flag = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--debug" {
+            debug = true;
+        } else if let Some(value) = arg
+            .strip_prefix("--env=")
+            .or_else(|| arg.strip_prefix("-e="))
+        {
+            if !value.is_empty() {
+                env_strings.push(value.to_string());
+            }
+        } else if (arg == "--env" || arg == "-e") && i + 1 < passthrough_args.len() {
+            env_strings.push(passthrough_args[i + 1].clone());
+            i += 1;
+        } else {
+            remaining_args.push(arg.clone());
+        }
+        i += 1;
+    }
+
+    ExtractedFlags {
+        model,
+        key_flag,
+        debug,
+        env_strings,
+        remaining_args,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn model_inline_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--model=gpt-4o", "file.ts"]));
+        assert_eq!(r.model, Some("gpt-4o".to_string()));
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn model_space_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--model", "gpt-4o", "file.ts"]));
+        assert_eq!(r.model, Some("gpt-4o".to_string()));
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn model_short_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-m", "gpt-4o"]));
+        assert_eq!(r.model, Some("gpt-4o".to_string()));
+        assert!(r.remaining_args.is_empty());
+    }
+
+    #[test]
+    fn model_no_value_triggers_picker() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--model"]));
+        assert_eq!(r.model, Some(String::new()));
+    }
+
+    #[test]
+    fn model_flag_as_value_corrected() {
+        // Clap swallowed `--resume` as the value of -m
+        let r = extract_aivo_flags(Some("--resume".to_string()), None, false, vec![], &[]);
+        assert_eq!(r.model, Some(String::new())); // picker triggered
+        assert_eq!(r.remaining_args, args(&["--resume"]));
+    }
+
+    #[test]
+    fn model_already_set_passthrough_not_overwritten() {
+        // clap parsed --model correctly; a second --model in passthrough should pass through
+        let r = extract_aivo_flags(
+            Some("gpt-4o".to_string()),
+            None,
+            false,
+            vec![],
+            &args(&["--model", "other"]),
+        );
+        assert_eq!(r.model, Some("gpt-4o".to_string()));
+        assert_eq!(r.remaining_args, args(&["--model", "other"]));
+    }
+
+    #[test]
+    fn key_inline_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--key=mykey"]));
+        assert_eq!(r.key_flag, Some("mykey".to_string()));
+    }
+
+    #[test]
+    fn key_space_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--key", "mykey"]));
+        assert_eq!(r.key_flag, Some("mykey".to_string()));
+    }
+
+    #[test]
+    fn key_short_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-k", "mykey"]));
+        assert_eq!(r.key_flag, Some("mykey".to_string()));
+    }
+
+    #[test]
+    fn key_flag_as_value_corrected() {
+        let r = extract_aivo_flags(None, Some("--something".to_string()), false, vec![], &[]);
+        assert_eq!(r.key_flag, None);
+        assert_eq!(r.remaining_args, args(&["--something"]));
+    }
+
+    #[test]
+    fn debug_flag() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--debug", "file.ts"]));
+        assert!(r.debug);
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn debug_already_set_preserved() {
+        let r = extract_aivo_flags(None, None, true, vec![], &[]);
+        assert!(r.debug);
+    }
+
+    #[test]
+    fn env_inline_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--env=FOO=bar"]));
+        assert_eq!(r.env_strings, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn env_short_inline_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-e=FOO=bar"]));
+        assert_eq!(r.env_strings, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn env_space_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--env", "FOO=bar"]));
+        assert_eq!(r.env_strings, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn env_short_space_form() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-e", "FOO=bar"]));
+        assert_eq!(r.env_strings, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn initial_envs_preserved() {
+        let r = extract_aivo_flags(None, None, false, vec!["PRE=1".to_string()], &args(&["-e", "POST=2"]));
+        assert_eq!(r.env_strings, vec!["PRE=1", "POST=2"]);
+    }
+
+    #[test]
+    fn unknown_args_pass_through() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--agent-name", "foo", "--resume"]));
+        assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "--resume"]));
+        assert_eq!(r.model, None);
+    }
+
+    #[test]
+    fn mixed_flags() {
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            vec![],
+            &args(&["--agent-name", "foo", "--model", "gpt-4o", "--debug", "file.ts"]),
+        );
+        assert_eq!(r.model, Some("gpt-4o".to_string()));
+        assert!(r.debug);
+        assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "file.ts"]));
+    }
 }
