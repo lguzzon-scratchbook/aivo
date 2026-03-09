@@ -191,12 +191,11 @@ impl StartCommand {
             });
         }
 
-        let items = vec![
-            "claude".to_string(),
-            "codex".to_string(),
-            "gemini".to_string(),
-            "opencode".to_string(),
-        ];
+        let tools = AIToolType::all();
+        let items = tools
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect::<Vec<_>>();
         let selected = FuzzySelect::new()
             .with_prompt("Select tool")
             .items(&items)
@@ -206,7 +205,7 @@ impl StartCommand {
             .flatten()
             .ok_or_else(|| anyhow::anyhow!("Cancelled"))?;
         Ok(Resolved {
-            value: AIToolType::parse(&items[selected]).expect("known tool"),
+            value: tools[selected],
             interactive: true,
         })
     }
@@ -220,58 +219,42 @@ impl StartCommand {
         let should_prompt = model_arg.as_ref().is_some_and(|value| value.is_empty())
             || (model_arg.is_none() && remembered.is_none());
 
+        if should_prompt {
+            return self.prompt_select_model(&key.value).await;
+        }
+
         match model_arg {
-            Some(value) if value.is_empty() => {
-                let client = http_utils::router_http_client();
-                let models = fetch_models_for_select(&client, &key.value, &self.cache).await;
-                if models.is_empty() {
-                    anyhow::bail!(
-                        "No models found for this key. Use 'aivo models --refresh' or specify one with --model <name>."
-                    );
-                }
-                let selected = FuzzySelect::new()
-                    .with_prompt("Select model")
-                    .items(&models)
-                    .default(0)
-                    .interact_opt()
-                    .ok()
-                    .flatten()
-                    .ok_or_else(|| anyhow::anyhow!("Cancelled"))?;
-                Ok(Resolved {
-                    value: Some(models[selected].clone()),
-                    interactive: true,
-                })
-            }
             Some(value) => Ok(Resolved {
                 value: Some(value),
                 interactive: false,
             }),
-            None if should_prompt => {
-                let client = http_utils::router_http_client();
-                let models = fetch_models_for_select(&client, &key.value, &self.cache).await;
-                if models.is_empty() {
-                    anyhow::bail!(
-                        "No models found for this key. Use 'aivo models --refresh' or specify one with --model <name>."
-                    );
-                }
-                let selected = FuzzySelect::new()
-                    .with_prompt("Select model")
-                    .items(&models)
-                    .default(0)
-                    .interact_opt()
-                    .ok()
-                    .flatten()
-                    .ok_or_else(|| anyhow::anyhow!("Cancelled"))?;
-                Ok(Resolved {
-                    value: Some(models[selected].clone()),
-                    interactive: true,
-                })
-            }
             None => Ok(Resolved {
                 value: remembered.and_then(|record| record.model.clone()),
                 interactive: false,
             }),
         }
+    }
+
+    async fn prompt_select_model(&self, key: &ApiKey) -> Result<Resolved<Option<String>>> {
+        let client = http_utils::router_http_client();
+        let models = fetch_models_for_select(&client, key, &self.cache).await;
+        if models.is_empty() {
+            anyhow::bail!(
+                "No models found for this key. Use 'aivo models --refresh' or specify one with --model <name>."
+            );
+        }
+        let selected = FuzzySelect::new()
+            .with_prompt("Select model")
+            .items(&models)
+            .default(0)
+            .interact_opt()
+            .ok()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("Cancelled"))?;
+        Ok(Resolved {
+            value: Some(models[selected].clone()),
+            interactive: true,
+        })
     }
 }
 

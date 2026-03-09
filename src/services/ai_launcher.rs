@@ -49,6 +49,10 @@ impl AIToolType {
             Self::Opencode => "opencode",
         }
     }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Claude, Self::Codex, Self::Gemini, Self::Opencode]
+    }
 }
 
 /// Launch options for AI tools
