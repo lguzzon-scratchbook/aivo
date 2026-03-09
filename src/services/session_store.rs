@@ -17,6 +17,7 @@ use std::fs::OpenOptions;
  * Stores credentials in ~/.config/aivo/config.json with AES-256-GCM encryption.
  */
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::errors::{CLIError, ErrorCategory};
@@ -77,7 +78,7 @@ const KEY_ID_LENGTH: usize = 4;
 const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
 
 /// Wrapper for encryption keys that automatically zeroizes on drop
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct SecretKey([u8; KEY_LENGTH]);
 
 impl SecretKey {
@@ -402,7 +403,17 @@ impl StoredConfig {
 
 /// Derives an encryption key from machine-specific information.
 /// Uses username and home directory to create a consistent key per machine.
+/// Cached via OnceLock since inputs never change during a process lifetime.
 fn derive_key() -> SecretKey {
+    static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
+    CACHED_KEY
+        .get_or_init(|| {
+            derive_key_inner()
+        })
+        .clone()
+}
+
+fn derive_key_inner() -> SecretKey {
     let username = system_env::username().unwrap_or_default();
     let homedir: String = system_env::home_dir()
         .map(|p| p.to_string_lossy().to_string())
