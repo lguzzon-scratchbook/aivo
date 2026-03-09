@@ -5,7 +5,7 @@
  * to OpenRouter, handling all necessary API transformations.
  */
 use anyhow::Result;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -219,6 +219,7 @@ async fn forward_request(
     client: &reqwest::Client,
     route: AnthropicRoute,
 ) -> Result<RouterResponse> {
+    let passthrough_headers = http_utils::extract_passthrough_headers(request)?;
     let body_str = http_utils::extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
@@ -229,10 +230,10 @@ async fn forward_request(
     pipeline.patch_json(route.patch_route(), &mut body, &ctx)?;
 
     let url = build_endpoint_url(&config.upstream_base_url, route.endpoint());
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let mut headers = passthrough_headers;
     let auth_value = format!("Bearer {}", config.upstream_api_key);
     headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     pipeline.patch_headers(route.patch_route(), &mut headers, &ctx)?;
 
     let response = client

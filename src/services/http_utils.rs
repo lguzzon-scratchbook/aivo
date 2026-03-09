@@ -5,6 +5,7 @@
 //! Used by: anthropic_router, openai_router, copilot_router, codex_router, gemini_router.
 
 use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -229,6 +230,66 @@ pub fn extract_request_body(request: &str) -> Result<&str> {
         .find("\r\n\r\n")
         .ok_or_else(|| anyhow::anyhow!("malformed HTTP request: missing header separator"))?;
     Ok(request[pos + 4..].trim_end_matches('\0').trim())
+}
+
+/// Extracts request headers that are safe to forward upstream.
+///
+/// This preserves custom routing metadata sent by tool clients (for example
+/// `x-provider`) while excluding hop-by-hop transport headers and headers that
+/// the router intentionally manages itself, such as auth and content length.
+pub fn extract_passthrough_headers(request: &str) -> Result<HeaderMap> {
+    let header_end = find_header_end(request.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP request: missing header separator"))?;
+    let headers = &request[..header_end];
+    let mut out = HeaderMap::new();
+
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if !should_passthrough_header(name) {
+            continue;
+        }
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value.trim()) else {
+            continue;
+        };
+        out.append(name, value);
+    }
+
+    Ok(out)
+}
+
+fn should_passthrough_header(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "host"
+            | "connection"
+            | "content-length"
+            | "content-type"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "authorization"
+            | "user-agent"
+            | "accept-encoding"
+            | "api-key"
+            | "x-api-key"
+            | "x-goog-api-key"
+    ) {
+        return false;
+    }
+
+    lower.starts_with("x-")
+        || lower == "anthropic-version"
+        || lower == "anthropic-beta"
+        || lower.starts_with("anthropic-")
 }
 
 /// Extracts the HTTP request path from the first line (e.g., "POST /v1/messages HTTP/1.1" → "/v1/messages").
@@ -487,6 +548,46 @@ mod tests {
     #[test]
     fn test_extract_request_body_short() {
         assert!(extract_request_body("AB").is_err());
+    }
+
+    #[test]
+    fn test_extract_passthrough_headers_keeps_custom_provider_headers() {
+        let req = concat!(
+            "POST /v1/messages HTTP/1.1\r\n",
+            "Host: localhost:8080\r\n",
+            "Authorization: Bearer local-token\r\n",
+            "x-api-key: upstream-token\r\n",
+            "Content-Type: application/json\r\n",
+            "x-provider: anthropic\r\n",
+            "x-vercel-ai-gateway-team: team_123\r\n",
+            "anthropic-beta: prompt-caching-2024-07-31\r\n",
+            "\r\n",
+            "{}"
+        );
+
+        let headers = extract_passthrough_headers(req).unwrap();
+        assert_eq!(
+            headers.get("x-provider").and_then(|v| v.to_str().ok()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            headers
+                .get("x-vercel-ai-gateway-team")
+                .and_then(|v| v.to_str().ok()),
+            Some("team_123")
+        );
+        assert_eq!(
+            headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("prompt-caching-2024-07-31")
+        );
+        assert!(headers.get("authorization").is_none());
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("content-type").is_none());
+    }
+
+    #[test]
+    fn test_extract_passthrough_headers_requires_header_separator() {
+        assert!(extract_passthrough_headers("POST /v1/messages HTTP/1.1").is_err());
     }
 
     #[test]

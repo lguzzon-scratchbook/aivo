@@ -50,12 +50,8 @@ impl ServeRouter {
 
     /// Binds to the port eagerly (propagates "address already in use" immediately),
     /// then spawns the accept loop in the background and returns the join handle.
-    pub async fn start_background(
-        self,
-        port: u16,
-    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-        let listener =
-            tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    pub async fn start_background(self, port: u16) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
 
         let copilot_tokens = if self.config.is_copilot {
             Some(Arc::new(CopilotTokenManager::new(
@@ -78,54 +74,54 @@ impl ServeRouter {
 
 async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeState>) -> Result<()> {
     loop {
-            let (mut socket, _) = listener.accept().await?;
-            let state = state.clone();
+        let (mut socket, _) = listener.accept().await?;
+        let state = state.clone();
 
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
 
-                let request_bytes = match http_utils::read_full_request(&mut socket).await {
-                    Ok(b) => b,
-                    Err(err) => {
-                        let response = http_utils::http_request_read_error_response(&err);
-                        let _ = socket.write_all(response.as_bytes()).await;
-                        return;
-                    }
-                };
+            let request_bytes = match http_utils::read_full_request(&mut socket).await {
+                Ok(b) => b,
+                Err(err) => {
+                    let response = http_utils::http_request_read_error_response(&err);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+            };
 
-                let request = String::from_utf8_lossy(&request_bytes).into_owned();
-                let path = http_utils::extract_request_path(&request);
-                let path_no_query = path.split('?').next().unwrap_or(&path).to_string();
+            let request = String::from_utf8_lossy(&request_bytes).into_owned();
+            let path = http_utils::extract_request_path(&request);
+            let path_no_query = path.split('?').next().unwrap_or(&path).to_string();
 
-                let response_str = match path_no_query.as_str() {
-                    "/v1/models" | "/models" => match handle_models(&state).await {
-                        Ok(r) => r,
-                        Err(e) => http_utils::http_error_response(500, &e.to_string()),
-                    },
-                    "/v1/chat/completions" => {
-                        if !request.starts_with("POST ") {
-                            http_utils::http_response(
-                                405,
-                                "application/json",
-                                r#"{"error":{"message":"Method not allowed"}}"#,
-                            )
-                        } else {
-                            match handle_chat(&request, &state).await {
-                                Ok(r) => r,
-                                Err(e) => http_utils::http_error_response(500, &e.to_string()),
-                            }
+            let response_str = match path_no_query.as_str() {
+                "/v1/models" | "/models" => match handle_models(&state).await {
+                    Ok(r) => r,
+                    Err(e) => http_utils::http_error_response(500, &e.to_string()),
+                },
+                "/v1/chat/completions" => {
+                    if !request.starts_with("POST ") {
+                        http_utils::http_response(
+                            405,
+                            "application/json",
+                            r#"{"error":{"message":"Method not allowed"}}"#,
+                        )
+                    } else {
+                        match handle_chat(&request, &state).await {
+                            Ok(r) => r,
+                            Err(e) => http_utils::http_error_response(500, &e.to_string()),
                         }
                     }
-                    _ => http_utils::http_response(
-                        404,
-                        "application/json",
-                        r#"{"error":{"message":"Not found"}}"#,
-                    ),
-                };
+                }
+                _ => http_utils::http_response(
+                    404,
+                    "application/json",
+                    r#"{"error":{"message":"Not found"}}"#,
+                ),
+            };
 
-                let _ = socket.write_all(response_str.as_bytes()).await;
-            });
-        }
+            let _ = socket.write_all(response_str.as_bytes()).await;
+        });
+    }
 }
 
 async fn handle_models(state: &ServeState) -> Result<String> {

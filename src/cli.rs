@@ -167,7 +167,6 @@ pub struct ChatArgs {
 }
 
 /// Parse environment variable strings in the format KEY=VALUE
-#[allow(dead_code)]
 pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
     let mut env_map = HashMap::new();
 
@@ -225,6 +224,7 @@ mod tests {
         assert!(commands.contains(&"update"));
         assert!(commands.contains(&"keys"));
         assert!(commands.contains(&"run"));
+        assert!(!commands.contains(&"stats"));
     }
 
     #[test]
@@ -240,6 +240,18 @@ mod tests {
             assert_eq!(run_args.tool, Some("claude".to_string()));
             assert!(run_args.debug);
             assert!(!run_args.args.contains(&"--debug".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_run_without_tool_parses_for_start_fallback() {
+        let cli = Cli::try_parse_from(["aivo", "run", "--model", "gpt-5", "--debug"]).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.tool, None);
+            assert_eq!(run_args.model, Some("gpt-5".to_string()));
+            assert!(run_args.debug);
         } else {
             panic!("Expected Run command");
         }

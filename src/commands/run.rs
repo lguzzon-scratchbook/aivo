@@ -171,11 +171,17 @@ impl RunCommand {
 
     /// Shows usage information
     pub fn print_help() {
-        println!("{} aivo run <tool> [args...]", style::bold("Usage:"));
+        println!("{} aivo run [tool] [args...]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
             style::dim("Launch an AI coding assistant with local API keys.")
+        );
+        println!(
+            "{}",
+            style::dim(
+                "When no tool is provided, `aivo run` falls back to the saved `start` flow."
+            )
         );
         println!(
             "{}",

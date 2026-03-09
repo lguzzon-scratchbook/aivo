@@ -267,10 +267,27 @@ impl AILauncher {
             args
         };
 
-        // Spawn the process with inherited stdio
-        let result = self.spawn_process(&tool_config.command, &args, env).await;
+        let mut child = self.spawn_child(&tool_config.command, &args, env)?;
 
-        // Clean up temp model catalog file written for this invocation
+        let _ = self
+            .session_store
+            .record_selection(&key.id, options.tool.as_str(), model.as_deref())
+            .await;
+        if let Some(cwd) = crate::services::system_env::current_dir_string() {
+            let _ = self
+                .session_store
+                .set_directory_start(
+                    &cwd,
+                    &key.id,
+                    &key.base_url,
+                    options.tool.as_str(),
+                    model.as_deref(),
+                )
+                .await;
+        }
+
+        let result = self.wait_for_process(&mut child).await;
+
         if let Some(ref path) = codex_model_catalog_path {
             let _ = tokio::fs::remove_file(path).await;
         }
@@ -516,13 +533,12 @@ impl AILauncher {
     }
 
     /// Spawns a child process with stdio inheritance and returns its exit code
-    #[cfg(unix)]
-    async fn spawn_process(
+    fn spawn_child(
         &self,
         command: &str,
         args: &[String],
         env: HashMap<String, String>,
-    ) -> Result<i32> {
+    ) -> Result<tokio::process::Child> {
         let mut cmd = Command::new(command);
         cmd.args(args)
             .envs(&env)
@@ -530,10 +546,15 @@ impl AILauncher {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn {}", command))?;
+        Ok(child)
+    }
 
+    /// Waits for a child process while forwarding signals on Unix.
+    #[cfg(unix)]
+    async fn wait_for_process(&self, child: &mut tokio::process::Child) -> Result<i32> {
         // Get the child PID for signal forwarding
         let child_id = child.id();
 
@@ -567,26 +588,9 @@ impl AILauncher {
         result.map_err(|e| e.into())
     }
 
-    /// Spawns a child process with stdio inheritance and returns its exit code (non-Unix)
+    /// Waits for a child process and returns its exit code (non-Unix)
     #[cfg(not(unix))]
-    async fn spawn_process(
-        &self,
-        command: &str,
-        args: &[String],
-        env: HashMap<String, String>,
-    ) -> Result<i32> {
-        let mut cmd = Command::new(command);
-        cmd.args(args)
-            .envs(&env)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn {}", command))?;
-
-        // On non-Unix platforms, just wait for the child
+    async fn wait_for_process(&self, child: &mut tokio::process::Child) -> Result<i32> {
         let status = child.wait().await?;
         Ok(status.code().unwrap_or(1))
     }

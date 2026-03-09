@@ -46,6 +46,30 @@ mod zeroizing_string {
     }
 }
 
+mod encrypted_chat_messages {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{StoredChatMessage, decrypt, encrypt};
+
+    pub fn serialize<S>(value: &[StoredChatMessage], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let json = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+        let encrypted = encrypt(&json).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&encrypted)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<StoredChatMessage>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let decrypted = decrypt(&value).map_err(serde::de::Error::custom)?;
+        serde_json::from_str(&decrypted).map_err(serde::de::Error::custom)
+    }
+}
+
 const IV_LENGTH: usize = 16;
 const SALT_LENGTH: usize = 32;
 const KEY_LENGTH: usize = 32;
@@ -164,6 +188,166 @@ impl ApiKey {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryStartRecord {
+    #[serde(rename = "keyId")]
+    pub key_id: String,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UsageCounter {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub selections: u64,
+    #[serde(rename = "promptTokens", default, skip_serializing_if = "is_zero")]
+    pub prompt_tokens: u64,
+    #[serde(rename = "completionTokens", default, skip_serializing_if = "is_zero")]
+    pub completion_tokens: u64,
+    #[serde(rename = "totalTokens", default, skip_serializing_if = "is_zero")]
+    pub total_tokens: u64,
+}
+
+impl UsageCounter {
+    fn add_tokens(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(completion_tokens);
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(prompt_tokens.saturating_add(completion_tokens));
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UsageStats {
+    #[serde(rename = "totalSelections", default, skip_serializing_if = "is_zero")]
+    pub total_selections: u64,
+    #[serde(rename = "totalPromptTokens", default, skip_serializing_if = "is_zero")]
+    pub total_prompt_tokens: u64,
+    #[serde(
+        rename = "totalCompletionTokens",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub total_completion_tokens: u64,
+    #[serde(rename = "totalTokens", default, skip_serializing_if = "is_zero")]
+    pub total_tokens: u64,
+    #[serde(
+        rename = "keyUsage",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub key_usage: HashMap<String, UsageCounter>,
+    #[serde(
+        rename = "toolCounts",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub tool_counts: HashMap<String, u64>,
+    #[serde(
+        rename = "modelUsage",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub model_usage: HashMap<String, UsageCounter>,
+}
+
+impl UsageStats {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn record_selection(&mut self, key_id: &str, tool: &str, model: Option<&str>) {
+        self.total_selections = self.total_selections.saturating_add(1);
+        let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
+        key_stats.selections = key_stats.selections.saturating_add(1);
+        let tool_count = self.tool_counts.entry(tool.to_string()).or_default();
+        *tool_count = tool_count.saturating_add(1);
+
+        if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+            let model_stats = self.model_usage.entry(model.to_string()).or_default();
+            model_stats.selections = model_stats.selections.saturating_add(1);
+        }
+    }
+
+    fn record_tokens(
+        &mut self,
+        key_id: &str,
+        model: Option<&str>,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        self.total_prompt_tokens = self.total_prompt_tokens.saturating_add(prompt_tokens);
+        self.total_completion_tokens = self
+            .total_completion_tokens
+            .saturating_add(completion_tokens);
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(prompt_tokens.saturating_add(completion_tokens));
+
+        self.key_usage
+            .entry(key_id.to_string())
+            .or_default()
+            .add_tokens(prompt_tokens, completion_tokens);
+
+        if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+            self.model_usage
+                .entry(model.to_string())
+                .or_default()
+                .add_tokens(prompt_tokens, completion_tokens);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatSessionState {
+    #[serde(rename = "sessionId", default = "default_chat_session_id")]
+    pub session_id: String,
+    #[serde(rename = "keyId")]
+    pub key_id: String,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    pub cwd: String,
+    pub model: String,
+    #[serde(with = "encrypted_chat_messages")]
+    pub messages: Vec<StoredChatMessage>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn default_chat_session_id() -> String {
+    "legacy".to_string()
+}
+
+fn chat_session_map_key(key_id: &str, cwd: &str, session_id: &str) -> String {
+    format!("{key_id}::{cwd}::{session_id}")
+}
+
+fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
+    config.chat_models.remove(key_id);
+    config
+        .directory_starts
+        .retain(|_, record| record.key_id != key_id);
+    config
+        .chat_sessions
+        .retain(|_, session| session.key_id != key_id);
+}
+
 /// Stored configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredConfig {
@@ -177,6 +361,24 @@ pub struct StoredConfig {
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub chat_models: HashMap<String, String>,
+    #[serde(
+        rename = "directory_starts",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub directory_starts: HashMap<String, DirectoryStartRecord>,
+    #[serde(
+        rename = "stats",
+        default,
+        skip_serializing_if = "UsageStats::is_empty"
+    )]
+    pub stats: UsageStats,
+    #[serde(
+        rename = "chat_sessions",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub chat_sessions: HashMap<String, ChatSessionState>,
 }
 
 impl Default for StoredConfig {
@@ -191,6 +393,9 @@ impl StoredConfig {
             api_keys: Vec::new(),
             active_key_id: None,
             chat_models: HashMap::new(),
+            directory_starts: HashMap::new(),
+            stats: UsageStats::default(),
+            chat_sessions: HashMap::new(),
         }
     }
 }
@@ -517,7 +722,7 @@ impl SessionStore {
             if config.active_key_id.as_deref() == Some(id) {
                 config.active_key_id = None;
             }
-            config.chat_models.remove(id);
+            remove_runtime_state_for_key(&mut config, id);
             self.save_unlocked(&config).await?;
             Ok(true)
         } else {
@@ -537,10 +742,14 @@ impl SessionStore {
         let _lock = self.acquire_config_lock()?;
         let mut config = self.load_unlocked().await?;
         if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            let base_url_changed = entry.base_url != base_url;
             entry.name = name.to_string();
             entry.base_url = base_url.to_string();
             entry.claude_protocol = claude_protocol;
             entry.key = Zeroizing::new(key.to_string());
+            if base_url_changed {
+                remove_runtime_state_for_key(&mut config, id);
+            }
             self.save_unlocked(&config).await?;
             Ok(true)
         } else {
@@ -697,6 +906,168 @@ impl SessionStore {
         config
             .chat_models
             .insert(key_id.to_string(), model.to_string());
+        self.save_unlocked(&config).await
+    }
+
+    pub async fn get_directory_start(&self, cwd: &str) -> Result<Option<DirectoryStartRecord>> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        let Some(record) = config.directory_starts.get(cwd).cloned() else {
+            return Ok(None);
+        };
+
+        let key_is_valid = config
+            .api_keys
+            .iter()
+            .any(|key| key.id == record.key_id && key.base_url == record.base_url);
+        if key_is_valid {
+            Ok(Some(record))
+        } else {
+            config.directory_starts.remove(cwd);
+            self.save_unlocked(&config).await?;
+            Ok(None)
+        }
+    }
+
+    pub async fn set_directory_start(
+        &self,
+        cwd: &str,
+        key_id: &str,
+        base_url: &str,
+        tool: &str,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        config.directory_starts.insert(
+            cwd.to_string(),
+            DirectoryStartRecord {
+                key_id: key_id.to_string(),
+                base_url: base_url.to_string(),
+                tool: tool.to_string(),
+                model: model
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        );
+        self.save_unlocked(&config).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn clear_directory_start(&self, cwd: &str) -> Result<bool> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        let removed = config.directory_starts.remove(cwd).is_some();
+        if removed {
+            self.save_unlocked(&config).await?;
+        }
+        Ok(removed)
+    }
+
+    pub async fn record_selection(
+        &self,
+        key_id: &str,
+        tool: &str,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        config.stats.record_selection(key_id, tool, model);
+        self.save_unlocked(&config).await
+    }
+
+    pub async fn record_tokens(
+        &self,
+        key_id: &str,
+        model: Option<&str>,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> Result<()> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        config
+            .stats
+            .record_tokens(key_id, model, prompt_tokens, completion_tokens);
+        self.save_unlocked(&config).await
+    }
+
+    pub async fn get_chat_session(
+        &self,
+        key_id: &str,
+        base_url: &str,
+        cwd: &str,
+    ) -> Result<Option<ChatSessionState>> {
+        Ok(self
+            .list_chat_sessions(key_id, base_url, cwd)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    pub async fn list_chat_sessions(
+        &self,
+        key_id: &str,
+        base_url: &str,
+        cwd: &str,
+    ) -> Result<Vec<ChatSessionState>> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        let key_is_valid = config
+            .api_keys
+            .iter()
+            .any(|key| key.id == key_id && key.base_url == base_url);
+
+        let mut dirty = false;
+        let mut sessions = Vec::new();
+        config.chat_sessions.retain(|_, session| {
+            let matches = session.key_id == key_id && session.cwd == cwd;
+            if !matches {
+                return true;
+            }
+
+            let keep = key_is_valid && session.base_url == base_url;
+            if keep {
+                sessions.push(session.clone());
+            } else {
+                dirty = true;
+            }
+            keep
+        });
+
+        if dirty {
+            self.save_unlocked(&config).await?;
+        }
+
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(sessions)
+    }
+
+    pub async fn save_chat_session_with_id(
+        &self,
+        key_id: &str,
+        base_url: &str,
+        cwd: &str,
+        session_id: &str,
+        model: &str,
+        messages: &[StoredChatMessage],
+    ) -> Result<()> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load_unlocked().await?;
+        let map_key = chat_session_map_key(key_id, cwd, session_id);
+        config.chat_sessions.insert(
+            map_key,
+            ChatSessionState {
+                session_id: session_id.to_string(),
+                key_id: key_id.to_string(),
+                base_url: base_url.to_string(),
+                cwd: cwd.to_string(),
+                model: model.to_string(),
+                messages: messages.to_vec(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        );
         self.save_unlocked(&config).await
     }
 
@@ -1013,6 +1384,144 @@ mod tests {
         let after = store.get_key_by_id(&id).await.unwrap().unwrap();
 
         assert_eq!(before.created_at, after.created_at);
+    }
+
+    #[tokio::test]
+    async fn test_directory_start_removed_when_key_base_url_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("orig", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+        store
+            .set_directory_start(
+                "/tmp/demo",
+                &id,
+                "http://localhost",
+                "claude",
+                Some("model-a"),
+            )
+            .await
+            .unwrap();
+
+        store
+            .update_key(&id, "orig", "https://new.example.com", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .get_directory_start("/tmp/demo")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_stats_and_chat_session_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path.clone());
+
+        let id = store
+            .add_key_with_protocol("orig", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        store
+            .record_selection(&id, "chat", Some("gpt-4o"))
+            .await
+            .unwrap();
+        store
+            .record_tokens(&id, Some("gpt-4o"), 10, 5)
+            .await
+            .unwrap();
+        store
+            .save_chat_session_with_id(
+                &id,
+                "http://localhost",
+                "/tmp/demo",
+                "legacy",
+                "gpt-4o",
+                &[StoredChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let stats = store.load().await.unwrap().stats;
+        assert_eq!(stats.total_selections, 1);
+        assert_eq!(stats.total_tokens, 15);
+        assert_eq!(stats.tool_counts.get("chat"), Some(&1));
+        assert_eq!(
+            stats
+                .model_usage
+                .get("gpt-4o")
+                .map(|usage| usage.total_tokens),
+            Some(15)
+        );
+
+        let session = store
+            .get_chat_session(&id, "http://localhost", "/tmp/demo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.session_id, "legacy");
+
+        store
+            .save_chat_session_with_id(
+                &id,
+                "http://localhost",
+                "/tmp/demo",
+                "session-2",
+                "gpt-4o-mini",
+                &[StoredChatMessage {
+                    role: "user".to_string(),
+                    content: "second".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let sessions = store
+            .list_chat_sessions(&id, "http://localhost", "/tmp/demo")
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.session_id == "session-2")
+        );
+
+        let raw = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(!raw.contains("\"hello\""));
+    }
+
+    #[tokio::test]
+    async fn test_clear_directory_start_returns_true_when_removed() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("orig", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+        store
+            .set_directory_start("/tmp/demo", &id, "http://localhost", "claude", None)
+            .await
+            .unwrap();
+
+        assert!(store.clear_directory_start("/tmp/demo").await.unwrap());
+        assert!(!store.clear_directory_start("/tmp/demo").await.unwrap());
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ pub mod keys;
 pub mod models;
 pub mod run;
 pub mod serve;
+pub mod start;
 pub mod update;
 
 pub use chat::ChatCommand;
@@ -19,4 +20,5 @@ pub use keys::KeysCommand;
 pub use models::ModelsCommand;
 pub use run::RunCommand;
 pub use serve::ServeCommand;
+pub use start::{StartCommand, StartFlowArgs};
 pub use update::UpdateCommand;

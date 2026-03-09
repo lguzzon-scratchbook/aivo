@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::tui::FuzzySelect;
 use anyhow::Result;
+use console::{Key, Term};
 use reqwest::{Client, StatusCode};
 use rustyline::{
     Context, Editor, Helper,
@@ -32,12 +33,14 @@ use crate::services::copilot_auth::{
 };
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
-use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::session_store::{ApiKey, SessionStore, StoredChatMessage};
 use crate::style;
 
 const CMD_EXIT: &str = "/exit";
+const CMD_HELP: &str = "/help";
 const CMD_MODEL: &str = "/model";
-const CMD_MODEL_ARG: &str = "/model ";
+const CMD_NEW: &str = "/new";
+const CMD_RESUME: &str = "/resume";
 /// Maximum number of messages to keep in chat history.
 /// When exceeded, the oldest messages are dropped (keeping any system message).
 const MAX_HISTORY_MESSAGES: usize = 50;
@@ -51,7 +54,7 @@ struct ChatHelper {
 impl ChatHelper {
     fn new() -> Self {
         Self {
-            commands: vec![CMD_EXIT, CMD_MODEL],
+            commands: vec![CMD_EXIT, CMD_HELP, CMD_MODEL, CMD_NEW, CMD_RESUME],
         }
     }
 }
@@ -133,6 +136,18 @@ struct ChunkChoice {
 #[derive(Debug, Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TokenUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+#[derive(Debug, Default)]
+struct ChatTurnResult {
+    content: String,
+    usage: Option<TokenUsage>,
 }
 
 /// Which API format the provider speaks
@@ -226,6 +241,7 @@ impl ChatCommand {
         one_shot: Option<String>,
         key_override: Option<ApiKey>,
     ) -> Result<ExitCode> {
+        let explicit_model_requested = model_flag.is_some();
         let key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
@@ -274,6 +290,8 @@ impl ChatCommand {
             }
         };
         let mut model = Self::transform_model_for_provider(&key.base_url, &raw_model);
+        let cwd =
+            crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
 
         // Create once so its token cache is reused across messages in the session.
         let copilot_tm = if key.base_url == "copilot" {
@@ -296,6 +314,9 @@ impl ChatCommand {
                 content: one_shot_input,
             }];
             let mut format = ChatFormat::OpenAI;
+            self.session_store
+                .record_selection(&key.id, "chat", Some(&raw_model))
+                .await?;
             let (spinning, spinner_handle) = style::start_spinner(None);
             let result = send_message_turn(
                 &client,
@@ -311,7 +332,17 @@ impl ChatCommand {
             let _ = spinner_handle.await;
 
             match result {
-                Ok(_) => {
+                Ok(turn) => {
+                    if let Some(usage) = turn.usage {
+                        self.session_store
+                            .record_tokens(
+                                &key.id,
+                                Some(&raw_model),
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                            )
+                            .await?;
+                    }
                     println!();
                     return Ok(ExitCode::Success);
                 }
@@ -327,12 +358,11 @@ impl ChatCommand {
         );
         eprintln!(
             "{}",
-            style::dim(
-                "Type /exit to quit, /model to pick a model, /model <name> to set directly. Ctrl+D also works."
-            )
+            style::dim("Type a message, or use /help for chat commands.")
         );
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut format = ChatFormat::OpenAI;
+        let mut session_id = new_chat_session_id();
         let prompt = format!("{} ", style::cyan(">"));
 
         let mut rl = Editor::<ChatHelper, rustyline::history::DefaultHistory>::new()
@@ -351,6 +381,46 @@ impl ChatCommand {
                 }
             }
         }
+
+        if let Some(saved_session) = self
+            .session_store
+            .get_chat_session(&key.id, &key.base_url, &cwd)
+            .await?
+            .filter(|session| !session.messages.is_empty())
+        {
+            let resume = prompt_yes_no(
+                &format!(
+                    "Resume your last session in this directory? ({} messages)",
+                    saved_session.messages.len()
+                ),
+                true,
+            )?;
+            if resume {
+                session_id = saved_session.session_id.clone();
+                if !explicit_model_requested {
+                    raw_model = saved_session.model.clone();
+                    model = Self::transform_model_for_provider(&key.base_url, &raw_model);
+                }
+                history = saved_session
+                    .messages
+                    .into_iter()
+                    .map(|message| ChatMessage {
+                        role: message.role,
+                        content: message.content,
+                    })
+                    .collect();
+                eprintln!(
+                    "{} Resumed {} messages",
+                    style::success_symbol(),
+                    history.len()
+                );
+                eprintln!("{}", style::dim(format!("Model: {}", model)));
+            }
+        }
+
+        self.session_store
+            .record_selection(&key.id, "chat", Some(&raw_model))
+            .await?;
 
         loop {
             let input = match rl.readline(&prompt) {
@@ -375,40 +445,110 @@ impl ChatCommand {
                 break;
             }
 
-            if input == CMD_MODEL || input.starts_with(CMD_MODEL_ARG) {
-                let selected_raw = if input == CMD_MODEL {
-                    let models_list = self.fetch_models_for_select(&client, &key).await;
-                    if models_list.is_empty() {
-                        eprintln!("  model: {}", style::cyan(&model));
-                        None
-                    } else {
-                        // Use raw_model (pre-transform) to find current selection in the list
-                        let current_idx = models_list
-                            .iter()
-                            .position(|m| m == &raw_model)
-                            .unwrap_or(0);
-                        FuzzySelect::new()
-                            .with_prompt("Select model")
-                            .items(&models_list)
-                            .default(current_idx)
-                            .interact_opt()
-                            .ok()
-                            .flatten()
-                            .map(|idx| models_list[idx].clone())
-                    }
-                } else {
-                    input
-                        .strip_prefix(CMD_MODEL_ARG)
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                };
+            if input == CMD_HELP {
+                print_chat_commands();
+                continue;
+            }
 
-                if let Some(raw) = selected_raw {
+            if input == CMD_NEW {
+                history.clear();
+                session_id = new_chat_session_id();
+                format = ChatFormat::OpenAI;
+                eprintln!("{}", style::dim("Started a new chat."));
+                continue;
+            }
+
+            if input == CMD_RESUME {
+                let sessions = self
+                    .session_store
+                    .list_chat_sessions(&key.id, &key.base_url, &cwd)
+                    .await?;
+                if sessions.is_empty() {
+                    eprintln!("{}", style::dim("No saved chats in this directory yet."));
+                    continue;
+                }
+
+                let items = sessions
+                    .iter()
+                    .map(format_session_choice)
+                    .collect::<Vec<_>>();
+                let current_idx = sessions
+                    .iter()
+                    .position(|session| session.session_id == session_id)
+                    .unwrap_or(0);
+
+                let selected = FuzzySelect::new()
+                    .with_prompt("Resume chat")
+                    .items(&items)
+                    .default(current_idx)
+                    .interact_opt()
+                    .ok()
+                    .flatten();
+
+                if let Some(idx) = selected {
+                    let session = &sessions[idx];
+                    session_id = session.session_id.clone();
+                    raw_model = session.model.clone();
+                    model = Self::transform_model_for_provider(&key.base_url, &raw_model);
+                    self.session_store
+                        .set_chat_model(&key.id, &raw_model)
+                        .await?;
+                    history = session
+                        .messages
+                        .iter()
+                        .map(|message| ChatMessage {
+                            role: message.role.clone(),
+                            content: message.content.clone(),
+                        })
+                        .collect();
+                    format = ChatFormat::OpenAI;
+                    eprintln!(
+                        "{}",
+                        style::dim(format!("Resumed {} messages · {}", history.len(), model))
+                    );
+                }
+                continue;
+            }
+
+            if input == CMD_MODEL {
+                let models_list = self.fetch_models_for_select(&client, &key).await;
+                if models_list.is_empty() {
+                    eprintln!("{}", style::dim(format!("Keeping {}", model)));
+                    continue;
+                }
+
+                let current_idx = models_list
+                    .iter()
+                    .position(|m| m == &raw_model)
+                    .unwrap_or(0);
+                if let Some(idx) = FuzzySelect::new()
+                    .with_prompt("Select model")
+                    .items(&models_list)
+                    .default(current_idx)
+                    .interact_opt()
+                    .ok()
+                    .flatten()
+                {
+                    let raw = models_list[idx].clone();
                     self.session_store.set_chat_model(&key.id, &raw).await?;
+                    self.session_store
+                        .record_selection(&key.id, "chat", Some(&raw))
+                        .await?;
                     raw_model = raw.clone();
                     model = Self::transform_model_for_provider(&key.base_url, &raw);
                     eprintln!("  model: {}", style::cyan(&model));
+                    if !history.is_empty() {
+                        self.session_store
+                            .save_chat_session_with_id(
+                                &key.id,
+                                &key.base_url,
+                                &cwd,
+                                &session_id,
+                                &raw_model,
+                                &to_stored_messages(&history),
+                            )
+                            .await?;
+                    }
                 }
                 continue;
             }
@@ -448,13 +588,33 @@ impl ChatCommand {
             style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
             match result {
-                Ok(assistant_content) => {
+                Ok(turn) => {
                     // Ensure newline after streamed response
                     println!();
                     history.push(ChatMessage {
                         role: "assistant".to_string(),
-                        content: assistant_content,
+                        content: turn.content,
                     });
+                    if let Some(usage) = turn.usage {
+                        self.session_store
+                            .record_tokens(
+                                &key.id,
+                                Some(&raw_model),
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                            )
+                            .await?;
+                    }
+                    self.session_store
+                        .save_chat_session_with_id(
+                            &key.id,
+                            &key.base_url,
+                            &cwd,
+                            &session_id,
+                            &raw_model,
+                            &to_stored_messages(&history),
+                        )
+                        .await?;
                 }
                 Err(e) => {
                     eprintln!("\n{} {}", style::red("Error:"), e);
@@ -545,7 +705,7 @@ async fn send_message_turn(
     history: &[ChatMessage],
     format: &mut ChatFormat,
     spinning: &Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<ChatTurnResult> {
     if let Some(tm) = copilot_tm {
         return send_copilot_request(client, tm, model, history, spinning).await;
     }
@@ -595,6 +755,91 @@ fn compose_one_shot_prompt(prompt: &str, stdin_context: Option<&str>) -> String 
     }
 }
 
+fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
+    history
+        .iter()
+        .map(|message| StoredChatMessage {
+            role: message.role.clone(),
+            content: message.content.clone(),
+        })
+        .collect()
+}
+
+fn print_chat_commands() {
+    let rows = [
+        (CMD_HELP, "Show chat commands"),
+        (CMD_MODEL, "Pick a different model"),
+        (CMD_NEW, "Start a fresh chat"),
+        (CMD_RESUME, "Resume a saved chat"),
+        (CMD_EXIT, "Leave chat"),
+    ];
+    let width = rows.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+
+    eprintln!("{}", style::bold("Commands"));
+    for (cmd, description) in rows {
+        eprintln!(
+            "  {}  {}",
+            style::cyan(format!("{cmd:<width$}")),
+            style::dim(description)
+        );
+    }
+}
+
+fn new_chat_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string()
+}
+
+fn format_session_choice(session: &crate::services::session_store::ChatSessionState) -> String {
+    let updated = session.updated_at.split('T').collect::<Vec<_>>();
+    let updated = if updated.len() == 2 {
+        let time = updated[1]
+            .split('.')
+            .next()
+            .unwrap_or(updated[1])
+            .trim_end_matches('Z');
+        format!("{} {}", updated[0], time)
+    } else {
+        session.updated_at.clone()
+    };
+
+    format!(
+        "{} · {} messages · {}",
+        session.model,
+        session.messages.len(),
+        updated
+    )
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> io::Result<bool> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    let term = Term::stdout();
+    term.write_str(&format!("{} {} ", prompt, suffix))?;
+
+    loop {
+        match term.read_key()? {
+            Key::Enter => {
+                term.write_line(if default_yes { "y" } else { "n" })?;
+                return Ok(default_yes);
+            }
+            Key::Char('y') | Key::Char('Y') => {
+                term.write_line("y")?;
+                return Ok(true);
+            }
+            Key::Char('n') | Key::Char('N') | Key::Escape => {
+                term.write_line("n")?;
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Returns the SSE payload for a `data:` line.
 /// Accepts both `data: {...}` and `data:{...}`.
 fn sse_data_payload(line: &str) -> Option<&str> {
@@ -618,6 +863,44 @@ fn extract_openai_message_content(body: &serde_json::Value) -> String {
                 .or_else(|| part.get("content").and_then(|v| v.as_str()))
         })
         .collect()
+}
+
+fn extract_openai_usage(body: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = body.get("usage")?;
+    Some(TokenUsage {
+        prompt_tokens: usage
+            .get("prompt_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        completion_tokens: usage
+            .get("completion_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+    })
+}
+
+fn extract_anthropic_usage(body: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = body.get("usage")?;
+    Some(TokenUsage {
+        prompt_tokens: usage
+            .get("input_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        completion_tokens: usage
+            .get("output_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+    })
+}
+
+fn parse_openai_usage_chunk(data: &str) -> Option<TokenUsage> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    extract_openai_usage(&value)
+}
+
+fn parse_anthropic_usage_chunk(data: &str) -> Option<TokenUsage> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    extract_anthropic_usage(&value)
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
@@ -684,7 +967,7 @@ async fn send_chat_request(
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<ChatTurnResult> {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/chat/completions", base);
 
@@ -720,6 +1003,7 @@ async fn send_chat_request(
     }
 
     let mut full_content = String::new();
+    let mut usage = None;
     let mut line_buf = String::new();
     let mut done = false;
 
@@ -739,6 +1023,9 @@ async fn send_chat_request(
                     done = true;
                     break;
                 }
+                if let Some(tokens) = parse_openai_usage_chunk(data) {
+                    usage = Some(tokens);
+                }
                 if let Some(content) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
                     print!("{}", content);
@@ -752,6 +1039,9 @@ async fn send_chat_request(
     let tail = line_buf.trim();
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
+            if let Some(tokens) = parse_openai_usage_chunk(data) {
+                usage = Some(tokens);
+            }
             if data.trim() != "[DONE]"
                 && let Some(content) = parse_sse_chunk(data)
             {
@@ -777,7 +1067,10 @@ async fn send_chat_request(
         return send_non_streaming(client, &url, key, model, messages, spinning).await;
     }
 
-    Ok(full_content)
+    Ok(ChatTurnResult {
+        content: full_content,
+        usage,
+    })
 }
 
 /// Non-streaming fallback for gateways that don't support SSE streaming.
@@ -788,7 +1081,7 @@ async fn send_non_streaming(
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<ChatTurnResult> {
     let request = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
@@ -814,6 +1107,7 @@ async fn send_non_streaming(
 
     let body: serde_json::Value = response.json().await?;
     let content = extract_openai_message_content(&body);
+    let usage = extract_openai_usage(&body);
 
     if content.is_empty() {
         style::stop_spinner(spinning);
@@ -824,7 +1118,7 @@ async fn send_non_streaming(
     print!("{}", content);
     io::stdout().flush()?;
 
-    Ok(content)
+    Ok(ChatTurnResult { content, usage })
 }
 
 /// Sends a chat request via GitHub Copilot (token exchange + Copilot API).
@@ -834,7 +1128,7 @@ async fn send_copilot_request(
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<ChatTurnResult> {
     let (copilot_token, api_endpoint) = tm.get_token().await?;
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
 
@@ -869,6 +1163,7 @@ async fn send_copilot_request(
     }
 
     let mut full_content = String::new();
+    let mut usage = None;
     let mut line_buf = String::new();
     let mut done = false;
 
@@ -888,6 +1183,9 @@ async fn send_copilot_request(
                     done = true;
                     break;
                 }
+                if let Some(tokens) = parse_openai_usage_chunk(data) {
+                    usage = Some(tokens);
+                }
                 if let Some(content) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
                     print!("{}", content);
@@ -901,6 +1199,9 @@ async fn send_copilot_request(
     let tail = line_buf.trim();
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
+            if let Some(tokens) = parse_openai_usage_chunk(data) {
+                usage = Some(tokens);
+            }
             if data.trim() != "[DONE]"
                 && let Some(content) = parse_sse_chunk(data)
             {
@@ -927,7 +1228,10 @@ async fn send_copilot_request(
             .await;
     }
 
-    Ok(full_content)
+    Ok(ChatTurnResult {
+        content: full_content,
+        usage,
+    })
 }
 
 async fn send_copilot_non_streaming(
@@ -937,7 +1241,7 @@ async fn send_copilot_non_streaming(
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<ChatTurnResult> {
     let request = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
@@ -965,6 +1269,7 @@ async fn send_copilot_non_streaming(
 
     let body: serde_json::Value = response.json().await?;
     let content = extract_openai_message_content(&body);
+    let usage = extract_openai_usage(&body);
 
     if content.is_empty() {
         style::stop_spinner(spinning);
@@ -975,7 +1280,7 @@ async fn send_copilot_non_streaming(
     print!("{}", content);
     io::stdout().flush()?;
 
-    Ok(content)
+    Ok(ChatTurnResult { content, usage })
 }
 
 /// Parses a single SSE data chunk and extracts the content delta
@@ -1029,7 +1334,7 @@ async fn send_anthropic_request(
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<ChatTurnResult> {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/messages", base);
 
@@ -1065,6 +1370,7 @@ async fn send_anthropic_request(
     }
 
     let mut full_content = String::new();
+    let mut usage = None;
     let mut line_buf = String::new();
 
     while let Some(chunk) = response.chunk().await? {
@@ -1075,9 +1381,27 @@ async fn send_anthropic_request(
             let line = line_buf[..pos].trim_end_matches('\r').to_string();
             line_buf = line_buf[pos + 1..].to_string();
 
-            if let Some(data) = sse_data_payload(&line)
-                && let Some(text) = parse_anthropic_chunk(data)
-            {
+            if let Some(data) = sse_data_payload(&line) {
+                if let Some(tokens) = parse_anthropic_usage_chunk(data) {
+                    usage = Some(tokens);
+                }
+                if let Some(text) = parse_anthropic_chunk(data) {
+                    style::stop_spinner(spinning);
+                    print!("{}", text);
+                    io::stdout().flush()?;
+                    full_content.push_str(&text);
+                }
+            }
+        }
+    }
+
+    if full_content.is_empty() {
+        let tail = line_buf.trim();
+        if let Some(data) = sse_data_payload(tail) {
+            if let Some(tokens) = parse_anthropic_usage_chunk(data) {
+                usage = Some(tokens);
+            }
+            if let Some(text) = parse_anthropic_chunk(data) {
                 style::stop_spinner(spinning);
                 print!("{}", text);
                 io::stdout().flush()?;
@@ -1086,24 +1410,15 @@ async fn send_anthropic_request(
         }
     }
 
-    if full_content.is_empty() {
-        let tail = line_buf.trim();
-        if let Some(data) = sse_data_payload(tail)
-            && let Some(text) = parse_anthropic_chunk(data)
-        {
-            style::stop_spinner(spinning);
-            print!("{}", text);
-            io::stdout().flush()?;
-            full_content.push_str(&text);
-        }
-    }
-
     // If streaming produced no content, fall back to non-streaming
     if full_content.is_empty() {
         return send_anthropic_non_streaming(client, &url, key, model, messages, spinning).await;
     }
 
-    Ok(full_content)
+    Ok(ChatTurnResult {
+        content: full_content,
+        usage,
+    })
 }
 
 /// Non-streaming fallback for Anthropic-format providers.
@@ -1114,7 +1429,7 @@ async fn send_anthropic_non_streaming(
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<ChatTurnResult> {
     let request = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -1143,6 +1458,7 @@ async fn send_anthropic_non_streaming(
     }
 
     let body: serde_json::Value = response.json().await?;
+    let usage = extract_anthropic_usage(&body);
 
     // Try Anthropic format: content[].text
     let content: String = body["content"]
@@ -1162,7 +1478,7 @@ async fn send_anthropic_non_streaming(
     print!("{}", content);
     io::stdout().flush()?;
 
-    Ok(content)
+    Ok(ChatTurnResult { content, usage })
 }
 
 /// Parses an Anthropic SSE data line and returns the text delta if present.
@@ -1220,7 +1536,7 @@ mod tests {
         let hist = make_history();
         let ctx = Context::new(&hist);
         let (_, completions) = h.complete("/", 1, &ctx).unwrap();
-        assert_eq!(completions.len(), 2);
+        assert_eq!(completions.len(), h.commands.len());
     }
 
     #[test]

@@ -9,6 +9,7 @@
  * Claude Code (Anthropic /v1/messages) → Router → OpenAI /v1/chat/completions → Cloudflare
  */
 use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +21,10 @@ use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
 };
 use crate::services::http_utils::{self, router_http_client};
-use crate::services::model_names::select_model_for_protocol;
+use crate::services::model_names::{
+    infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_protocol,
+    should_preserve_cross_protocol_model,
+};
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::{
     OpenAIToGeminiConfig, build_google_generate_content_url,
@@ -156,22 +160,17 @@ async fn handle_anthropic_to_upstream(
     config: &Arc<OpenAIRouterConfig>,
     client: &reqwest::Client,
 ) -> Result<RouterResponse> {
+    let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
     let body_str = http_utils::extract_request_body(request)?;
 
     let body: Value = serde_json::from_str(body_str)?;
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content);
     cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
+    prepare_gateway_model_metadata(&mut simplified, &mut passthrough_headers, config);
     let requested_stream = simplified
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-
-    let selected_model = select_model_for_protocol(
-        simplified.get("model").and_then(|v| v.as_str()),
-        None,
-        config.target_protocol,
-    );
-    simplified["model"] = Value::String(selected_model);
 
     // Transform model name: add prefix if configured (e.g., "@cf/" for Cloudflare)
     if config.target_protocol == ProviderProtocol::Openai
@@ -197,6 +196,7 @@ async fn handle_anthropic_to_upstream(
             let url = build_google_generate_content_url(&config.target_base_url, &model);
             let response = client
                 .post(&url)
+                .headers(passthrough_headers.clone())
                 .header("x-goog-api-key", config.target_api_key.as_str())
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "aivo-router/1.0")
@@ -237,6 +237,7 @@ async fn handle_anthropic_to_upstream(
             let url = http_utils::build_chat_completions_url(&config.target_base_url);
             let response = client
                 .post(&url)
+                .headers(passthrough_headers)
                 .header("Authorization", format!("Bearer {}", config.target_api_key))
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "aivo-router/1.0")
@@ -286,6 +287,36 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value 
             fallback_tool_arguments_json: "{}",
         },
     )
+}
+
+fn prepare_gateway_model_metadata(
+    simplified: &mut Value,
+    passthrough_headers: &mut HeaderMap,
+    config: &OpenAIRouterConfig,
+) {
+    let requested_model = simplified
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let selected_model = if should_preserve_cross_protocol_model(
+        &config.target_base_url,
+        &requested_model,
+        config.target_protocol,
+    ) {
+        requested_model.clone()
+    } else {
+        select_model_for_protocol(Some(&requested_model), None, config.target_protocol)
+    };
+    simplified["model"] = Value::String(selected_model);
+
+    if is_gateway_style_endpoint(&config.target_base_url)
+        && !passthrough_headers.contains_key("x-provider")
+        && let Some(provider) = infer_provider_name_from_model(&requested_model)
+        && let Ok(value) = HeaderValue::from_str(&provider)
+    {
+        passthrough_headers.insert("x-provider", value);
+    }
 }
 
 fn cap_max_tokens_field(body: &mut Value, cap: Option<u64>) {
@@ -960,6 +991,47 @@ mod tests {
             messages[0]["tool_calls"][0]["function"]["name"],
             "list_files"
         );
+    }
+
+    #[test]
+    fn test_prepare_gateway_model_metadata_preserves_gateway_claude_model() {
+        let config = OpenAIRouterConfig {
+            target_base_url: "https://api.ai.example-gateway.net/endpoint".to_string(),
+            target_api_key: "test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            max_tokens_cap: None,
+        };
+        let mut body = json!({"model": "claude-sonnet-4-6"});
+        let mut headers = HeaderMap::new();
+
+        prepare_gateway_model_metadata(&mut body, &mut headers, &config);
+
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(
+            headers.get("x-provider").and_then(|v| v.to_str().ok()),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn test_prepare_gateway_model_metadata_remaps_plain_openai_endpoint() {
+        let config = OpenAIRouterConfig {
+            target_base_url: "https://api.openai.com/v1".to_string(),
+            target_api_key: "test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            max_tokens_cap: None,
+        };
+        let mut body = json!({"model": "claude-sonnet-4-6"});
+        let mut headers = HeaderMap::new();
+
+        prepare_gateway_model_metadata(&mut body, &mut headers, &config);
+
+        assert_eq!(body["model"], "gpt-4o");
+        assert!(headers.get("x-provider").is_none());
     }
 
     #[test]

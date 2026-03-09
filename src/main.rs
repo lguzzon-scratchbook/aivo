@@ -15,7 +15,10 @@ mod tui;
 mod version;
 
 use cli::{Cli, Commands};
-use commands::{ChatCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand, UpdateCommand};
+use commands::{
+    ChatCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand, StartCommand, StartFlowArgs,
+    UpdateCommand,
+};
 use errors::ExitCode;
 use services::session_store::ApiKey;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
@@ -124,7 +127,6 @@ async fn main() {
             let env_injector = EnvironmentInjector::new();
             let ai_launcher =
                 AILauncher::new(session_store.clone(), env_injector, models_cache.clone());
-            let command = RunCommand::new(ai_launcher, models_cache);
 
             // Re-extract aivo flags from passthrough args that clap's trailing_var_arg
             // may have swallowed (e.g. `aivo run claude --agent-name foo --model opus`
@@ -207,53 +209,81 @@ async fn main() {
                 i += 1;
             }
 
-            // Handle --key flag: resolve key for temporary use (not persisted)
-            let key_override = if let Some(ref key_id_or_name) = key_flag {
-                match session_store
-                    .resolve_key_by_id_or_name(key_id_or_name)
+            if run_args.tool.is_none() {
+                if !remaining_args.is_empty() {
+                    eprintln!(
+                        "{} `aivo run` without a tool does not accept passthrough args",
+                        style::red("Error:")
+                    );
+                    eprintln!(
+                        "  {}",
+                        style::dim("Use `aivo run <tool> ...` for passthrough flags.")
+                    );
+                    process::exit(ExitCode::UserError.code());
+                }
+
+                let command = StartCommand::new(session_store, ai_launcher, models_cache);
+                command
+                    .execute(StartFlowArgs {
+                        model,
+                        key: key_flag,
+                        tool: None,
+                        debug,
+                        yes: false,
+                        envs: env_strings,
+                    })
                     .await
-                {
-                    Ok(key) => Some(key),
-                    Err(e) => {
-                        eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(ExitCode::UserError.code());
-                    }
-                }
             } else {
-                match resolve_active_key_or_prompt(&session_store).await {
-                    Some(key) => Some(key),
-                    None => process::exit(ExitCode::AuthError.code()),
-                }
-            };
+                let command = RunCommand::new(ai_launcher, models_cache);
 
-            let env = if !env_strings.is_empty() {
-                let mut map = std::collections::HashMap::new();
-                for env_str in &env_strings {
-                    if let Some((key, value)) = env_str.split_once('=') {
-                        map.insert(key.to_string(), value.to_string());
-                    } else {
-                        eprintln!(
-                            "{} Ignoring malformed env value '{}' (expected KEY=VALUE format)",
-                            style::yellow("Warning:"),
-                            env_str
-                        );
+                // Handle --key flag: resolve key for temporary use (not persisted)
+                let key_override = if let Some(ref key_id_or_name) = key_flag {
+                    match session_store
+                        .resolve_key_by_id_or_name(key_id_or_name)
+                        .await
+                    {
+                        Ok(key) => Some(key),
+                        Err(e) => {
+                            eprintln!("{} {}", style::red("Error:"), e);
+                            process::exit(ExitCode::UserError.code());
+                        }
                     }
-                }
-                Some(map)
-            } else {
-                None
-            };
+                } else {
+                    match resolve_active_key_or_prompt(&session_store).await {
+                        Some(key) => Some(key),
+                        None => process::exit(ExitCode::AuthError.code()),
+                    }
+                };
 
-            command
-                .execute(
-                    run_args.tool.as_deref(),
-                    remaining_args,
-                    debug,
-                    model,
-                    env,
-                    key_override,
-                )
-                .await
+                let env = if !env_strings.is_empty() {
+                    let mut map = std::collections::HashMap::new();
+                    for env_str in &env_strings {
+                        if let Some((key, value)) = env_str.split_once('=') {
+                            map.insert(key.to_string(), value.to_string());
+                        } else {
+                            eprintln!(
+                                "{} Ignoring malformed env value '{}' (expected KEY=VALUE format)",
+                                style::yellow("Warning:"),
+                                env_str
+                            );
+                        }
+                    }
+                    Some(map)
+                } else {
+                    None
+                };
+
+                command
+                    .execute(
+                        run_args.tool.as_deref(),
+                        remaining_args,
+                        debug,
+                        model,
+                        env,
+                        key_override,
+                    )
+                    .await
+            }
         }
 
         Commands::Models(models_args) => {
@@ -393,8 +423,8 @@ fn print_help() {
     println!("{}", style::bold("Commands:"));
     println!(
         "  {}      {}",
-        style::cyan("run <tool>"),
-        style::dim("Launch AI tool with local API keys")
+        style::cyan("run [tool]"),
+        style::dim("Launch AI tool, or use the saved start flow")
     );
     println!(
         "  {}  {}",

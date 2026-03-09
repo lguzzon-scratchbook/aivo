@@ -62,3 +62,13 @@ pub fn username() -> Option<String> {
         None
     }
 }
+
+/// Best-effort current working directory lookup with canonicalization when possible.
+pub fn current_dir() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    std::fs::canonicalize(&cwd).ok().or(Some(cwd))
+}
+
+pub fn current_dir_string() -> Option<String> {
+    current_dir().map(|path| path.to_string_lossy().to_string())
+}

@@ -69,6 +69,44 @@ pub fn transform_model_for_provider(base_url: &str, model: &str) -> String {
     }
 }
 
+pub fn is_gateway_style_endpoint(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    lower.contains("/endpoint") || lower.contains("gateway")
+}
+
+pub fn infer_provider_name_from_model(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((provider, _)) = trimmed.split_once('/')
+        && !provider.trim().is_empty()
+    {
+        return Some(provider.trim().to_ascii_lowercase());
+    }
+
+    match infer_model_protocol(trimmed) {
+        Some(ProviderProtocol::Anthropic) => Some("anthropic".to_string()),
+        Some(ProviderProtocol::Google) => Some("google".to_string()),
+        Some(ProviderProtocol::Openai) => Some("openai".to_string()),
+        None => None,
+    }
+}
+
+pub fn should_preserve_cross_protocol_model(
+    base_url: &str,
+    model: &str,
+    target_protocol: ProviderProtocol,
+) -> bool {
+    match infer_model_protocol(model) {
+        Some(protocol) if protocol != target_protocol => {
+            target_protocol == ProviderProtocol::Openai && is_gateway_style_endpoint(base_url)
+        }
+        _ => false,
+    }
+}
+
 /// Converts Claude model names from Anthropic/Claude Code format to Copilot format.
 ///
 /// Claude Code sends names like `claude-sonnet-4-6-20250603` or `claude-sonnet-4-6`.
@@ -280,6 +318,43 @@ mod tests {
             select_model_for_protocol(Some("gemini-2.0-flash"), None, ProviderProtocol::Openai),
             "gpt-4o"
         );
+    }
+
+    #[test]
+    fn test_should_preserve_cross_protocol_model_for_gateway_endpoint() {
+        assert!(should_preserve_cross_protocol_model(
+            "https://api.ai.example-gateway.net/endpoint",
+            "claude-sonnet-4-6",
+            ProviderProtocol::Openai
+        ));
+        assert!(should_preserve_cross_protocol_model(
+            "http://localhost:3005/endpoint",
+            "claude-sonnet-4-6",
+            ProviderProtocol::Openai
+        ));
+        assert!(is_gateway_style_endpoint("https://ai-gateway.vercel.sh/v1"));
+    }
+
+    #[test]
+    fn test_should_not_preserve_cross_protocol_model_for_plain_openai_endpoint() {
+        assert!(!should_preserve_cross_protocol_model(
+            "https://api.openai.com/v1",
+            "claude-sonnet-4-6",
+            ProviderProtocol::Openai
+        ));
+    }
+
+    #[test]
+    fn test_infer_provider_name_from_model() {
+        assert_eq!(
+            infer_provider_name_from_model("claude-sonnet-4-6").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            infer_provider_name_from_model("moonshot/kimi-k2.5").as_deref(),
+            Some("moonshot")
+        );
+        assert_eq!(infer_provider_name_from_model("").as_deref(), None);
     }
 
     #[test]
