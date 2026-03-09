@@ -920,6 +920,13 @@ impl SessionStore {
         }
     }
 
+    /// Gets all keys and the active key ID without decrypting secrets.
+    /// Use this for display-only paths (e.g., `aivo keys` list).
+    pub async fn get_keys_and_active_id_info(&self) -> Result<(Vec<ApiKey>, Option<String>)> {
+        let config = self.load_raw().await?;
+        Ok((config.api_keys, config.active_key_id))
+    }
+
     /// Gets the active key's display metadata (id, name, base_url) without decrypting secrets.
     /// Use this when the key value is not needed (e.g., help output).
     pub async fn get_active_key_info(&self) -> Result<Option<ApiKey>> {

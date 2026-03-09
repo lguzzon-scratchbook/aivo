@@ -121,8 +121,7 @@ impl KeysCommand {
 
     /// Lists all API keys
     async fn list_keys(&self) -> Result<ExitCode> {
-        let keys = self.session_store.get_keys().await?;
-        let active_key = self.session_store.get_active_key().await?;
+        let (keys, active_key_id) = self.session_store.get_keys_and_active_id_info().await?;
 
         if keys.is_empty() {
             println!("{}", style::dim("No API keys found."));
@@ -131,7 +130,7 @@ impl KeysCommand {
 
         println!();
         for key in &keys {
-            let is_active = active_key.as_ref().map(|k| k.id == key.id).unwrap_or(false);
+            let is_active = active_key_id.as_deref() == Some(key.id.as_str());
             let active_indicator = if is_active {
                 style::bullet_symbol()
             } else {
