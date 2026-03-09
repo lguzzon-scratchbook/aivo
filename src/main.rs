@@ -327,7 +327,7 @@ async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<Ap
 /// Prints the active key info.
 /// Only prints if there is an active key configured.
 async fn print_active_key(session_store: &SessionStore) {
-    let active_key = match session_store.get_active_key().await.ok().flatten() {
+    let active_key = match session_store.get_active_key_info().await.ok().flatten() {
         Some(key) => key,
         None => return,
     };

@@ -698,6 +698,12 @@ impl SessionStore {
     }
 
     async fn load_unlocked(&self) -> Result<StoredConfig> {
+        let parsed = self.load_raw().await?;
+        self.decrypt_keys(&parsed)
+    }
+
+    /// Loads config without decrypting API key secrets (fast path for metadata-only reads).
+    async fn load_raw(&self) -> Result<StoredConfig> {
         let data = match tokio::fs::read_to_string(&self.config_path).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -706,16 +712,12 @@ impl SessionStore {
             Err(e) => return Err(e.into()),
         };
 
-        let parsed: StoredConfig = match serde_json::from_str(&data) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "config file is corrupted and cannot be read: {e}"
-                ));
-            }
-        };
-
-        self.decrypt_keys(&parsed)
+        match serde_json::from_str(&data) {
+            Ok(p) => Ok(p),
+            Err(e) => Err(anyhow::anyhow!(
+                "config file is corrupted and cannot be read: {e}"
+            )),
+        }
     }
 
     /// Adds a new API key with an optional explicit Claude protocol.
@@ -911,6 +913,17 @@ impl SessionStore {
     /// Gets the currently active API key
     pub async fn get_active_key(&self) -> Result<Option<ApiKey>> {
         let config = self.load().await?;
+
+        match config.active_key_id {
+            Some(ref id) => Ok(config.api_keys.into_iter().find(|k| k.id == *id)),
+            None => Ok(None),
+        }
+    }
+
+    /// Gets the active key's display metadata (id, name, base_url) without decrypting secrets.
+    /// Use this when the key value is not needed (e.g., help output).
+    pub async fn get_active_key_info(&self) -> Result<Option<ApiKey>> {
+        let config = self.load_raw().await?;
 
         match config.active_key_id {
             Some(ref id) => Ok(config.api_keys.into_iter().find(|k| k.id == *id)),
