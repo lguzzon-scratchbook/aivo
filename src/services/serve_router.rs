@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::models::fetch_models;
+use crate::services::codex_router::{
+    CodexRouterConfig, convert_chat_response_to_responses_sse, convert_responses_to_chat_request,
+};
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::model_names::{copilot_model_name, transform_model_for_openrouter};
@@ -163,6 +166,17 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                         handle_chat(&request, &state).await
                     }
                 }
+                "/v1/responses" | "/responses" => {
+                    if !request.starts_with("POST ") {
+                        Ok(buffered_response(
+                            405,
+                            "application/json",
+                            br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
+                        ))
+                    } else {
+                        handle_responses(&request, &state).await
+                    }
+                }
                 _ => Ok(buffered_response(
                     404,
                     "application/json",
@@ -200,8 +214,63 @@ async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
 
 async fn handle_chat(request: &str, state: &ServeState) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
-    let mut body: Value = serde_json::from_str(body_str)?;
+    let body: Value = serde_json::from_str(body_str)?;
 
+    handle_chat_body(body, state).await
+}
+
+async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterResponse> {
+    let body_str = http_utils::extract_request_body(request)?;
+    let body: Value = serde_json::from_str(body_str)?;
+    let original_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-4o")
+        .to_string();
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let chat_body = convert_responses_to_chat_request(&body, &responses_router_config(state));
+    let chat_response = handle_chat_body(chat_body, state).await?;
+
+    match chat_response {
+        RouterResponse::Buffered {
+            status,
+            content_type,
+            body,
+        } => {
+            if status >= 400 {
+                return Ok(buffered_response(status, &content_type, body));
+            }
+
+            let chat_json: Value = serde_json::from_slice(&body)?;
+            if client_wants_stream {
+                let sse =
+                    convert_chat_response_to_responses_sse(&chat_json, false, &original_model);
+                Ok(buffered_response(
+                    200,
+                    "text/event-stream",
+                    sse.into_bytes(),
+                ))
+            } else {
+                let response_json =
+                    convert_chat_response_to_responses_json(&chat_json, &original_model)?;
+                Ok(buffered_response(
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&response_json)?,
+                ))
+            }
+        }
+        RouterResponse::Streaming { .. } => {
+            anyhow::bail!("internal error: responses route expected buffered chat response");
+        }
+    }
+}
+
+async fn handle_chat_body(mut body: Value, state: &ServeState) -> Result<RouterResponse> {
     let client_wants_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -213,6 +282,19 @@ async fn handle_chat(request: &str, state: &ServeState) -> Result<RouterResponse
         }
         ProviderProtocol::Google => handle_chat_gemini(&mut body, client_wants_stream, state).await,
         ProviderProtocol::Openai => handle_chat_openai(&mut body, client_wants_stream, state).await,
+    }
+}
+
+fn responses_router_config(state: &ServeState) -> CodexRouterConfig {
+    CodexRouterConfig {
+        target_base_url: state.config.upstream_base_url.clone(),
+        api_key: state.config.upstream_api_key.clone(),
+        target_protocol: state.config.upstream_protocol,
+        copilot_token_manager: state.copilot_tokens.clone(),
+        model_prefix: None,
+        requires_reasoning_content: false,
+        actual_model: None,
+        max_tokens_cap: None,
     }
 }
 
@@ -1003,9 +1085,34 @@ fn map_gemini_finish_reason(finish_reason: &str, saw_tool_call: bool) -> &'stati
     }
 }
 
+fn convert_chat_response_to_responses_json(chat: &Value, original_model: &str) -> Result<Value> {
+    let sse = convert_chat_response_to_responses_sse(chat, false, original_model);
+    extract_completed_response_from_sse(&sse)
+        .ok_or_else(|| anyhow::anyhow!("failed to synthesize responses JSON payload"))
+}
+
+fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
+    let mut saw_completed_event = false;
+
+    for line in sse.lines() {
+        if let Some(event) = line.strip_prefix("event:") {
+            saw_completed_event = event.trim() == "response.completed";
+            continue;
+        }
+
+        if saw_completed_event && let Some(data) = sse_data_payload(line) {
+            let payload: Value = serde_json::from_str(data).ok()?;
+            return payload.get("response").cloned();
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_anthropic_stream_converter_emits_openai_sse() {
@@ -1059,5 +1166,50 @@ mod tests {
         assert!(output.contains("\"name\":\"shell\""));
         assert!(output.contains("\"finish_reason\":\"tool_calls\""));
         assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_convert_chat_response_to_responses_json_text() {
+        let chat = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "Hello from responses"}
+            }]
+        });
+
+        let response = convert_chat_response_to_responses_json(&chat, "gpt-4o").unwrap();
+
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["model"], "gpt-4o");
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(
+            response["output"][0]["content"][0]["text"],
+            "Hello from responses"
+        );
+    }
+
+    #[test]
+    fn test_convert_chat_response_to_responses_json_tool_call() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let response = convert_chat_response_to_responses_json(&chat, "gpt-4o").unwrap();
+
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["call_id"], "call_123");
+        assert_eq!(response["output"][0]["name"], "shell");
     }
 }
