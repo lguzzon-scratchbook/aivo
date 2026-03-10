@@ -49,7 +49,6 @@ mod zeroizing_string {
     }
 }
 
-
 const IV_LENGTH: usize = 16;
 const SALT_LENGTH: usize = 32;
 const KEY_LENGTH: usize = 32;
@@ -301,9 +300,36 @@ pub struct ChatSessionState {
     pub cwd: String,
     pub model: String,
     /// Raw encrypted blob. Call `decrypt_messages()` to get the actual messages.
+    #[serde(deserialize_with = "deserialize_messages_field")]
     pub messages: String,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
+}
+
+/// Deserializes the `messages` field, handling both the legacy array format and the current
+/// encrypted string format. Legacy sessions stored messages as a JSON array; they are
+/// re-encrypted on the fly so the field always holds an encrypted string after loading.
+fn deserialize_messages_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        // Current format: already an encrypted string
+        Value::String(s) => Ok(s),
+        // Legacy format: plain JSON array of {role, content} objects — re-encrypt it
+        Value::Array(_) => {
+            let json = serde_json::to_string(&value).map_err(D::Error::custom)?;
+            encrypt(&json).map_err(D::Error::custom)
+        }
+        other => Err(D::Error::custom(format!(
+            "expected string or array for messages, got {}",
+            other
+        ))),
+    }
 }
 
 impl ChatSessionState {
@@ -401,11 +427,7 @@ impl StoredConfig {
 /// Cached via OnceLock since inputs never change during a process lifetime.
 fn derive_key() -> SecretKey {
     static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
-    CACHED_KEY
-        .get_or_init(|| {
-            derive_key_inner()
-        })
-        .clone()
+    CACHED_KEY.get_or_init(|| derive_key_inner()).clone()
 }
 
 fn derive_key_inner() -> SecretKey {
@@ -433,11 +455,7 @@ fn derive_key_inner() -> SecretKey {
 /// Cached via OnceLock since inputs never change during a process lifetime.
 fn derive_key_v3() -> SecretKey {
     static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
-    CACHED_KEY
-        .get_or_init(|| {
-            derive_key_v3_inner()
-        })
-        .clone()
+    CACHED_KEY.get_or_init(|| derive_key_v3_inner()).clone()
 }
 
 fn derive_key_v3_inner() -> SecretKey {
@@ -498,7 +516,11 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
     combined.extend_from_slice(&ciphertext);
 
     // Encode as base64 with v3 marker
-    Ok(format!("{}{}", V3_ENCRYPTION_MARKER, BASE64.encode(&combined)))
+    Ok(format!(
+        "{}{}",
+        V3_ENCRYPTION_MARKER,
+        BASE64.encode(&combined)
+    ))
 }
 
 /// Decrypts an encrypted string. Supports both v3 (enc3:) and legacy v2 (enc:) formats.
@@ -668,15 +690,20 @@ impl SessionStore {
         {
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::Foundation::BOOL;
-            use windows_sys::Win32::Storage::FileSystem::{
-                LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
-            };
+            use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
 
             let handle = file.as_raw_handle();
             let mut overlapped = unsafe { std::mem::zeroed() };
             // SAFETY: handle is valid; we own `file` for the guard's lifetime.
             let rc: BOOL = unsafe {
-                LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, u32::MAX, u32::MAX, &mut overlapped)
+                LockFileEx(
+                    handle,
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
             };
             if rc == 0 {
                 return Err(std::io::Error::last_os_error())
@@ -694,8 +721,7 @@ impl SessionStore {
             .await
             .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
 
-        let data =
-            serde_json::to_string_pretty(config).context("Failed to serialize config")?;
+        let data = serde_json::to_string_pretty(config).context("Failed to serialize config")?;
 
         let tmp_path = self.config_path.with_extension("json.tmp");
 
@@ -1182,7 +1208,6 @@ impl SessionStore {
         );
         self.save_raw(&config).await
     }
-
 }
 
 fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
@@ -1833,6 +1858,67 @@ mod tests {
         // Should decrypt successfully using legacy path
         let decrypted = decrypt(&v2_encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_chat_session_messages_migration_from_legacy_array() {
+        // Simulate a config.json written by the old code: messages is a JSON array
+        let json = r#"{
+            "sessionId": "sess1",
+            "keyId": "key1",
+            "baseUrl": "https://api.example.com",
+            "cwd": "/tmp",
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"}
+            ],
+            "updatedAt": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let session: ChatSessionState =
+            serde_json::from_str(json).expect("should migrate legacy array");
+
+        // After migration the field should be an encrypted string
+        assert!(
+            is_encrypted(&session.messages),
+            "messages should be re-encrypted"
+        );
+
+        // And decryption should yield the original messages
+        let messages = session
+            .decrypt_messages()
+            .expect("should decrypt migrated messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "hi there");
+    }
+
+    #[test]
+    fn test_chat_session_messages_current_format_roundtrip() {
+        let msgs = vec![
+            StoredChatMessage {
+                role: "user".into(),
+                content: "ping".into(),
+            },
+            StoredChatMessage {
+                role: "assistant".into(),
+                content: "pong".into(),
+            },
+        ];
+        let json = serde_json::to_string(&msgs).unwrap();
+        let encrypted = encrypt(&json).unwrap();
+
+        let session_json = format!(
+            r#"{{"sessionId":"s","keyId":"k","baseUrl":"u","cwd":"/","model":"m","messages":{},"updatedAt":"2024-01-01T00:00:00Z"}}"#,
+            serde_json::to_string(&encrypted).unwrap()
+        );
+
+        let session: ChatSessionState = serde_json::from_str(&session_json).unwrap();
+        let decoded = session.decrypt_messages().unwrap();
+        assert_eq!(decoded, msgs);
     }
 
     // Tests moved from tests/encryption_property.rs

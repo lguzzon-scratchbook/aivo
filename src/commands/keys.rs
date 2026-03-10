@@ -588,8 +588,7 @@ impl KeysCommand {
         empty_message: &str,
     ) -> Result<KeySelection> {
         // Load without decrypting — only metadata is needed for selection.
-        let (all_keys, active_key_id) =
-            self.session_store.get_keys_and_active_id_info().await?;
+        let (all_keys, active_key_id) = self.session_store.get_keys_and_active_id_info().await?;
 
         if all_keys.is_empty() {
             println!("{}", style::dim(empty_message));

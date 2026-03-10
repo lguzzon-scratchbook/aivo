@@ -540,14 +540,26 @@ mod tests {
 
     #[test]
     fn model_inline_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--model=gpt-4o", "file.ts"]));
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            vec![],
+            &args(&["--model=gpt-4o", "file.ts"]),
+        );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
         assert_eq!(r.remaining_args, args(&["file.ts"]));
     }
 
     #[test]
     fn model_space_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--model", "gpt-4o", "file.ts"]));
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            vec![],
+            &args(&["--model", "gpt-4o", "file.ts"]),
+        );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
         assert_eq!(r.remaining_args, args(&["file.ts"]));
     }
@@ -651,13 +663,25 @@ mod tests {
 
     #[test]
     fn initial_envs_preserved() {
-        let r = extract_aivo_flags(None, None, false, vec!["PRE=1".to_string()], &args(&["-e", "POST=2"]));
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            vec!["PRE=1".to_string()],
+            &args(&["-e", "POST=2"]),
+        );
         assert_eq!(r.env_strings, vec!["PRE=1", "POST=2"]);
     }
 
     #[test]
     fn unknown_args_pass_through() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--agent-name", "foo", "--resume"]));
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            vec![],
+            &args(&["--agent-name", "foo", "--resume"]),
+        );
         assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "--resume"]));
         assert_eq!(r.model, None);
     }
@@ -669,7 +693,14 @@ mod tests {
             None,
             false,
             vec![],
-            &args(&["--agent-name", "foo", "--model", "gpt-4o", "--debug", "file.ts"]),
+            &args(&[
+                "--agent-name",
+                "foo",
+                "--model",
+                "gpt-4o",
+                "--debug",
+                "file.ts",
+            ]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
         assert!(r.debug);

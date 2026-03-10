@@ -36,15 +36,19 @@ impl ProviderQuirks {
         } else {
             None
         };
-        let requires_reasoning_content =
-            base_url.contains("moonshot.cn") || base_url.contains("moonshot.ai")
+        let requires_reasoning_content = base_url.contains("moonshot.cn")
+            || base_url.contains("moonshot.ai")
             || base_url.contains("deepseek.com");
         let max_tokens_cap = if base_url.contains("deepseek.com") {
             Some(8192)
         } else {
             None
         };
-        Self { model_prefix, requires_reasoning_content, max_tokens_cap }
+        Self {
+            model_prefix,
+            requires_reasoning_content,
+            max_tokens_cap,
+        }
     }
 
     /// Injects the quirk env vars into `env` using the given key prefix (e.g. `"AIVO_OPENAI_ROUTER"`).
