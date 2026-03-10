@@ -96,13 +96,8 @@ impl FuzzySelect {
                 lines
             };
 
-            let key = match term.read_key() {
+            let key = match term.read_key_raw() {
                 Ok(key) => key,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    let _ = term.clear_last_lines(1 + items_drawn);
-                    let _ = term.show_cursor();
-                    return Ok(None);
-                }
                 Err(e) => {
                     let _ = term.clear_last_lines(1 + items_drawn);
                     let _ = term.show_cursor();
@@ -137,7 +132,7 @@ impl FuzzySelect {
                     }
                     return Ok(None);
                 }
-                Key::Escape => {
+                Key::Escape | Key::CtrlC => {
                     term.show_cursor()?;
                     return Ok(None);
                 }
