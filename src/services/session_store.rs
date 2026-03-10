@@ -49,29 +49,6 @@ mod zeroizing_string {
     }
 }
 
-mod encrypted_chat_messages {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use super::{StoredChatMessage, decrypt, encrypt};
-
-    pub fn serialize<S>(value: &[StoredChatMessage], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let json = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
-        let encrypted = encrypt(&json).map_err(serde::ser::Error::custom)?;
-        serializer.serialize_str(&encrypted)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<StoredChatMessage>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        let decrypted = decrypt(&value).map_err(serde::de::Error::custom)?;
-        serde_json::from_str(&decrypted).map_err(serde::de::Error::custom)
-    }
-}
 
 const IV_LENGTH: usize = 16;
 const SALT_LENGTH: usize = 32;
@@ -323,10 +300,26 @@ pub struct ChatSessionState {
     pub base_url: String,
     pub cwd: String,
     pub model: String,
-    #[serde(with = "encrypted_chat_messages")]
-    pub messages: Vec<StoredChatMessage>,
+    /// Raw encrypted blob. Call `decrypt_messages()` to get the actual messages.
+    pub messages: String,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
+}
+
+impl ChatSessionState {
+    /// Returns the number of messages. Returns 0 if empty or on decryption error.
+    pub fn message_count(&self) -> usize {
+        self.decrypt_messages().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Decrypts and returns the stored messages.
+    pub fn decrypt_messages(&self) -> Result<Vec<StoredChatMessage>> {
+        if self.messages.is_empty() {
+            return Ok(vec![]);
+        }
+        let json = decrypt(&self.messages)?;
+        serde_json::from_str(&json).context("Failed to parse stored messages")
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -1173,6 +1166,8 @@ impl SessionStore {
         let _lock = self.acquire_config_lock()?;
         let mut config = self.load().await?;
         let map_key = chat_session_map_key(key_id, cwd, session_id);
+        let json = serde_json::to_string(messages).context("Failed to serialize messages")?;
+        let encrypted = encrypt(&json)?;
         config.chat_sessions.insert(
             map_key,
             ChatSessionState {
@@ -1181,7 +1176,7 @@ impl SessionStore {
                 base_url: base_url.to_string(),
                 cwd: cwd.to_string(),
                 model: model.to_string(),
-                messages: messages.to_vec(),
+                messages: encrypted,
                 updated_at: Utc::now().to_rfc3339(),
             },
         );
@@ -1571,7 +1566,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.message_count(), 1);
         assert_eq!(session.session_id, "legacy");
 
         store

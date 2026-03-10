@@ -382,16 +382,19 @@ impl ChatCommand {
             }
         }
 
-        if let Some(saved_session) = self
+        if let Some((saved_session, saved_messages)) = self
             .session_store
             .get_chat_session(&key.id, &key.base_url, &cwd)
             .await?
-            .filter(|session| !session.messages.is_empty())
+            .and_then(|session| {
+                let msgs = session.decrypt_messages().ok()?;
+                (!msgs.is_empty()).then_some((session, msgs))
+            })
         {
             let resume = prompt_yes_no(
                 &format!(
                     "Resume your last session in this directory? ({} messages)",
-                    saved_session.messages.len()
+                    saved_messages.len()
                 ),
                 true,
             )?;
@@ -401,8 +404,7 @@ impl ChatCommand {
                     raw_model = saved_session.model.clone();
                     model = Self::transform_model_for_provider(&key.base_url, &raw_model);
                 }
-                history = saved_session
-                    .messages
+                history = saved_messages
                     .into_iter()
                     .map(|message| ChatMessage {
                         role: message.role,
@@ -494,11 +496,11 @@ impl ChatCommand {
                         .set_chat_model(&key.id, &raw_model)
                         .await?;
                     history = session
-                        .messages
-                        .iter()
+                        .decrypt_messages()?
+                        .into_iter()
                         .map(|message| ChatMessage {
-                            role: message.role.clone(),
-                            content: message.content.clone(),
+                            role: message.role,
+                            content: message.content,
                         })
                         .collect();
                     format = ChatFormat::OpenAI;
@@ -811,7 +813,7 @@ fn format_session_choice(session: &crate::services::session_store::ChatSessionSt
     format!(
         "{} · {} messages · {}",
         session.model,
-        session.messages.len(),
+        session.message_count(),
         updated
     )
 }
