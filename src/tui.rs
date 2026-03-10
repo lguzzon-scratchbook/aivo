@@ -44,7 +44,6 @@ impl FuzzySelect {
         let mut selection = self.default.min(self.items.len().saturating_sub(1));
         let mut page_start = 0;
         let page_size = 10;
-        let mut lines_drawn = 0usize;
 
         loop {
             let filtered: Vec<(usize, &String)> = self
@@ -72,19 +71,13 @@ impl FuzzySelect {
 
             let end_idx = (page_start + page_size).min(count);
 
-            // Clear previously drawn lines by moving up and erasing
-            if lines_drawn > 0 {
-                term.move_cursor_up(lines_drawn)?;
-                term.clear_to_end_of_screen()?;
-            }
-
             term.write_line(&format!("{}: {}", crate::style::bold(&self.prompt), query))?;
-            lines_drawn = 1;
 
-            if count == 0 {
+            let items_drawn = if count == 0 {
                 term.write_line(&format!("  {}", crate::style::dim("(no matches)")))?;
-                lines_drawn += 1;
+                1
             } else {
+                let mut lines = 0;
                 for (i, (_, item)) in filtered.iter().enumerate().take(end_idx).skip(page_start) {
                     let is_selected = i == selection;
                     let symbol = if is_selected {
@@ -98,25 +91,27 @@ impl FuzzySelect {
                         crate::style::dim(item)
                     };
                     term.write_line(&format!("{} {}", symbol, styled_item))?;
-                    lines_drawn += 1;
+                    lines += 1;
                 }
-            }
+                lines
+            };
 
             let key = match term.read_key() {
                 Ok(key) => key,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    let _ = term.move_cursor_up(lines_drawn);
-                    let _ = term.clear_to_end_of_screen();
+                    let _ = term.clear_last_lines(1 + items_drawn);
                     let _ = term.show_cursor();
                     return Ok(None);
                 }
                 Err(e) => {
-                    let _ = term.move_cursor_up(lines_drawn);
-                    let _ = term.clear_to_end_of_screen();
+                    let _ = term.clear_last_lines(1 + items_drawn);
                     let _ = term.show_cursor();
                     return Err(e);
                 }
             };
+
+            // Clear drawn lines before next iteration or exit
+            term.clear_last_lines(1 + items_drawn)?;
 
             match key {
                 Key::ArrowUp | Key::Char('\x10') => {
@@ -136,8 +131,6 @@ impl FuzzySelect {
                     }
                 }
                 Key::Enter => {
-                    term.move_cursor_up(lines_drawn)?;
-                    term.clear_to_end_of_screen()?;
                     term.show_cursor()?;
                     if count > 0 {
                         return Ok(Some(filtered[selection].0));
@@ -145,8 +138,6 @@ impl FuzzySelect {
                     return Ok(None);
                 }
                 Key::Escape => {
-                    term.move_cursor_up(lines_drawn)?;
-                    term.clear_to_end_of_screen()?;
                     term.show_cursor()?;
                     return Ok(None);
                 }
