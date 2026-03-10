@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::models::fetch_models;
@@ -72,6 +73,10 @@ enum StreamingBody {
         upstream: reqwest::Response,
         converter: GeminiToOpenAIStreamConverter,
     },
+    Responses {
+        source: Box<StreamingBody>,
+        converter: OpenAIToResponsesStreamConverter,
+    },
 }
 
 #[derive(Default)]
@@ -102,6 +107,50 @@ struct GeminiToOpenAIStreamConverter {
     saw_tool_call: bool,
     next_tool_index: usize,
 }
+
+struct OpenAIToResponsesStreamConverter {
+    pending: String,
+    response_id: String,
+    created_at: u64,
+    model: String,
+    started: bool,
+    completed: bool,
+    text_item: Option<ResponsesTextItemState>,
+    tool_calls: HashMap<usize, ResponsesToolCallState>,
+    next_output_index: usize,
+}
+
+struct ResponsesTextItemState {
+    item_id: String,
+    output_index: usize,
+    content: String,
+}
+
+struct ResponsesToolCallState {
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    output_index: usize,
+    started: bool,
+}
+
+enum ResponsesOutputItem {
+    Message {
+        item_id: String,
+        output_index: usize,
+        content: String,
+    },
+    FunctionCall {
+        item_id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        output_index: usize,
+    },
+}
+
+static RESPONSES_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl ServeRouter {
     pub fn new(config: ServeRouterConfig, key: ApiKey) -> Self {
@@ -232,7 +281,8 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let chat_body = convert_responses_to_chat_request(&body, &responses_router_config(state));
+    let mut chat_body = convert_responses_to_chat_request(&body, &responses_router_config(state));
+    chat_body["stream"] = json!(client_wants_stream);
     let chat_response = handle_chat_body(chat_body, state).await?;
 
     match chat_response {
@@ -247,8 +297,11 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
 
             let chat_json: Value = serde_json::from_slice(&body)?;
             if client_wants_stream {
-                let sse =
-                    convert_chat_response_to_responses_sse(&chat_json, false, &original_model);
+                let sse = if content_type.contains("text/event-stream") {
+                    convert_chat_sse_to_responses_sse(std::str::from_utf8(&body)?, &original_model)?
+                } else {
+                    convert_chat_response_to_responses_sse(&chat_json, false, &original_model)
+                };
                 Ok(buffered_response(
                     200,
                     "text/event-stream",
@@ -264,8 +317,25 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
                 ))
             }
         }
-        RouterResponse::Streaming { .. } => {
-            anyhow::bail!("internal error: responses route expected buffered chat response");
+        RouterResponse::Streaming {
+            status,
+            content_type: _,
+            body,
+        } => {
+            if !client_wants_stream {
+                anyhow::bail!(
+                    "internal error: responses route received streaming body for non-streaming request"
+                );
+            }
+
+            Ok(RouterResponse::Streaming {
+                status,
+                content_type: "text/event-stream".to_string(),
+                body: StreamingBody::Responses {
+                    source: Box::new(body),
+                    converter: OpenAIToResponsesStreamConverter::new(&original_model),
+                },
+            })
         }
     }
 }
@@ -576,6 +646,71 @@ async fn write_router_response(
                             write_chunk(socket, mapped.as_bytes()).await?;
                         }
                     }
+                    let tail = converter.finish()?;
+                    if !tail.is_empty() {
+                        write_chunk(socket, tail.as_bytes()).await?;
+                    }
+                }
+                StreamingBody::Responses {
+                    source,
+                    mut converter,
+                } => {
+                    match *source {
+                        StreamingBody::Upstream(mut upstream) => {
+                            while let Some(chunk) = upstream.chunk().await? {
+                                let mapped = converter.push_bytes(&chunk)?;
+                                if !mapped.is_empty() {
+                                    write_chunk(socket, mapped.as_bytes()).await?;
+                                }
+                            }
+                        }
+                        StreamingBody::Anthropic {
+                            mut upstream,
+                            converter: mut openai_converter,
+                        } => {
+                            while let Some(chunk) = upstream.chunk().await? {
+                                let openai = openai_converter.push_bytes(&chunk)?;
+                                if !openai.is_empty() {
+                                    let mapped = converter.push_bytes(openai.as_bytes())?;
+                                    if !mapped.is_empty() {
+                                        write_chunk(socket, mapped.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            let openai_tail = openai_converter.finish()?;
+                            if !openai_tail.is_empty() {
+                                let mapped = converter.push_bytes(openai_tail.as_bytes())?;
+                                if !mapped.is_empty() {
+                                    write_chunk(socket, mapped.as_bytes()).await?;
+                                }
+                            }
+                        }
+                        StreamingBody::Gemini {
+                            mut upstream,
+                            converter: mut openai_converter,
+                        } => {
+                            while let Some(chunk) = upstream.chunk().await? {
+                                let openai = openai_converter.push_bytes(&chunk)?;
+                                if !openai.is_empty() {
+                                    let mapped = converter.push_bytes(openai.as_bytes())?;
+                                    if !mapped.is_empty() {
+                                        write_chunk(socket, mapped.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            let openai_tail = openai_converter.finish()?;
+                            if !openai_tail.is_empty() {
+                                let mapped = converter.push_bytes(openai_tail.as_bytes())?;
+                                if !mapped.is_empty() {
+                                    write_chunk(socket, mapped.as_bytes()).await?;
+                                }
+                            }
+                        }
+                        StreamingBody::Responses { .. } => {
+                            anyhow::bail!("nested responses stream sources are not supported");
+                        }
+                    }
+
                     let tail = converter.finish()?;
                     if !tail.is_empty() {
                         write_chunk(socket, tail.as_bytes()).await?;
@@ -1085,10 +1220,454 @@ fn map_gemini_finish_reason(finish_reason: &str, saw_tool_call: bool) -> &'stati
     }
 }
 
+impl OpenAIToResponsesStreamConverter {
+    fn new(original_model: &str) -> Self {
+        Self {
+            pending: String::new(),
+            response_id: next_responses_id("resp"),
+            created_at: current_unix_ts(),
+            model: original_model.to_string(),
+            started: false,
+            completed: false,
+            text_item: None,
+            tool_calls: HashMap::new(),
+            next_output_index: 0,
+        }
+    }
+
+    fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
+        self.pending.push_str(&String::from_utf8_lossy(chunk));
+        let mut output = String::new();
+
+        while let Some(pos) = self.pending.find('\n') {
+            let line = self.pending[..pos].trim_end_matches('\r').to_string();
+            self.pending = self.pending[pos + 1..].to_string();
+            self.process_line(&line, &mut output)?;
+        }
+
+        Ok(output)
+    }
+
+    fn finish(&mut self) -> Result<String> {
+        let mut output = String::new();
+
+        let tail = self.pending.trim_end_matches('\r').trim().to_string();
+        self.pending.clear();
+        if !tail.is_empty() {
+            self.process_line(&tail, &mut output)?;
+        }
+
+        if !self.completed {
+            self.finalize(&mut output);
+        }
+
+        Ok(output)
+    }
+
+    fn process_line(&mut self, line: &str, output: &mut String) -> Result<()> {
+        let Some(data) = sse_data_payload(line) else {
+            return Ok(());
+        };
+
+        if data == "[DONE]" {
+            if !self.completed {
+                self.finalize(output);
+            }
+            return Ok(());
+        }
+
+        let chunk: Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(_) => return Ok(()),
+        };
+
+        if let Some(model) = chunk.get("model").and_then(|v| v.as_str())
+            && !model.is_empty()
+            && self.model.is_empty()
+        {
+            self.model = model.to_string();
+        }
+
+        let choice = chunk
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+
+        if !delta.is_null() {
+            self.ensure_started(output);
+        }
+
+        if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+            && !text.is_empty()
+        {
+            self.ensure_text_item(output);
+            if let Some(text_item) = self.text_item.as_mut() {
+                text_item.content.push_str(text);
+                output.push_str(&responses_sse_event(
+                    "response.output_text.delta",
+                    json!({
+                        "type": "response.output_text.delta",
+                        "response_id": self.response_id,
+                        "item_id": text_item.item_id,
+                        "output_index": text_item.output_index,
+                        "content_index": 0,
+                        "delta": text
+                    }),
+                ));
+            }
+        }
+
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            for tool_call in tool_calls {
+                let index = tool_call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if !self.tool_calls.contains_key(&index) {
+                    let output_index = self.take_output_index();
+                    self.tool_calls.insert(
+                        index,
+                        ResponsesToolCallState {
+                            item_id: next_responses_id("fc"),
+                            call_id: tool_call
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .filter(|v| !v.is_empty())
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| format!("call_{index}")),
+                            name: String::new(),
+                            arguments: String::new(),
+                            output_index,
+                            started: false,
+                        },
+                    );
+                }
+                let state = self
+                    .tool_calls
+                    .get_mut(&index)
+                    .expect("tool state inserted");
+
+                if let Some(call_id) = tool_call.get("id").and_then(|v| v.as_str())
+                    && !call_id.is_empty()
+                {
+                    state.call_id = call_id.to_string();
+                }
+                if let Some(name) = tool_call
+                    .get("function")
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    && !name.is_empty()
+                {
+                    state.name = name.to_string();
+                }
+
+                if !state.started {
+                    output.push_str(&responses_sse_event(
+                        "response.output_item.added",
+                        json!({
+                            "type": "response.output_item.added",
+                            "response_id": self.response_id,
+                            "output_index": state.output_index,
+                            "item": {
+                                "id": state.item_id,
+                                "call_id": state.call_id,
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "name": state.name,
+                                "arguments": state.arguments
+                            }
+                        }),
+                    ));
+                    state.started = true;
+                }
+
+                if let Some(arguments) = tool_call
+                    .get("function")
+                    .and_then(|v| v.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    && !arguments.is_empty()
+                {
+                    state.arguments.push_str(arguments);
+                    output.push_str(&responses_sse_event(
+                        "response.function_call_arguments.delta",
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "response_id": self.response_id,
+                            "output_index": state.output_index,
+                            "item_id": state.item_id,
+                            "delta": arguments
+                        }),
+                    ));
+                }
+            }
+        }
+
+        if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str())
+            && !finish_reason.is_empty()
+        {
+            self.finalize(output);
+        }
+
+        Ok(())
+    }
+
+    fn ensure_started(&mut self, output: &mut String) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        output.push_str(&responses_sse_event(
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "model": self.model,
+                    "created_at": self.created_at,
+                    "status": "in_progress",
+                    "output": []
+                }
+            }),
+        ));
+    }
+
+    fn ensure_text_item(&mut self, output: &mut String) {
+        if self.text_item.is_some() {
+            return;
+        }
+
+        let output_index = self.take_output_index();
+        let item_id = next_responses_id("msg");
+        output.push_str(&responses_sse_event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "response_id": self.response_id,
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            }),
+        ));
+        output.push_str(&responses_sse_event(
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "response_id": self.response_id,
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""}
+            }),
+        ));
+        self.text_item = Some(ResponsesTextItemState {
+            item_id,
+            output_index,
+            content: String::new(),
+        });
+    }
+
+    fn finalize(&mut self, output: &mut String) {
+        if self.completed {
+            return;
+        }
+
+        self.ensure_started(output);
+
+        if self.text_item.is_none() && self.tool_calls.is_empty() {
+            self.ensure_text_item(output);
+        }
+
+        if let Some(text_item) = self.text_item.as_ref() {
+            output.push_str(&responses_sse_event(
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "response_id": self.response_id,
+                    "item_id": text_item.item_id,
+                    "output_index": text_item.output_index,
+                    "content_index": 0,
+                    "text": text_item.content
+                }),
+            ));
+            output.push_str(&responses_sse_event(
+                "response.content_part.done",
+                json!({
+                    "type": "response.content_part.done",
+                    "response_id": self.response_id,
+                    "item_id": text_item.item_id,
+                    "output_index": text_item.output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": text_item.content}
+                }),
+            ));
+            output.push_str(&responses_sse_event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "response_id": self.response_id,
+                    "output_index": text_item.output_index,
+                    "item": {
+                        "id": text_item.item_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": text_item.content,
+                            "annotations": []
+                        }]
+                    }
+                }),
+            ));
+        }
+
+        let mut tool_indexes: Vec<usize> = self.tool_calls.keys().copied().collect();
+        tool_indexes.sort_unstable();
+        for index in tool_indexes {
+            if let Some(tool_call) = self.tool_calls.get(&index) {
+                output.push_str(&responses_sse_event(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "response_id": self.response_id,
+                        "output_index": tool_call.output_index,
+                        "item_id": tool_call.item_id,
+                        "arguments": tool_call.arguments
+                    }),
+                ));
+                output.push_str(&responses_sse_event(
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "response_id": self.response_id,
+                        "output_index": tool_call.output_index,
+                        "item": {
+                            "id": tool_call.item_id,
+                            "call_id": tool_call.call_id,
+                            "type": "function_call",
+                            "status": "completed",
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments
+                        }
+                    }),
+                ));
+            }
+        }
+
+        let output_items = self.output_items();
+        output.push_str(&responses_sse_event(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "model": self.model,
+                    "created_at": self.created_at,
+                    "status": "completed",
+                    "output": output_items
+                }
+            }),
+        ));
+
+        self.completed = true;
+    }
+
+    fn take_output_index(&mut self) -> usize {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
+    }
+
+    fn output_items(&self) -> Vec<Value> {
+        let mut items = Vec::new();
+
+        if let Some(text_item) = self.text_item.as_ref() {
+            items.push(ResponsesOutputItem::Message {
+                item_id: text_item.item_id.clone(),
+                output_index: text_item.output_index,
+                content: text_item.content.clone(),
+            });
+        }
+
+        let mut tool_items: Vec<ResponsesOutputItem> = self
+            .tool_calls
+            .values()
+            .map(|tool_call| ResponsesOutputItem::FunctionCall {
+                item_id: tool_call.item_id.clone(),
+                call_id: tool_call.call_id.clone(),
+                name: tool_call.name.clone(),
+                arguments: tool_call.arguments.clone(),
+                output_index: tool_call.output_index,
+            })
+            .collect();
+        items.append(&mut tool_items);
+        items.sort_by_key(|item| match item {
+            ResponsesOutputItem::Message { output_index, .. } => *output_index,
+            ResponsesOutputItem::FunctionCall { output_index, .. } => *output_index,
+        });
+
+        items
+            .into_iter()
+            .map(|item| match item {
+                ResponsesOutputItem::Message {
+                    item_id, content, ..
+                } => json!({
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": content,
+                        "annotations": []
+                    }]
+                }),
+                ResponsesOutputItem::FunctionCall {
+                    item_id,
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => json!({
+                    "id": item_id,
+                    "call_id": call_id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "name": name,
+                    "arguments": arguments
+                }),
+            })
+            .collect()
+    }
+}
+
 fn convert_chat_response_to_responses_json(chat: &Value, original_model: &str) -> Result<Value> {
     let sse = convert_chat_response_to_responses_sse(chat, false, original_model);
     extract_completed_response_from_sse(&sse)
         .ok_or_else(|| anyhow::anyhow!("failed to synthesize responses JSON payload"))
+}
+
+fn convert_chat_sse_to_responses_sse(chat_sse: &str, original_model: &str) -> Result<String> {
+    let mut converter = OpenAIToResponsesStreamConverter::new(original_model);
+    let mut output = converter.push_bytes(chat_sse.as_bytes())?;
+    output.push_str(&converter.finish()?);
+    Ok(output)
+}
+
+fn responses_sse_event(event: &str, data: Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
+fn next_responses_id(prefix: &str) -> String {
+    let count = RESPONSES_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}_{}_{count}", current_unix_ts())
 }
 
 fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
@@ -1211,5 +1790,41 @@ mod tests {
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["call_id"], "call_123");
         assert_eq!(response["output"][0]["name"], "shell");
+    }
+
+    #[test]
+    fn test_convert_chat_sse_to_responses_sse_text() {
+        let chat_sse = concat!(
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let responses_sse = convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o").unwrap();
+
+        assert!(responses_sse.contains("event: response.created"));
+        assert!(responses_sse.contains("event: response.output_text.delta"));
+        assert!(responses_sse.contains("\"delta\":\"Hel\""));
+        assert!(responses_sse.contains("\"delta\":\"lo\""));
+        assert!(responses_sse.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_convert_chat_sse_to_responses_sse_tool_call() {
+        let chat_sse = concat!(
+            "data: {\"id\":\"chatcmpl_2\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_2\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"shell\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_2\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let responses_sse = convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o").unwrap();
+
+        assert!(responses_sse.contains("event: response.output_item.added"));
+        assert!(responses_sse.contains("event: response.function_call_arguments.delta"));
+        assert!(responses_sse.contains("\"call_id\":\"call_abc\""));
+        assert!(responses_sse.contains("\"delta\":\"{\\\"cmd\\\":\\\"ls\\\"}\""));
+        assert!(responses_sse.contains("event: response.completed"));
     }
 }
