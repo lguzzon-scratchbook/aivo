@@ -72,3 +72,70 @@ pub fn current_dir() -> Option<PathBuf> {
 pub fn current_dir_string() -> Option<String> {
     current_dir().map(|path| path.to_string_lossy().to_string())
 }
+
+/// Returns a hardware-specific machine identifier.
+/// - macOS: IOPlatformUUID
+/// - Linux: /etc/machine-id
+/// - Windows: HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+pub fn machine_id() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(pos) = line.find("IOPlatformUUID")
+                && let Some(start) = line[pos..].find('"').map(|i| pos + i + 1)
+                && let Some(end) = line[start..].find('"').map(|i| start + i)
+            {
+                // Format: "IOPlatformUUID" = "XXXXXXXX-..."
+                let uuid = line[start..end].trim().to_string();
+                if !uuid.is_empty() {
+                    return Some(uuid);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/etc/machine-id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains("MachineGuid") {
+                // Format: MachineGuid    REG_SZ    XXXXXXXX-...
+                if let Some(guid) = line.split_whitespace().last() {
+                    let guid = guid.trim().to_string();
+                    if !guid.is_empty() {
+                        return Some(guid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}

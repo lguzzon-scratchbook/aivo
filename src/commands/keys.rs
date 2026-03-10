@@ -1,13 +1,13 @@
 /**
  * KeysCommand handler for managing API keys.
  */
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::cli::KeysArgs;
 use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
-use crate::services::session_store::{self, ApiKey, SessionStore};
+use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
 enum KeySelection {
@@ -168,7 +168,8 @@ impl KeysCommand {
             )
             .await?
         {
-            KeySelection::Key(key) => {
+            KeySelection::Key(mut key) => {
+                SessionStore::decrypt_key_secret(&mut key)?;
                 self.activate_key(&key).await?;
                 Ok(ExitCode::Success)
             }
@@ -204,7 +205,8 @@ impl KeysCommand {
             )
             .await?
         {
-            KeySelection::Key(key) => {
+            KeySelection::Key(mut key) => {
+                SessionStore::decrypt_key_secret(&mut key)?;
                 self.display_key_details(&key);
                 Ok(ExitCode::Success)
             }
@@ -234,7 +236,10 @@ impl KeysCommand {
             .resolve_key_selection(key_id_or_name, "Select a key to edit", "No API keys found.")
             .await?
         {
-            KeySelection::Key(key) => key,
+            KeySelection::Key(mut key) => {
+                SessionStore::decrypt_key_secret(&mut key)?;
+                key
+            }
             KeySelection::Cancelled => {
                 println!("{}", style::dim("Cancelled."));
                 return Ok(ExitCode::Success);
@@ -552,8 +557,7 @@ impl KeysCommand {
         };
 
         // Show confirmation
-        let preview = key_preview(&key_to_remove.key);
-        println!("Key: {} {}", style::cyan(&key_to_remove.id), preview);
+        println!("ID:  {}", style::cyan(&key_to_remove.id));
         println!("URL: {}", style::dim(&key_to_remove.base_url));
         println!();
 
@@ -631,18 +635,8 @@ impl KeysCommand {
             prompt_pick_key(&all_keys, prompt, default_idx)?
         };
 
-        // Decrypt only the selected key's secret.
         match selected {
-            Some(mut key) => {
-                if session_store::is_encrypted(&key.key) {
-                    let plaintext = session_store::decrypt(&key.key)
-                        .with_context(|| {
-                            format!("failed to decrypt key '{}'", key.display_name())
-                        })?;
-                    key.key = zeroize::Zeroizing::new(plaintext);
-                }
-                Ok(KeySelection::Key(key))
-            }
+            Some(key) => Ok(KeySelection::Key(key)),
             None => Ok(KeySelection::Cancelled),
         }
     }
@@ -707,7 +701,8 @@ pub(crate) async fn prompt_select_key(
     default: usize,
 ) -> Result<Option<ApiKey>> {
     match prompt_pick_key(keys, prompt, default)? {
-        Some(key) => {
+        Some(mut key) => {
+            SessionStore::decrypt_key_secret(&mut key)?;
             session_store.set_active_key(&key.id).await?;
             let preview = key_preview(&key.key);
             eprintln!(
@@ -837,10 +832,10 @@ mod tests {
         assert_eq!(keys[0].name, "minimax");
         assert_eq!(keys[0].base_url, "https://api.minimax.io/anthropic");
         assert_eq!(keys[0].claude_protocol, None);
-        assert_eq!(keys[0].key.as_str(), "sk-minimax-test");
 
         let active = store.get_active_key().await.unwrap().unwrap();
         assert_eq!(active.id, keys[0].id);
+        assert_eq!(active.key.as_str(), "sk-minimax-test");
     }
 
     #[tokio::test]

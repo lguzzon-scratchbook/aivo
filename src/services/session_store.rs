@@ -23,8 +23,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::errors::{CLIError, ErrorCategory};
 use crate::services::system_env;
 
-/// Marker to identify encrypted values
+/// Marker to identify encrypted values (legacy v2)
 pub const ENCRYPTION_MARKER: &str = "enc:";
+/// Marker for v3 encryption (includes machine ID in key derivation)
+pub const V3_ENCRYPTION_MARKER: &str = "enc3:";
 
 /// Serde module for serializing/deserializing Zeroizing<String> as regular String
 mod zeroizing_string {
@@ -434,14 +436,46 @@ fn derive_key_inner() -> SecretKey {
     SecretKey(key)
 }
 
-/// Checks if a string is encrypted
+/// Derives encryption key using username, home directory, and machine ID (v3).
+/// Cached via OnceLock since inputs never change during a process lifetime.
+fn derive_key_v3() -> SecretKey {
+    static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
+    CACHED_KEY
+        .get_or_init(|| {
+            derive_key_v3_inner()
+        })
+        .clone()
+}
+
+fn derive_key_v3_inner() -> SecretKey {
+    let username = system_env::username().unwrap_or_default();
+    let homedir: String = system_env::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let machine_id = system_env::machine_id().unwrap_or_default();
+    let machine_data = format!("{}:{}:{}", username, homedir, machine_id);
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"aivo-salt-v3");
+    hasher.update(machine_data.as_bytes());
+    let salt_full = hasher.finalize();
+    let salt = &salt_full[..SALT_LENGTH];
+
+    let iterations = ITERATIONS;
+    let mut key = [0u8; KEY_LENGTH];
+    pbkdf2_hmac::<Sha256>(machine_data.as_bytes(), salt, iterations, &mut key);
+
+    SecretKey(key)
+}
+
+/// Checks if a string is encrypted (v2 or v3)
 pub fn is_encrypted(value: &str) -> bool {
-    value.starts_with(ENCRYPTION_MARKER)
+    value.starts_with(V3_ENCRYPTION_MARKER) || value.starts_with(ENCRYPTION_MARKER)
 }
 
 type Aes256Gcm16 = AesGcm<Aes256, U16, U16>;
 
-/// Encrypts a plaintext string
+/// Encrypts a plaintext string using v3 key derivation (includes machine ID)
 pub fn encrypt(plaintext: &str) -> Result<String> {
     if plaintext.is_empty() {
         return Ok(plaintext.to_string());
@@ -452,7 +486,7 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
         return Ok(plaintext.to_string());
     }
 
-    let key = derive_key();
+    let key = derive_key_v3();
     let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
 
     let mut iv = [0u8; IV_LENGTH];
@@ -470,11 +504,11 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
     combined.extend_from_slice(&iv);
     combined.extend_from_slice(&ciphertext);
 
-    // Encode as base64 with marker
-    Ok(format!("{}{}", ENCRYPTION_MARKER, BASE64.encode(&combined)))
+    // Encode as base64 with v3 marker
+    Ok(format!("{}{}", V3_ENCRYPTION_MARKER, BASE64.encode(&combined)))
 }
 
-/// Decrypts an encrypted string
+/// Decrypts an encrypted string. Supports both v3 (enc3:) and legacy v2 (enc:) formats.
 pub fn decrypt(encrypted_data: &str) -> Result<String> {
     if encrypted_data.is_empty() {
         return Ok(encrypted_data.to_string());
@@ -484,12 +518,18 @@ pub fn decrypt(encrypted_data: &str) -> Result<String> {
         return Err(anyhow::anyhow!("Invalid encrypted data: missing marker"));
     }
 
-    let key = derive_key();
+    // Determine version and select the appropriate key + marker length
+    let (key, marker_len) = if encrypted_data.starts_with(V3_ENCRYPTION_MARKER) {
+        (derive_key_v3(), V3_ENCRYPTION_MARKER.len())
+    } else {
+        (derive_key(), ENCRYPTION_MARKER.len())
+    };
+
     let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
 
     // Decode from base64
     let data = BASE64
-        .decode(&encrypted_data[ENCRYPTION_MARKER.len()..])
+        .decode(&encrypted_data[marker_len..])
         .map_err(|e| anyhow::anyhow!("Base64 decode failed: {}", e))?;
 
     if data.len() < IV_LENGTH {
@@ -654,28 +694,16 @@ impl SessionStore {
     }
 
     /// Saves config to the config file.
+    /// Keys must already be encrypted before calling this.
     /// Uses atomic write (write to temp file then rename) to prevent corruption.
-    #[allow(dead_code)]
-    pub async fn save(&self, config: &StoredConfig) -> Result<()> {
-        let _lock = self.acquire_config_lock()?;
-        self.save_unlocked(config).await
-    }
-
-    async fn save_unlocked(&self, config: &StoredConfig) -> Result<()> {
+    async fn save_raw(&self, config: &StoredConfig) -> Result<()> {
         tokio::fs::create_dir_all(&self.config_dir)
             .await
             .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
 
-        // Encrypt only the api_keys vec (avoids cloning the full config which may
-        // include large chat session history).
-        let encrypted_keys = self.encrypt_keys(config)?;
-        let mut serializable = serde_json::to_value(config).context("Failed to serialize config")?;
-        serializable["api_keys"] =
-            serde_json::to_value(&encrypted_keys).context("Failed to serialize encrypted keys")?;
         let data =
-            serde_json::to_string_pretty(&serializable).context("Failed to serialize config")?;
+            serde_json::to_string_pretty(config).context("Failed to serialize config")?;
 
-        // Write to a temp file first, then atomically rename to prevent partial writes
         let tmp_path = self.config_path.with_extension("json.tmp");
 
         tokio::fs::write(&tmp_path, &data)
@@ -703,18 +731,9 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Loads config from the config file
+    /// Loads config from the config file. Keys remain encrypted;
+    /// use `decrypt_key_secret` on individual keys that need plaintext access.
     pub async fn load(&self) -> Result<StoredConfig> {
-        self.load_unlocked().await
-    }
-
-    async fn load_unlocked(&self) -> Result<StoredConfig> {
-        let parsed = self.load_raw().await?;
-        self.decrypt_keys(&parsed)
-    }
-
-    /// Loads config without decrypting API key secrets (fast path for metadata-only reads).
-    async fn load_raw(&self) -> Result<StoredConfig> {
         let data = match tokio::fs::read_to_string(&self.config_path).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -740,39 +759,61 @@ impl SessionStore {
         key: &str,
     ) -> Result<String> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        // Load raw config without decrypting existing keys — we only need to
+        // append a new key so there is no reason to touch existing secrets.
+        let mut config = self.load().await?;
 
         let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
         let id = generate_key_id(&existing_ids)?;
 
-        config.api_keys.push(ApiKey::new_with_protocol(
+        let mut new_key = ApiKey::new_with_protocol(
             id.clone(),
             name.to_string(),
             base_url.to_string(),
             claude_protocol,
             key.to_string(),
-        ));
+        );
+        // Pre-encrypt the new key so save_unlocked can write it as-is
+        new_key.key = Zeroizing::new(encrypt(&new_key.key)?);
+        config.api_keys.push(new_key);
 
-        self.save_unlocked(&config).await?;
+        // Save directly — existing keys are already encrypted in the raw config
+        self.save_raw(&config).await?;
         Ok(id)
     }
 
-    /// Gets all API keys
+    /// Gets all API keys without decrypting secrets.
+    /// Callers that need the plaintext secret should call `decrypt_key_secret` on individual keys.
     pub async fn get_keys(&self) -> Result<Vec<ApiKey>> {
         Ok(self.load().await?.api_keys)
     }
 
-    /// Gets a specific API key by ID
+    /// Decrypts a single key's secret in place.
+    pub fn decrypt_key_secret(key: &mut ApiKey) -> Result<()> {
+        if is_encrypted(&key.key) {
+            let plaintext = decrypt(&key.key)
+                .with_context(|| format!("failed to decrypt key '{}'", key.display_name()))?;
+            key.key = Zeroizing::new(plaintext);
+        }
+        Ok(())
+    }
+
+    /// Gets a specific API key by ID with its secret decrypted.
     #[allow(dead_code)]
     pub async fn get_key_by_id(&self, id: &str) -> Result<Option<ApiKey>> {
         let keys = self.get_keys().await?;
-        Ok(keys.into_iter().find(|k| k.id == id))
+        if let Some(mut key) = keys.into_iter().find(|k| k.id == id) {
+            Self::decrypt_key_secret(&mut key)?;
+            Ok(Some(key))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Deletes an API key by ID
     pub async fn delete_key(&self, id: &str) -> Result<bool> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         let initial_len = config.api_keys.len();
         config.api_keys.retain(|k| k.id != id);
 
@@ -781,7 +822,7 @@ impl SessionStore {
                 config.active_key_id = None;
             }
             remove_runtime_state_for_key(&mut config, id);
-            self.save_unlocked(&config).await?;
+            self.save_raw(&config).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -798,17 +839,17 @@ impl SessionStore {
         key: &str,
     ) -> Result<bool> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
             let base_url_changed = entry.base_url != base_url;
             entry.name = name.to_string();
             entry.base_url = base_url.to_string();
             entry.claude_protocol = claude_protocol;
-            entry.key = Zeroizing::new(key.to_string());
+            entry.key = Zeroizing::new(encrypt(key)?);
             if base_url_changed {
                 remove_runtime_state_for_key(&mut config, id);
             }
-            self.save_unlocked(&config).await?;
+            self.save_raw(&config).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -816,13 +857,13 @@ impl SessionStore {
     }
 
     /// Internal helper: load config, apply `f` to the key with `id`, save, and return whether
-    /// the key was found.
+    /// the key was found. Does not decrypt/re-encrypt keys — only touches metadata fields.
     async fn update_key_field(&self, id: &str, f: impl FnOnce(&mut ApiKey)) -> Result<bool> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
             f(entry);
-            self.save_unlocked(&config).await?;
+            self.save_raw(&config).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -869,7 +910,7 @@ impl SessionStore {
     /// Sets the currently active API key
     pub async fn set_active_key(&self, id: &str) -> Result<()> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
 
         if !config.api_keys.iter().any(|k| k.id == id) {
             return Err(CLIError::new(
@@ -882,18 +923,19 @@ impl SessionStore {
         }
 
         config.active_key_id = Some(id.to_string());
-        self.save_unlocked(&config).await
+        self.save_raw(&config).await
     }
 
-    /// Resolves an API key by ID or name.
+    /// Resolves an API key by ID or name, decrypting only the matched key's secret.
     /// Tries exact ID match first, then name match.
     /// Returns an error if no match found or multiple names match.
     pub async fn resolve_key_by_id_or_name(&self, id_or_name: &str) -> Result<ApiKey> {
         let keys = self.get_keys().await?;
 
         // Try exact ID match first
-        if let Some(key) = keys.iter().find(|k| k.id == id_or_name) {
-            return Ok(key.clone());
+        if let Some(mut key) = keys.iter().find(|k| k.id == id_or_name).cloned() {
+            Self::decrypt_key_secret(&mut key)?;
+            return Ok(key);
         }
 
         // Try name match
@@ -907,7 +949,11 @@ impl SessionStore {
                 Some("Run 'aivo keys' to see available keys"),
             )
             .into()),
-            1 => Ok(name_matches[0].clone()),
+            1 => {
+                let mut key = name_matches[0].clone();
+                Self::decrypt_key_secret(&mut key)?;
+                Ok(key)
+            }
             _ => Err(CLIError::new(
                 format!(
                     "Multiple keys found with name \"{}\". Use the key ID instead.",
@@ -921,12 +967,19 @@ impl SessionStore {
         }
     }
 
-    /// Gets the currently active API key
+    /// Gets the currently active API key with its secret decrypted.
     pub async fn get_active_key(&self) -> Result<Option<ApiKey>> {
         let config = self.load().await?;
 
         match config.active_key_id {
-            Some(ref id) => Ok(config.api_keys.into_iter().find(|k| k.id == *id)),
+            Some(ref id) => {
+                if let Some(mut key) = config.api_keys.into_iter().find(|k| k.id == *id) {
+                    Self::decrypt_key_secret(&mut key)?;
+                    Ok(Some(key))
+                } else {
+                    Ok(None)
+                }
+            }
             None => Ok(None),
         }
     }
@@ -934,14 +987,14 @@ impl SessionStore {
     /// Gets all keys and the active key ID without decrypting secrets.
     /// Use this for display-only paths (e.g., `aivo keys` list).
     pub async fn get_keys_and_active_id_info(&self) -> Result<(Vec<ApiKey>, Option<String>)> {
-        let config = self.load_raw().await?;
+        let config = self.load().await?;
         Ok((config.api_keys, config.active_key_id))
     }
 
     /// Gets the active key's display metadata (id, name, base_url) without decrypting secrets.
     /// Use this when the key value is not needed (e.g., help output).
     pub async fn get_active_key_info(&self) -> Result<Option<ApiKey>> {
-        let config = self.load_raw().await?;
+        let config = self.load().await?;
 
         match config.active_key_id {
             Some(ref id) => Ok(config.api_keys.into_iter().find(|k| k.id == *id)),
@@ -964,15 +1017,14 @@ impl SessionStore {
     /// Saves the chat model for a specific API key
     pub async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         config
             .chat_models
             .insert(key_id.to_string(), model.to_string());
-        self.save_unlocked(&config).await
+        self.save_raw(&config).await
     }
 
     pub async fn get_directory_start(&self, cwd: &str) -> Result<Option<DirectoryStartRecord>> {
-        // Fast path: shared read — load() acquires and releases the lock internally.
         let config = self.load().await?;
         let Some(record) = config.directory_starts.get(cwd).cloned() else {
             return Ok(None);
@@ -986,11 +1038,11 @@ impl SessionStore {
             return Ok(Some(record));
         }
 
-        // Slow path: stale record — re-acquire exclusive lock, reload, remove, save.
+        // Stale record — re-acquire exclusive lock, reload, remove, save.
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         config.directory_starts.remove(cwd);
-        self.save_unlocked(&config).await?;
+        self.save_raw(&config).await?;
         Ok(None)
     }
 
@@ -1003,7 +1055,7 @@ impl SessionStore {
         model: Option<&str>,
     ) -> Result<()> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         config.directory_starts.insert(
             cwd.to_string(),
             DirectoryStartRecord {
@@ -1017,16 +1069,16 @@ impl SessionStore {
                 updated_at: Utc::now().to_rfc3339(),
             },
         );
-        self.save_unlocked(&config).await
+        self.save_raw(&config).await
     }
 
     #[allow(dead_code)]
     pub async fn clear_directory_start(&self, cwd: &str) -> Result<bool> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         let removed = config.directory_starts.remove(cwd).is_some();
         if removed {
-            self.save_unlocked(&config).await?;
+            self.save_raw(&config).await?;
         }
         Ok(removed)
     }
@@ -1038,9 +1090,9 @@ impl SessionStore {
         model: Option<&str>,
     ) -> Result<()> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         config.stats.record_selection(key_id, tool, model);
-        self.save_unlocked(&config).await
+        self.save_raw(&config).await
     }
 
     pub async fn record_tokens(
@@ -1051,11 +1103,11 @@ impl SessionStore {
         completion_tokens: u64,
     ) -> Result<()> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         config
             .stats
             .record_tokens(key_id, model, prompt_tokens, completion_tokens);
-        self.save_unlocked(&config).await
+        self.save_raw(&config).await
     }
 
     pub async fn get_chat_session(
@@ -1078,7 +1130,7 @@ impl SessionStore {
         cwd: &str,
     ) -> Result<Vec<ChatSessionState>> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         let key_is_valid = config
             .api_keys
             .iter()
@@ -1102,7 +1154,7 @@ impl SessionStore {
         });
 
         if dirty {
-            self.save_unlocked(&config).await?;
+            self.save_raw(&config).await?;
         }
 
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -1119,7 +1171,7 @@ impl SessionStore {
         messages: &[StoredChatMessage],
     ) -> Result<()> {
         let _lock = self.acquire_config_lock()?;
-        let mut config = self.load_unlocked().await?;
+        let mut config = self.load().await?;
         let map_key = chat_session_map_key(key_id, cwd, session_id);
         config.chat_sessions.insert(
             map_key,
@@ -1133,34 +1185,9 @@ impl SessionStore {
                 updated_at: Utc::now().to_rfc3339(),
             },
         );
-        self.save_unlocked(&config).await
+        self.save_raw(&config).await
     }
 
-    /// Encrypts API keys before saving
-    /// Encrypts API keys before saving.
-    /// Only clones the `api_keys` vec (not the full config) to keep allocation minimal.
-    fn encrypt_keys(&self, config: &StoredConfig) -> Result<Vec<ApiKey>> {
-        let mut encrypted_keys = config.api_keys.clone();
-        for key in &mut encrypted_keys {
-            if !is_encrypted(&key.key) {
-                key.key = Zeroizing::new(encrypt(&key.key)?);
-            }
-        }
-        Ok(encrypted_keys)
-    }
-
-    /// Decrypts API keys after loading
-    fn decrypt_keys(&self, config: &StoredConfig) -> Result<StoredConfig> {
-        let mut decrypted = config.clone();
-        for key in &mut decrypted.api_keys {
-            if is_encrypted(&key.key) {
-                let plaintext = decrypt(&key.key)
-                    .with_context(|| format!("failed to decrypt key '{}'", key.display_name()))?;
-                key.key = Zeroizing::new(plaintext);
-            }
-        }
-        Ok(decrypted)
-    }
 }
 
 fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
@@ -1249,9 +1276,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify the file contains encrypted key
+        // Verify the file contains encrypted key (v3 marker)
         let file_content = tokio::fs::read_to_string(&config_path).await.unwrap();
-        assert!(file_content.contains("enc:"));
+        assert!(file_content.contains("enc3:"));
         assert!(!file_content.contains("sk-secret-12345"));
 
         // Verify we can still read back the decrypted key
@@ -1359,16 +1386,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_returns_error_on_invalid_encrypted_key() {
+    async fn test_decrypt_returns_error_on_invalid_encrypted_key() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         // "enc:" prefix triggers decryption; the payload is not valid ciphertext
-        let bad_config = r#"{"api_keys":[{"id":"aaaa","name":"test","baseUrl":"http://example.com","key":"enc:notvalidbase64!!!","createdAt":"2024-01-01T00:00:00Z"}],"active_key_id":null}"#;
+        let bad_config = r#"{"api_keys":[{"id":"aaaa","name":"test","baseUrl":"http://example.com","key":"enc:notvalidbase64!!!","createdAt":"2024-01-01T00:00:00Z"}],"active_key_id":"aaaa"}"#;
         tokio::fs::write(&config_path, bad_config.as_bytes())
             .await
             .unwrap();
         let store = SessionStore::with_path(config_path);
-        let result = store.load().await;
+        // load() succeeds — keys remain encrypted in memory
+        let config = store.load().await.unwrap();
+        assert_eq!(config.api_keys.len(), 1);
+        // Decryption fails when we try to access the secret
+        let mut key = config.api_keys[0].clone();
+        let result = SessionStore::decrypt_key_secret(&mut key);
         assert!(
             result.is_err(),
             "expected Err on invalid encrypted key, got Ok"
@@ -1744,11 +1776,11 @@ mod tests {
         let plaintext = "test-api-key-12345";
         let encrypted = encrypt(plaintext).unwrap();
 
-        // Should start with enc:
-        assert!(encrypted.starts_with(ENCRYPTION_MARKER));
+        // Should start with enc3: (v3 marker)
+        assert!(encrypted.starts_with(V3_ENCRYPTION_MARKER));
 
         // Should be base64 after marker
-        let data = &encrypted[ENCRYPTION_MARKER.len()..];
+        let data = &encrypted[V3_ENCRYPTION_MARKER.len()..];
         let decoded = BASE64.decode(data).unwrap();
 
         // Format: 16 byte IV + ciphertext (includes 16 byte auth tag in aes-gcm)
@@ -1779,9 +1811,33 @@ mod tests {
     #[test]
     fn test_is_encrypted_detection() {
         assert!(is_encrypted("enc:abc123"));
+        assert!(is_encrypted("enc3:abc123"));
         assert!(!is_encrypted("plain-text"));
         assert!(!is_encrypted(""));
         assert!(!is_encrypted("enc"));
+    }
+
+    #[test]
+    fn test_legacy_v2_decrypt() {
+        // Encrypt using legacy v2 key derivation
+        let plaintext = "legacy-api-key-v2";
+        let key = derive_key();
+        let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
+
+        let mut iv = [0u8; IV_LENGTH];
+        rand::thread_rng().fill_bytes(&mut iv);
+        let nonce = GenericArray::from_slice(&iv);
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
+
+        let mut combined = Vec::with_capacity(IV_LENGTH + ciphertext.len());
+        combined.extend_from_slice(&iv);
+        combined.extend_from_slice(&ciphertext);
+
+        let v2_encrypted = format!("{}{}", ENCRYPTION_MARKER, BASE64.encode(&combined));
+
+        // Should decrypt successfully using legacy path
+        let decrypted = decrypt(&v2_encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     // Tests moved from tests/encryption_property.rs

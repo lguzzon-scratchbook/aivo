@@ -143,10 +143,14 @@ impl StartCommand {
         let keys = self.session_store.get_keys().await?;
         match keys.len() {
             0 => anyhow::bail!("No API key configured. Run 'aivo keys add' first."),
-            1 => Ok(Resolved {
-                value: keys[0].clone(),
-                interactive: false,
-            }),
+            1 => {
+                let mut key = keys[0].clone();
+                SessionStore::decrypt_key_secret(&mut key)?;
+                Ok(Resolved {
+                    value: key,
+                    interactive: false,
+                })
+            }
             _ => {
                 let items = keys
                     .iter()
@@ -159,12 +163,17 @@ impl StartCommand {
                     .interact_opt()
                     .ok()
                     .flatten();
-                selected
-                    .map(|idx| Resolved {
-                        value: keys[idx].clone(),
-                        interactive: true,
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("Cancelled"))
+                match selected {
+                    Some(idx) => {
+                        let mut key = keys[idx].clone();
+                        SessionStore::decrypt_key_secret(&mut key)?;
+                        Ok(Resolved {
+                            value: key,
+                            interactive: true,
+                        })
+                    }
+                    None => Err(anyhow::anyhow!("Cancelled")),
+                }
             }
         }
     }
