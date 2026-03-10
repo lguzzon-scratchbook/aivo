@@ -1,6 +1,7 @@
 //! ServeCommand — starts a local OpenAI-compatible HTTP server.
 
 use anyhow::Result;
+use std::net::IpAddr;
 
 use crate::errors::ExitCode;
 use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
@@ -50,6 +51,14 @@ impl ServeCommand {
             detect_provider_protocol(&key.base_url)
         };
 
+        if is_self_proxy_target(&key.base_url, port) {
+            anyhow::bail!(
+                "Refusing to start `aivo serve`: active upstream {} points back to http://127.0.0.1:{} and would proxy into itself. Switch to a real provider key with `aivo use <name>` or pass `--key <name>`.",
+                key.base_url,
+                port
+            );
+        }
+
         // Capture display info before moving key into the router
         let display_name = key.display_name().to_string();
         let display_host = if is_copilot {
@@ -69,7 +78,7 @@ impl ServeCommand {
         let router = ServeRouter::new(config, key);
 
         // Bind eagerly — errors here (e.g. "address already in use") before printing startup
-        router.start_background(port).await?;
+        let mut handle = router.start_background(port).await?;
 
         eprintln!(
             "{} Listening on http://127.0.0.1:{}",
@@ -79,7 +88,25 @@ impl ServeCommand {
         eprintln!("  {} · {}", display_name, style::dim(&display_host));
         eprintln!("  {}", style::dim("Press Ctrl+C to stop"));
 
-        tokio::signal::ctrl_c().await?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                handle.abort();
+                let _ = handle.await;
+            }
+            result = &mut handle => match result {
+                Ok(Ok(())) => {
+                    anyhow::bail!("serve router stopped unexpectedly");
+                }
+                Ok(Err(err)) => {
+                    return Err(err);
+                }
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => {
+                    anyhow::bail!("serve router task failed: {}", err);
+                }
+            },
+        }
 
         Ok(ExitCode::Success)
     }
@@ -110,5 +137,50 @@ impl ServeCommand {
         println!("  {}", style::dim("aivo serve"));
         println!("  {}", style::dim("aivo serve -p 8080"));
         println!("  {}", style::dim("aivo serve -k openrouter"));
+    }
+}
+
+fn is_self_proxy_target(base_url: &str, port: u16) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let Some(target_port) = url.port_or_known_default() else {
+        return false;
+    };
+
+    if target_port != port {
+        return false;
+    }
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_self_proxy_target;
+
+    #[test]
+    fn detects_localhost_self_proxy() {
+        assert!(is_self_proxy_target("http://127.0.0.1:24860", 24860));
+        assert!(is_self_proxy_target("http://127.0.0.1:24860/v1", 24860));
+        assert!(is_self_proxy_target("http://localhost:24860", 24860));
+        assert!(is_self_proxy_target("http://[::1]:24860/v1", 24860));
+    }
+
+    #[test]
+    fn ignores_other_ports_and_hosts() {
+        assert!(!is_self_proxy_target("http://127.0.0.1:8080", 24860));
+        assert!(!is_self_proxy_target("https://api.openai.com/v1", 24860));
+        assert!(!is_self_proxy_target("not-a-url", 24860));
     }
 }

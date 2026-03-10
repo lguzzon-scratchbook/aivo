@@ -23,6 +23,15 @@ pub fn build_google_generate_content_url(base_url: &str, model: &str) -> String 
     }
 }
 
+pub fn build_google_stream_generate_content_url(base_url: &str, model: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/models") {
+        format!("{}/{}:streamGenerateContent?alt=sse", base, model)
+    } else {
+        format!("{}/models/{}:streamGenerateContent?alt=sse", base, model)
+    }
+}
+
 pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGeminiConfig) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
@@ -383,6 +392,24 @@ mod tests {
         assert_eq!(
             converted["choices"][0]["message"]["tool_calls"][0]["id"],
             "call_1"
+        );
+    }
+
+    #[test]
+    fn test_build_google_stream_generate_content_url() {
+        assert_eq!(
+            build_google_stream_generate_content_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-2.5-pro"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            build_google_stream_generate_content_url(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "google/gemini-2.5-pro"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/google/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
     }
 }
