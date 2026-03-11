@@ -1166,7 +1166,6 @@ impl GeminiToOpenAIStreamConverter {
     }
 }
 
-
 fn openai_sse_chunk(
     id: &str,
     created: u64,

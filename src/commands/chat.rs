@@ -843,7 +843,6 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> io::Result<bool> {
     }
 }
 
-
 /// Extracts assistant text from OpenAI-compatible non-streaming chat responses.
 fn extract_openai_message_content(body: &serde_json::Value) -> String {
     if let Some(content) = body["choices"][0]["message"]["content"].as_str() {

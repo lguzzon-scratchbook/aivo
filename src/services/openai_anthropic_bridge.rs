@@ -338,7 +338,6 @@ fn extract_openai_text(content: Option<&Value>) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

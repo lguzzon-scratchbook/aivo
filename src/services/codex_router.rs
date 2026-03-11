@@ -1,3 +1,16 @@
+use crate::services::copilot_auth::CopilotTokenManager;
+use crate::services::http_utils::{self, current_unix_ts};
+use crate::services::model_names::select_model_for_protocol;
+use crate::services::openai_anthropic_bridge::{
+    OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
+    convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
+};
+use crate::services::openai_gemini_bridge::{
+    OpenAIToGeminiConfig, build_google_generate_content_url,
+    convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
+    openai_chat_model,
+};
+use crate::services::provider_protocol::ProviderProtocol;
 /**
  * Built-in Codex Router service
  *
@@ -16,19 +29,6 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::http_utils::{self, current_unix_ts};
-use crate::services::model_names::select_model_for_protocol;
-use crate::services::openai_anthropic_bridge::{
-    OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
-    convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
-};
-use crate::services::openai_gemini_bridge::{
-    OpenAIToGeminiConfig, build_google_generate_content_url,
-    convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
-    openai_chat_model,
-};
-use crate::services::provider_protocol::ProviderProtocol;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1097,7 +1097,6 @@ fn gen_id(prefix: &str) -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}_{}_{:06}", prefix, current_unix_ts(), n % 1_000_000)
 }
-
 
 // =============================================================================
 // TESTS

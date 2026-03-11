@@ -57,7 +57,11 @@ fn detect_base_url(name: &str) -> Option<&'static str> {
         ("fireworks", "https://api.fireworks.ai/inference/v1"),
         ("minimax", "https://api.minimax.io/anthropic"),
         ("deepseek", "https://api.deepseek.com/v1"),
-        ("moonshot", "https://api.moonshot.cn/v1"),
+        ("moonshot", "https://api.moonshot.ai/v1"),
+        ("anthropic", "https://api.anthropic.com"),
+        ("openai", "https://api.openai.com"),
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ("zai", "https://api.z.ai/v1"),
         ("groq", "https://api.groq.com/openai/v1"),
         ("xai", "https://api.x.ai/v1"),
         ("mistral", "https://api.mistral.ai/v1"),
@@ -361,7 +365,7 @@ impl KeysCommand {
         use std::io::{self, Write};
 
         fn read_line(prompt: &str) -> io::Result<String> {
-            print!("{}", prompt);
+            print!("{}", style::dim(prompt));
             io::stdout().flush()?;
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
@@ -504,12 +508,18 @@ impl KeysCommand {
         let key = if let Some(key) = add_options.key {
             key.to_string()
         } else {
-            read_line("API Key: ")?
+            loop {
+                let input = read_line("API Key: ")?;
+                if !input.is_empty() {
+                    break input;
+                }
+
+                let prompt = style::yellow("Save without an API key?");
+                if confirm(&prompt)? {
+                    break String::new();
+                }
+            }
         };
-        if key.is_empty() {
-            eprintln!("{} API Key cannot be empty", style::red("Error:"));
-            return Ok(ExitCode::UserError);
-        }
 
         println!();
 
