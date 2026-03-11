@@ -8,6 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
+const BRAILLE_SPINNER_FRAMES: [&str; 10] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
+
 /// Supported style names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StyleName {
@@ -91,26 +96,26 @@ pub fn empty_bullet_symbol() -> String {
     dim("○")
 }
 
+pub fn spinner_frame(index: usize) -> &'static str {
+    BRAILLE_SPINNER_FRAMES[index % BRAILLE_SPINNER_FRAMES.len()]
+}
+
 /// Starts a braille spinner on stderr. Returns the flag and join handle.
 /// Pass an optional label to display after the spinner character.
 pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let spinning = Arc::new(AtomicBool::new(true));
     let spinning_clone = spinning.clone();
     let label = label.map(str::to_owned).unwrap_or_default();
-    let first_frame = "\u{280b}";
+    let first_frame = spinner_frame(0);
 
     // Paint the first frame synchronously so short operations still show feedback.
     eprint!("\r{}{}", dim(first_frame), label);
     let _ = io::stderr().flush();
 
     let handle = tokio::task::spawn_blocking(move || {
-        let frames = [
-            "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
-            "\u{2827}", "\u{2807}", "\u{280f}",
-        ];
         let mut i = 1;
         while spinning_clone.load(Ordering::Relaxed) {
-            eprint!("\r{}{}", dim(frames[i % frames.len()]), label);
+            eprint!("\r{}{}", dim(spinner_frame(i)), label);
             let _ = io::stderr().flush();
             std::thread::sleep(std::time::Duration::from_millis(80));
             i += 1;

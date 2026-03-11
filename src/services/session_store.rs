@@ -334,6 +334,7 @@ where
 
 impl ChatSessionState {
     /// Returns the number of messages. Returns 0 if empty or on decryption error.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn message_count(&self) -> usize {
         self.decrypt_messages().map(|v| v.len()).unwrap_or(0)
     }
@@ -427,7 +428,7 @@ impl StoredConfig {
 /// Cached via OnceLock since inputs never change during a process lifetime.
 fn derive_key() -> SecretKey {
     static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
-    CACHED_KEY.get_or_init(|| derive_key_inner()).clone()
+    CACHED_KEY.get_or_init(derive_key_inner).clone()
 }
 
 fn derive_key_inner() -> SecretKey {
@@ -455,7 +456,7 @@ fn derive_key_inner() -> SecretKey {
 /// Cached via OnceLock since inputs never change during a process lifetime.
 fn derive_key_v3() -> SecretKey {
     static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
-    CACHED_KEY.get_or_init(|| derive_key_v3_inner()).clone()
+    CACHED_KEY.get_or_init(derive_key_v3_inner).clone()
 }
 
 fn derive_key_v3_inner() -> SecretKey {
@@ -818,7 +819,6 @@ impl SessionStore {
     }
 
     /// Gets a specific API key by ID with its secret decrypted.
-    #[allow(dead_code)]
     pub async fn get_key_by_id(&self, id: &str) -> Result<Option<ApiKey>> {
         let keys = self.get_keys().await?;
         if let Some(mut key) = keys.into_iter().find(|k| k.id == id) {
@@ -1129,6 +1129,7 @@ impl SessionStore {
         self.save_raw(&config).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_chat_session(
         &self,
         key_id: &str,

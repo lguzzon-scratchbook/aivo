@@ -18,7 +18,8 @@ cargo fmt               # Format code (run before committing)
 
 ## Git Conventions
 
-Always squash merge to main. Never fast-forward. Command: `git merge --squash <branch> && git commit`
+* Always squash merge to main. Never fast-forward. Command: `git merge --squash <branch> && git commit`
+* Do not commit automatically to the fix.
 
 ## CLI / UX Conventions
 
@@ -58,7 +59,8 @@ SessionStore → EnvironmentInjector → AILauncher
 | ----------- | ---------------------------------------------------------- |
 | `run.rs`    | Launch AI tools; falls back to `start` flow when no tool given |
 | `start.rs`  | Interactive remembered-start flow (key + tool + model picker) |
-| `chat.rs`   | Interactive chat REPL with streaming responses             |
+| `chat.rs`   | Interactive chat command; routes to TUI or one-shot mode   |
+| `chat_tui.rs` | Full-screen interactive chat TUI (ratatui + crossterm)   |
 | `keys.rs`   | API key management (add, rm, use, edit, cat, list)         |
 | `models.rs` | List available models from active provider (1h cache)      |
 | `serve.rs`  | Local OpenAI-compatible API server                         |

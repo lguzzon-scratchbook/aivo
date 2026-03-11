@@ -364,7 +364,7 @@ fn print_help() {
     println!(
         "  {}  {}",
         style::cyan("chat [--model]"),
-        style::dim("Start an interactive chat REPL")
+        style::dim("Start the interactive chat TUI")
     );
     println!(
         "  {}   {}",

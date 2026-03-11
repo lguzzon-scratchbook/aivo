@@ -14,6 +14,8 @@ doctest = false
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 console = "0.15"
+crossterm = "0.28"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -22,6 +24,7 @@ tokio = { version = "1.43", features = ["rt", "macros", "process", "signal", "ti
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+pulldown-cmark = "0.12"
 
 # Encryption
 aes = "0.8"
@@ -35,7 +38,6 @@ zeroize = { version = "1.8", features = ["derive"] }
 # Utils
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1.0"
-rustyline = "14"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

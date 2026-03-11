@@ -44,7 +44,7 @@ aivo claude
 | `aivo codex` | Run Codex |
 | `aivo gemini` | Run Gemini |
 | `aivo opencode` | Run OpenCode |
-| `aivo chat` | Interactive chat REPL (or one-shot with `-x`) |
+| `aivo chat` | Full-screen interactive chat TUI (or one-shot with `-x`) |
 | `aivo models` | List available models from active provider |
 | `aivo serve` | Start a local OpenAI-compatible API server |
 | `aivo use [name]` | Switch active key |

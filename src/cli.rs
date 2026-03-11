@@ -42,7 +42,7 @@ pub enum Commands {
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
     Keys(KeysArgs),
 
-    /// Start an interactive chat REPL
+    /// Start the interactive chat TUI
     Chat(ChatArgs),
 
     /// List available models from the active provider

@@ -109,14 +109,14 @@ impl FuzzySelect {
             term.clear_last_lines(1 + items_drawn)?;
 
             match key {
-                Key::ArrowUp | Key::Char('\x10') => {
+                key if is_previous_key(&key) => {
                     if selection > 0 {
                         selection -= 1;
                     } else if count > 0 {
                         selection = count - 1;
                     }
                 }
-                Key::ArrowDown | Key::Char('\x0e') => {
+                key if is_next_key(&key) => {
                     if count > 0 {
                         if selection < count - 1 {
                             selection += 1;
@@ -156,6 +156,18 @@ impl FuzzySelect {
     }
 }
 
+fn is_previous_key(key: &Key) -> bool {
+    matches!(key, Key::ArrowUp | Key::Char('\x10')) || matches_application_arrow(key, 'A')
+}
+
+fn is_next_key(key: &Key) -> bool {
+    matches!(key, Key::ArrowDown | Key::Char('\x0e')) || matches_application_arrow(key, 'B')
+}
+
+fn matches_application_arrow(key: &Key, direction: char) -> bool {
+    matches!(key, Key::UnknownEscSeq(seq) if seq.as_slice() == ['O', direction])
+}
+
 fn matches_fuzzy(query: &str, target: &str) -> bool {
     let mut q_chars = query.chars();
     let mut current_q_char = match q_chars.next() {
@@ -173,4 +185,24 @@ fn matches_fuzzy(query: &str, target: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_next_key, is_previous_key};
+    use console::Key;
+
+    #[test]
+    fn recognizes_application_cursor_mode_arrows() {
+        assert!(is_previous_key(&Key::UnknownEscSeq(vec!['O', 'A'])));
+        assert!(is_next_key(&Key::UnknownEscSeq(vec!['O', 'B'])));
+    }
+
+    #[test]
+    fn recognizes_standard_navigation_shortcuts() {
+        assert!(is_previous_key(&Key::ArrowUp));
+        assert!(is_previous_key(&Key::Char('\x10')));
+        assert!(is_next_key(&Key::ArrowDown));
+        assert!(is_next_key(&Key::Char('\x0e')));
+    }
 }

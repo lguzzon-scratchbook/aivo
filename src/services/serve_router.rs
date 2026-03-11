@@ -58,7 +58,7 @@ enum RouterResponse {
     Streaming {
         status: u16,
         content_type: String,
-        body: StreamingBody,
+        body: Box<StreamingBody>,
     },
 }
 
@@ -331,10 +331,10 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
             Ok(RouterResponse::Streaming {
                 status,
                 content_type: "text/event-stream".to_string(),
-                body: StreamingBody::Responses {
-                    source: Box::new(body),
+                body: Box::new(StreamingBody::Responses {
+                    source: body,
                     converter: OpenAIToResponsesStreamConverter::new(&original_model),
-                },
+                }),
             })
         }
     }
@@ -414,10 +414,10 @@ async fn handle_chat_anthropic(
         return Ok(RouterResponse::Streaming {
             status,
             content_type: "text/event-stream".to_string(),
-            body: StreamingBody::Anthropic {
+            body: Box::new(StreamingBody::Anthropic {
                 upstream: response,
                 converter: AnthropicToOpenAIStreamConverter::new(&fallback_model),
-            },
+            }),
         });
     }
 
@@ -488,10 +488,10 @@ async fn handle_chat_gemini(
         return Ok(RouterResponse::Streaming {
             status,
             content_type: "text/event-stream".to_string(),
-            body: StreamingBody::Gemini {
+            body: Box::new(StreamingBody::Gemini {
                 upstream: response,
                 converter: GeminiToOpenAIStreamConverter::new(&model),
-            },
+            }),
         });
     }
 
@@ -562,7 +562,7 @@ async fn handle_chat_openai(
         return Ok(RouterResponse::Streaming {
             status,
             content_type,
-            body: StreamingBody::Upstream(response),
+            body: Box::new(StreamingBody::Upstream(response)),
         });
     }
 
@@ -615,7 +615,7 @@ async fn write_router_response(
             let headers = http_utils::http_chunked_response_head(status, &content_type);
             socket.write_all(headers.as_bytes()).await?;
 
-            match body {
+            match *body {
                 StreamingBody::Upstream(mut upstream) => {
                     while let Some(chunk) = upstream.chunk().await? {
                         write_chunk(socket, &chunk).await?;

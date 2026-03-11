@@ -1,29 +1,18 @@
 /**
- * ChatCommand handler for interactive REPL with streaming API responses.
- * Tries OpenAI-compatible /v1/chat/completions first; falls back to
- * Anthropic's /v1/messages format if the provider returns 404/405.
+ * ChatCommand handler. Interactive sessions launch the full-screen TUI
+ * (chat_tui). One-shot queries (-x flag) stream directly to stdout using
+ * OpenAI-compatible /v1/chat/completions, falling back to Anthropic
+ * /v1/messages on 404/405.
  */
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::tui::FuzzySelect;
 use anyhow::Result;
-use console::{Key, Term};
 use reqwest::{Client, StatusCode};
-use rustyline::{
-    Context, Editor, Helper,
-    completion::{Completer, Pair},
-    error::ReadlineError,
-    highlight::Highlighter,
-    hint::Hinter,
-    history::History,
-    validate::Validator,
-};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 
 use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
@@ -37,79 +26,14 @@ use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore, StoredChatMessage};
 use crate::style;
 
-const CMD_EXIT: &str = "/exit";
-const CMD_HELP: &str = "/help";
-const CMD_MODEL: &str = "/model";
-const CMD_NEW: &str = "/new";
-const CMD_RESUME: &str = "/resume";
+#[path = "chat_tui.rs"]
+mod chat_tui;
+
 /// Maximum number of messages to keep in chat history.
 /// When exceeded, the oldest messages are dropped (keeping any system message).
 const MAX_HISTORY_MESSAGES: usize = 50;
 /// Retry budget for transient HTTP failures.
 const MAX_REQUEST_ATTEMPTS: usize = 3;
-
-struct ChatHelper {
-    commands: Vec<&'static str>,
-}
-
-impl ChatHelper {
-    fn new() -> Self {
-        Self {
-            commands: vec![CMD_EXIT, CMD_HELP, CMD_MODEL, CMD_NEW, CMD_RESUME],
-        }
-    }
-}
-
-impl Completer for ChatHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        if !line.starts_with('/') {
-            return Ok((0, vec![]));
-        }
-        let prefix = &line[..pos];
-        let completions = self
-            .commands
-            .iter()
-            .filter(|&&cmd| cmd.starts_with(prefix))
-            .map(|&cmd| Pair {
-                display: cmd.to_string(),
-                replacement: cmd.to_string(),
-            })
-            .collect();
-        Ok((0, completions))
-    }
-}
-
-impl Hinter for ChatHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        // Only hint when cursor is at end of input and input starts with /
-        if pos < line.len() || !line.starts_with('/') {
-            return None;
-        }
-        self.commands
-            .iter()
-            .find(|&&cmd| cmd.starts_with(line) && cmd != line)
-            .map(|&cmd| cmd[pos..].to_string())
-    }
-}
-
-impl Highlighter for ChatHelper {
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned(crate::style::dim(hint))
-    }
-}
-
-impl Validator for ChatHelper {}
-
-impl Helper for ChatHelper {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -242,7 +166,6 @@ impl ChatCommand {
         one_shot: Option<String>,
         key_override: Option<ApiKey>,
     ) -> Result<ExitCode> {
-        let explicit_model_requested = model_flag.is_some();
         let key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
@@ -259,7 +182,7 @@ impl ChatCommand {
 
         let client = crate::services::http_utils::router_http_client();
 
-        let mut raw_model = match self.resolve_model(&key.id, model_flag).await? {
+        let raw_model = match self.resolve_model(&key.id, model_flag).await? {
             Some(m) => m,
             None => {
                 // No model set for this key — prompt user to select one
@@ -290,13 +213,15 @@ impl ChatCommand {
                 }
             }
         };
-        let mut model = Self::transform_model_for_provider(&key.base_url, &raw_model);
+        let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
 
         // Create once so its token cache is reused across messages in the session.
         let copilot_tm = if key.base_url == "copilot" {
-            Some(CopilotTokenManager::new(key.key.as_str().to_string()))
+            Some(Arc::new(CopilotTokenManager::new(
+                key.key.as_str().to_string(),
+            )))
         } else {
             None
         };
@@ -322,11 +247,16 @@ impl ChatCommand {
             let result = send_message_turn(
                 &client,
                 &key,
-                copilot_tm.as_ref(),
+                copilot_tm.as_deref(),
                 &model,
                 &history,
                 &mut format,
                 &spinning,
+                &mut |chunk| {
+                    print!("{chunk}");
+                    io::stdout().flush()?;
+                    Ok(())
+                },
             )
             .await;
             style::stop_spinner(&spinning);
@@ -351,305 +281,35 @@ impl ChatCommand {
             }
         }
 
-        eprintln!(
-            "{} model: {} {}",
-            style::success_symbol(),
-            style::cyan(&model),
-            style::dim(format!("({})", key.base_url))
-        );
-        eprintln!(
-            "{}",
-            style::dim("Type a message, or use /help for chat commands.")
-        );
-        let mut history: Vec<ChatMessage> = Vec::new();
-        let mut format = ChatFormat::OpenAI;
-        let mut session_id = new_chat_session_id();
-        let prompt = format!("{} ", style::cyan(">"));
-
-        let mut rl = Editor::<ChatHelper, rustyline::history::DefaultHistory>::new()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        rl.set_helper(Some(ChatHelper::new()));
-
-        let history_path: PathBuf = crate::services::system_env::home_dir()
-            .map(|p| p.join(".config").join("aivo").join("chat_history"))
-            .unwrap_or_else(|| PathBuf::from(".config/aivo/chat_history"));
-        if let Ok(data) = std::fs::read_to_string(&history_path)
-            && let Ok(plain) = crate::services::session_store::decrypt(&data)
-        {
-            for line in plain.lines() {
-                if !line.is_empty() {
-                    let _ = rl.add_history_entry(line);
-                }
-            }
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            anyhow::bail!(
+                "Interactive chat now uses a full-screen TUI. Run it in a terminal, or use -x/--execute for non-interactive mode."
+            );
         }
 
-        if let Some((saved_session, saved_messages)) = self
-            .session_store
-            .get_chat_session(&key.id, &key.base_url, &cwd)
-            .await?
-            .and_then(|session| {
-                let msgs = session.decrypt_messages().ok()?;
-                (!msgs.is_empty()).then_some((session, msgs))
-            })
-        {
-            let resume = prompt_yes_no(
-                &format!(
-                    "Resume your last session in this directory? ({} messages)",
-                    saved_messages.len()
-                ),
-                true,
-            )?;
-            if resume {
-                session_id = saved_session.session_id.clone();
-                if !explicit_model_requested {
-                    raw_model = saved_session.model.clone();
-                    model = Self::transform_model_for_provider(&key.base_url, &raw_model);
-                }
-                history = saved_messages
-                    .into_iter()
-                    .map(|message| ChatMessage {
-                        role: message.role,
-                        content: message.content,
-                    })
-                    .collect();
-                eprintln!(
-                    "{} Resumed {} messages",
-                    style::success_symbol(),
-                    history.len()
-                );
-                eprintln!("{}", style::dim(format!("Model: {}", model)));
-            }
-        }
+        let initial_session = new_chat_session_id();
+        let initial_history = Vec::new();
+        let startup_notice = None;
 
         self.session_store
             .record_selection(&key.id, "chat", Some(&raw_model))
             .await?;
 
-        loop {
-            let input = match rl.readline(&prompt) {
-                Ok(line) => line,
-                Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
-                    eprintln!();
-                    break;
-                }
-                Err(_) => break,
-            };
+        chat_tui::run_chat_tui(chat_tui::ChatTuiParams {
+            session_store: self.session_store.clone(),
+            cache: self.cache.clone(),
+            client,
+            key,
+            copilot_tm,
+            cwd,
+            raw_model,
+            model,
+            initial_session,
+            initial_history,
+            startup_notice,
+        })
+        .await?;
 
-            let input = input.trim().to_string();
-
-            if input.is_empty() {
-                continue;
-            }
-
-            rl.add_history_entry(&input)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-            if input == CMD_EXIT {
-                break;
-            }
-
-            if input == CMD_HELP {
-                print_chat_commands();
-                continue;
-            }
-
-            if input == CMD_NEW {
-                history.clear();
-                session_id = new_chat_session_id();
-                format = ChatFormat::OpenAI;
-                eprintln!("{}", style::dim("Started a new chat."));
-                continue;
-            }
-
-            if input == CMD_RESUME {
-                let sessions = self
-                    .session_store
-                    .list_chat_sessions(&key.id, &key.base_url, &cwd)
-                    .await?;
-                if sessions.is_empty() {
-                    eprintln!("{}", style::dim("No saved chats in this directory yet."));
-                    continue;
-                }
-
-                let items = sessions
-                    .iter()
-                    .map(format_session_choice)
-                    .collect::<Vec<_>>();
-                let current_idx = sessions
-                    .iter()
-                    .position(|session| session.session_id == session_id)
-                    .unwrap_or(0);
-
-                let selected = FuzzySelect::new()
-                    .with_prompt("Resume chat")
-                    .items(&items)
-                    .default(current_idx)
-                    .interact_opt()
-                    .ok()
-                    .flatten();
-
-                if let Some(idx) = selected {
-                    let session = &sessions[idx];
-                    session_id = session.session_id.clone();
-                    raw_model = session.model.clone();
-                    model = Self::transform_model_for_provider(&key.base_url, &raw_model);
-                    self.session_store
-                        .set_chat_model(&key.id, &raw_model)
-                        .await?;
-                    history = session
-                        .decrypt_messages()?
-                        .into_iter()
-                        .map(|message| ChatMessage {
-                            role: message.role,
-                            content: message.content,
-                        })
-                        .collect();
-                    format = ChatFormat::OpenAI;
-                    eprintln!(
-                        "{}",
-                        style::dim(format!("Resumed {} messages · {}", history.len(), model))
-                    );
-                }
-                continue;
-            }
-
-            if input == CMD_MODEL {
-                let models_list = self.fetch_models_for_select(&client, &key).await;
-                if models_list.is_empty() {
-                    eprintln!("{}", style::dim(format!("Keeping {}", model)));
-                    continue;
-                }
-
-                let current_idx = models_list
-                    .iter()
-                    .position(|m| m == &raw_model)
-                    .unwrap_or(0);
-                if let Some(idx) = FuzzySelect::new()
-                    .with_prompt("Select model")
-                    .items(&models_list)
-                    .default(current_idx)
-                    .interact_opt()
-                    .ok()
-                    .flatten()
-                {
-                    let raw = models_list[idx].clone();
-                    self.session_store.set_chat_model(&key.id, &raw).await?;
-                    self.session_store
-                        .record_selection(&key.id, "chat", Some(&raw))
-                        .await?;
-                    raw_model = raw.clone();
-                    model = Self::transform_model_for_provider(&key.base_url, &raw);
-                    eprintln!("  model: {}", style::cyan(&model));
-                    if !history.is_empty() {
-                        self.session_store
-                            .save_chat_session_with_id(
-                                &key.id,
-                                &key.base_url,
-                                &cwd,
-                                &session_id,
-                                &raw_model,
-                                &to_stored_messages(&history),
-                            )
-                            .await?;
-                    }
-                }
-                continue;
-            }
-
-            if input.starts_with('/') {
-                let cmd = input.split_whitespace().next().unwrap_or(&input);
-                eprintln!(
-                    "{} Unknown command: {}",
-                    style::yellow("Warning:"),
-                    style::cyan(cmd)
-                );
-                continue;
-            }
-
-            // Add user message to history and trim if needed
-            history.push(ChatMessage {
-                role: "user".to_string(),
-                content: input,
-            });
-            trim_history(&mut history, MAX_HISTORY_MESSAGES);
-
-            // Start loading spinner
-            let (spinning, spinner_handle) = style::start_spinner(None);
-
-            // Stream response, auto-detecting provider format
-            let result = send_message_turn(
-                &client,
-                &key,
-                copilot_tm.as_ref(),
-                &model,
-                &history,
-                &mut format,
-                &spinning,
-            )
-            .await;
-
-            style::stop_spinner(&spinning);
-            let _ = spinner_handle.await;
-            match result {
-                Ok(turn) => {
-                    // Ensure newline after streamed response
-                    println!();
-                    history.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: turn.content,
-                    });
-                    if let Some(usage) = turn.usage {
-                        self.session_store
-                            .record_tokens(
-                                &key.id,
-                                Some(&raw_model),
-                                usage.prompt_tokens,
-                                usage.completion_tokens,
-                            )
-                            .await?;
-                    }
-                    self.session_store
-                        .save_chat_session_with_id(
-                            &key.id,
-                            &key.base_url,
-                            &cwd,
-                            &session_id,
-                            &raw_model,
-                            &to_stored_messages(&history),
-                        )
-                        .await?;
-                }
-                Err(e) => {
-                    eprintln!("\n{} {}", style::red("Error:"), e);
-                    // Remove the failed user message so user can retry
-                    history.pop();
-                }
-            }
-        }
-
-        if !rl.history().is_empty() {
-            let joined = rl
-                .history()
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if let Ok(encrypted) = crate::services::session_store::encrypt(&joined) {
-                if let Some(parent) = history_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if std::fs::write(&history_path, &encrypted).is_ok() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &history_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        );
-                    }
-                }
-            }
-        }
         Ok(ExitCode::Success)
     }
 
@@ -661,11 +321,19 @@ impl ChatCommand {
         println!();
         println!(
             "{}",
-            style::dim("Start an interactive chat REPL with streaming responses.")
+            style::dim("Start the interactive full-screen chat TUI with streaming responses.")
         );
         println!(
             "{}",
-            style::dim("Uses the active API key to call the chat completions endpoint.")
+            style::dim(
+                "Uses the active API key and opens a transcript/composer interface in your terminal."
+            )
+        );
+        println!(
+            "{}",
+            style::dim(
+                "Slash commands are available inside chat: /new, /resume, /model, /key, /help, /exit."
+            )
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -685,6 +353,65 @@ impl ChatCommand {
             style::dim("Send one message and exit (uses piped stdin as context)")
         );
         println!();
+        println!("{}", style::bold("Slash Commands:"));
+        println!(
+            "  {}  {}",
+            style::cyan("/new"),
+            style::dim("Start a fresh chat with the current key and model")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("/resume [query]"),
+            style::dim("Resume a saved chat from this directory")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("/model [name]"),
+            style::dim("Switch the current chat model")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("/key [id|name]"),
+            style::dim("Switch to another saved key for this chat")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("/help / /exit"),
+            style::dim("Open command help / leave chat")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("//message"),
+            style::dim("Send a literal leading slash")
+        );
+        println!();
+        println!("{}", style::bold("Keys:"));
+        println!(
+            "  {}  {}",
+            style::cyan("Enter / Ctrl+J"),
+            style::dim("Send message / insert newline")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("Ctrl+R / F1"),
+            style::dim("Open resume picker / show help")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("Ctrl+P / Ctrl+N"),
+            style::dim("Previous / next input")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("Ctrl+M"),
+            style::dim("Change model")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("AIVO_REDUCE_MOTION=1"),
+            style::dim("Disable chat TUI motion effects")
+        );
+        println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo chat"));
         println!("  {}", style::dim("aivo chat --model gpt-4o"));
@@ -700,7 +427,8 @@ impl ChatCommand {
     }
 }
 
-async fn send_message_turn(
+#[allow(clippy::too_many_arguments)]
+async fn send_message_turn<F>(
     client: &Client,
     key: &ApiKey,
     copilot_tm: Option<&CopilotTokenManager>,
@@ -708,20 +436,25 @@ async fn send_message_turn(
     history: &[ChatMessage],
     format: &mut ChatFormat,
     spinning: &Arc<AtomicBool>,
-) -> Result<ChatTurnResult> {
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     if let Some(tm) = copilot_tm {
-        return send_copilot_request(client, tm, model, history, spinning).await;
+        return send_copilot_request(client, tm, model, history, spinning, on_chunk).await;
     }
 
     match format {
         ChatFormat::OpenAI => {
-            match send_chat_request(client, key, model, history, spinning).await {
+            match send_chat_request(client, key, model, history, spinning, on_chunk).await {
                 ok @ Ok(_) => ok,
                 Err(e) if is_format_mismatch(&e) => {
                     // Provider doesn't speak OpenAI format; try Anthropic
-                    match send_anthropic_request(client, key, model, history, spinning).await {
+                    match send_anthropic_request(client, key, model, history, spinning, on_chunk)
+                        .await
+                    {
                         Ok(content) => {
-                            eprintln!("{}", style::dim("  (using Anthropic messages format)"));
                             *format = ChatFormat::Anthropic;
                             Ok(content)
                         }
@@ -732,7 +465,7 @@ async fn send_message_turn(
             }
         }
         ChatFormat::Anthropic => {
-            send_anthropic_request(client, key, model, history, spinning).await
+            send_anthropic_request(client, key, model, history, spinning, on_chunk).await
         }
     }
 }
@@ -768,26 +501,6 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
         .collect()
 }
 
-fn print_chat_commands() {
-    let rows = [
-        (CMD_HELP, "Show chat commands"),
-        (CMD_MODEL, "Pick a different model"),
-        (CMD_NEW, "Start a fresh chat"),
-        (CMD_RESUME, "Resume a saved chat"),
-        (CMD_EXIT, "Leave chat"),
-    ];
-    let width = rows.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
-
-    eprintln!("{}", style::bold("Commands"));
-    for (cmd, description) in rows {
-        eprintln!(
-            "  {}  {}",
-            style::cyan(format!("{cmd:<width$}")),
-            style::dim(description)
-        );
-    }
-}
-
 fn new_chat_session_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -796,51 +509,6 @@ fn new_chat_session_id() -> String {
         .unwrap_or_default()
         .as_nanos()
         .to_string()
-}
-
-fn format_session_choice(session: &crate::services::session_store::ChatSessionState) -> String {
-    let updated = session.updated_at.split('T').collect::<Vec<_>>();
-    let updated = if updated.len() == 2 {
-        let time = updated[1]
-            .split('.')
-            .next()
-            .unwrap_or(updated[1])
-            .trim_end_matches('Z');
-        format!("{} {}", updated[0], time)
-    } else {
-        session.updated_at.clone()
-    };
-
-    format!(
-        "{} · {} messages · {}",
-        session.model,
-        session.message_count(),
-        updated
-    )
-}
-
-fn prompt_yes_no(prompt: &str, default_yes: bool) -> io::Result<bool> {
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    let term = Term::stdout();
-    term.write_str(&format!("{} {} ", prompt, suffix))?;
-
-    loop {
-        match term.read_key()? {
-            Key::Enter => {
-                term.write_line(if default_yes { "y" } else { "n" })?;
-                return Ok(default_yes);
-            }
-            Key::Char('y') | Key::Char('Y') => {
-                term.write_line("y")?;
-                return Ok(true);
-            }
-            Key::Char('n') | Key::Char('N') | Key::Escape => {
-                term.write_line("n")?;
-                return Ok(false);
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Extracts assistant text from OpenAI-compatible non-streaming chat responses.
@@ -958,13 +626,17 @@ where
 /// Sends a chat completion request and prints the response.
 /// Tries streaming first; falls back to non-streaming if the server returns a 5xx error.
 /// Returns the full assistant message content.
-async fn send_chat_request(
+async fn send_chat_request<F>(
     client: &Client,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<ChatTurnResult> {
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/chat/completions", base);
 
@@ -989,7 +661,7 @@ async fn send_chat_request(
     // Note: 404 is NOT included here — it means wrong endpoint, not streaming unsupported.
     // The caller detects 404 and switches to a different API format instead.
     if response.status().is_server_error() {
-        return send_non_streaming(client, &url, key, model, messages, spinning).await;
+        return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
     }
 
     if !response.status().is_success() {
@@ -1025,8 +697,7 @@ async fn send_chat_request(
                 }
                 if let Some(content) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
-                    print!("{}", content);
-                    io::stdout().flush()?;
+                    on_chunk(&content)?;
                     full_content.push_str(&content);
                 }
             }
@@ -1043,8 +714,7 @@ async fn send_chat_request(
                 && let Some(content) = parse_sse_chunk(data)
             {
                 style::stop_spinner(spinning);
-                print!("{}", content);
-                io::stdout().flush()?;
+                on_chunk(&content)?;
                 full_content.push_str(&content);
             }
         } else if full_content.is_empty()
@@ -1053,15 +723,14 @@ async fn send_chat_request(
             let content = extract_openai_message_content(&resp);
             if !content.is_empty() {
                 style::stop_spinner(spinning);
-                print!("{}", content);
-                io::stdout().flush()?;
+                on_chunk(&content)?;
                 full_content = content;
             }
         }
     }
 
     if full_content.is_empty() {
-        return send_non_streaming(client, &url, key, model, messages, spinning).await;
+        return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
     }
 
     Ok(ChatTurnResult {
@@ -1071,14 +740,18 @@ async fn send_chat_request(
 }
 
 /// Non-streaming fallback for gateways that don't support SSE streaming.
-async fn send_non_streaming(
+async fn send_non_streaming<F>(
     client: &Client,
     url: &str,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<ChatTurnResult> {
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let request = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
@@ -1112,20 +785,23 @@ async fn send_non_streaming(
     }
 
     style::stop_spinner(spinning);
-    print!("{}", content);
-    io::stdout().flush()?;
+    on_chunk(&content)?;
 
     Ok(ChatTurnResult { content, usage })
 }
 
 /// Sends a chat request via GitHub Copilot (token exchange + Copilot API).
-async fn send_copilot_request(
+async fn send_copilot_request<F>(
     client: &Client,
     tm: &CopilotTokenManager,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<ChatTurnResult> {
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let (copilot_token, api_endpoint) = tm.get_token().await?;
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
 
@@ -1148,8 +824,16 @@ async fn send_copilot_request(
     .await?;
 
     if response.status().is_server_error() {
-        return send_copilot_non_streaming(client, &url, &copilot_token, model, messages, spinning)
-            .await;
+        return send_copilot_non_streaming(
+            client,
+            &url,
+            &copilot_token,
+            model,
+            messages,
+            spinning,
+            on_chunk,
+        )
+        .await;
     }
 
     if !response.status().is_success() {
@@ -1185,8 +869,7 @@ async fn send_copilot_request(
                 }
                 if let Some(content) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
-                    print!("{}", content);
-                    io::stdout().flush()?;
+                    on_chunk(&content)?;
                     full_content.push_str(&content);
                 }
             }
@@ -1203,8 +886,7 @@ async fn send_copilot_request(
                 && let Some(content) = parse_sse_chunk(data)
             {
                 style::stop_spinner(spinning);
-                print!("{}", content);
-                io::stdout().flush()?;
+                on_chunk(&content)?;
                 full_content.push_str(&content);
             }
         } else if full_content.is_empty()
@@ -1213,16 +895,23 @@ async fn send_copilot_request(
             let content = extract_openai_message_content(&resp);
             if !content.is_empty() {
                 style::stop_spinner(spinning);
-                print!("{}", content);
-                io::stdout().flush()?;
+                on_chunk(&content)?;
                 full_content = content;
             }
         }
     }
 
     if full_content.is_empty() {
-        return send_copilot_non_streaming(client, &url, &copilot_token, model, messages, spinning)
-            .await;
+        return send_copilot_non_streaming(
+            client,
+            &url,
+            &copilot_token,
+            model,
+            messages,
+            spinning,
+            on_chunk,
+        )
+        .await;
     }
 
     Ok(ChatTurnResult {
@@ -1231,14 +920,18 @@ async fn send_copilot_request(
     })
 }
 
-async fn send_copilot_non_streaming(
+async fn send_copilot_non_streaming<F>(
     client: &Client,
     url: &str,
     copilot_token: &str,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<ChatTurnResult> {
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let request = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
@@ -1274,8 +967,7 @@ async fn send_copilot_non_streaming(
     }
 
     style::stop_spinner(spinning);
-    print!("{}", content);
-    io::stdout().flush()?;
+    on_chunk(&content)?;
 
     Ok(ChatTurnResult { content, usage })
 }
@@ -1325,13 +1017,17 @@ fn is_format_mismatch(e: &anyhow::Error) -> bool {
 
 /// Sends a request using Anthropic's native /v1/messages API.
 /// Tries streaming first; falls back to non-streaming on server errors.
-async fn send_anthropic_request(
+async fn send_anthropic_request<F>(
     client: &Client,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<ChatTurnResult> {
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/messages", base);
 
@@ -1356,7 +1052,10 @@ async fn send_anthropic_request(
     .await?;
 
     if response.status().is_server_error() || response.status() == reqwest::StatusCode::NOT_FOUND {
-        return send_anthropic_non_streaming(client, &url, key, model, messages, spinning).await;
+        return send_anthropic_non_streaming(
+            client, &url, key, model, messages, spinning, on_chunk,
+        )
+        .await;
     }
 
     if !response.status().is_success() {
@@ -1384,8 +1083,7 @@ async fn send_anthropic_request(
                 }
                 if let Some(text) = parse_anthropic_chunk(data) {
                     style::stop_spinner(spinning);
-                    print!("{}", text);
-                    io::stdout().flush()?;
+                    on_chunk(&text)?;
                     full_content.push_str(&text);
                 }
             }
@@ -1400,8 +1098,7 @@ async fn send_anthropic_request(
             }
             if let Some(text) = parse_anthropic_chunk(data) {
                 style::stop_spinner(spinning);
-                print!("{}", text);
-                io::stdout().flush()?;
+                on_chunk(&text)?;
                 full_content.push_str(&text);
             }
         }
@@ -1409,7 +1106,10 @@ async fn send_anthropic_request(
 
     // If streaming produced no content, fall back to non-streaming
     if full_content.is_empty() {
-        return send_anthropic_non_streaming(client, &url, key, model, messages, spinning).await;
+        return send_anthropic_non_streaming(
+            client, &url, key, model, messages, spinning, on_chunk,
+        )
+        .await;
     }
 
     Ok(ChatTurnResult {
@@ -1419,14 +1119,18 @@ async fn send_anthropic_request(
 }
 
 /// Non-streaming fallback for Anthropic-format providers.
-async fn send_anthropic_non_streaming(
+async fn send_anthropic_non_streaming<F>(
     client: &Client,
     url: &str,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
-) -> Result<ChatTurnResult> {
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let request = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -1472,8 +1176,7 @@ async fn send_anthropic_non_streaming(
     }
 
     style::stop_spinner(spinning);
-    print!("{}", content);
-    io::stdout().flush()?;
+    on_chunk(&content)?;
 
     Ok(ChatTurnResult { content, usage })
 }
@@ -1491,93 +1194,6 @@ pub fn parse_anthropic_chunk(data: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyline::Context;
-    use rustyline::history::DefaultHistory;
-
-    fn make_history() -> DefaultHistory {
-        DefaultHistory::new()
-    }
-
-    #[test]
-    fn test_completer_exit_prefix() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        let (start, completions) = h.complete("/e", 2, &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert!(completions.iter().any(|p| p.replacement == "/exit"));
-    }
-
-    #[test]
-    fn test_completer_model_prefix() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        let (start, completions) = h.complete("/m", 2, &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert!(completions.iter().any(|p| p.replacement == "/model"));
-    }
-
-    #[test]
-    fn test_completer_no_match_for_normal_text() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        let (_, completions) = h.complete("hello", 5, &ctx).unwrap();
-        assert!(completions.is_empty());
-    }
-
-    #[test]
-    fn test_completer_full_slash_prefix_returns_all() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        let (_, completions) = h.complete("/", 1, &ctx).unwrap();
-        assert_eq!(completions.len(), h.commands.len());
-    }
-
-    #[test]
-    fn test_hinter_shows_remainder_for_partial_exit() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        let hint = h.hint("/e", 2, &ctx);
-        assert_eq!(hint.as_deref(), Some("xit"));
-    }
-
-    #[test]
-    fn test_hinter_shows_remainder_for_partial_model() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        let hint = h.hint("/m", 2, &ctx);
-        assert_eq!(hint.as_deref(), Some("odel"));
-    }
-
-    #[test]
-    fn test_hinter_no_hint_for_complete_command() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        assert!(h.hint("/exit", 5, &ctx).is_none());
-    }
-
-    #[test]
-    fn test_hinter_no_hint_for_normal_text() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        assert!(h.hint("hello", 5, &ctx).is_none());
-    }
-
-    #[test]
-    fn test_hinter_no_hint_when_cursor_not_at_end() {
-        let h = ChatHelper::new();
-        let hist = make_history();
-        let ctx = Context::new(&hist);
-        // cursor at pos 2, line is longer — mid-edit, no hint
-        assert!(h.hint("/exit", 2, &ctx).is_none());
-    }
 
     #[test]
     fn test_parse_sse_chunk_with_content() {
