@@ -31,6 +31,7 @@ use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::http_utils::sse_data_payload;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore, StoredChatMessage};
@@ -842,11 +843,6 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> io::Result<bool> {
     }
 }
 
-/// Returns the SSE payload for a `data:` line.
-/// Accepts both `data: {...}` and `data:{...}`.
-fn sse_data_payload(line: &str) -> Option<&str> {
-    line.strip_prefix("data:").map(str::trim_start)
-}
 
 /// Extracts assistant text from OpenAI-compatible non-streaming chat responses.
 fn extract_openai_message_content(body: &serde_json::Value) -> String {

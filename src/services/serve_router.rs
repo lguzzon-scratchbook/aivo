@@ -9,14 +9,13 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::models::fetch_models;
 use crate::services::codex_router::{
     CodexRouterConfig, convert_chat_response_to_responses_sse, convert_responses_to_chat_request,
 };
 use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::http_utils::{self, router_http_client};
+use crate::services::http_utils::{self, current_unix_ts, router_http_client, sse_data_payload};
 use crate::services::model_names::{copilot_model_name, transform_model_for_openrouter};
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
@@ -295,11 +294,11 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
                 return Ok(buffered_response(status, &content_type, body));
             }
 
-            let chat_json: Value = serde_json::from_slice(&body)?;
             if client_wants_stream {
                 let sse = if content_type.contains("text/event-stream") {
                     convert_chat_sse_to_responses_sse(std::str::from_utf8(&body)?, &original_model)?
                 } else {
+                    let chat_json: Value = serde_json::from_slice(&body)?;
                     convert_chat_response_to_responses_sse(&chat_json, false, &original_model)
                 };
                 Ok(buffered_response(
@@ -308,6 +307,7 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
                     sse.into_bytes(),
                 ))
             } else {
+                let chat_json: Value = serde_json::from_slice(&body)?;
                 let response_json =
                     convert_chat_response_to_responses_json(&chat_json, &original_model)?;
                 Ok(buffered_response(
@@ -744,7 +744,7 @@ impl AnthropicToOpenAIStreamConverter {
         Self {
             pending: String::new(),
             id: "chatcmpl-aivo".to_string(),
-            model: fallback_model.to_string(),
+            model: String::new(),
             fallback_model: fallback_model.to_string(),
             created: current_unix_ts(),
             role_sent: false,
@@ -860,7 +860,7 @@ impl AnthropicToOpenAIStreamConverter {
                     output.push_str(&openai_sse_chunk(
                         &self.id,
                         self.created,
-                        &self.model_name(),
+                        self.model_name(),
                         json!({
                             "tool_calls": [{
                                 "index": index,
@@ -887,7 +887,7 @@ impl AnthropicToOpenAIStreamConverter {
                             output.push_str(&openai_sse_chunk(
                                 &self.id,
                                 self.created,
-                                &self.model_name(),
+                                self.model_name(),
                                 json!({ "content": text }),
                                 Value::Null,
                             ));
@@ -910,7 +910,7 @@ impl AnthropicToOpenAIStreamConverter {
                             output.push_str(&openai_sse_chunk(
                                 &self.id,
                                 self.created,
-                                &self.model_name(),
+                                self.model_name(),
                                 json!({
                                     "tool_calls": [{
                                         "index": index,
@@ -962,7 +962,7 @@ impl AnthropicToOpenAIStreamConverter {
         output.push_str(&openai_sse_chunk(
             &self.id,
             self.created,
-            &self.model_name(),
+            self.model_name(),
             json!({ "role": "assistant" }),
             Value::Null,
         ));
@@ -976,7 +976,7 @@ impl AnthropicToOpenAIStreamConverter {
         output.push_str(&openai_sse_chunk(
             &self.id,
             self.created,
-            &self.model_name(),
+            self.model_name(),
             json!({}),
             json!(finish_reason),
         ));
@@ -984,11 +984,11 @@ impl AnthropicToOpenAIStreamConverter {
         self.finished = true;
     }
 
-    fn model_name(&self) -> String {
+    fn model_name(&self) -> &str {
         if self.model.is_empty() {
-            self.fallback_model.clone()
+            &self.fallback_model
         } else {
-            self.model.clone()
+            &self.model
         }
     }
 }
@@ -1166,16 +1166,6 @@ impl GeminiToOpenAIStreamConverter {
     }
 }
 
-fn sse_data_payload(line: &str) -> Option<&str> {
-    line.strip_prefix("data:").map(str::trim_start)
-}
-
-fn current_unix_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 fn openai_sse_chunk(
     id: &str,

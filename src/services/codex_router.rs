@@ -16,10 +16,8 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::http_utils;
+use crate::services::http_utils::{self, current_unix_ts};
 use crate::services::model_names::select_model_for_protocol;
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
@@ -793,7 +791,7 @@ pub fn convert_chat_response_to_responses_sse(
     original_model: &str,
 ) -> String {
     let resp_id = gen_id("resp");
-    let created_at = unix_timestamp();
+    let created_at = current_unix_ts();
     // Map model name for Codex CLI compatibility
     let codex_model = map_model_for_codex_cli(original_model);
     let mut sse = String::new();
@@ -1097,19 +1095,9 @@ fn sse_event(event_type: &str, data: &Value) -> String {
 /// Generates a unique ID using an atomic counter + timestamp
 fn gen_id(prefix: &str) -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{}_{}_{:06}", prefix, secs, n % 1_000_000)
+    format!("{}_{}_{:06}", prefix, current_unix_ts(), n % 1_000_000)
 }
 
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 // =============================================================================
 // TESTS

@@ -8,6 +8,7 @@ use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
@@ -440,6 +441,20 @@ pub fn build_chat_completions_url(base_url: &str) -> String {
     } else {
         format!("{}/v1/chat/completions", base)
     }
+}
+
+/// Returns the current Unix timestamp in seconds.
+pub fn current_unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Returns the SSE payload for a `data:` line.
+/// Accepts both `data: {...}` and `data:{...}`.
+pub fn sse_data_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("data:").map(str::trim_start)
 }
 
 /// Creates a `reqwest::Client` with connection pooling for router use.

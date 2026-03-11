@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::services::http_utils::current_unix_ts;
 
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToAnthropicChatConfig {
@@ -337,12 +338,6 @@ fn extract_openai_text(content: Option<&Value>) -> String {
     }
 }
 
-fn current_unix_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[cfg(test)]
 mod tests {

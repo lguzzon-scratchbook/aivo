@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::services::http_utils::current_unix_ts;
 
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToGeminiConfig {
@@ -15,20 +16,24 @@ pub fn openai_chat_model(body: &Value, default_model: &str) -> String {
 }
 
 pub fn build_google_generate_content_url(base_url: &str, model: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/models") {
-        format!("{}/{}:generateContent", base, model)
-    } else {
-        format!("{}/models/{}:generateContent", base, model)
-    }
+    build_google_content_url(base_url, model, false)
 }
 
 pub fn build_google_stream_generate_content_url(base_url: &str, model: &str) -> String {
+    build_google_content_url(base_url, model, true)
+}
+
+fn build_google_content_url(base_url: &str, model: &str, stream: bool) -> String {
     let base = base_url.trim_end_matches('/');
-    if base.ends_with("/models") {
-        format!("{}/{}:streamGenerateContent?alt=sse", base, model)
+    let suffix = if stream {
+        ":streamGenerateContent?alt=sse"
     } else {
-        format!("{}/models/{}:streamGenerateContent?alt=sse", base, model)
+        ":generateContent"
+    };
+    if base.ends_with("/models") {
+        format!("{}/{}{}", base, model, suffix)
+    } else {
+        format!("{}/models/{}{}", base, model, suffix)
     }
 }
 
@@ -318,12 +323,6 @@ fn extract_openai_text(content: Option<&Value>) -> String {
     }
 }
 
-fn current_unix_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[cfg(test)]
 mod tests {
