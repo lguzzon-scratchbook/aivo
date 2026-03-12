@@ -691,10 +691,11 @@ impl SessionStore {
         {
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::Foundation::BOOL;
+            use windows_sys::Win32::System::IO::OVERLAPPED;
             use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
 
             let handle = file.as_raw_handle();
-            let mut overlapped = unsafe { std::mem::zeroed() };
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
             // SAFETY: handle is valid; we own `file` for the guard's lifetime.
             let rc: BOOL = unsafe {
                 LockFileEx(
