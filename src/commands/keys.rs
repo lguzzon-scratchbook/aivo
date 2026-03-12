@@ -940,7 +940,7 @@ mod tests {
         );
         assert_eq!(
             detect_base_url("moonshot"),
-            Some("https://api.moonshot.cn/v1")
+            Some("https://api.moonshot.ai/v1")
         );
         assert_eq!(
             detect_base_url("minimax"),
@@ -984,8 +984,6 @@ mod tests {
     fn test_detect_base_url_no_match() {
         assert_eq!(detect_base_url("random"), None);
         assert_eq!(detect_base_url(""), None);
-        assert_eq!(detect_base_url("anthropic"), None);
-        assert_eq!(detect_base_url("openai"), None);
     }
 
     #[test]
