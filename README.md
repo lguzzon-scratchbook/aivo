@@ -1,20 +1,32 @@
 # aivo
 
-Run Claude Code, Codex, and Gemini CLI across multiple providers.
+`aivo` is a lightweight CLI for securely managing API keys
+and running Claude Code, Codex, and Gemini CLI across providers.
+
+
+## What it does
+
+- Launches `claude`, `codex`, `gemini`, and `opencode` with provider-specific env wiring.
+- Stores multiple API keys locally and lets you switch between them quickly.
+- Provides a simple chat TUI and a one-shot `-x` mode.
+- Can expose the active provider as a local OpenAI-compatible server.
 
 ## Install
+
+Homebrew:
 
 ```bash
 brew install yuanchuan/tap/aivo
 ```
 
-Or via install script:
+Install script:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yuanchuan/aivo/main/scripts/install.sh | sh
 ```
 
 Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/releases).
+
 
 ## Quick Start
 
@@ -36,149 +48,129 @@ aivo keys add copilot
 aivo claude
 ```
 
-## Common Commands
+## Everyday usage
 
-| Command | Description |
-|---|---|
-| `aivo claude` | Run Claude Code |
-| `aivo codex` | Run Codex |
-| `aivo gemini` | Run Gemini |
-| `aivo opencode` | Run OpenCode |
-| `aivo chat` | Full-screen interactive chat TUI (or one-shot with `-x`) |
-| `aivo models` | List available models from active provider |
-| `aivo serve` | Start a local OpenAI-compatible API server |
-| `aivo use [name]` | Switch active key |
-| `aivo keys add` | Add an API key |
-| `aivo keys` | List all keys |
-| `aivo update` | Update `aivo` |
-
-All extra flags pass through to the underlying tool:
+Run a tool with its normal flags:
 
 ```bash
 aivo claude --dangerously-skip-permissions
-aivo claude --resume 16354407-050e-4447-a068-4db7922ff841
+aivo claude --resume 16354407-050e-4447-a068-4db222ff841
 aivo claude --model moonshotai/kimi-k2.5
+```
 
-aivo claude --key my-proxy       # use a specific saved key
-aivo claude --env DEBUG=true     # inject extra env vars
+Pick a model for one run:
 
+```bash
+aivo claude --model moonshotai/kimi-k2.5
 aivo chat --model openai/gpt-4o
-aivo chat -x "hello"
-git diff --cached | aivo chat -x "Summarize these changes in one sentence"
-
-aivo models                      # cached for 1h
-aivo models --refresh            # force-refresh
-
-aivo serve                       # start on default port 24860
-aivo serve --port 8080           # start on custom port
 ```
 
-
-## Key Management
+Or let `--model` open the model picker if the provider supports the model list API:
 
 ```bash
-aivo keys       # list all keys
-aivo keys add   # add a new key (interactive)
-aivo keys use   # switch active key
-aivo keys cat   # show key details
-aivo keys rm    # remove a key
-aivo keys edit  # edit a key
+aivo claude --model
+aivo chat --model
 ```
 
-### Adding popular providers
+Use a different saved key without changing the active one:
 
-**OpenRouter**
 ```bash
-aivo keys add --base-url=https://openrouter.ai/api/v1 --key=xxx
+aivo claude --key openrouter
+aivo codex --key copilot
 ```
 
-**Vercel AI Gateway**
+Inject extra env vars into the child process:
+
 ```bash
-aivo keys add --base-url=https://ai-gateway.vercel.sh/v1 --key=xxx
+aivo claude --env=BASH_DEFAULT_TIMEOUT_MS=60000
 ```
 
-**DeepSeek**
+Use the interactive start flow for the current directory:
+
 ```bash
-aivo keys add --base-url=https://api.deepseek.com/v1 --key=xxx
+aivo run
 ```
 
-**Fireworks**
+`aivo run` without a tool will reuse the saved selection for that directory when it has one.
+
+## Keys and providers
+
+List, inspect, switch, edit, or remove saved keys:
+
 ```bash
-aivo keys add --base-url=https://api.fireworks.ai/inference/v1 --key=xxx
+aivo keys
+aivo keys add
+aivo keys use
+aivo keys cat
+aivo keys edit
+aivo keys rm
 ```
 
-**MiniMax**
-```bash
-aivo keys add --base-url=https://api.minimax.io/anthropic --key=xxx
-```
+`aivo use <name>` is a shortcut for `aivo keys use <name>`.
 
-**Moonshot**
-```bash
-aivo keys add --base-url=https://api.moonshot.cn/v1 --key=xxx
-```
-
-**Groq**
-```bash
-aivo keys add --base-url=https://api.groq.com/openai/v1 --key=xxx
-```
-
-**xAI (Grok)**
-```bash
-aivo keys add --base-url=https://api.x.ai/v1 --key=xxx
-```
-
-**Mistral**
-```bash
-aivo keys add --base-url=https://api.mistral.ai/v1 --key=xxx
-```
-
-**Cloudflare Workers AI**
-```bash
-aivo keys add --base-url=https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1 --key=xxx
-```
-
-Use `aivo keys` to view your saved providers and `aivo use` to switch between them.
-
-## Multiple Providers
-
-Save multiple keys and switch between them on the fly:
+Examples:
 
 ```bash
-# save a few providers
-aivo keys add --name=openrouter --base-url=https://openrouter.ai/api/v1 --key=xxx
-aivo keys add --name=groq --base-url=https://api.groq.com/openai/v1 --key=xxx
+aivo keys add openrouter --base-url https://openrouter.ai/api/v1 --key xxx
+aivo keys add groq --base-url https://api.groq.com/openai/v1 --key xxx
+aivo keys add deepseek --base-url https://api.deepseek.com/v1 --key xxx
 aivo keys add copilot
-
-# switch active provider
-aivo use openrouter
-
-# or use a specific key for a single run
-aivo claude --key groq
-aivo claude --key copilot
 ```
 
-## Local API Server
+You are not limited to the providers above.
+Any endpoint that matches the supported protocols can be saved with `aivo keys add`.
+Keys are stored locally and encrypted in the user config directory.
 
-`aivo serve` exposes your active provider as a local OpenAI-compatible endpoint — useful for MCP servers, scripts, or any tool that speaks the OpenAI API:
+## Models
+
+List models for the active provider:
 
 ```bash
-aivo serve                  # listens on http://127.0.0.1:24860
-aivo serve --port 8080      # custom port
-aivo serve --key openrouter # serve a specific saved key
+aivo models
+aivo models --refresh
+aivo models --key openrouter
 ```
 
-Then point any OpenAI client at `http://127.0.0.1:24860`.
+Model lists are cached for one hour. `--refresh` bypasses the cache.
+
+## Chat
+
+`aivo chat` starts the full-screen chat UI. `-x` runs a single prompt and exits.
+
+```bash
+aivo chat
+aivo chat -x "Summarize this repository"
+git diff --cached | aivo chat -x "Write a one-line commit message"
+```
+
+The selected chat model is remembered per saved key.
+
+## Local API server
+
+`aivo serve` exposes the active provider as a local OpenAI-compatible endpoint:
+
+```bash
+aivo serve
+aivo serve --port 8080
+aivo serve --key openrouter
+```
+
+Default address:
+
+```text
+http://127.0.0.1:24860
+```
+
+This is handy for scripts, MCP servers, and tools that already speak the OpenAI API.
 
 ## Development
 
 ```bash
 make build
 make build-debug
+make check
 make test
 make clippy
-make check
-
-# build the final optimized binary explicitly
 make build-release
 ```
 
