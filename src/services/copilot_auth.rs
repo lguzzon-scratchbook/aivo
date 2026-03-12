@@ -161,7 +161,7 @@ pub async fn device_flow_login() -> Result<String> {
     // Step 2: Display instructions
     println!(
         "{} Visit {} — enter code: {}",
-        style::yellow("→"),
+        style::arrow_symbol(),
         style::blue(&device.verification_uri),
         style::bold(&device.user_code)
     );

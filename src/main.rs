@@ -332,7 +332,6 @@ async fn print_active_key(session_store: &SessionStore) {
         None => return,
     };
 
-    println!();
     println!("{}", style::bold("Active key:"));
     let id_padded = format!("{:<4}", active_key.id);
     println!(

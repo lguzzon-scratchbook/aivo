@@ -1044,7 +1044,7 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         eprintln!(
             "  {} Gemini + Copilot: no model specified. Gemini models are not available on \
              Copilot. Pass --model <model> (e.g., --model gpt-4o).",
-            crate::style::yellow("warning:")
+            crate::style::yellow("Warning:")
         );
     }
 

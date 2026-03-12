@@ -64,8 +64,8 @@ impl UpdateCommand {
         println!("{}", style::bold("Options:"));
         println!(
             "  {}, {}    Force update even if installed via a package manager",
-            style::green("-f"),
-            style::green("--force")
+            style::cyan("-f"),
+            style::cyan("--force")
         );
     }
 

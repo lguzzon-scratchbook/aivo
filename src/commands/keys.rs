@@ -132,7 +132,8 @@ impl KeysCommand {
             return Ok(ExitCode::Success);
         }
 
-        println!();
+        let max_name_len = keys.iter().map(|k| k.name.len()).max().unwrap_or(0);
+
         for key in &keys {
             let is_active = active_key_id.as_deref() == Some(key.id.as_str());
             let active_indicator = if is_active {
@@ -141,22 +142,14 @@ impl KeysCommand {
                 style::empty_bullet_symbol()
             };
             let id_padded = format!("{:<4}", key.id);
-            if key.name.is_empty() {
-                println!(
-                    "  {} {}  {}",
-                    active_indicator,
-                    style::cyan(&id_padded),
-                    style::dim(&key.base_url)
-                );
-            } else {
-                println!(
-                    "  {} {}  {}  {}",
-                    active_indicator,
-                    style::cyan(&id_padded),
-                    key.name,
-                    style::dim(&key.base_url)
-                );
-            }
+            let name_padded = format!("{:<width$}", key.name, width = max_name_len);
+            println!(
+                "{} {}  {}  {}",
+                active_indicator,
+                style::cyan(&id_padded),
+                name_padded,
+                style::dim(&key.base_url)
+            );
         }
 
         Ok(ExitCode::Success)
@@ -225,11 +218,9 @@ impl KeysCommand {
 
     /// Displays key details
     fn display_key_details(&self, key: &ApiKey) {
-        println!();
         println!("Name:     {}", style::cyan(key.display_name()));
         println!("Base URL: {}", style::blue(&key.base_url));
         println!("API Key:  {}", style::yellow(&*key.key));
-        println!();
     }
 
     /// Interactively edits an API key
@@ -486,7 +477,6 @@ impl KeysCommand {
                 .await?;
             self.session_store.set_active_key(&id).await?;
 
-            println!();
             println!(
                 "{} Added and activated key: {}",
                 style::success_symbol(),
@@ -520,8 +510,6 @@ impl KeysCommand {
                 }
             }
         };
-
-        println!();
 
         let id = self
             .session_store
@@ -656,7 +644,7 @@ impl KeysCommand {
             println!("  {:<18} {}", label, style::dim(description));
         };
 
-        println!("{}", style::bold("Usage: aivo keys [action]"));
+        println!("{} aivo keys [action]", style::bold("Usage:"));
         println!();
         println!("{}", style::bold("Actions:"));
         print_row("(no action)", "- List all API keys");

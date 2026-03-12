@@ -2502,8 +2502,7 @@ impl ChatTuiApp {
             for (filtered_index, item) in visible {
                 let item_lines =
                     picker_entry_lines(item, filtered_index == picker.selected, chunks[1].width);
-                row_to_filtered_index
-                    .extend(std::iter::repeat_n(filtered_index, item_lines.len()));
+                row_to_filtered_index.extend(std::iter::repeat_n(filtered_index, item_lines.len()));
                 lines.extend(item_lines);
             }
 
@@ -3542,7 +3541,11 @@ fn session_preview_text_from_messages(messages: &[ChatMessage], raw_model: &str)
         .collect::<Vec<_>>()
         .join(" · ");
 
-    if !joined.is_empty() { joined } else { raw_model.to_string() }
+    if !joined.is_empty() {
+        joined
+    } else {
+        raw_model.to_string()
+    }
 }
 
 fn collapse_whitespace(text: &str) -> String {
