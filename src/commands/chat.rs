@@ -470,6 +470,52 @@ where
     }
 }
 
+/// Calls the API to produce a compact summary of `history`.
+/// Returns the summary text on success.
+async fn perform_compact(
+    client: &Client,
+    key: &ApiKey,
+    copilot_tm: Option<&CopilotTokenManager>,
+    model: &str,
+    history: &[ChatMessage],
+) -> Result<String> {
+    let system = ChatMessage {
+        role: "system".to_string(),
+        content: "Summarize this conversation concisely but thoroughly. Preserve key facts, decisions, code snippets, file paths, and action items. Write in second person. Be concise.".to_string(),
+    };
+    let request_msg = ChatMessage {
+        role: "user".to_string(),
+        content: "Please summarize our conversation so far.".to_string(),
+    };
+    let messages: Vec<ChatMessage> = std::iter::once(system)
+        .chain(history.iter().cloned())
+        .chain(std::iter::once(request_msg))
+        .collect();
+
+    let spinning = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut format = ChatFormat::OpenAI;
+    let mut summary = String::new();
+    send_message_turn(
+        client,
+        key,
+        copilot_tm,
+        model,
+        &messages,
+        &mut format,
+        &spinning,
+        &mut |chunk| {
+            summary.push_str(chunk);
+            Ok(())
+        },
+    )
+    .await?;
+
+    if summary.is_empty() {
+        anyhow::bail!("Compact request returned an empty summary");
+    }
+    Ok(summary)
+}
+
 fn read_stdin_if_piped() -> Result<Option<String>> {
     if io::stdin().is_terminal() {
         return Ok(None);

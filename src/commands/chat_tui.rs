@@ -22,7 +22,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -43,6 +45,8 @@ const ERROR: Color = Color::Rgb(230, 134, 128);
 const THINKING: Color = Color::Rgb(237, 213, 104);
 const EMPTY_STATE_BOTTOM_GAP: u16 = 1;
 const TRANSCRIPT_BOTTOM_PADDING: u16 = 1;
+const COMPACT_SUGGEST_THRESHOLD: u64 = 120_000;
+const COMPACT_MIN_MESSAGES: usize = 4;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("new", "start a fresh chat"),
@@ -51,6 +55,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("model", "switch model"),
     ("key", "switch saved key"),
     ("help", "open help"),
+    ("compact", "summarize history to reduce context"),
 ];
 
 pub(super) struct ChatTuiParams {
@@ -297,6 +302,7 @@ enum SlashCommand {
     Model(Option<String>),
     Key(Option<String>),
     Help,
+    Compact,
 }
 
 enum RuntimeEvent {
@@ -306,6 +312,9 @@ enum RuntimeEvent {
         format: ChatFormat,
     },
     ModelsLoaded(std::result::Result<Vec<String>, String>),
+    CompactFinished {
+        result: std::result::Result<String, String>,
+    },
 }
 
 struct ChatTuiApp {
@@ -333,6 +342,7 @@ struct ChatTuiApp {
     sending: bool,
     request_started_at: Option<Instant>,
     last_usage: Option<TokenUsage>,
+    context_tokens: u64,
     follow_output: bool,
     transcript_scroll: usize,
     transcript_width: u16,
@@ -378,6 +388,7 @@ impl ChatTuiApp {
             sending: false,
             request_started_at: None,
             last_usage: None,
+            context_tokens: 0,
             follow_output: true,
             transcript_scroll: 0,
             transcript_width: 0,
@@ -593,10 +604,20 @@ impl ChatTuiApp {
                                         usage.completion_tokens,
                                     )
                                     .await?;
+                                self.context_tokens = usage.prompt_tokens + usage.completion_tokens;
                                 self.last_usage = Some(usage);
+                            } else {
+                                self.context_tokens = estimate_context_tokens(&self.history);
                             }
                             self.persist_history().await?;
-                            self.notice = None;
+                            if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
+                                self.notice = Some((
+                                    ACCENT,
+                                    "Context is large — try /compact to summarize".to_string(),
+                                ));
+                            } else {
+                                self.notice = None;
+                            }
                         }
                         Err(err) => {
                             self.pending_response.clear();
@@ -647,6 +668,26 @@ impl ChatTuiApp {
                         self.notice = Some((ERROR, err));
                     }
                 },
+                RuntimeEvent::CompactFinished { result } => {
+                    self.sending = false;
+                    self.response_task = None;
+                    match result {
+                        Ok(summary) => {
+                            self.history = vec![ChatMessage {
+                                role: "system".to_string(),
+                                content: summary,
+                            }];
+                            self.session_id = new_chat_session_id();
+                            self.context_tokens = estimate_context_tokens(&self.history);
+                            self.last_usage = None;
+                            self.persist_history().await?;
+                            self.notice = Some((MUTED, "Conversation compacted".to_string()));
+                        }
+                        Err(err) => {
+                            self.notice = Some((ERROR, err));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1086,6 +1127,10 @@ impl ChatTuiApp {
                 self.open_help_overlay();
                 Ok(false)
             }
+            SlashCommand::Compact => {
+                self.start_compact();
+                Ok(false)
+            }
         }
     }
 
@@ -1112,8 +1157,41 @@ impl ChatTuiApp {
         self.session_id = new_chat_session_id();
         self.format = ChatFormat::OpenAI;
         self.last_usage = None;
+        self.context_tokens = 0;
         self.follow_output = true;
         self.notice = None;
+    }
+
+    fn start_compact(&mut self) {
+        if self.history.len() < COMPACT_MIN_MESSAGES {
+            self.notice = Some((MUTED, "Not enough history to compact".to_string()));
+            return;
+        }
+        if self.sending {
+            self.notice = Some((
+                MUTED,
+                "Cannot compact while a request is in progress".to_string(),
+            ));
+            return;
+        }
+
+        self.sending = true;
+        self.notice = Some((MUTED, "Compacting conversation...".to_string()));
+
+        let history = self.history.clone();
+        let client = self.client.clone();
+        let key = self.key.clone();
+        let copilot_tm = self.copilot_tm.clone();
+        let model = self.model.clone();
+        let tx = self.tx.clone();
+
+        let task = tokio::spawn(async move {
+            let result = perform_compact(&client, &key, copilot_tm.as_deref(), &model, &history)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(RuntimeEvent::CompactFinished { result });
+        });
+        self.response_task = Some(task);
     }
 
     fn cancel_inflight_request(&mut self) {
@@ -1451,6 +1529,7 @@ impl ChatTuiApp {
         self.pending_submit = None;
         self.format = ChatFormat::OpenAI;
         self.last_usage = None;
+        self.context_tokens = estimate_context_tokens(&self.history);
         self.follow_output = true;
         self.raw_model = snapshot.raw_model.clone();
         self.model =
@@ -1697,7 +1776,11 @@ impl ChatTuiApp {
                     .track_style(Style::default().fg(Color::Rgb(50, 54, 56)))
                     .begin_symbol(None)
                     .end_symbol(None);
-                frame.render_stateful_widget(scrollbar, transcript_content_area, &mut scrollbar_state);
+                frame.render_stateful_widget(
+                    scrollbar,
+                    transcript_content_area,
+                    &mut scrollbar_state,
+                );
             }
         }
 
@@ -1881,11 +1964,28 @@ impl ChatTuiApp {
     }
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let footer = build_footer_text(&self.raw_model, &self.key.base_url, &self.cwd, area.width);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(MUTED)))),
-            area,
-        );
+        let token_label = format_token_count(self.context_tokens);
+        let token_label_width = token_label.chars().count() as u16;
+        let left_width = if token_label_width == 0 {
+            area.width
+        } else {
+            area.width.saturating_sub(token_label_width + 1)
+        };
+        let left_text =
+            build_footer_text(&self.raw_model, &self.key.base_url, &self.cwd, left_width);
+        let left_len = left_text.chars().count() as u16;
+        let pad = left_width.saturating_sub(left_len);
+        let token_color = if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
+            ACCENT
+        } else {
+            MUTED
+        };
+        let mut spans = vec![Span::styled(left_text, Style::default().fg(MUTED))];
+        if token_label_width > 0 {
+            spans.push(Span::raw(" ".repeat(usize::from(pad) + 1)));
+            spans.push(Span::styled(token_label, Style::default().fg(token_color)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_picker(&mut self, frame: &mut Frame<'_>, area: Rect, picker: &PickerState) {
@@ -2007,6 +2107,13 @@ impl ChatTuiApp {
                 Span::styled("  switch saved key", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
+                Span::styled("/compact", cmd_style),
+                Span::styled(
+                    "  summarize history to reduce context",
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("/help", cmd_style),
                 Span::styled("  open this help", Style::default().fg(TEXT)),
             ]),
@@ -2114,7 +2221,12 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste, DisableMouseCapture);
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
         original_hook(info);
     }));
     let mut app = ChatTuiApp::new(params).await?;
@@ -2127,7 +2239,12 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let result: Result<_> = (|| {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -2761,6 +2878,25 @@ fn compact_styled_lines(lines: &mut Vec<StyledLine>) {
     *lines = compacted;
 }
 
+fn format_token_count(tokens: u64) -> String {
+    if tokens == 0 {
+        return String::new();
+    }
+    if tokens < 1_000 {
+        format!("{tokens}")
+    } else {
+        format!("{}k", tokens / 1_000)
+    }
+}
+
+fn estimate_context_tokens(history: &[ChatMessage]) -> u64 {
+    let total_chars: usize = history
+        .iter()
+        .map(|m| m.role.len() + m.content.len() + 20)
+        .sum();
+    (total_chars / 4) as u64
+}
+
 fn build_footer_text(model: &str, base_url: &str, cwd: &str, width: u16) -> String {
     let host = footer_host_label(base_url);
     let cwd_label = footer_cwd_label(cwd);
@@ -2939,6 +3075,7 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "model" => Ok(SlashCommand::Model(argument)),
         "key" => Ok(SlashCommand::Key(argument)),
         "help" => Ok(SlashCommand::Help),
+        "compact" => Ok(SlashCommand::Compact),
         "" => anyhow::bail!("Type a command after '/'"),
         other => anyhow::bail!("Unknown command '/{other}'"),
     }
@@ -3176,6 +3313,7 @@ mod tests {
             sending: false,
             request_started_at: None,
             last_usage: None,
+            context_tokens: 0,
             follow_output: true,
             transcript_scroll: 0,
             transcript_width: 0,
