@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::Value;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -449,6 +450,12 @@ pub fn current_unix_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Parses a JSON value as a `u64`, accepting both JSON numbers and numeric strings.
+pub fn parse_token_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 /// Returns the SSE payload for a `data:` line.

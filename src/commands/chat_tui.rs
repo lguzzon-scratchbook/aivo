@@ -840,6 +840,7 @@ impl ChatTuiApp {
                                 self.last_usage = Some(usage);
                             } else {
                                 self.context_tokens = estimate_context_tokens(&self.history);
+                                self.last_usage = None;
                             }
                             self.persist_history().await?;
                             if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
@@ -2375,7 +2376,7 @@ impl ChatTuiApp {
     }
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let token_label = format_token_count(self.context_tokens);
+        let token_label = format_token_count(self.context_tokens, self.last_usage);
         let token_label_width = token_label.chars().count() as u16;
         let left_width = if token_label_width == 0 {
             area.width
@@ -3437,8 +3438,16 @@ fn compact_styled_lines(lines: &mut Vec<StyledLine>) {
     *lines = compacted;
 }
 
-fn format_token_count(tokens: u64) -> String {
-    format!("{tokens} tk")
+fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> String {
+    if let Some(usage) = usage {
+        let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        return format!("{total} tk");
+    }
+    if tokens == 0 {
+        "0 tk".to_string()
+    } else {
+        format!("~{tokens} tk est")
+    }
 }
 
 fn estimate_context_tokens(history: &[ChatMessage]) -> u64 {
@@ -4337,10 +4346,24 @@ mod tests {
     }
 
     #[test]
-    fn test_format_token_count_uses_tk_suffix() {
-        assert_eq!(format_token_count(0), "0 tk");
-        assert_eq!(format_token_count(105), "105 tk");
-        assert_eq!(format_token_count(12_345), "12345 tk");
+    fn test_format_token_count_with_usage_shows_total() {
+        assert_eq!(
+            format_token_count(
+                999,
+                Some(TokenUsage {
+                    prompt_tokens: 24,
+                    completion_tokens: 11
+                })
+            ),
+            "35 tk"
+        );
+    }
+
+    #[test]
+    fn test_format_token_count_marks_estimates() {
+        assert_eq!(format_token_count(0, None), "0 tk");
+        assert_eq!(format_token_count(105, None), "~105 tk est");
+        assert_eq!(format_token_count(12_345, None), "~12345 tk est");
     }
 
     #[test]

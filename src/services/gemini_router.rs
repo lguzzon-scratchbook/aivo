@@ -291,7 +291,7 @@ pub fn convert_gemini_to_openai(
         }
         if let Some(mt) = gc.get("maxOutputTokens") {
             let val = if let Some(cap) = max_tokens_cap {
-                parse_token_u64(mt)
+                http_utils::parse_token_u64(mt)
                     .map(|n| serde_json::json!(n.min(cap)))
                     .unwrap_or(mt.clone())
             } else {
@@ -305,11 +305,6 @@ pub fn convert_gemini_to_openai(
     }
 
     req
-}
-
-fn parse_token_u64(v: &Value) -> Option<u64> {
-    v.as_u64()
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 /// Converts Gemini content parts to one or more OpenAI messages.

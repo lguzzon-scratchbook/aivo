@@ -485,17 +485,12 @@ pub fn is_responses_api_format(body: &Value) -> bool {
 
 fn cap_token_value(v: &Value, cap: Option<u64>) -> Value {
     if let Some(limit) = cap {
-        parse_token_u64(v)
+        http_utils::parse_token_u64(v)
             .map(|n| json!(n.min(limit)))
             .unwrap_or(v.clone())
     } else {
         v.clone()
     }
-}
-
-fn parse_token_u64(v: &Value) -> Option<u64> {
-    v.as_u64()
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 fn apply_max_tokens_cap_to_fields(body: &mut Value, cap: Option<u64>, fields: &[&str]) {

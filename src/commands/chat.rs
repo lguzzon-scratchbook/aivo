@@ -20,7 +20,7 @@ use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
-use crate::services::http_utils::sse_data_payload;
+use crate::services::http_utils::{parse_token_u64, sse_data_payload};
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore, StoredChatMessage};
@@ -67,6 +67,18 @@ struct ChunkDelta {
 struct TokenUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TokenUsageUpdate {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+impl TokenUsageUpdate {
+    fn is_empty(self) -> bool {
+        self.prompt_tokens.is_none() && self.completion_tokens.is_none()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -577,41 +589,65 @@ fn extract_openai_message_content(body: &serde_json::Value) -> String {
 }
 
 fn extract_openai_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let usage = body.get("usage")?;
+    let update = extract_openai_usage_update(body)?;
     Some(TokenUsage {
-        prompt_tokens: usage
-            .get("prompt_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0),
-        completion_tokens: usage
-            .get("completion_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0),
+        prompt_tokens: update.prompt_tokens.unwrap_or(0),
+        completion_tokens: update.completion_tokens.unwrap_or(0),
     })
 }
 
 fn extract_anthropic_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let usage = body.get("usage")?;
+    let update = extract_anthropic_usage_update(body)?;
     Some(TokenUsage {
-        prompt_tokens: usage
-            .get("input_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0),
-        completion_tokens: usage
-            .get("output_tokens")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0),
+        prompt_tokens: update.prompt_tokens.unwrap_or(0),
+        completion_tokens: update.completion_tokens.unwrap_or(0),
     })
 }
 
-fn parse_openai_usage_chunk(data: &str) -> Option<TokenUsage> {
-    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-    extract_openai_usage(&value)
+fn extract_openai_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
+    let usage = body.get("usage")?;
+    let update = TokenUsageUpdate {
+        prompt_tokens: usage.get("prompt_tokens").and_then(parse_token_u64),
+        completion_tokens: usage.get("completion_tokens").and_then(parse_token_u64),
+    };
+    if update.is_empty() {
+        None
+    } else {
+        Some(update)
+    }
 }
 
-fn parse_anthropic_usage_chunk(data: &str) -> Option<TokenUsage> {
+fn extract_anthropic_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
+    let usage = body.get("usage")?;
+    let update = TokenUsageUpdate {
+        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
+        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
+    };
+    if update.is_empty() {
+        None
+    } else {
+        Some(update)
+    }
+}
+
+fn parse_openai_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
     let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-    extract_anthropic_usage(&value)
+    extract_openai_usage_update(&value)
+}
+
+fn parse_anthropic_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    extract_anthropic_usage_update(&value)
+}
+
+fn merge_token_usage(usage: &mut Option<TokenUsage>, update: TokenUsageUpdate) {
+    let current = usage.get_or_insert_with(TokenUsage::default);
+    if let Some(tokens) = update.prompt_tokens {
+        current.prompt_tokens = tokens;
+    }
+    if let Some(tokens) = update.completion_tokens {
+        current.completion_tokens = tokens;
+    }
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
@@ -739,7 +775,7 @@ where
                     break;
                 }
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
-                    usage = Some(tokens);
+                    merge_token_usage(&mut usage, tokens);
                 }
                 if let Some(content) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
@@ -754,7 +790,7 @@ where
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
             if let Some(tokens) = parse_openai_usage_chunk(data) {
-                usage = Some(tokens);
+                merge_token_usage(&mut usage, tokens);
             }
             if data.trim() != "[DONE]"
                 && let Some(content) = parse_sse_chunk(data)
@@ -911,7 +947,7 @@ where
                     break;
                 }
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
-                    usage = Some(tokens);
+                    merge_token_usage(&mut usage, tokens);
                 }
                 if let Some(content) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
@@ -926,7 +962,7 @@ where
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
             if let Some(tokens) = parse_openai_usage_chunk(data) {
-                usage = Some(tokens);
+                merge_token_usage(&mut usage, tokens);
             }
             if data.trim() != "[DONE]"
                 && let Some(content) = parse_sse_chunk(data)
@@ -1125,7 +1161,7 @@ where
 
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_anthropic_usage_chunk(data) {
-                    usage = Some(tokens);
+                    merge_token_usage(&mut usage, tokens);
                 }
                 if let Some(text) = parse_anthropic_chunk(data) {
                     style::stop_spinner(spinning);
@@ -1140,7 +1176,7 @@ where
         let tail = line_buf.trim();
         if let Some(data) = sse_data_payload(tail) {
             if let Some(tokens) = parse_anthropic_usage_chunk(data) {
-                usage = Some(tokens);
+                merge_token_usage(&mut usage, tokens);
             }
             if let Some(text) = parse_anthropic_chunk(data) {
                 style::stop_spinner(spinning);
@@ -1355,6 +1391,84 @@ mod tests {
     #[test]
     fn test_parse_anthropic_chunk_invalid_json() {
         assert_eq!(parse_anthropic_chunk("not json"), None);
+    }
+
+    #[test]
+    fn test_merge_openai_stream_usage_across_chunks() {
+        let mut usage = None;
+        merge_token_usage(
+            &mut usage,
+            parse_openai_usage_chunk(r#"{"usage":{"prompt_tokens":24}}"#).unwrap(),
+        );
+        merge_token_usage(
+            &mut usage,
+            parse_openai_usage_chunk(r#"{"usage":{"completion_tokens":11}}"#).unwrap(),
+        );
+
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                prompt_tokens: 24,
+                completion_tokens: 11
+            })
+        );
+    }
+
+    #[test]
+    fn test_merge_anthropic_stream_usage_across_events() {
+        let mut usage = None;
+        merge_token_usage(
+            &mut usage,
+            parse_anthropic_usage_chunk(r#"{"usage":{"input_tokens":12}}"#).unwrap(),
+        );
+        merge_token_usage(
+            &mut usage,
+            parse_anthropic_usage_chunk(r#"{"usage":{"output_tokens":7}}"#).unwrap(),
+        );
+
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                prompt_tokens: 12,
+                completion_tokens: 7
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_openai_usage_accepts_numeric_strings() {
+        let body = serde_json::json!({
+            "usage": {
+                "prompt_tokens": "10",
+                "completion_tokens": "5"
+            }
+        });
+
+        assert_eq!(
+            extract_openai_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_anthropic_usage_accepts_numeric_strings() {
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": "8",
+                "output_tokens": "3"
+            }
+        });
+
+        assert_eq!(
+            extract_anthropic_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 8,
+                completion_tokens: 3
+            })
+        );
     }
 
     #[test]

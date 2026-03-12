@@ -323,16 +323,11 @@ fn cap_max_tokens_field(body: &mut Value, cap: Option<u64>) {
     let Some(limit) = cap else {
         return;
     };
-    if let Some(mt) = body.get("max_tokens").and_then(parse_token_u64)
+    if let Some(mt) = body.get("max_tokens").and_then(http_utils::parse_token_u64)
         && mt > limit
     {
         body["max_tokens"] = json!(limit);
     }
-}
-
-fn parse_token_u64(v: &Value) -> Option<u64> {
-    v.as_u64()
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 /// Convert OpenAI /v1/chat/completions response to Anthropic /v1/messages format
