@@ -1,12 +1,11 @@
 # aivo
 
-`aivo` is a lightweight CLI for securely managing API keys
-and running Claude Code, Codex, and Gemini CLI across providers.
+A lightweight CLI for managing API keys and running Claude Code, Codex, and Gemini CLI across providers.
 
 
 ## What it does
 
-- Launches `claude`, `codex`, `gemini`, and `opencode` with provider-specific env wiring.
+- Launches `claude`, `codex`, `gemini`, and `opencode` easily with provider-specific env wiring.
 - Stores multiple API keys locally and lets you switch between them quickly.
 - Provides a simple chat TUI and a one-shot `-x` mode.
 - Can expose the active provider as a local OpenAI-compatible server.
@@ -22,7 +21,7 @@ brew install yuanchuan/tap/aivo
 Install script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yuanchuan/aivo/main/scripts/install.sh | sh
+curl -fsSL https://yuanchuan.dev/aivo/install.sh | sh
 ```
 
 Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/releases).
