@@ -44,11 +44,11 @@ const USER: Color = Color::Rgb(166, 193, 226);
 const LINK: Color = Color::Rgb(142, 181, 219);
 const QUOTE: Color = Color::Rgb(143, 164, 146);
 const ERROR: Color = Color::Rgb(230, 134, 128);
-const THINKING: Color = Color::Rgb(237, 213, 104);
 const EMPTY_STATE_BOTTOM_GAP: u16 = 1;
 const TRANSCRIPT_BOTTOM_PADDING: u16 = 1;
 const COMPACT_SUGGEST_THRESHOLD: u64 = 120_000;
 const COMPACT_MIN_MESSAGES: usize = 4;
+const COMPOSER_PREFIX_WIDTH: u16 = 2;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("new", "start a fresh chat"),
@@ -1096,7 +1096,7 @@ impl ChatTuiApp {
                 return Ok(false);
             }
             KeyCode::Esc if self.sending => {
-                self.cancel_inflight_request();
+                self.interrupt_inflight_request().await?;
                 return Ok(false);
             }
             KeyCode::PageUp => {
@@ -1508,6 +1508,34 @@ impl ChatTuiApp {
         self.pending_response.clear();
         self.follow_output = true;
         self.notice = Some((MUTED, "Request cancelled".to_string()));
+    }
+
+    async fn interrupt_inflight_request(&mut self) -> Result<()> {
+        if self.pending_response.is_empty() {
+            self.cancel_inflight_request();
+            return Ok(());
+        }
+
+        if let Some(task) = self.response_task.take() {
+            task.abort();
+        }
+
+        let partial = std::mem::take(&mut self.pending_response);
+        self.pending_submit = None;
+        self.cursor = self.draft.len();
+        self.slash_hint = None;
+        self.sending = false;
+        self.request_started_at = None;
+        self.follow_output = true;
+        self.history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: partial,
+        });
+        self.context_tokens = estimate_context_tokens(&self.history);
+        self.last_usage = None;
+        self.persist_history().await?;
+        self.notice = Some((MUTED, "Response interrupted".to_string()));
+        Ok(())
     }
 
     fn record_draft_history(&mut self, input: &str) {
@@ -1979,12 +2007,8 @@ impl ChatTuiApp {
     }
 
     fn estimated_transcript_height(&self, width: u16) -> usize {
-        let width = usize::from(width.max(1));
-        self.build_transcript()
-            .plain_lines
-            .into_iter()
-            .map(|line| wrapped_line_count(&line, width))
-            .sum()
+        let transcript = self.build_transcript();
+        wrapped_text_line_count(transcript.text, width.max(1))
     }
 
     fn build_transcript(&self) -> RenderedTranscript {
@@ -2115,11 +2139,8 @@ impl ChatTuiApp {
 
         let transcript = self.build_transcript();
         let transcript_area = chunks[0];
-        let transcript_line_height = transcript
-            .plain_lines
-            .iter()
-            .map(|line| wrapped_line_count(line, usize::from(transcript_area.width.max(1))))
-            .sum::<usize>() as u16;
+        let transcript_line_height =
+            wrapped_text_line_count(transcript.text.clone(), transcript_area.width.max(1)) as u16;
         let transcript_padding =
             if transcript_area.height > 2 && transcript_line_height > transcript_area.height {
                 TRANSCRIPT_BOTTOM_PADDING
@@ -2206,10 +2227,14 @@ impl ChatTuiApp {
         frame.render_widget(composer, composer_area);
 
         if self.should_show_input_cursor() {
-            let (cursor_x, cursor_y) =
-                cursor_position(&self.draft, self.cursor, composer_area.width.max(1));
+            let (cursor_x, cursor_y) = cursor_position(
+                &self.draft,
+                self.cursor,
+                composer_area.width.max(1),
+                COMPOSER_PREFIX_WIDTH,
+            );
             frame.set_cursor_position((
-                composer_area.x + cursor_x + 2,
+                composer_area.x + cursor_x,
                 composer_area.y + cursor_y.min(composer_area.height.saturating_sub(1)),
             ));
         }
@@ -2227,15 +2252,13 @@ impl ChatTuiApp {
     }
 
     fn empty_state_height(&self, width: u16) -> u16 {
-        let content_width = usize::from(width.saturating_sub(1).max(1));
-        let intro_height = self
-            .empty_state_plain_lines(width)
-            .into_iter()
-            .map(|line| wrapped_line_count(&line, content_width))
-            .sum::<usize>() as u16;
+        let content_width = width.saturating_sub(1).max(1);
+        let intro_height =
+            wrapped_text_line_count(plain_lines_to_text(self.empty_state_plain_lines(width)), content_width)
+                as u16;
 
         let error_height = error_notice(self.notice.as_ref())
-            .map(|error| wrapped_line_count(&format!("Error: {error}"), content_width) as u16 + 1)
+            .map(|error| wrapped_text_line_count(format!("Error: {error}"), content_width) as u16 + 1)
             .unwrap_or(0);
 
         intro_height
@@ -2376,28 +2399,32 @@ impl ChatTuiApp {
     }
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let token_label = format_token_count(self.context_tokens, self.last_usage);
-        let token_label_width = token_label.chars().count() as u16;
-        let left_width = if token_label_width == 0 {
+        let (right_label, right_color) = self.footer_status_label();
+        let right_label_width = display_width(&right_label) as u16;
+        let left_width = if right_label_width == 0 {
             area.width
         } else {
-            area.width.saturating_sub(token_label_width + 1)
+            area.width.saturating_sub(right_label_width + 1)
         };
         let left_text =
             build_footer_text(&self.raw_model, &self.key.base_url, &self.cwd, left_width);
-        let left_len = left_text.chars().count() as u16;
+        let left_len = display_width(&left_text) as u16;
         let pad = left_width.saturating_sub(left_len);
-        let token_color = if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
+        let mut spans = vec![Span::styled(left_text, Style::default().fg(MUTED))];
+        if right_label_width > 0 {
+            spans.push(Span::raw(" ".repeat(usize::from(pad) + 1)));
+            spans.push(Span::styled(right_label, Style::default().fg(right_color)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn footer_status_label(&self) -> (String, Color) {
+        let color = if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
             ACCENT
         } else {
             MUTED
         };
-        let mut spans = vec![Span::styled(left_text, Style::default().fg(MUTED))];
-        if token_label_width > 0 {
-            spans.push(Span::raw(" ".repeat(usize::from(pad) + 1)));
-            spans.push(Span::styled(token_label, Style::default().fg(token_color)));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        (format_token_count(self.context_tokens, self.last_usage), color)
     }
 
     fn render_picker(&mut self, frame: &mut Frame<'_>, area: Rect, picker: &PickerState) {
@@ -2922,14 +2949,12 @@ struct StyledLine {
 
 struct RenderedTranscript {
     text: Text<'static>,
-    plain_lines: Vec<String>,
 }
 
 impl From<Vec<StyledLine>> for RenderedTranscript {
     fn from(lines: Vec<StyledLine>) -> Self {
-        let plain_lines = lines.iter().map(|line| line.plain.clone()).collect();
         let text = Text::from(lines.into_iter().map(|line| line.line).collect::<Vec<_>>());
-        Self { text, plain_lines }
+        Self { text }
     }
 }
 
@@ -2986,29 +3011,15 @@ fn render_assistant_streaming(
     lines: &mut Vec<StyledLine>,
     content: &str,
     sending: bool,
-    frame_tick: usize,
-    reduce_motion: bool,
+    _frame_tick: usize,
+    _reduce_motion: bool,
 ) {
-    let mut rendered = render_markdown_lines(content);
+    let rendered = render_markdown_lines(content);
     if rendered.is_empty() {
-        let suffix = if sending && !reduce_motion && (frame_tick / 18).is_multiple_of(2) {
-            "▋"
-        } else {
-            ""
-        };
-        push_styled_line(lines, suffix, Style::default().fg(THINKING));
+        if sending {
+            push_styled_line(lines, "", Style::default());
+        }
         return;
-    }
-
-    if sending
-        && !rendered.is_empty()
-        && !reduce_motion
-        && let Some(last) = rendered.last_mut()
-    {
-        last.line
-            .spans
-            .push(Span::styled(" ▋", Style::default().fg(THINKING)));
-        last.plain.push_str(" ▋");
     }
 
     lines.extend(rendered);
@@ -3441,12 +3452,27 @@ fn compact_styled_lines(lines: &mut Vec<StyledLine>) {
 fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> String {
     if let Some(usage) = usage {
         let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
-        return format!("{total} tk");
+        return format!("{} token", format_token_count_value(total));
     }
     if tokens == 0 {
-        "0 tk".to_string()
+        "0 token".to_string()
     } else {
-        format!("~{tokens} tk est")
+        format!("~{} token", format_token_count_value(tokens))
+    }
+}
+
+fn format_token_count_value(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+
+    let rounded_tenths = (tokens + 50) / 100;
+    let thousands = rounded_tenths / 10;
+    let tenths = rounded_tenths % 10;
+    if tenths == 0 {
+        format!("{thousands}k")
+    } else {
+        format!("{thousands}.{tenths}k")
     }
 }
 
@@ -3567,6 +3593,19 @@ fn plain_text_from_spans(spans: &[Span<'static>]) -> String {
         plain.push_str(span.content.as_ref());
     }
     plain
+}
+
+fn plain_lines_to_text(lines: Vec<String>) -> Text<'static> {
+    Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+}
+
+// Keep transcript height calculations aligned with Ratatui's own word-wrapping rules.
+fn wrapped_text_line_count(text: impl Into<Text<'static>>, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+
+    Paragraph::new(text).wrap(Wrap { trim: false }).line_count(width)
 }
 
 fn metadata_text_len(value: &str) -> usize {
@@ -3999,19 +4038,29 @@ fn centered_rect(width_pct: u16, height_pct: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn cursor_position(text: &str, cursor: usize, width: u16) -> (u16, u16) {
+fn cursor_position(text: &str, cursor: usize, width: u16, line_prefix_width: u16) -> (u16, u16) {
     let width = usize::from(width.max(1));
     let text_before = &text[..cursor.min(text.len())];
-    let mut x = 0usize;
+    let line_prefix_width = usize::from(line_prefix_width);
+    let mut x = line_prefix_width.min(width.saturating_sub(1));
     let mut y = 0usize;
 
-    for (i, segment) in text_before.split('\n').enumerate() {
-        if i > 0 {
+    for ch in text_before.chars() {
+        if ch == '\n' {
             y += 1;
+            x = line_prefix_width.min(width.saturating_sub(1));
+            continue;
         }
-        let len = segment.chars().count();
-        y += len / width;
-        x = len % width;
+
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_width == 0 {
+            continue;
+        }
+        if x + ch_width > width {
+            y += 1;
+            x = 0;
+        }
+        x += ch_width;
     }
 
     (x as u16, y as u16)
@@ -4034,19 +4083,6 @@ fn format_time_ago_short(updated_at: &str) -> String {
         2_592_001..=31_535_999 => format!("{}mo", seconds / 2_592_000),
         _ => format!("{}y", seconds / 31_536_000),
     }
-}
-
-fn wrapped_line_count(line: &str, width: usize) -> usize {
-    if line.is_empty() {
-        return 1;
-    }
-
-    let mut total = 0usize;
-    for part in line.split('\n') {
-        let len = part.chars().count().max(1);
-        total += len.div_ceil(width.max(1));
-    }
-    total.max(1)
 }
 
 fn parse_slash_command(input: &str) -> Result<SlashCommand> {
@@ -4112,10 +4148,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_wrapped_line_count() {
-        assert_eq!(wrapped_line_count("", 10), 1);
-        assert_eq!(wrapped_line_count("hello", 10), 1);
-        assert_eq!(wrapped_line_count("abcdefghij", 5), 2);
+    fn test_wrapped_text_line_count_uses_ratatui_word_wrap() {
+        assert_eq!(wrapped_text_line_count("", 10), 1);
+        assert_eq!(wrapped_text_line_count("hello", 10), 1);
+        assert_eq!(wrapped_text_line_count("abcdefghij", 5), 2);
+        assert_eq!(wrapped_text_line_count("word word word", 8), 3);
     }
 
     #[test]
@@ -4134,11 +4171,21 @@ mod tests {
     #[test]
     fn test_cursor_position_multiline() {
         // cursor at end of text
-        assert_eq!(cursor_position("hello", 5, 10), (5, 0));
-        assert_eq!(cursor_position("hello\nworld", 11, 10), (5, 1));
+        assert_eq!(cursor_position("hello", 5, 10, 2), (7, 0));
+        assert_eq!(cursor_position("hello\nworld", 11, 10, 2), (7, 1));
         // cursor in middle
-        assert_eq!(cursor_position("hello\nworld", 6, 10), (0, 1));
-        assert_eq!(cursor_position("hello\nworld", 0, 10), (0, 0));
+        assert_eq!(cursor_position("hello\nworld", 6, 10, 2), (2, 1));
+        assert_eq!(cursor_position("hello\nworld", 0, 10, 2), (2, 0));
+    }
+
+    #[test]
+    fn test_cursor_position_uses_display_width_for_cjk() {
+        assert_eq!(cursor_position("最新的软件开发工具", "最新的软件开发工具".len(), 30, 2), (20, 0));
+    }
+
+    #[test]
+    fn test_cursor_position_wraps_after_prefix_width() {
+        assert_eq!(cursor_position("abcdefgh", 8, 8, 2), (2, 1));
     }
 
     #[test]
@@ -4324,6 +4371,20 @@ mod tests {
     }
 
     #[test]
+    fn test_render_assistant_streaming_does_not_append_cursor_glyph() {
+        let mut lines = Vec::new();
+        render_assistant_streaming(&mut lines, "- item", true, 0, false);
+
+        let plain = lines
+            .into_iter()
+            .map(|line| line.plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!plain.contains('▋'));
+        assert!(plain.contains("• item"));
+    }
+
+    #[test]
     fn test_truncate_for_width() {
         assert_eq!(truncate_for_width("hello", 10), "hello");
         assert_eq!(truncate_for_width("hello world", 6), "hello…");
@@ -4346,6 +4407,19 @@ mod tests {
     }
 
     #[test]
+    fn test_footer_status_label_stays_token_count_while_streaming() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.sending = true;
+        app.request_started_at = Some(Instant::now() - Duration::from_secs(12));
+        app.context_tokens = 5_120;
+
+        let (label, color) = app.footer_status_label();
+        assert_eq!(label, "~5.1k token");
+        assert_eq!(color, MUTED);
+    }
+
+    #[test]
     fn test_format_token_count_with_usage_shows_total() {
         assert_eq!(
             format_token_count(
@@ -4355,15 +4429,26 @@ mod tests {
                     completion_tokens: 11
                 })
             ),
-            "35 tk"
+            "35 token"
+        );
+        assert_eq!(
+            format_token_count(
+                5_120,
+                Some(TokenUsage {
+                    prompt_tokens: 5_000,
+                    completion_tokens: 120
+                })
+            ),
+            "5.1k token"
         );
     }
 
     #[test]
     fn test_format_token_count_marks_estimates() {
-        assert_eq!(format_token_count(0, None), "0 tk");
-        assert_eq!(format_token_count(105, None), "~105 tk est");
-        assert_eq!(format_token_count(12_345, None), "~12345 tk est");
+        assert_eq!(format_token_count(0, None), "0 token");
+        assert_eq!(format_token_count(105, None), "~105 token");
+        assert_eq!(format_token_count(5_000, None), "~5k token");
+        assert_eq!(format_token_count(12_345, None), "~12.3k token");
     }
 
     #[test]
@@ -4640,6 +4725,39 @@ mod tests {
         assert_eq!(
             app.notice.as_ref().map(|(_, text)| text.as_str()),
             Some("Request cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interrupt_inflight_request_keeps_partial_response() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.session_store = store;
+        app.cwd = "/tmp/demo".to_string();
+        app.session_id = "session-123".to_string();
+        app.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "draft".to_string(),
+        });
+        app.pending_submit = Some("draft".to_string());
+        app.pending_response = "partial".to_string();
+        app.sending = true;
+        app.request_started_at = Some(Instant::now());
+
+        app.interrupt_inflight_request().await.unwrap();
+
+        assert!(!app.sending);
+        assert!(app.pending_response.is_empty());
+        assert!(app.pending_submit.is_none());
+        assert!(app.draft.is_empty());
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[1].role, "assistant");
+        assert_eq!(app.history[1].content, "partial");
+        assert_eq!(
+            app.notice.as_ref().map(|(_, text)| text.as_str()),
+            Some("Response interrupted")
         );
     }
 
