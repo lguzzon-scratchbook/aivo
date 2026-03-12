@@ -434,7 +434,7 @@ pub(crate) async fn fetch_models_for_select(
     key: &ApiKey,
     cache: &ModelsCache,
 ) -> Vec<String> {
-    fetch_models_with_spinner(client, key, cache, false, None)
+    fetch_models_cached(client, key, cache, false)
         .await
         .unwrap_or_default()
 }

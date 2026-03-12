@@ -168,7 +168,7 @@ fn matches_application_arrow(key: &Key, direction: char) -> bool {
     matches!(key, Key::UnknownEscSeq(seq) if seq.as_slice() == ['O', direction])
 }
 
-fn matches_fuzzy(query: &str, target: &str) -> bool {
+pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
     let mut q_chars = query.chars();
     let mut current_q_char = match q_chars.next() {
         Some(c) => c,

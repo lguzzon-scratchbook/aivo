@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -28,8 +28,10 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::style::spinner_frame;
+use crate::tui::matches_fuzzy;
 
 use super::*;
 
@@ -73,29 +75,40 @@ pub(super) struct ChatTuiParams {
 }
 
 #[derive(Clone)]
-struct SessionSnapshot {
+struct SessionPreview {
     key_id: String,
     key_name: String,
     base_url: String,
     session_id: String,
     raw_model: String,
     updated_at: String,
-    messages: Vec<ChatMessage>,
+    title: String,
+    preview_text: String,
 }
 
-impl SessionSnapshot {
+fn decrypt_to_chat_messages(
+    state: &crate::services::session_store::ChatSessionState,
+) -> Result<Vec<ChatMessage>> {
+    let messages = state
+        .decrypt_messages()?
+        .into_iter()
+        .map(|m| ChatMessage {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+    Ok(messages)
+}
+
+impl SessionPreview {
     fn from_state(
         state: crate::services::session_store::ChatSessionState,
         key: &ApiKey,
     ) -> Result<Self> {
-        let messages = state
-            .decrypt_messages()?
-            .into_iter()
-            .map(|message| ChatMessage {
-                role: message.role,
-                content: message.content,
-            })
-            .collect();
+        let messages = decrypt_to_chat_messages(&state)?;
+
+        let title = session_title_from_messages(&messages, &state.model);
+        let preview_text = session_preview_text_from_messages(&messages, &state.model);
 
         Ok(Self {
             key_id: key.id.clone(),
@@ -104,50 +117,42 @@ impl SessionSnapshot {
             session_id: state.session_id,
             raw_model: state.model,
             updated_at: state.updated_at,
-            messages,
+            title,
+            preview_text,
         })
-    }
-
-    fn resume_label(&self, width: u16) -> String {
-        let meta = format!(
-            "{} · {}",
-            format_time_ago_short(&self.updated_at),
-            self.key_name
-        );
-        let reserved = meta.chars().count().saturating_add(3) as u16;
-        let title = truncate_for_width(&self.base_title(), width.saturating_sub(reserved).max(1));
-        format!("{title} · {meta}")
     }
 
     fn search_text(&self) -> String {
         format!(
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {}",
             self.session_id,
-            self.base_title(),
+            self.title,
+            self.preview_text,
             self.key_name,
             self.raw_model,
             self.base_url
         )
     }
+}
 
-    fn base_title(&self) -> String {
-        let last_user = self
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "user" && !message.content.trim().is_empty())
-            .map(|message| first_non_empty_line(&message.content));
-        let fallback = self
-            .messages
-            .iter()
-            .rev()
-            .find(|message| !message.content.trim().is_empty())
-            .map(|message| first_non_empty_line(&message.content));
+#[derive(Clone)]
+struct LoadedSession {
+    key_id: String,
+    session_id: String,
+    raw_model: String,
+    messages: Vec<ChatMessage>,
+}
 
-        last_user
-            .or(fallback)
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| self.raw_model.clone())
+impl LoadedSession {
+    fn from_state(state: crate::services::session_store::ChatSessionState) -> Result<Self> {
+        let messages = decrypt_to_chat_messages(&state)?;
+
+        Ok(Self {
+            key_id: state.key_id,
+            session_id: state.session_id,
+            raw_model: state.model,
+            messages,
+        })
     }
 }
 
@@ -168,7 +173,7 @@ impl Overlay {
 enum PickerValue {
     Model(String),
     Key(ApiKey),
-    Session(SessionSnapshot),
+    Session(SessionPreview),
 }
 
 #[derive(Clone)]
@@ -176,6 +181,12 @@ struct PickerEntry {
     label: String,
     search_text: String,
     value: PickerValue,
+}
+
+impl PickerEntry {
+    fn row_height(&self) -> usize {
+        1
+    }
 }
 
 #[derive(Clone)]
@@ -202,14 +213,75 @@ struct PickerState {
     loading: bool,
     selected: usize,
     kind: PickerKind,
+    pending_delete: Option<DeleteConfirmTarget>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct PickerHitbox {
     overlay_area: Rect,
     list_area: Rect,
-    first_visible_index: usize,
-    visible_count: usize,
+    row_to_filtered_index: Vec<Option<usize>>,
+}
+
+#[derive(Clone)]
+struct LoadingResume {
+    request_id: u64,
+    preview: SessionPreview,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DeleteConfirmTarget {
+    key_id: String,
+    session_id: String,
+}
+
+#[derive(Clone)]
+struct ResumeRestoreState {
+    key: ApiKey,
+    copilot_tm: Option<Arc<CopilotTokenManager>>,
+    raw_model: String,
+    model: String,
+    format: ChatFormat,
+    history: Vec<ChatMessage>,
+    draft: String,
+    cursor: usize,
+    slash_hint: Option<String>,
+    draft_history_index: Option<usize>,
+    draft_history_stash: Option<String>,
+    session_id: String,
+    notice: Option<(Color, String)>,
+    pending_response: String,
+    pending_submit: Option<String>,
+    last_usage: Option<TokenUsage>,
+    context_tokens: u64,
+    follow_output: bool,
+    transcript_scroll: usize,
+}
+
+impl ResumeRestoreState {
+    fn capture(app: &ChatTuiApp) -> Self {
+        Self {
+            key: app.key.clone(),
+            copilot_tm: app.copilot_tm.clone(),
+            raw_model: app.raw_model.clone(),
+            model: app.model.clone(),
+            format: app.format.clone(),
+            history: app.history.clone(),
+            draft: app.draft.clone(),
+            cursor: app.cursor,
+            slash_hint: app.slash_hint.clone(),
+            draft_history_index: app.draft_history_index,
+            draft_history_stash: app.draft_history_stash.clone(),
+            session_id: app.session_id.clone(),
+            notice: app.notice.clone(),
+            pending_response: app.pending_response.clone(),
+            pending_submit: app.pending_submit.clone(),
+            last_usage: app.last_usage,
+            context_tokens: app.context_tokens,
+            follow_output: app.follow_output,
+            transcript_scroll: app.transcript_scroll,
+        }
+    }
 }
 
 impl PickerState {
@@ -221,6 +293,7 @@ impl PickerState {
             loading: true,
             selected: 0,
             kind,
+            pending_delete: None,
         }
     }
 
@@ -237,6 +310,7 @@ impl PickerState {
             loading: false,
             selected: 0,
             kind,
+            pending_delete: None,
         }
     }
 
@@ -263,29 +337,101 @@ impl PickerState {
         )
     }
 
-    fn visible_range(&self, max_rows: usize) -> (usize, usize) {
-        let len = self.filtered_items().len();
-        if len == 0 || max_rows == 0 {
-            return (0, 0);
+    fn visible_items(&self, max_rows: usize) -> Vec<(usize, &PickerEntry)> {
+        let filtered = self.filtered_items();
+        if filtered.is_empty() || max_rows == 0 {
+            return Vec::new();
         }
 
-        let max_rows = max_rows.min(len);
-        let start = self
-            .selected
-            .saturating_sub(max_rows.saturating_sub(1))
-            .min(len.saturating_sub(max_rows));
-        (start, start + max_rows)
+        let selected = self.selected.min(filtered.len().saturating_sub(1));
+        let mut start = selected;
+        let mut used_rows = filtered[selected].1.row_height();
+
+        while start > 0 {
+            let next_height = filtered[start - 1].1.row_height();
+            if used_rows + next_height > max_rows {
+                break;
+            }
+            used_rows += next_height;
+            start -= 1;
+        }
+
+        let mut end = selected + 1;
+        while end < filtered.len() {
+            let next_height = filtered[end].1.row_height();
+            if used_rows + next_height > max_rows {
+                break;
+            }
+            used_rows += next_height;
+            end += 1;
+        }
+
+        filtered[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, (_, item))| (start + offset, *item))
+            .collect()
     }
 
     fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let len = self.filtered_items().len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected == 0 {
+            self.selected = len - 1;
+        } else {
+            self.selected -= 1;
+        }
     }
 
     fn select_next(&mut self) {
         let len = self.filtered_items().len();
         if len > 0 {
-            self.selected = (self.selected + 1).min(len - 1);
+            self.selected = if self.selected + 1 >= len {
+                0
+            } else {
+                self.selected + 1
+            };
         }
+    }
+
+    fn clear_pending_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
+    fn selected_delete_target(&self) -> Option<DeleteConfirmTarget> {
+        let (_, item) = self.filtered_items().get(self.selected).copied()?;
+        match &item.value {
+            PickerValue::Session(session) => Some(DeleteConfirmTarget {
+                key_id: session.key_id.clone(),
+                session_id: session.session_id.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn arm_or_confirm_delete(&mut self) -> bool {
+        let Some(target) = self.selected_delete_target() else {
+            return false;
+        };
+        if self.pending_delete.as_ref() == Some(&target) {
+            self.pending_delete = None;
+            true
+        } else {
+            self.pending_delete = Some(target);
+            false
+        }
+    }
+
+    fn delete_is_armed_for_selected(&self) -> bool {
+        self.selected_delete_target()
+            .is_some_and(|target| self.pending_delete.as_ref() == Some(&target))
+    }
+
+    fn delete_is_armed_for_session(&self, preview: &SessionPreview) -> bool {
+        self.pending_delete.as_ref().is_some_and(|target| {
+            target.key_id == preview.key_id && target.session_id == preview.session_id
+        })
     }
 }
 
@@ -314,6 +460,10 @@ enum RuntimeEvent {
     ModelsLoaded(std::result::Result<Vec<String>, String>),
     CompactFinished {
         result: std::result::Result<String, String>,
+    },
+    ResumeLoaded {
+        request_id: u64,
+        result: std::result::Result<LoadedSession, String>,
     },
 }
 
@@ -350,6 +500,10 @@ struct ChatTuiApp {
     tx: UnboundedSender<RuntimeEvent>,
     rx: UnboundedReceiver<RuntimeEvent>,
     response_task: Option<JoinHandle<()>>,
+    resume_task: Option<JoinHandle<()>>,
+    resume_request_id: u64,
+    loading_resume: Option<LoadingResume>,
+    resume_restore_state: Option<ResumeRestoreState>,
     reduce_motion: bool,
     frame_tick: usize,
     picker_hitbox: Option<PickerHitbox>,
@@ -396,6 +550,10 @@ impl ChatTuiApp {
             tx,
             rx,
             response_task: None,
+            resume_task: None,
+            resume_request_id: 0,
+            loading_resume: None,
+            resume_restore_state: None,
             reduce_motion: reduce_motion_requested(),
             frame_tick: 0,
             picker_hitbox: None,
@@ -404,6 +562,80 @@ impl ChatTuiApp {
 
     fn persist_draft_history(&self) {
         let _ = save_persisted_draft_history(&self.draft_history);
+    }
+
+    fn is_busy(&self) -> bool {
+        self.sending || self.loading_resume.is_some()
+    }
+
+    fn should_show_input_cursor(&self) -> bool {
+        !self.overlay.blocks_input() && !self.is_busy()
+    }
+
+    fn abort_resume_task(&mut self) {
+        if let Some(task) = self.resume_task.take() {
+            task.abort();
+        }
+    }
+
+    fn discard_resume_state(&mut self) {
+        self.abort_resume_task();
+        self.loading_resume = None;
+        self.resume_restore_state = None;
+    }
+
+    fn restore_resume_state(&mut self, state: ResumeRestoreState) {
+        self.key = state.key;
+        self.copilot_tm = state.copilot_tm;
+        self.raw_model = state.raw_model;
+        self.model = state.model;
+        self.format = state.format;
+        self.history = state.history;
+        self.draft = state.draft;
+        self.cursor = state.cursor;
+        self.slash_hint = state.slash_hint;
+        self.draft_history_index = state.draft_history_index;
+        self.draft_history_stash = state.draft_history_stash;
+        self.session_id = state.session_id;
+        self.notice = state.notice;
+        self.pending_response = state.pending_response;
+        self.pending_submit = state.pending_submit;
+        self.last_usage = state.last_usage;
+        self.context_tokens = state.context_tokens;
+        self.follow_output = state.follow_output;
+        self.transcript_scroll = state.transcript_scroll;
+        self.loading_resume = None;
+        self.resume_restore_state = None;
+        self.request_started_at = None;
+        self.sending = false;
+    }
+
+    fn cancel_resume_load(&mut self) {
+        self.abort_resume_task();
+        self.loading_resume = None;
+        if let Some(state) = self.resume_restore_state.take() {
+            self.restore_resume_state(state);
+        }
+        self.notice = Some((MUTED, "Resume cancelled".to_string()));
+    }
+
+    fn clear_for_resume_loading(&mut self) {
+        self.history.clear();
+        self.draft.clear();
+        self.cursor = 0;
+        self.slash_hint = None;
+        self.draft_history_index = None;
+        self.draft_history_stash = None;
+        self.pending_response.clear();
+        self.pending_submit = None;
+        self.format = ChatFormat::OpenAI;
+        self.last_usage = None;
+        self.context_tokens = 0;
+        self.follow_output = true;
+        self.transcript_scroll = 0;
+        self.request_started_at = None;
+        self.sending = false;
+        self.notice = None;
     }
 
     fn cursor_left(&mut self) {
@@ -688,6 +920,31 @@ impl ChatTuiApp {
                         }
                     }
                 }
+                RuntimeEvent::ResumeLoaded { request_id, result } => {
+                    let Some(loading) = &self.loading_resume else {
+                        continue;
+                    };
+                    if loading.request_id != request_id {
+                        continue;
+                    }
+
+                    self.resume_task = None;
+                    match result {
+                        Ok(session) => {
+                            self.apply_loaded_session(session).await?;
+                            self.loading_resume = None;
+                            self.resume_restore_state = None;
+                            self.notice = None;
+                        }
+                        Err(err) => {
+                            self.loading_resume = None;
+                            if let Some(state) = self.resume_restore_state.take() {
+                                self.restore_resume_state(state);
+                            }
+                            self.notice = Some((ERROR, err));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -720,10 +977,12 @@ impl ChatTuiApp {
                     },
                     Ok(Event::Resize(_, _)) => {}
                     Ok(Event::Paste(text)) => {
-                        for ch in text.chars() {
-                            self.insert_char_at_cursor(ch);
+                        if !self.overlay.blocks_input() && !self.is_busy() {
+                            for ch in text.chars() {
+                                self.insert_char_at_cursor(ch);
+                            }
+                            self.update_slash_hint();
                         }
-                        self.update_slash_hint();
                     }
                     Ok(_) => {}
                     Err(err) => break Err(err.into()),
@@ -735,6 +994,10 @@ impl ChatTuiApp {
             tokio::time::sleep(Duration::from_millis(16)).await;
         };
 
+        self.discard_resume_state();
+        if let Some(task) = self.response_task.take() {
+            task.abort();
+        }
         restore_terminal(terminal)?;
         run_result
     }
@@ -745,6 +1008,7 @@ impl ChatTuiApp {
         }
 
         let mut picker_submit = None;
+        let mut picker_delete = None;
         match &mut self.overlay {
             Overlay::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::F(1)) {
@@ -763,35 +1027,57 @@ impl ChatTuiApp {
                 match key.code {
                     KeyCode::Esc => self.overlay = Overlay::None,
                     KeyCode::Up => {
+                        picker.clear_pending_delete();
                         picker.select_prev();
                     }
                     KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        picker.clear_pending_delete();
                         picker.select_prev();
                     }
                     KeyCode::Down => {
+                        picker.clear_pending_delete();
                         picker.select_next();
                     }
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        picker.clear_pending_delete();
                         picker.select_next();
                     }
                     KeyCode::Backspace => {
+                        picker.clear_pending_delete();
                         picker.query.pop();
                         picker.selected = 0;
                     }
                     KeyCode::Enter => {
-                        picker_submit = Some(picker.selected);
+                        if picker.delete_is_armed_for_selected() {
+                            picker_delete = Some(picker.selected);
+                        } else {
+                            picker_submit = Some(picker.selected);
+                        }
+                    }
+                    KeyCode::Char('d')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(picker.kind, PickerKind::Session) =>
+                    {
+                        if picker.arm_or_confirm_delete() {
+                            picker_delete = Some(picker.selected);
+                        }
                     }
                     KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        picker.clear_pending_delete();
                         picker.query.push(ch);
                         picker.selected = 0;
                     }
                     _ => {}
                 }
-                if picker_submit.is_none() {
+                if picker_submit.is_none() && picker_delete.is_none() {
                     return Ok(false);
                 }
             }
             Overlay::None => {}
+        }
+
+        if let Some(selected) = picker_delete {
+            return self.delete_picker_selection(selected).await;
         }
 
         if let Some(selected) = picker_submit {
@@ -804,6 +1090,10 @@ impl ChatTuiApp {
         }
 
         match key.code {
+            KeyCode::Esc if self.loading_resume.is_some() => {
+                self.cancel_resume_load();
+                return Ok(false);
+            }
             KeyCode::Esc if self.sending => {
                 self.cancel_inflight_request();
                 return Ok(false);
@@ -848,26 +1138,38 @@ impl ChatTuiApp {
                 self.scroll_down_lines(3);
                 return Ok(false);
             }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('p')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.loading_resume.is_none() =>
+            {
                 self.history_prev();
                 return Ok(false);
             }
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.loading_resume.is_none() =>
+            {
                 self.history_next();
                 return Ok(false);
             }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.loading_resume.is_none() =>
+            {
                 self.open_resume_picker(None).await?;
                 return Ok(false);
             }
-            KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('m')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.loading_resume.is_none() =>
+            {
                 self.open_model_picker(None, ModelSelectionTarget::CurrentChat, false);
                 return Ok(false);
             }
             _ => {}
         }
 
-        if self.sending {
+        if self.is_busy() {
             return Ok(false);
         }
 
@@ -985,14 +1287,12 @@ impl ChatTuiApp {
             (Overlay::Picker(picker), MouseEventKind::Down(MouseButton::Left))
                 if !picker.loading =>
             {
-                if let Some(hitbox) = self.picker_hitbox {
+                if let Some(hitbox) = &self.picker_hitbox {
                     let point = (mouse.column, mouse.row);
                     if rect_contains(hitbox.list_area, point) {
                         let row = usize::from(mouse.row.saturating_sub(hitbox.list_area.y));
-                        if row < hitbox.visible_count {
-                            return self
-                                .activate_picker_selection(hitbox.first_visible_index + row)
-                                .await;
+                        if let Some(Some(filtered_index)) = hitbox.row_to_filtered_index.get(row) {
+                            return self.activate_picker_selection(*filtered_index).await;
                         }
                     } else if !rect_contains(hitbox.overlay_area, point) {
                         self.overlay = Overlay::None;
@@ -1142,6 +1442,7 @@ impl ChatTuiApp {
     }
 
     fn start_new_chat(&mut self) {
+        self.discard_resume_state();
         self.cancel_inflight_request();
         self.overlay = Overlay::None;
         self.history.clear();
@@ -1269,6 +1570,7 @@ impl ChatTuiApp {
         target: ModelSelectionTarget,
         auto_accept_exact: bool,
     ) {
+        self.prepare_for_model_picker();
         let query = query.unwrap_or_default();
         self.overlay = Overlay::Picker(Box::new(PickerState::loading(
             "Select model",
@@ -1297,6 +1599,12 @@ impl ChatTuiApp {
                 tx.send(RuntimeEvent::ModelsLoaded(Ok(models))).ok();
             }
         });
+    }
+
+    fn prepare_for_model_picker(&mut self) {
+        if self.sending {
+            self.cancel_inflight_request();
+        }
     }
 
     async fn apply_model(&mut self, raw_model: String) -> Result<()> {
@@ -1370,13 +1678,13 @@ impl ChatTuiApp {
             .into_iter()
             .map(|key| PickerEntry {
                 label: format!("{} · {}", key.display_name(), key.base_url),
-                search_text: format!("{} {} {}", key.id, key.display_name(), key.base_url),
+                search_text: key_search_text(&key),
                 value: PickerValue::Key(key),
             })
             .collect();
 
         self.overlay = Overlay::Picker(Box::new(PickerState::ready(
-            "Select key",
+            "Keys",
             query.unwrap_or_default(),
             items,
             PickerKind::Key,
@@ -1394,21 +1702,21 @@ impl ChatTuiApp {
         if let Some(query) = &query
             && let Some(snapshot) = sessions.iter().find(|session| session.session_id == *query)
         {
-            self.resume_snapshot(snapshot.clone()).await?;
+            self.begin_resume_load(snapshot.clone());
             return Ok(());
         }
 
         let items = sessions
             .into_iter()
             .map(|session| PickerEntry {
-                label: session.resume_label(64),
+                label: session.title.clone(),
                 search_text: session.search_text(),
                 value: PickerValue::Session(session),
             })
             .collect();
 
         self.overlay = Overlay::Picker(Box::new(PickerState::ready(
-            "Resume chat",
+            "Sessions",
             query.unwrap_or_default(),
             items,
             PickerKind::Session,
@@ -1448,11 +1756,58 @@ impl ChatTuiApp {
                 self.begin_key_switch(key).await?;
             }
             (PickerKind::Session, PickerValue::Session(session)) => {
-                self.resume_snapshot(session).await?;
+                self.begin_resume_load(session);
             }
             _ => {}
         }
 
+        Ok(false)
+    }
+
+    async fn delete_picker_selection(&mut self, filtered_index: usize) -> Result<bool> {
+        let session = {
+            let Overlay::Picker(picker) = &self.overlay else {
+                return Ok(false);
+            };
+            let Some((_, item)) = picker.filtered_items().get(filtered_index).copied() else {
+                return Ok(false);
+            };
+            match &item.value {
+                PickerValue::Session(session) => session.clone(),
+                _ => return Ok(false),
+            }
+        };
+
+        let removed = self
+            .session_store
+            .delete_chat_session(&session.key_id, &self.cwd, &session.session_id)
+            .await?;
+        if !removed {
+            self.notice = Some((ERROR, "Saved chat no longer exists".to_string()));
+            return Ok(false);
+        }
+
+        if let Overlay::Picker(picker) = &mut self.overlay {
+            picker.clear_pending_delete();
+            picker.items.retain(|item| {
+                !matches!(
+                    &item.value,
+                    PickerValue::Session(existing)
+                        if existing.key_id == session.key_id && existing.session_id == session.session_id
+                )
+            });
+
+            let filtered_len = picker.filtered_items().len();
+            if filtered_len == 0 {
+                self.overlay = Overlay::None;
+                self.notice = Some((MUTED, "Saved chat deleted".to_string()));
+                return Ok(false);
+            }
+
+            picker.selected = picker.selected.min(filtered_len.saturating_sub(1));
+        }
+
+        self.notice = Some((MUTED, "Saved chat deleted".to_string()));
         Ok(false)
     }
 
@@ -1505,11 +1860,37 @@ impl ChatTuiApp {
             .await
     }
 
-    async fn resume_snapshot(&mut self, snapshot: SessionSnapshot) -> Result<()> {
-        if self.key.id != snapshot.key_id {
+    fn begin_resume_load(&mut self, preview: SessionPreview) {
+        self.discard_resume_state();
+        self.overlay = Overlay::None;
+        if self.sending {
+            self.cancel_inflight_request();
+        }
+
+        self.resume_restore_state = Some(ResumeRestoreState::capture(self));
+        self.clear_for_resume_loading();
+        self.resume_request_id = self.resume_request_id.wrapping_add(1);
+        let request_id = self.resume_request_id;
+        self.loading_resume = Some(LoadingResume {
+            request_id,
+            preview: preview.clone(),
+        });
+
+        let session_store = self.session_store.clone();
+        let cwd = self.cwd.clone();
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            let result = load_resume_session(&session_store, &cwd, &preview).await;
+            let _ = tx.send(RuntimeEvent::ResumeLoaded { request_id, result });
+        });
+        self.resume_task = Some(task);
+    }
+
+    async fn apply_loaded_session(&mut self, session: LoadedSession) -> Result<()> {
+        if self.key.id != session.key_id {
             let key = self
                 .session_store
-                .get_key_by_id(&snapshot.key_id)
+                .get_key_by_id(&session.key_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Saved key for this chat is no longer available"))?;
             self.key = key;
@@ -1517,9 +1898,8 @@ impl ChatTuiApp {
         }
 
         self.overlay = Overlay::None;
-        self.cancel_inflight_request();
-        self.session_id = snapshot.session_id;
-        self.history = snapshot.messages;
+        self.session_id = session.session_id;
+        self.history = session.messages;
         self.draft.clear();
         self.cursor = 0;
         self.slash_hint = None;
@@ -1531,16 +1911,16 @@ impl ChatTuiApp {
         self.last_usage = None;
         self.context_tokens = estimate_context_tokens(&self.history);
         self.follow_output = true;
-        self.raw_model = snapshot.raw_model.clone();
+        self.transcript_scroll = 0;
+        self.raw_model = session.raw_model.clone();
         self.model =
-            ChatCommand::transform_model_for_provider(&self.key.base_url, &snapshot.raw_model);
+            ChatCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
         self.session_store
-            .set_chat_model(&self.key.id, &snapshot.raw_model)
+            .set_chat_model(&self.key.id, &session.raw_model)
             .await?;
         self.session_store
-            .record_selection(&self.key.id, "chat", Some(&snapshot.raw_model))
+            .record_selection(&self.key.id, "chat", Some(&session.raw_model))
             .await?;
-        self.notice = None;
         Ok(())
     }
 
@@ -1615,13 +1995,7 @@ impl ChatTuiApp {
             return lines.into();
         }
 
-        push_transcript_intro(
-            &mut lines,
-            &self.raw_model,
-            self.key.display_name(),
-            &self.key.base_url,
-            &self.cwd,
-        );
+        push_transcript_intro(&mut lines, &self.raw_model, &self.key.base_url, &self.cwd);
         push_message_spacing(&mut lines);
 
         for message in &self.history {
@@ -1673,10 +2047,25 @@ impl ChatTuiApp {
     fn transcript_intro_lines(&self) -> Vec<String> {
         vec![
             "AIVO Chat".to_string(),
-            self.raw_model.clone(),
-            format!("{} · {}", self.key.display_name(), self.key.base_url),
+            format!("{} · {}", self.raw_model, self.key.base_url),
             self.cwd.clone(),
         ]
+    }
+
+    fn empty_state_plain_lines(&self, width: u16) -> Vec<String> {
+        if let Some(loading) = &self.loading_resume {
+            vec![
+                "Loading saved chat…".to_string(),
+                loading.preview.title.clone(),
+                plain_text_from_spans(&resume_metadata_spans(
+                    &loading.preview,
+                    width.saturating_sub(2).max(1),
+                )),
+                self.cwd.clone(),
+            ]
+        } else {
+            self.transcript_intro_lines()
+        }
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
@@ -1815,7 +2204,7 @@ impl ChatTuiApp {
         let composer = Paragraph::new(self.render_composer_text()).wrap(Wrap { trim: false });
         frame.render_widget(composer, composer_area);
 
-        if !self.overlay.blocks_input() {
+        if self.should_show_input_cursor() {
             let (cursor_x, cursor_y) =
                 cursor_position(&self.draft, self.cursor, composer_area.width.max(1));
             frame.set_cursor_position((
@@ -1839,7 +2228,7 @@ impl ChatTuiApp {
     fn empty_state_height(&self, width: u16) -> u16 {
         let content_width = usize::from(width.saturating_sub(1).max(1));
         let intro_height = self
-            .transcript_intro_lines()
+            .empty_state_plain_lines(width)
             .into_iter()
             .map(|line| wrapped_line_count(&line, content_width))
             .sum::<usize>() as u16;
@@ -1861,27 +2250,47 @@ impl ChatTuiApp {
             height: area.height.saturating_sub(EMPTY_STATE_BOTTOM_GAP),
         };
 
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    "AIVO",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " Chat",
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                self.raw_model.as_str(),
-                Style::default().fg(TEXT),
-            )),
-            Line::from(Span::styled(
-                format!("{} · {}", self.key.display_name(), self.key.base_url),
-                Style::default().fg(MUTED),
-            )),
-            Line::from(Span::styled(self.cwd.as_str(), Style::default().fg(FAINT))),
-        ];
+        let lines = if let Some(loading) = &self.loading_resume {
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        "Loading",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " saved chat…",
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    loading.preview.title.clone(),
+                    Style::default().fg(TEXT),
+                )),
+                Line::from(resume_metadata_spans(
+                    &loading.preview,
+                    area.width.max(1).saturating_sub(2),
+                )),
+                Line::from(Span::styled(self.cwd.as_str(), Style::default().fg(FAINT))),
+            ]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        "AIVO",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " Chat",
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!("{} · {}", self.raw_model, self.key.base_url),
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(self.cwd.as_str(), Style::default().fg(FAINT))),
+            ]
+        };
 
         let mut lines = lines;
         if let Some(error) = error_notice(self.notice.as_ref()) {
@@ -1901,18 +2310,20 @@ impl ChatTuiApp {
     fn render_composer_text(&self) -> Text<'static> {
         let prompt = if self.draft_history_index.is_some() {
             Span::styled(
-                "↶ ",
+                "^ ",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled("› ", Style::default().fg(USER).add_modifier(Modifier::BOLD))
+            Span::styled("> ", Style::default().fg(USER).add_modifier(Modifier::BOLD))
         };
         if self.draft.is_empty() {
-            let placeholder = if self.sending {
+            let placeholder = if self.loading_resume.is_some() {
+                Span::styled("Resume loading…", Style::default().fg(FAINT))
+            } else if self.sending {
                 Span::styled("", Style::default())
             } else {
                 Span::styled(
-                    "Ask anything · / for commands · F1 for help",
+                    " Ask anything · / for commands · F1 for help",
                     Style::default().fg(FAINT),
                 )
             };
@@ -1925,11 +2336,11 @@ impl ChatTuiApp {
             let prefix = if index == 0 {
                 if self.draft_history_index.is_some() {
                     Span::styled(
-                        "↶ ",
+                        "^ ",
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    Span::styled("› ", Style::default().fg(USER).add_modifier(Modifier::BOLD))
+                    Span::styled("> ", Style::default().fg(USER).add_modifier(Modifier::BOLD))
                 }
             } else {
                 Span::raw("  ")
@@ -1989,14 +2400,15 @@ impl ChatTuiApp {
     }
 
     fn render_picker(&mut self, frame: &mut Frame<'_>, area: Rect, picker: &PickerState) {
+        if matches!(picker.kind, PickerKind::Session) {
+            self.render_session_picker(frame, area, picker);
+            return;
+        }
+
         frame.render_widget(Clear, area);
         let shell = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(FAINT))
-            .title(Span::styled(
-                picker.title,
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
+            .border_style(Style::default().fg(FAINT));
         frame.render_widget(shell, area);
 
         let inner = area.inner(ratatui::layout::Margin {
@@ -2012,9 +2424,58 @@ impl ChatTuiApp {
             ])
             .split(inner);
 
+        let filtered_count = picker.filtered_items().len();
+        let total_count = picker.items.len();
+        let status_label = if picker.loading {
+            "loading · esc".to_string()
+        } else {
+            format!(
+                "{} · esc",
+                format_picker_match_count(
+                    filtered_count,
+                    total_count,
+                    picker_kind_noun(&picker.kind)
+                )
+            )
+        };
+        let status_width = display_width(&status_label) as u16;
+        let title_width = display_width(picker.title) as u16;
+        let middle_padding = chunks[0]
+            .width
+            .saturating_sub(title_width + status_width)
+            .max(1);
+        let header = Line::from(vec![
+            Span::styled(
+                picker.title,
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(usize::from(middle_padding))),
+            Span::styled(status_label, Style::default().fg(MUTED)),
+        ]);
         frame.render_widget(
-            Paragraph::new(format!("Filter  {}", picker.query)).style(Style::default().fg(TEXT)),
-            chunks[0],
+            Paragraph::new(header),
+            Rect::new(chunks[0].x, chunks[0].y, chunks[0].width, 1),
+        );
+        let search_line = if picker.query.is_empty() {
+            Line::from(vec![
+                Span::styled("/ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    picker_search_placeholder(&picker.kind),
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                ),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("/ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    picker.query.clone(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ])
+        };
+        frame.render_widget(
+            Paragraph::new(search_line),
+            Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
         );
 
         if picker.loading {
@@ -2025,28 +2486,34 @@ impl ChatTuiApp {
             return;
         }
 
-        let filtered = picker.filtered_items();
-        let (start, end) = picker.visible_range(usize::from(chunks[1].height));
-        let lines = if filtered.is_empty() {
-            vec![Line::from(Span::styled(
-                "No matches",
-                Style::default().fg(MUTED),
-            ))]
+        let visible = picker.visible_items(usize::from(chunks[1].height));
+        let (lines, row_to_filtered_index) = if visible.is_empty() {
+            (
+                vec![Line::from(Span::styled(
+                    "No matches",
+                    Style::default().fg(MUTED),
+                ))],
+                Vec::new(),
+            )
         } else {
-            filtered[start..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, (_, item))| {
-                    panel_line(start + offset == picker.selected, &item.label).line
-                })
-                .collect::<Vec<_>>()
+            let mut lines = Vec::new();
+            let mut row_to_filtered_index = Vec::new();
+
+            for (filtered_index, item) in visible {
+                let item_lines =
+                    picker_entry_lines(item, filtered_index == picker.selected, chunks[1].width);
+                row_to_filtered_index
+                    .extend(std::iter::repeat(filtered_index).take(item_lines.len()));
+                lines.extend(item_lines);
+            }
+
+            (lines, row_to_filtered_index)
         };
 
         self.picker_hitbox = Some(PickerHitbox {
             overlay_area: area,
             list_area: chunks[1],
-            first_visible_index: start,
-            visible_count: end.saturating_sub(start),
+            row_to_filtered_index: row_to_filtered_index.into_iter().map(Some).collect(),
         });
 
         frame.render_widget(
@@ -2056,8 +2523,94 @@ impl ChatTuiApp {
             chunks[1],
         );
         frame.render_widget(
-            Paragraph::new("Type to filter · Ctrl+P/Ctrl+N move · Enter select · Esc close")
+            Paragraph::new("Type to filter · Up/Down wrap · Enter open · Esc close")
                 .style(Style::default().fg(MUTED)),
+            chunks[2],
+        );
+    }
+
+    fn render_session_picker(&mut self, frame: &mut Frame<'_>, area: Rect, picker: &PickerState) {
+        frame.render_widget(Clear, area);
+        let shell = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(FAINT));
+        frame.render_widget(shell, area);
+
+        let inner = area.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 2,
+        });
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(6),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let filtered_count = picker.filtered_items().len();
+        let total_count = picker.items.len();
+        let status_label = format!(
+            "{} · esc",
+            format_session_match_count(filtered_count, total_count)
+        );
+        let search_placeholder = if picker.query.is_empty() {
+            vec![Span::styled(
+                "filter chats, keys, models",
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            )]
+        } else {
+            vec![Span::styled(
+                picker.query.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )]
+        };
+        let search_width = chunks[0].width.max(1);
+        let title_label = "Sessions";
+        let esc_width = status_label.chars().count() as u16;
+        let title_width = title_label.chars().count() as u16;
+        let middle_padding = search_width.saturating_sub(title_width + esc_width).max(1);
+        let mut header_spans = vec![Span::styled(
+            title_label,
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )];
+        header_spans.push(Span::raw(" ".repeat(usize::from(middle_padding))));
+        header_spans.push(Span::styled(status_label, Style::default().fg(MUTED)));
+        frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
+
+        let search_line = Line::from(
+            std::iter::once(Span::styled("/ ", Style::default().fg(ACCENT)))
+                .chain(search_placeholder)
+                .collect::<Vec<_>>(),
+        );
+        frame.render_widget(
+            Paragraph::new(search_line),
+            Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
+        );
+
+        let (lines, row_to_filtered_index) =
+            render_session_picker_rows(picker, usize::from(chunks[1].height), chunks[1].width);
+
+        self.picker_hitbox = Some(PickerHitbox {
+            overlay_area: area,
+            list_area: chunks[1],
+            row_to_filtered_index,
+        });
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(TEXT))
+                .wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+        let footer_text = if picker.pending_delete.is_some() {
+            "Enter or Ctrl+D confirm delete · Esc cancel"
+        } else {
+            "Type to filter · Up/Down wrap · Enter open · Ctrl+D delete"
+        };
+        frame.render_widget(
+            Paragraph::new(footer_text).style(Style::default().fg(MUTED)),
             chunks[2],
         );
     }
@@ -2274,19 +2827,19 @@ async fn load_session_snapshots(
     session_store: &SessionStore,
     key: &ApiKey,
     cwd: &str,
-) -> Result<Vec<SessionSnapshot>> {
+) -> Result<Vec<SessionPreview>> {
     session_store
         .list_chat_sessions(&key.id, &key.base_url, cwd)
         .await?
         .into_iter()
-        .map(|state| SessionSnapshot::from_state(state, key))
+        .map(|state| SessionPreview::from_state(state, key))
         .collect()
 }
 
 async fn load_resume_snapshots(
     session_store: &SessionStore,
     cwd: &str,
-) -> Result<Vec<SessionSnapshot>> {
+) -> Result<Vec<SessionPreview>> {
     let keys = session_store.get_keys().await?;
     let mut sessions = Vec::new();
 
@@ -2296,6 +2849,20 @@ async fn load_resume_snapshots(
 
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(sessions)
+}
+
+async fn load_resume_session(
+    session_store: &SessionStore,
+    cwd: &str,
+    preview: &SessionPreview,
+) -> std::result::Result<LoadedSession, String> {
+    let session = session_store
+        .get_chat_session(&preview.key_id, &preview.base_url, cwd)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "Saved chat is no longer available".to_string())?;
+
+    LoadedSession::from_state(session).map_err(|err| err.to_string())
 }
 
 fn load_persisted_draft_history() -> Vec<String> {
@@ -2372,13 +2939,7 @@ fn push_message_spacing(lines: &mut Vec<StyledLine>) {
     }
 }
 
-fn push_transcript_intro(
-    lines: &mut Vec<StyledLine>,
-    raw_model: &str,
-    key_name: &str,
-    base_url: &str,
-    cwd: &str,
-) {
+fn push_transcript_intro(lines: &mut Vec<StyledLine>, raw_model: &str, base_url: &str, cwd: &str) {
     lines.push(line_with_plain(vec![
         Span::styled(
             "AIVO".to_string(),
@@ -2389,10 +2950,9 @@ fn push_transcript_intro(
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
     ]));
-    push_styled_line(lines, raw_model.to_string(), Style::default().fg(TEXT));
     push_styled_line(
         lines,
-        format!("{key_name} · {base_url}"),
+        format!("{raw_model} · {base_url}"),
         Style::default().fg(MUTED),
     );
     push_styled_line(lines, cwd.to_string(), Style::default().fg(FAINT));
@@ -2405,7 +2965,7 @@ fn should_add_message_spacing(previous_role: Option<&str>, next_role: &str) -> b
 fn render_user_message(lines: &mut Vec<StyledLine>, content: &str) {
     let mut had_line = false;
     for (idx, raw_line) in content.lines().enumerate() {
-        let prefix = if idx == 0 { "› " } else { "  " };
+        let prefix = if idx == 0 { "> " } else { "  " };
         push_styled_line(
             lines,
             format!("{prefix}{raw_line}"),
@@ -2414,7 +2974,7 @@ fn render_user_message(lines: &mut Vec<StyledLine>, content: &str) {
         had_line = true;
     }
     if !had_line {
-        push_styled_line(lines, "› ", Style::default().fg(USER));
+        push_styled_line(lines, "> ", Style::default().fg(USER));
     }
 }
 
@@ -2879,14 +3439,7 @@ fn compact_styled_lines(lines: &mut Vec<StyledLine>) {
 }
 
 fn format_token_count(tokens: u64) -> String {
-    if tokens == 0 {
-        return String::new();
-    }
-    if tokens < 1_000 {
-        format!("{tokens}")
-    } else {
-        format!("{}k", tokens / 1_000)
-    }
+    format!("{tokens} tk")
 }
 
 fn estimate_context_tokens(history: &[ChatMessage]) -> u64 {
@@ -2955,17 +3508,464 @@ fn footer_cwd_label(cwd: &str) -> String {
         .to_string()
 }
 
-fn panel_line(selected: bool, text: &str) -> StyledLine {
-    if selected {
-        line_with_plain(vec![Span::styled(
-            format!("› {text}"),
-            Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD),
-        )])
+fn session_title_from_messages(messages: &[ChatMessage], raw_model: &str) -> String {
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !message.content.trim().is_empty())
+        .map(|message| first_non_empty_line(&message.content));
+    let fallback = messages
+        .iter()
+        .rev()
+        .find(|message| !message.content.trim().is_empty())
+        .map(|message| first_non_empty_line(&message.content));
+
+    last_user
+        .or(fallback)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| raw_model.to_string())
+}
+
+fn session_preview_text_from_messages(messages: &[ChatMessage], raw_model: &str) -> String {
+    let snippets = messages
+        .iter()
+        .rev()
+        .filter(|message| !message.content.trim().is_empty())
+        .take(2)
+        .map(|message| collapse_whitespace(&message.content))
+        .collect::<Vec<_>>();
+
+    let joined = snippets
+        .into_iter()
+        .rev()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+
+    (!joined.is_empty())
+        .then_some(joined)
+        .unwrap_or_else(|| raw_model.to_string())
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn plain_text_from_spans(spans: &[Span<'static>]) -> String {
+    let mut plain = String::new();
+    for span in spans {
+        plain.push_str(span.content.as_ref());
+    }
+    plain
+}
+
+fn metadata_text_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn resume_metadata_values(
+    preview: &SessionPreview,
+    width: u16,
+) -> (String, String, Option<String>) {
+    const SEPARATOR_LEN: usize = 3;
+
+    let time_value = format_time_ago_short(&preview.updated_at);
+    let key_value = preview.key_name.clone();
+    let available = usize::from(width.max(1));
+
+    let mut used = metadata_text_len(&time_value) + SEPARATOR_LEN + metadata_text_len(&key_value);
+    let full_model_len = SEPARATOR_LEN + metadata_text_len(&preview.raw_model);
+
+    if used + full_model_len <= available {
+        return (time_value, key_value, Some(preview.raw_model.clone()));
+    }
+
+    used += SEPARATOR_LEN;
+    if used >= available {
+        return (time_value, key_value, None);
+    }
+
+    let model_width = available.saturating_sub(used) as u16;
+    (
+        time_value,
+        key_value,
+        Some(truncate_for_width(&preview.raw_model, model_width.max(1))),
+    )
+}
+
+fn push_resume_metadata_segment(spans: &mut Vec<Span<'static>>, value: String, color: Color) {
+    if !spans.is_empty() {
+        spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+    }
+    spans.push(Span::styled(value, Style::default().fg(color)));
+}
+
+fn resume_metadata_spans(preview: &SessionPreview, width: u16) -> Vec<Span<'static>> {
+    let (time_value, key_value, model_value) = resume_metadata_values(preview, width);
+    let mut spans = Vec::new();
+    push_resume_metadata_segment(&mut spans, time_value, ACCENT);
+    push_resume_metadata_segment(&mut spans, key_value, USER);
+    if let Some(model_value) = model_value {
+        push_resume_metadata_segment(&mut spans, model_value, ASSISTANT);
+    }
+    spans
+}
+
+fn format_session_group_label(updated_at: &str) -> String {
+    let parsed = DateTime::parse_from_rfc3339(updated_at)
+        .map(|value| value.with_timezone(&Local))
+        .ok();
+    let Some(parsed) = parsed else {
+        return updated_at.to_string();
+    };
+    let today = Local::now().date_naive();
+    if parsed.date_naive() == today {
+        "Today".to_string()
     } else {
-        line_with_plain(vec![Span::styled(
-            format!("  {text}"),
-            Style::default().fg(TEXT),
-        )])
+        parsed.format("%a %b %d %Y").to_string()
+    }
+}
+
+fn format_session_time(updated_at: &str) -> String {
+    DateTime::parse_from_rfc3339(updated_at)
+        .map(|value| value.with_timezone(&Local).format("%-I:%M %p").to_string())
+        .unwrap_or_else(|_| updated_at.to_string())
+}
+
+fn format_session_match_count(filtered: usize, total: usize) -> String {
+    if total == 0 {
+        return "0 chats".to_string();
+    }
+    if filtered == total {
+        return format!("{total} chats");
+    }
+    format!("{filtered}/{total}")
+}
+
+fn format_picker_match_count(filtered: usize, total: usize, noun: &str) -> String {
+    if total == 0 {
+        return format!("0 {noun}");
+    }
+    if filtered == total {
+        return format!("{total} {noun}");
+    }
+    format!("{filtered}/{total}")
+}
+
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn truncate_for_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut result = String::new();
+    let mut used = 0;
+    let limit = max_width - 1;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > limit {
+            break;
+        }
+        used += width;
+        result.push(ch);
+    }
+    result.push('…');
+    result
+}
+
+fn picker_kind_noun(kind: &PickerKind) -> &'static str {
+    match kind {
+        PickerKind::Key => "keys",
+        PickerKind::Model { .. } => "models",
+        PickerKind::Session => "chats",
+    }
+}
+
+fn picker_search_placeholder(kind: &PickerKind) -> &'static str {
+    match kind {
+        PickerKind::Key => "filter key name or endpoint",
+        PickerKind::Model { .. } => "filter model names",
+        PickerKind::Session => "filter saved chats",
+    }
+}
+
+fn key_search_text(key: &ApiKey) -> String {
+    format!(
+        "{} {} {}",
+        key.id,
+        key.display_name(),
+        footer_host_label(&key.base_url)
+    )
+}
+
+fn key_picker_item_line(key: &ApiKey, selected: bool, width: u16) -> Line<'static> {
+    const SELECT_BG: Color = Color::Rgb(78, 108, 136);
+    const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
+    const SELECT_ACCENT: Color = Color::Rgb(255, 228, 194);
+    const PREFIX_WIDTH: usize = 2;
+    const SEPARATOR: &str = " · ";
+
+    let name = key.display_name().to_string();
+    let endpoint = key.base_url.clone();
+    let content_width = usize::from(width.max(1))
+        .saturating_sub(PREFIX_WIDTH)
+        .max(1);
+    let separator_width = display_width(SEPARATOR);
+    let name_width = display_width(&name);
+    let max_endpoint_width = content_width.saturating_sub(name_width + separator_width);
+
+    let (rendered_name, rendered_endpoint) = if max_endpoint_width >= 12 {
+        (
+            name,
+            truncate_for_display_width(&endpoint, max_endpoint_width.max(1)),
+        )
+    } else {
+        let combined = format!("{}{}{}", key.display_name(), SEPARATOR, key.base_url);
+        (
+            truncate_for_display_width(&combined, content_width),
+            String::new(),
+        )
+    };
+
+    let plain = if rendered_endpoint.is_empty() {
+        rendered_name.clone()
+    } else {
+        format!("{rendered_name}{SEPARATOR}{rendered_endpoint}")
+    };
+    let fill_width = content_width.saturating_sub(display_width(&plain));
+
+    let fill_style = if selected {
+        Style::default().bg(SELECT_BG)
+    } else {
+        Style::default()
+    };
+    let prefix_style = if selected {
+        fill_style.fg(SELECT_ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        fill_style
+    };
+    let name_style = if selected {
+        Style::default()
+            .fg(SELECT_TEXT)
+            .bg(SELECT_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    };
+    let endpoint_style = if selected {
+        Style::default().fg(SELECT_ACCENT).bg(SELECT_BG)
+    } else {
+        Style::default().fg(MUTED)
+    };
+
+    let mut spans = vec![Span::styled(
+        if selected { "> " } else { "  " },
+        prefix_style,
+    )];
+    spans.push(Span::styled(rendered_name, name_style));
+    if !rendered_endpoint.is_empty() {
+        spans.push(Span::styled(SEPARATOR, endpoint_style));
+        spans.push(Span::styled(rendered_endpoint, endpoint_style));
+    }
+    spans.push(Span::styled(" ".repeat(fill_width), fill_style));
+    Line::from(spans)
+}
+
+fn session_picker_item_lines(
+    preview: &SessionPreview,
+    selected: bool,
+    armed_delete: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    const SELECT_BG: Color = Color::Rgb(78, 108, 136);
+    const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
+    const SELECT_TIME: Color = Color::Rgb(255, 228, 194);
+    const DELETE_BG: Color = Color::Rgb(104, 63, 63);
+    const DELETE_TEXT: Color = Color::Rgb(255, 241, 233);
+    const DELETE_TIME: Color = Color::Rgb(255, 198, 176);
+    const PREFIX_WIDTH: usize = 2;
+
+    let time = format_session_time(&preview.updated_at);
+    let content_width = usize::from(width.max(1))
+        .saturating_sub(PREFIX_WIDTH)
+        .max(1);
+    let time_width = display_width(&time);
+    let preview_width = content_width
+        .saturating_sub(time_width.saturating_add(2))
+        .max(1);
+    let summary = truncate_for_display_width(&preview.preview_text, preview_width);
+    let summary_width = display_width(&summary);
+    let gap_width = content_width
+        .saturating_sub(summary_width + time_width)
+        .max(1);
+
+    let (active_bg, active_text, active_time) = if armed_delete {
+        (DELETE_BG, DELETE_TEXT, DELETE_TIME)
+    } else {
+        (SELECT_BG, SELECT_TEXT, SELECT_TIME)
+    };
+
+    let line_style = if selected {
+        Style::default()
+            .fg(active_text)
+            .bg(active_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT)
+    };
+    let time_style = if selected {
+        Style::default()
+            .fg(active_time)
+            .bg(active_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ACCENT)
+    };
+    let fill_style = if selected {
+        Style::default().bg(active_bg)
+    } else {
+        Style::default()
+    };
+
+    vec![Line::from(vec![
+        Span::styled(
+            if armed_delete {
+                "! "
+            } else if selected {
+                "> "
+            } else {
+                "  "
+            },
+            if selected {
+                fill_style.fg(active_time).add_modifier(Modifier::BOLD)
+            } else {
+                fill_style
+            },
+        ),
+        Span::styled(summary, line_style),
+        Span::styled(" ".repeat(gap_width), fill_style),
+        Span::styled(time, time_style),
+    ])]
+}
+
+fn render_session_picker_rows(
+    picker: &PickerState,
+    max_rows: usize,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+    let filtered = picker.filtered_items();
+    if filtered.is_empty() || max_rows == 0 {
+        return (
+            vec![Line::from(Span::styled(
+                "No matches",
+                Style::default().fg(MUTED),
+            ))],
+            Vec::new(),
+        );
+    }
+
+    let mut all_rows: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+    let mut previous_group = String::new();
+    for (filtered_index, (_, item)) in filtered.iter().enumerate() {
+        let PickerValue::Session(preview) = &item.value else {
+            continue;
+        };
+        let group = format_session_group_label(&preview.updated_at);
+        if group != previous_group {
+            if !all_rows.is_empty() {
+                all_rows.push((Line::from(""), None));
+            }
+            all_rows.push((
+                Line::from(Span::styled(
+                    group.clone(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )),
+                None,
+            ));
+            previous_group = group;
+        }
+        let selected = filtered_index == picker.selected;
+        let armed_delete = selected && picker.delete_is_armed_for_session(preview);
+        for line in session_picker_item_lines(preview, selected, armed_delete, width) {
+            all_rows.push((line, Some(filtered_index)));
+        }
+    }
+
+    if all_rows.len() <= max_rows {
+        let (lines, row_map): (Vec<_>, Vec<_>) = all_rows.into_iter().unzip();
+        return (lines, row_map);
+    }
+
+    let selected_row = all_rows
+        .iter()
+        .position(|(_, index)| *index == Some(picker.selected))
+        .unwrap_or(0);
+    let mut start = selected_row.saturating_sub(max_rows / 2);
+    let mut end = (start + max_rows).min(all_rows.len());
+    if end - start < max_rows {
+        start = end.saturating_sub(max_rows);
+    }
+    while start > 0 && all_rows[start].1 == all_rows[start - 1].1 {
+        start -= 1;
+        end = (start + max_rows).min(all_rows.len());
+    }
+    if start > 0 && all_rows[start].1.is_some() && all_rows[start - 1].1.is_none() {
+        start -= 1;
+        end = (start + max_rows).min(all_rows.len());
+    }
+
+    let (lines, row_map): (Vec<_>, Vec<_>) = all_rows[start..end].iter().cloned().unzip();
+    (lines, row_map)
+}
+
+fn picker_entry_lines(item: &PickerEntry, selected: bool, width: u16) -> Vec<Line<'static>> {
+    match &item.value {
+        PickerValue::Session(preview) => session_picker_item_lines(preview, selected, false, width),
+        PickerValue::Key(key) => vec![key_picker_item_line(key, selected, width)],
+        _ => {
+            const SELECT_BG: Color = Color::Rgb(78, 108, 136);
+            const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
+            const SELECT_ACCENT: Color = Color::Rgb(255, 228, 194);
+            const PREFIX_WIDTH: usize = 2;
+
+            let content_width = usize::from(width.max(1))
+                .saturating_sub(PREFIX_WIDTH)
+                .max(1);
+            let label = truncate_for_display_width(&item.label, content_width);
+            let fill_width = content_width.saturating_sub(display_width(&label));
+            let fill_style = if selected {
+                Style::default().bg(SELECT_BG)
+            } else {
+                Style::default()
+            };
+            let prefix_style = if selected {
+                fill_style.fg(SELECT_ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                fill_style
+            };
+            let label_style = if selected {
+                Style::default()
+                    .fg(SELECT_TEXT)
+                    .bg(SELECT_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            vec![Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, prefix_style),
+                Span::styled(label, label_style),
+                Span::styled(" ".repeat(fill_width), fill_style),
+            ])]
+        }
     }
 }
 
@@ -3039,25 +4039,6 @@ fn wrapped_line_count(line: &str, width: usize) -> usize {
     total.max(1)
 }
 
-fn matches_fuzzy(query: &str, target: &str) -> bool {
-    let mut q_chars = query.chars();
-    let mut current = match q_chars.next() {
-        Some(ch) => ch,
-        None => return true,
-    };
-
-    for ch in target.chars() {
-        if ch.eq_ignore_ascii_case(&current) {
-            current = match q_chars.next() {
-                Some(next) => next,
-                None => return true,
-            };
-        }
-    }
-
-    false
-}
-
 fn parse_slash_command(input: &str) -> Result<SlashCommand> {
     let trimmed = input.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -3093,20 +4074,7 @@ fn is_help_shortcut(key: KeyEvent) -> bool {
 }
 
 fn truncate_for_width(text: &str, width: u16) -> String {
-    let width = usize::from(width.max(1));
-    let len = text.chars().count();
-    if len <= width {
-        return text.to_string();
-    }
-    if width <= 1 {
-        return "…".to_string();
-    }
-    let mut result = text
-        .chars()
-        .take(width.saturating_sub(1))
-        .collect::<String>();
-    result.push('…');
-    result
+    truncate_for_display_width(text, usize::from(width))
 }
 
 fn first_non_empty_line(text: &str) -> String {
@@ -3321,6 +4289,10 @@ mod tests {
             tx,
             rx,
             response_task: None,
+            resume_task: None,
+            resume_request_id: 0,
+            loading_resume: None,
+            resume_restore_state: None,
             reduce_motion: false,
             frame_tick: 0,
             picker_hitbox: None,
@@ -3364,6 +4336,114 @@ mod tests {
     }
 
     #[test]
+    fn test_format_token_count_uses_tk_suffix() {
+        assert_eq!(format_token_count(0), "0 tk");
+        assert_eq!(format_token_count(105), "105 tk");
+        assert_eq!(format_token_count(12_345), "12345 tk");
+    }
+
+    #[test]
+    fn test_transcript_intro_lines_use_model_and_base_url() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.raw_model = "claude-sonnet-4".to_string();
+        app.key = ApiKey::new_with_protocol(
+            "prod".to_string(),
+            "test".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            None,
+            String::new(),
+        );
+        app.cwd = "/tmp/project".to_string();
+
+        assert_eq!(
+            app.transcript_intro_lines(),
+            vec![
+                "AIVO Chat".to_string(),
+                "claude-sonnet-4 · https://openrouter.ai/api/v1".to_string(),
+                "/tmp/project".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_format_session_match_count() {
+        assert_eq!(format_session_match_count(0, 0), "0 chats");
+        assert_eq!(format_session_match_count(4, 4), "4 chats");
+        assert_eq!(format_session_match_count(2, 5), "2/5");
+    }
+
+    #[test]
+    fn test_truncate_for_display_width_handles_wide_text() {
+        let truncated = truncate_for_display_width("你好🙂 hello", 8);
+        assert!(display_width(&truncated) <= 8);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn test_session_picker_item_line_fits_mixed_width_preview() {
+        let preview = SessionPreview {
+            key_id: "key-1".to_string(),
+            key_name: "prod".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            session_id: "session-1234".to_string(),
+            raw_model: "deepseek".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339(),
+            title: "hi".to_string(),
+            preview_text: "hi · Hi there! ✨ 想聊点什么？还是需要我帮忙呢？ 我随时待命～ 😊🌟"
+                .to_string(),
+        };
+
+        let line = session_picker_item_lines(&preview, true, false, 64)
+            .into_iter()
+            .next()
+            .unwrap();
+        let plain = plain_text_from_spans(&line.spans);
+        assert!(display_width(&plain) <= 64);
+    }
+
+    #[test]
+    fn test_key_picker_item_line_fits_modal_width() {
+        let key = ApiKey::new_with_protocol(
+            "deepseek".to_string(),
+            "deepseek".to_string(),
+            "https://api.cloudflare.com/client/v4/accounts/long/endpoint".to_string(),
+            None,
+            "sk-test".to_string(),
+        );
+
+        let line = key_picker_item_line(&key, true, 36);
+        let plain = plain_text_from_spans(&line.spans);
+        assert!(display_width(&plain) <= 36);
+        assert!(plain.contains("deepseek"));
+    }
+
+    #[test]
+    fn test_key_search_text_uses_host_not_full_path() {
+        let key = ApiKey::new_with_protocol(
+            "testgw".to_string(),
+            "testgw".to_string(),
+            "https://api.ai.example-gateway.net/endpoint".to_string(),
+            None,
+            "sk-test".to_string(),
+        );
+
+        let search = key_search_text(&key);
+        assert!(search.contains("testgw"));
+        assert!(search.contains("api.ai.example-gateway.net"));
+        assert!(!search.contains("/endpoint"));
+    }
+
+    #[test]
+    fn test_key_filter_does_not_match_across_full_url_path() {
+        let unrelated = "groq groq api.groq.com";
+        let target = "testgw testgw api.ai.example-gateway.net";
+
+        assert!(matches_fuzzy("gapn", target));
+        assert!(!matches_fuzzy("gapn", unrelated));
+    }
+
+    #[test]
     fn test_error_notice_only_returns_errors() {
         let error = (ERROR, "boom".to_string());
         let info = (MUTED, "ok".to_string());
@@ -3373,7 +4453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_picker_visible_range_tracks_selection() {
+    fn test_picker_visible_items_track_selection_for_single_line_rows() {
         let picker = PickerState {
             title: "Select model",
             query: String::new(),
@@ -3387,9 +4467,82 @@ mod tests {
             loading: false,
             selected: 4,
             kind: PickerKind::Session,
+            pending_delete: None,
         };
 
-        assert_eq!(picker.visible_range(3), (2, 5));
+        let visible = picker.visible_items(3);
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].0, 2);
+        assert_eq!(visible[2].0, 4);
+    }
+
+    #[test]
+    fn test_picker_navigation_wraps() {
+        let mut picker = PickerState {
+            title: "Select model",
+            query: String::new(),
+            items: (0..3)
+                .map(|index| PickerEntry {
+                    label: format!("item-{index}"),
+                    search_text: format!("item-{index}"),
+                    value: PickerValue::Model(format!("item-{index}")),
+                })
+                .collect(),
+            loading: false,
+            selected: 0,
+            kind: PickerKind::Session,
+            pending_delete: None,
+        };
+
+        picker.select_prev();
+        assert_eq!(picker.selected, 2);
+
+        picker.select_next();
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn test_picker_visible_items_respect_single_line_session_rows() {
+        let preview = SessionPreview {
+            key_id: "key-1".to_string(),
+            key_name: "prod".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            session_id: "session-1234".to_string(),
+            raw_model: "claude".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
+            title: "Deploy status".to_string(),
+            preview_text: "Deploy status for api gateway after rollout".to_string(),
+        };
+        let picker = PickerState {
+            title: "Resume",
+            query: String::new(),
+            items: vec![
+                PickerEntry {
+                    label: "one".to_string(),
+                    search_text: "one".to_string(),
+                    value: PickerValue::Session(preview.clone()),
+                },
+                PickerEntry {
+                    label: "two".to_string(),
+                    search_text: "two".to_string(),
+                    value: PickerValue::Session(preview.clone()),
+                },
+                PickerEntry {
+                    label: "three".to_string(),
+                    search_text: "three".to_string(),
+                    value: PickerValue::Session(preview),
+                },
+            ],
+            loading: false,
+            selected: 2,
+            kind: PickerKind::Session,
+            pending_delete: None,
+        };
+
+        let visible = picker.visible_items(4);
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].0, 0);
+        assert_eq!(visible[2].0, 2);
     }
 
     #[test]
@@ -3441,6 +4594,59 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_for_model_picker_cancels_inflight_request() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "draft".to_string(),
+        });
+        app.pending_submit = Some("draft".to_string());
+        app.pending_response = "partial".to_string();
+        app.sending = true;
+        app.request_started_at = Some(Instant::now());
+
+        app.prepare_for_model_picker();
+
+        assert!(!app.sending);
+        assert!(app.pending_response.is_empty());
+        assert_eq!(app.draft, "draft");
+        assert!(app.history.is_empty());
+        assert!(app.request_started_at.is_none());
+        assert_eq!(
+            app.notice.as_ref().map(|(_, text)| text.as_str()),
+            Some("Request cancelled")
+        );
+    }
+
+    #[test]
+    fn test_empty_composer_placeholder_reserves_cursor_cell() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = make_test_app(tx, rx);
+        let line = app.render_composer_text().lines[0].clone();
+        let plain = plain_text_from_spans(&line.spans);
+        assert_eq!(plain, ">  Ask anything · / for commands · F1 for help");
+    }
+
+    #[test]
+    fn test_overlay_hides_input_cursor() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        assert!(app.should_show_input_cursor());
+
+        app.overlay = Overlay::Picker(Box::new(PickerState::loading(
+            "Select model",
+            String::new(),
+            PickerKind::Model {
+                target: ModelSelectionTarget::CurrentChat,
+                auto_accept_exact: false,
+            },
+        )));
+
+        assert!(!app.should_show_input_cursor());
+    }
+
+    #[test]
     fn test_persisted_draft_history_roundtrip() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("chat_history");
@@ -3452,28 +4658,316 @@ mod tests {
     }
 
     #[test]
-    fn test_session_resume_label_uses_last_user_message() {
-        let snapshot = SessionSnapshot {
+    fn test_session_preview_uses_last_user_message() {
+        let preview = SessionPreview {
             key_id: "key-1".to_string(),
             key_name: "prod".to_string(),
             base_url: "https://api.example.com".to_string(),
             session_id: "session".to_string(),
             raw_model: "claude".to_string(),
             updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
-            messages: vec![
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: "Hi".to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "What is the deployment status for api gateway?".to_string(),
-                },
-            ],
+            title: session_title_from_messages(
+                &[
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: "Hi".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "What is the deployment status for api gateway?".to_string(),
+                    },
+                ],
+                "claude",
+            ),
+            preview_text: "What is the deployment status for api gateway?".to_string(),
         };
 
-        let label = snapshot.resume_label(32);
-        assert!(label.starts_with("What is the"));
-        assert!(label.ends_with("· 2h · prod"));
+        assert_eq!(
+            preview.title,
+            "What is the deployment status for api gateway?".to_string()
+        );
+    }
+
+    #[test]
+    fn test_session_preview_text_uses_two_latest_turns() {
+        let preview = session_preview_text_from_messages(
+            &[
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: "hi there".to_string(),
+                },
+            ],
+            "claude",
+        );
+
+        assert_eq!(preview, "hello · hi there");
+    }
+
+    #[test]
+    fn test_resume_metadata_spans_drop_labels_and_id() {
+        let preview = SessionPreview {
+            key_id: "key-1".to_string(),
+            key_name: "prod".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            session_id: "session-1234".to_string(),
+            raw_model: "claude-sonnet-4-extended".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
+            title: "Deploy status".to_string(),
+            preview_text: "Deploy status for api gateway after rollout".to_string(),
+        };
+
+        let plain = plain_text_from_spans(&resume_metadata_spans(&preview, 40));
+        assert!(plain.contains("2h"));
+        assert!(plain.contains("prod"));
+        assert!(plain.contains("claude"));
+        assert!(!plain.contains("time"));
+        assert!(!plain.contains("key"));
+        assert!(!plain.contains("model"));
+        assert!(!plain.contains("session-1"));
+    }
+
+    #[test]
+    fn test_session_picker_item_line_shows_two_turn_preview() {
+        let preview = SessionPreview {
+            key_id: "key-1".to_string(),
+            key_name: "prod".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            session_id: "session-1234".to_string(),
+            raw_model: "claude-sonnet-4-extended".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
+            title: "Deploy status".to_string(),
+            preview_text:
+                "What is the deployment status for api gateway after the canary rollout finished?"
+                    .to_string(),
+        };
+
+        let lines = session_picker_item_lines(&preview, false, false, 32);
+        let first = plain_text_from_spans(&lines[0].spans);
+
+        assert!(first.contains("What is"));
+        assert!(first.chars().any(|ch| ch.is_ascii_digit()));
+        assert!(!first.contains("key"));
+    }
+
+    #[tokio::test]
+    async fn test_begin_resume_load_clears_transcript_before_result() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "old".to_string(),
+        });
+        app.pending_response = "pending".to_string();
+        app.draft = "draft".to_string();
+        let preview = SessionPreview {
+            key_id: app.key.id.clone(),
+            key_name: app.key.display_name().to_string(),
+            base_url: app.key.base_url.clone(),
+            session_id: "session-1234".to_string(),
+            raw_model: "claude".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
+            title: "Deploy status".to_string(),
+            preview_text: "Deploy status for api gateway after rollout".to_string(),
+        };
+
+        app.begin_resume_load(preview.clone());
+
+        assert!(app.history.is_empty());
+        assert!(app.pending_response.is_empty());
+        assert!(app.draft.is_empty());
+        assert_eq!(
+            app.loading_resume
+                .as_ref()
+                .map(|loading| loading.preview.title.clone()),
+            Some(preview.title)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_picker_selection_removes_saved_chat() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+            .await
+            .unwrap();
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "https://api.example.com",
+                "/tmp/demo",
+                "session-1234",
+                "claude",
+                &[
+                    crate::services::session_store::StoredChatMessage {
+                        role: "user".to_string(),
+                        content: "hello".to_string(),
+                    },
+                    crate::services::session_store::StoredChatMessage {
+                        role: "assistant".to_string(),
+                        content: "hi there".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let preview = SessionPreview {
+            key_id: key_id.clone(),
+            key_name: "prod".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            session_id: "session-1234".to_string(),
+            raw_model: "claude".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339(),
+            title: "hello".to_string(),
+            preview_text: "hello · hi there".to_string(),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.session_store = store.clone();
+        app.cwd = "/tmp/demo".to_string();
+        app.overlay = Overlay::Picker(Box::new(PickerState::ready(
+            "Sessions",
+            String::new(),
+            vec![PickerEntry {
+                label: preview.title.clone(),
+                search_text: preview.search_text(),
+                value: PickerValue::Session(preview),
+            }],
+            PickerKind::Session,
+        )));
+
+        app.delete_picker_selection(0).await.unwrap();
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(
+            app.notice.as_ref().map(|(_, text)| text.as_str()),
+            Some("Saved chat deleted")
+        );
+        let saved = app
+            .session_store
+            .get_chat_session(&key_id, "https://api.example.com", "/tmp/demo")
+            .await
+            .unwrap();
+        assert!(saved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_d_requires_confirmation_before_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+            .await
+            .unwrap();
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "https://api.example.com",
+                "/tmp/demo",
+                "session-1234",
+                "claude",
+                &[crate::services::session_store::StoredChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let preview = SessionPreview {
+            key_id: key_id.clone(),
+            key_name: "prod".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            session_id: "session-1234".to_string(),
+            raw_model: "claude".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339(),
+            title: "hello".to_string(),
+            preview_text: "hello".to_string(),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.session_store = store.clone();
+        app.cwd = "/tmp/demo".to_string();
+        app.overlay = Overlay::Picker(Box::new(PickerState::ready(
+            "Sessions",
+            String::new(),
+            vec![PickerEntry {
+                label: preview.title.clone(),
+                search_text: preview.search_text(),
+                value: PickerValue::Session(preview),
+            }],
+            PickerKind::Session,
+        )));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let saved = app
+            .session_store
+            .get_chat_session(&key_id, "https://api.example.com", "/tmp/demo")
+            .await
+            .unwrap();
+        assert!(saved.is_some());
+        let Overlay::Picker(picker) = &app.overlay else {
+            panic!("expected picker overlay");
+        };
+        assert!(picker.pending_delete.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let saved = app
+            .session_store
+            .get_chat_session(&key_id, "https://api.example.com", "/tmp/demo")
+            .await
+            .unwrap();
+        assert!(saved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resume_loaded_failure_restores_previous_state() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx.clone(), rx);
+        app.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "old".to_string(),
+        });
+        let preview = SessionPreview {
+            key_id: app.key.id.clone(),
+            key_name: app.key.display_name().to_string(),
+            base_url: app.key.base_url.clone(),
+            session_id: "session-1234".to_string(),
+            raw_model: "claude".to_string(),
+            updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
+            title: "Deploy status".to_string(),
+            preview_text: "Deploy status for api gateway after rollout".to_string(),
+        };
+
+        app.begin_resume_load(preview);
+        let request_id = app.loading_resume.as_ref().unwrap().request_id;
+        tx.send(RuntimeEvent::ResumeLoaded {
+            request_id,
+            result: Err("boom".to_string()),
+        })
+        .unwrap();
+
+        app.handle_runtime_events().await.unwrap();
+
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[0].content, "old");
+        assert!(app.loading_resume.is_none());
+        assert_eq!(
+            app.notice.as_ref().map(|(_, text)| text.as_str()),
+            Some("boom")
+        );
     }
 }
