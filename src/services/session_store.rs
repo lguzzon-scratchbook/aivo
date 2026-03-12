@@ -1209,6 +1209,22 @@ impl SessionStore {
         );
         self.save_raw(&config).await
     }
+
+    pub async fn delete_chat_session(
+        &self,
+        key_id: &str,
+        cwd: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let _lock = self.acquire_config_lock()?;
+        let mut config = self.load().await?;
+        let map_key = chat_session_map_key(key_id, cwd, session_id);
+        let removed = config.chat_sessions.remove(&map_key).is_some();
+        if removed {
+            self.save_raw(&config).await?;
+        }
+        Ok(removed)
+    }
 }
 
 fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
