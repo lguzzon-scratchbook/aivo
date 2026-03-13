@@ -287,6 +287,8 @@ impl UsageStats {
 pub struct StoredChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1587,6 +1589,7 @@ mod tests {
                 &[StoredChatMessage {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    reasoning_content: None,
                 }],
             )
             .await
@@ -1622,6 +1625,7 @@ mod tests {
                 &[StoredChatMessage {
                     role: "user".to_string(),
                     content: "second".to_string(),
+                    reasoning_content: None,
                 }],
             )
             .await
@@ -1920,10 +1924,12 @@ mod tests {
             StoredChatMessage {
                 role: "user".into(),
                 content: "ping".into(),
+                reasoning_content: None,
             },
             StoredChatMessage {
                 role: "assistant".into(),
                 content: "pong".into(),
+                reasoning_content: None,
             },
         ];
         let json = serde_json::to_string(&msgs).unwrap();

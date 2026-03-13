@@ -39,6 +39,8 @@ const MAX_REQUEST_ATTEMPTS: usize = 3;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -61,6 +63,21 @@ struct ChunkChoice {
 #[derive(Debug, Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    thinking: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatResponseChunk {
+    Content(String),
+    Reasoning(String),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AssistantResponse {
+    content: String,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,6 +101,7 @@ impl TokenUsageUpdate {
 #[derive(Debug, Default)]
 struct ChatTurnResult {
     content: String,
+    reasoning_content: Option<String>,
     usage: Option<TokenUsage>,
 }
 
@@ -108,6 +126,7 @@ struct AnthropicStreamEvent {
 #[derive(Deserialize)]
 struct AnthropicDelta {
     text: Option<String>,
+    thinking: Option<String>,
 }
 
 /// ChatCommand provides an interactive REPL for chatting with AI models
@@ -250,12 +269,14 @@ impl ChatCommand {
             let history = vec![ChatMessage {
                 role: "user".to_string(),
                 content: one_shot_input,
+                reasoning_content: None,
             }];
             let mut format = ChatFormat::OpenAI;
             self.session_store
                 .record_selection(&key.id, "chat", Some(&raw_model))
                 .await?;
             let (spinning, spinner_handle) = style::start_spinner(None);
+            let mut current_section: Option<&'static str> = None;
             let result = send_message_turn(
                 &client,
                 &key,
@@ -265,7 +286,25 @@ impl ChatCommand {
                 &mut format,
                 &spinning,
                 &mut |chunk| {
-                    print!("{chunk}");
+                    match chunk {
+                        ChatResponseChunk::Reasoning(text) => {
+                            if current_section != Some("thinking") {
+                                if current_section.is_some() {
+                                    print!("\n\n");
+                                }
+                                print!("Thinking:\n");
+                                current_section = Some("thinking");
+                            }
+                            print!("{text}");
+                        }
+                        ChatResponseChunk::Content(text) => {
+                            if current_section == Some("thinking") {
+                                print!("\n\nAnswer:\n");
+                            }
+                            current_section = Some("answer");
+                            print!("{text}");
+                        }
+                    }
                     io::stdout().flush()?;
                     Ok(())
                 },
@@ -420,6 +459,11 @@ impl ChatCommand {
         );
         println!(
             "  {}  {}",
+            style::cyan("Ctrl+T"),
+            style::dim("Show / hide thinking blocks")
+        );
+        println!(
+            "  {}  {}",
             style::cyan("AIVO_REDUCE_MOTION=1"),
             style::dim("Disable chat TUI motion effects")
         );
@@ -451,7 +495,7 @@ async fn send_message_turn<F>(
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     if let Some(tm) = copilot_tm {
         return send_copilot_request(client, tm, model, history, spinning, on_chunk).await;
@@ -494,10 +538,12 @@ async fn perform_compact(
     let system = ChatMessage {
         role: "system".to_string(),
         content: "Summarize this conversation concisely but thoroughly. Preserve key facts, decisions, code snippets, file paths, and action items. Write in second person. Be concise.".to_string(),
+        reasoning_content: None,
     };
     let request_msg = ChatMessage {
         role: "user".to_string(),
         content: "Please summarize our conversation so far.".to_string(),
+        reasoning_content: None,
     };
     let messages: Vec<ChatMessage> = std::iter::once(system)
         .chain(history.iter().cloned())
@@ -516,7 +562,9 @@ async fn perform_compact(
         &mut format,
         &spinning,
         &mut |chunk| {
-            summary.push_str(chunk);
+            if let ChatResponseChunk::Content(text) = chunk {
+                summary.push_str(&text);
+            }
             Ok(())
         },
     )
@@ -555,6 +603,7 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
         .map(|message| StoredChatMessage {
             role: message.role.clone(),
             content: message.content.clone(),
+            reasoning_content: message.reasoning_content.clone(),
         })
         .collect()
 }
@@ -569,23 +618,59 @@ fn new_chat_session_id() -> String {
         .to_string()
 }
 
-/// Extracts assistant text from OpenAI-compatible non-streaming chat responses.
-fn extract_openai_message_content(body: &serde_json::Value) -> String {
-    if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
-        return content.to_string();
+fn normalize_reasoning_content(reasoning: String) -> Option<String> {
+    if reasoning.trim().is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    }
+}
+
+fn extract_reasoning_part(part: &serde_json::Value) -> Option<String> {
+    part.get("thinking")
+        .and_then(|v| v.as_str())
+        .or_else(|| part.get("reasoning_content").and_then(|v| v.as_str()))
+        .or_else(|| part.get("reasoning").and_then(|v| v.as_str()))
+        .or_else(|| part.get("text").and_then(|v| v.as_str()))
+        .or_else(|| part.get("content").and_then(|v| v.as_str()))
+        .map(ToString::to_string)
+}
+
+fn extract_openai_message(body: &serde_json::Value) -> AssistantResponse {
+    let message = &body["choices"][0]["message"];
+    let mut content_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+
+    if let Some(reasoning) = message.get("reasoning_content").and_then(|v| v.as_str()) {
+        reasoning_parts.push(reasoning.to_string());
     }
 
-    // Some providers return content as an array of typed parts.
-    body["choices"][0]["message"]["content"]
-        .as_array()
-        .iter()
-        .flat_map(|parts| parts.iter())
-        .filter_map(|part| {
-            part.get("text")
+    if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+        content_parts.push(content.to_string());
+    } else if let Some(parts) = message.get("content").and_then(|v| v.as_array()) {
+        for part in parts {
+            let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if matches!(part_type, "reasoning" | "thinking") {
+                if let Some(reasoning) = extract_reasoning_part(part) {
+                    reasoning_parts.push(reasoning);
+                }
+                continue;
+            }
+
+            if let Some(text) = part
+                .get("text")
                 .and_then(|v| v.as_str())
                 .or_else(|| part.get("content").and_then(|v| v.as_str()))
-        })
-        .collect()
+            {
+                content_parts.push(text.to_string());
+            }
+        }
+    }
+
+    AssistantResponse {
+        content: content_parts.concat(),
+        reasoning_content: normalize_reasoning_content(reasoning_parts.join("")),
+    }
 }
 
 fn extract_openai_usage(body: &serde_json::Value) -> Option<TokenUsage> {
@@ -717,7 +802,7 @@ async fn send_chat_request<F>(
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/chat/completions", base);
@@ -754,6 +839,7 @@ where
     }
 
     let mut full_content = String::new();
+    let mut full_reasoning = String::new();
     let mut usage = None;
     let mut line_buf = String::new();
     let mut done = false;
@@ -777,10 +863,15 @@ where
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
-                if let Some(content) = parse_sse_chunk(data) {
+                if let Some(chunk) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
-                    on_chunk(&content)?;
-                    full_content.push_str(&content);
+                    match &chunk {
+                        ChatResponseChunk::Content(content) => full_content.push_str(content),
+                        ChatResponseChunk::Reasoning(reasoning) => {
+                            full_reasoning.push_str(reasoning);
+                        }
+                    }
+                    on_chunk(chunk)?;
                 }
             }
         }
@@ -793,30 +884,40 @@ where
                 merge_token_usage(&mut usage, tokens);
             }
             if data.trim() != "[DONE]"
-                && let Some(content) = parse_sse_chunk(data)
+                && let Some(chunk) = parse_sse_chunk(data)
             {
                 style::stop_spinner(spinning);
-                on_chunk(&content)?;
-                full_content.push_str(&content);
+                match &chunk {
+                    ChatResponseChunk::Content(content) => full_content.push_str(content),
+                    ChatResponseChunk::Reasoning(reasoning) => full_reasoning.push_str(reasoning),
+                }
+                on_chunk(chunk)?;
             }
         } else if full_content.is_empty()
             && let Ok(resp) = serde_json::from_str::<serde_json::Value>(tail)
         {
-            let content = extract_openai_message_content(&resp);
-            if !content.is_empty() {
+            let response = extract_openai_message(&resp);
+            if !response.content.is_empty() || response.reasoning_content.is_some() {
                 style::stop_spinner(spinning);
-                on_chunk(&content)?;
-                full_content = content;
+                if let Some(reasoning) = response.reasoning_content.clone() {
+                    on_chunk(ChatResponseChunk::Reasoning(reasoning.clone()))?;
+                    full_reasoning = reasoning;
+                }
+                if !response.content.is_empty() {
+                    on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
+                    full_content = response.content;
+                }
             }
         }
     }
 
-    if full_content.is_empty() {
+    if full_content.is_empty() && full_reasoning.is_empty() {
         return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
     }
 
     Ok(ChatTurnResult {
         content: full_content,
+        reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
     })
 }
@@ -832,7 +933,7 @@ async fn send_non_streaming<F>(
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     let request = ChatRequest {
         model: model.to_string(),
@@ -858,18 +959,27 @@ where
     }
 
     let body: serde_json::Value = response.json().await?;
-    let content = extract_openai_message_content(&body);
+    let response = extract_openai_message(&body);
     let usage = extract_openai_usage(&body);
 
-    if content.is_empty() {
+    if response.content.is_empty() && response.reasoning_content.is_none() {
         style::stop_spinner(spinning);
         anyhow::bail!("Provider returned an empty response");
     }
 
     style::stop_spinner(spinning);
-    on_chunk(&content)?;
+    if let Some(reasoning) = response.reasoning_content.clone() {
+        on_chunk(ChatResponseChunk::Reasoning(reasoning))?;
+    }
+    if !response.content.is_empty() {
+        on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
+    }
 
-    Ok(ChatTurnResult { content, usage })
+    Ok(ChatTurnResult {
+        content: response.content,
+        reasoning_content: response.reasoning_content,
+        usage,
+    })
 }
 
 /// Sends a chat request via GitHub Copilot (token exchange + Copilot API).
@@ -882,7 +992,7 @@ async fn send_copilot_request<F>(
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     let (copilot_token, api_endpoint) = tm.get_token().await?;
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
@@ -926,6 +1036,7 @@ where
     }
 
     let mut full_content = String::new();
+    let mut full_reasoning = String::new();
     let mut usage = None;
     let mut line_buf = String::new();
     let mut done = false;
@@ -949,10 +1060,15 @@ where
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
-                if let Some(content) = parse_sse_chunk(data) {
+                if let Some(chunk) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
-                    on_chunk(&content)?;
-                    full_content.push_str(&content);
+                    match &chunk {
+                        ChatResponseChunk::Content(content) => full_content.push_str(content),
+                        ChatResponseChunk::Reasoning(reasoning) => {
+                            full_reasoning.push_str(reasoning);
+                        }
+                    }
+                    on_chunk(chunk)?;
                 }
             }
         }
@@ -965,25 +1081,34 @@ where
                 merge_token_usage(&mut usage, tokens);
             }
             if data.trim() != "[DONE]"
-                && let Some(content) = parse_sse_chunk(data)
+                && let Some(chunk) = parse_sse_chunk(data)
             {
                 style::stop_spinner(spinning);
-                on_chunk(&content)?;
-                full_content.push_str(&content);
+                match &chunk {
+                    ChatResponseChunk::Content(content) => full_content.push_str(content),
+                    ChatResponseChunk::Reasoning(reasoning) => full_reasoning.push_str(reasoning),
+                }
+                on_chunk(chunk)?;
             }
         } else if full_content.is_empty()
             && let Ok(resp) = serde_json::from_str::<serde_json::Value>(tail)
         {
-            let content = extract_openai_message_content(&resp);
-            if !content.is_empty() {
+            let response = extract_openai_message(&resp);
+            if !response.content.is_empty() || response.reasoning_content.is_some() {
                 style::stop_spinner(spinning);
-                on_chunk(&content)?;
-                full_content = content;
+                if let Some(reasoning) = response.reasoning_content.clone() {
+                    on_chunk(ChatResponseChunk::Reasoning(reasoning.clone()))?;
+                    full_reasoning = reasoning;
+                }
+                if !response.content.is_empty() {
+                    on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
+                    full_content = response.content;
+                }
             }
         }
     }
 
-    if full_content.is_empty() {
+    if full_content.is_empty() && full_reasoning.is_empty() {
         return send_copilot_non_streaming(
             client,
             &url,
@@ -998,6 +1123,7 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
+        reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
     })
 }
@@ -1012,7 +1138,7 @@ async fn send_copilot_non_streaming<F>(
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     let request = ChatRequest {
         model: model.to_string(),
@@ -1040,24 +1166,47 @@ where
     }
 
     let body: serde_json::Value = response.json().await?;
-    let content = extract_openai_message_content(&body);
+    let response = extract_openai_message(&body);
     let usage = extract_openai_usage(&body);
 
-    if content.is_empty() {
+    if response.content.is_empty() && response.reasoning_content.is_none() {
         style::stop_spinner(spinning);
         anyhow::bail!("Provider returned an empty response");
     }
 
     style::stop_spinner(spinning);
-    on_chunk(&content)?;
+    if let Some(reasoning) = response.reasoning_content.clone() {
+        on_chunk(ChatResponseChunk::Reasoning(reasoning))?;
+    }
+    if !response.content.is_empty() {
+        on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
+    }
 
-    Ok(ChatTurnResult { content, usage })
+    Ok(ChatTurnResult {
+        content: response.content,
+        reasoning_content: response.reasoning_content,
+        usage,
+    })
 }
 
-/// Parses a single SSE data chunk and extracts the content delta
-pub fn parse_sse_chunk(data: &str) -> Option<String> {
+/// Parses a single SSE data chunk and extracts either a content or reasoning delta.
+fn parse_sse_chunk(data: &str) -> Option<ChatResponseChunk> {
     let chunk: ChatChunk = serde_json::from_str(data).ok()?;
-    chunk.choices.first()?.delta.content.clone()
+    let delta = &chunk.choices.first()?.delta;
+    delta
+        .reasoning_content
+        .clone()
+        .or_else(|| delta.reasoning.clone())
+        .or_else(|| delta.thinking.clone())
+        .filter(|text| !text.is_empty())
+        .map(ChatResponseChunk::Reasoning)
+        .or_else(|| {
+            delta
+                .content
+                .clone()
+                .filter(|text| !text.is_empty())
+                .map(ChatResponseChunk::Content)
+        })
 }
 
 /// Trims chat history to keep at most `max_messages` messages.
@@ -1108,7 +1257,7 @@ async fn send_anthropic_request<F>(
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/messages", base);
@@ -1148,6 +1297,7 @@ where
     }
 
     let mut full_content = String::new();
+    let mut full_reasoning = String::new();
     let mut usage = None;
     let mut line_buf = String::new();
 
@@ -1163,10 +1313,15 @@ where
                 if let Some(tokens) = parse_anthropic_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
-                if let Some(text) = parse_anthropic_chunk(data) {
+                if let Some(chunk) = parse_anthropic_chunk(data) {
                     style::stop_spinner(spinning);
-                    on_chunk(&text)?;
-                    full_content.push_str(&text);
+                    match &chunk {
+                        ChatResponseChunk::Content(text) => full_content.push_str(text),
+                        ChatResponseChunk::Reasoning(reasoning) => {
+                            full_reasoning.push_str(reasoning);
+                        }
+                    }
+                    on_chunk(chunk)?;
                 }
             }
         }
@@ -1178,16 +1333,19 @@ where
             if let Some(tokens) = parse_anthropic_usage_chunk(data) {
                 merge_token_usage(&mut usage, tokens);
             }
-            if let Some(text) = parse_anthropic_chunk(data) {
+            if let Some(chunk) = parse_anthropic_chunk(data) {
                 style::stop_spinner(spinning);
-                on_chunk(&text)?;
-                full_content.push_str(&text);
+                match &chunk {
+                    ChatResponseChunk::Content(text) => full_content.push_str(text),
+                    ChatResponseChunk::Reasoning(reasoning) => full_reasoning.push_str(reasoning),
+                }
+                on_chunk(chunk)?;
             }
         }
     }
 
     // If streaming produced no content, fall back to non-streaming
-    if full_content.is_empty() {
+    if full_content.is_empty() && full_reasoning.is_empty() {
         return send_anthropic_non_streaming(
             client, &url, key, model, messages, spinning, on_chunk,
         )
@@ -1196,6 +1354,7 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
+        reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
     })
 }
@@ -1211,7 +1370,7 @@ async fn send_anthropic_non_streaming<F>(
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     let request = serde_json::json!({
         "model": model,
@@ -1243,31 +1402,66 @@ where
     let body: serde_json::Value = response.json().await?;
     let usage = extract_anthropic_usage(&body);
 
-    // Try Anthropic format: content[].text
-    let content: String = body["content"]
-        .as_array()
-        .iter()
-        .flat_map(|arr| arr.iter())
-        .filter(|c| c["type"].as_str() == Some("text"))
-        .filter_map(|c| c["text"].as_str())
-        .collect();
+    let mut content_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    for block in body["content"].as_array().into_iter().flatten() {
+        match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    content_parts.push(text.to_string());
+                }
+            }
+            "thinking" => {
+                if let Some(reasoning) = block
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| block.get("text").and_then(|v| v.as_str()))
+                {
+                    reasoning_parts.push(reasoning.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
 
-    if content.is_empty() {
+    let content = content_parts.concat();
+    let reasoning_content = normalize_reasoning_content(reasoning_parts.join(""));
+
+    if content.is_empty() && reasoning_content.is_none() {
         style::stop_spinner(spinning);
         anyhow::bail!("Provider returned an empty response");
     }
 
     style::stop_spinner(spinning);
-    on_chunk(&content)?;
+    if let Some(reasoning) = reasoning_content.clone() {
+        on_chunk(ChatResponseChunk::Reasoning(reasoning))?;
+    }
+    if !content.is_empty() {
+        on_chunk(ChatResponseChunk::Content(content.clone()))?;
+    }
 
-    Ok(ChatTurnResult { content, usage })
+    Ok(ChatTurnResult {
+        content,
+        reasoning_content,
+        usage,
+    })
 }
 
-/// Parses an Anthropic SSE data line and returns the text delta if present.
-pub fn parse_anthropic_chunk(data: &str) -> Option<String> {
+/// Parses an Anthropic SSE data line and returns either a text or thinking delta.
+fn parse_anthropic_chunk(data: &str) -> Option<ChatResponseChunk> {
     let event: AnthropicStreamEvent = serde_json::from_str(data).ok()?;
     if event.event_type == "content_block_delta" {
-        event.delta?.text
+        let delta = event.delta?;
+        delta
+            .thinking
+            .filter(|text| !text.is_empty())
+            .map(ChatResponseChunk::Reasoning)
+            .or_else(|| {
+                delta
+                    .text
+                    .filter(|text| !text.is_empty())
+                    .map(ChatResponseChunk::Content)
+            })
     } else {
         None
     }
@@ -1280,7 +1474,10 @@ mod tests {
     #[test]
     fn test_parse_sse_chunk_with_content() {
         let data = r#"{"id":"chatcmpl-1","choices":[{"delta":{"content":"Hello"}}]}"#;
-        assert_eq!(parse_sse_chunk(data), Some("Hello".to_string()));
+        assert_eq!(
+            parse_sse_chunk(data),
+            Some(ChatResponseChunk::Content("Hello".to_string()))
+        );
     }
 
     #[test]
@@ -1313,11 +1510,17 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_openai_message_content_string_and_parts() {
+    fn test_extract_openai_message_string_and_parts() {
         let text = serde_json::json!({
             "choices": [{"message": {"content": "hello"}}]
         });
-        assert_eq!(extract_openai_message_content(&text), "hello");
+        assert_eq!(
+            extract_openai_message(&text),
+            AssistantResponse {
+                content: "hello".to_string(),
+                reasoning_content: None,
+            }
+        );
 
         let parts = serde_json::json!({
             "choices": [{
@@ -1329,7 +1532,33 @@ mod tests {
                 }
             }]
         });
-        assert_eq!(extract_openai_message_content(&parts), "hello world");
+        assert_eq!(
+            extract_openai_message(&parts),
+            AssistantResponse {
+                content: "hello world".to_string(),
+                reasoning_content: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_extract_openai_message_reasoning_content() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "answer",
+                    "reasoning_content": "step by step"
+                }
+            }]
+        });
+
+        assert_eq!(
+            extract_openai_message(&body),
+            AssistantResponse {
+                content: "answer".to_string(),
+                reasoning_content: Some("step by step".to_string()),
+            }
+        );
     }
 
     #[test]
@@ -1364,16 +1593,32 @@ mod tests {
         let msg = ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
+            reasoning_content: Some("hidden".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"content\":\"hello\""));
+        assert!(!json.contains("reasoning_content"));
     }
 
     #[test]
     fn test_parse_anthropic_chunk_with_text() {
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
-        assert_eq!(parse_anthropic_chunk(data), Some("Hello".to_string()));
+        assert_eq!(
+            parse_anthropic_chunk(data),
+            Some(ChatResponseChunk::Content("Hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_anthropic_chunk_with_thinking() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Need to inspect files."}}"#;
+        assert_eq!(
+            parse_anthropic_chunk(data),
+            Some(ChatResponseChunk::Reasoning(
+                "Need to inspect files.".to_string()
+            ))
+        );
     }
 
     #[test]

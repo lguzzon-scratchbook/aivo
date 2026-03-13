@@ -51,6 +51,8 @@ const COMPACT_MIN_MESSAGES: usize = 4;
 const COMPOSER_PREFIX_WIDTH: u16 = 2;
 
 const COMMAND_MENU_MAX_ROWS: usize = 7;
+const PICKER_ROW_PREFIX_WIDTH: usize = 2;
+const SELECT_WARM: Color = Color::Rgb(255, 228, 194);
 
 #[derive(Clone, Copy)]
 struct SlashCommandSpec {
@@ -151,6 +153,7 @@ fn decrypt_to_chat_messages(
         .map(|m| ChatMessage {
             role: m.role,
             content: m.content,
+            reasoning_content: m.reasoning_content,
         })
         .collect();
     Ok(messages)
@@ -306,7 +309,9 @@ struct ResumeRestoreState {
     draft_history_stash: Option<String>,
     session_id: String,
     notice: Option<(Color, String)>,
+    show_reasoning: bool,
     pending_response: String,
+    pending_reasoning: String,
     pending_submit: Option<String>,
     last_usage: Option<TokenUsage>,
     context_tokens: u64,
@@ -360,7 +365,9 @@ impl ResumeRestoreState {
             draft_history_stash: app.draft_history_stash.clone(),
             session_id: app.session_id.clone(),
             notice: app.notice.clone(),
+            show_reasoning: app.show_reasoning,
             pending_response: app.pending_response.clone(),
+            pending_reasoning: app.pending_reasoning.clone(),
             pending_submit: app.pending_submit.clone(),
             last_usage: app.last_usage,
             context_tokens: app.context_tokens,
@@ -538,7 +545,7 @@ enum SlashCommand {
 }
 
 enum RuntimeEvent {
-    Delta(String),
+    Delta(ChatResponseChunk),
     Finished {
         result: std::result::Result<ChatTurnResult, String>,
         format: ChatFormat,
@@ -573,7 +580,9 @@ struct ChatTuiApp {
     session_id: String,
     overlay: Overlay,
     notice: Option<(Color, String)>,
+    show_reasoning: bool,
     pending_response: String,
+    pending_reasoning: String,
     pending_submit: Option<String>,
     sending: bool,
     request_started_at: Option<Instant>,
@@ -623,7 +632,9 @@ impl ChatTuiApp {
             session_id: params.initial_session,
             overlay: Overlay::None,
             notice: startup_notice,
+            show_reasoning: true,
             pending_response: String::new(),
+            pending_reasoning: String::new(),
             pending_submit: None,
             sending: false,
             request_started_at: None,
@@ -684,7 +695,9 @@ impl ChatTuiApp {
         self.draft_history_stash = state.draft_history_stash;
         self.session_id = state.session_id;
         self.notice = state.notice;
+        self.show_reasoning = state.show_reasoning;
         self.pending_response = state.pending_response;
+        self.pending_reasoning = state.pending_reasoning;
         self.pending_submit = state.pending_submit;
         self.last_usage = state.last_usage;
         self.context_tokens = state.context_tokens;
@@ -713,6 +726,7 @@ impl ChatTuiApp {
         self.draft_history_index = None;
         self.draft_history_stash = None;
         self.pending_response.clear();
+        self.pending_reasoning.clear();
         self.pending_submit = None;
         self.format = ChatFormat::OpenAI;
         self.last_usage = None;
@@ -979,7 +993,6 @@ impl ChatTuiApp {
         };
         self.draft = command.insertion_text();
         self.cursor = self.draft.len();
-        self.command_menu.query = command.name.to_string();
         self.command_menu.selected = 0;
         self.command_menu.dismissed = true;
         self.command_menu.placement = None;
@@ -1003,9 +1016,12 @@ impl ChatTuiApp {
     async fn handle_runtime_events(&mut self) -> Result<()> {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                RuntimeEvent::Delta(delta) => {
-                    self.pending_response.push_str(&delta);
-                }
+                RuntimeEvent::Delta(delta) => match delta {
+                    ChatResponseChunk::Content(text) => self.pending_response.push_str(&text),
+                    ChatResponseChunk::Reasoning(text) => {
+                        self.pending_reasoning.push_str(&text);
+                    }
+                },
                 RuntimeEvent::Finished { result, format } => {
                     self.sending = false;
                     self.request_started_at = None;
@@ -1018,11 +1034,18 @@ impl ChatTuiApp {
                             } else {
                                 self.pending_response.clone()
                             };
+                            let reasoning_content = if self.pending_reasoning.is_empty() {
+                                turn.reasoning_content.clone()
+                            } else {
+                                Some(self.pending_reasoning.clone())
+                            };
                             self.pending_submit = None;
                             self.pending_response.clear();
+                            self.pending_reasoning.clear();
                             self.history.push(ChatMessage {
                                 role: "assistant".to_string(),
                                 content,
+                                reasoning_content,
                             });
                             if let Some(usage) = turn.usage {
                                 self.session_store
@@ -1051,6 +1074,7 @@ impl ChatTuiApp {
                         }
                         Err(err) => {
                             self.pending_response.clear();
+                            self.pending_reasoning.clear();
                             if self
                                 .history
                                 .last()
@@ -1106,6 +1130,7 @@ impl ChatTuiApp {
                             self.history = vec![ChatMessage {
                                 role: "system".to_string(),
                                 content: summary,
+                                reasoning_content: None,
                             }];
                             self.session_id = new_chat_session_id();
                             self.context_tokens = estimate_context_tokens(&self.history);
@@ -1146,6 +1171,18 @@ impl ChatTuiApp {
             }
         }
         Ok(())
+    }
+
+    fn toggle_reasoning_visibility(&mut self) {
+        self.show_reasoning = !self.show_reasoning;
+        self.notice = Some((
+            MUTED,
+            if self.show_reasoning {
+                "Thinking blocks shown".to_string()
+            } else {
+                "Thinking blocks hidden".to_string()
+            },
+        ));
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -1367,6 +1404,13 @@ impl ChatTuiApp {
                     && self.loading_resume.is_none() =>
             {
                 self.open_model_picker(None, ModelSelectionTarget::CurrentChat, false);
+                return Ok(false);
+            }
+            KeyCode::Char('t')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.loading_resume.is_none() =>
+            {
+                self.toggle_reasoning_visibility();
                 return Ok(false);
             }
             _ => {}
@@ -1595,11 +1639,13 @@ impl ChatTuiApp {
         self.notice = None;
         self.last_usage = None;
         self.pending_response.clear();
+        self.pending_reasoning.clear();
         self.pending_submit = Some(input.clone());
         self.request_started_at = Some(Instant::now());
         self.history.push(ChatMessage {
             role: "user".to_string(),
             content: input,
+            reasoning_content: None,
         });
         trim_history(&mut self.history, MAX_HISTORY_MESSAGES);
         self.sending = true;
@@ -1615,8 +1661,8 @@ impl ChatTuiApp {
 
         self.response_task = Some(tokio::spawn(async move {
             let spinning = Arc::new(AtomicBool::new(false));
-            let mut on_chunk = |chunk: &str| -> Result<()> {
-                tx.send(RuntimeEvent::Delta(chunk.to_string())).ok();
+            let mut on_chunk = |chunk: ChatResponseChunk| -> Result<()> {
+                tx.send(RuntimeEvent::Delta(chunk)).ok();
                 Ok(())
             };
 
@@ -1686,6 +1732,7 @@ impl ChatTuiApp {
         self.draft_history_index = None;
         self.draft_history_stash = None;
         self.pending_response.clear();
+        self.pending_reasoning.clear();
         self.pending_submit = None;
         self.sending = false;
         self.request_started_at = None;
@@ -1739,12 +1786,13 @@ impl ChatTuiApp {
         self.sending = false;
         self.request_started_at = None;
         self.pending_response.clear();
+        self.pending_reasoning.clear();
         self.follow_output = true;
         self.notice = Some((MUTED, "Request cancelled".to_string()));
     }
 
     async fn interrupt_inflight_request(&mut self) -> Result<()> {
-        if self.pending_response.is_empty() {
+        if self.pending_response.is_empty() && self.pending_reasoning.is_empty() {
             self.cancel_inflight_request();
             return Ok(());
         }
@@ -1754,6 +1802,7 @@ impl ChatTuiApp {
         }
 
         let partial = std::mem::take(&mut self.pending_response);
+        let reasoning = std::mem::take(&mut self.pending_reasoning);
         self.pending_submit = None;
         self.cursor = self.draft.len();
         self.sync_command_menu_state();
@@ -1763,6 +1812,7 @@ impl ChatTuiApp {
         self.history.push(ChatMessage {
             role: "assistant".to_string(),
             content: partial,
+            reasoning_content: normalize_reasoning_content(reasoning),
         });
         self.context_tokens = estimate_context_tokens(&self.history);
         self.last_usage = None;
@@ -2248,7 +2298,11 @@ impl ChatTuiApp {
         let mut lines = Vec::new();
         let mut previous_role: Option<&str> = None;
 
-        if self.history.is_empty() && self.pending_response.is_empty() && !self.sending {
+        if self.history.is_empty()
+            && self.pending_response.is_empty()
+            && self.pending_reasoning.is_empty()
+            && !self.sending
+        {
             push_styled_line(&mut lines, "", Style::default());
             return lines.into();
         }
@@ -2262,13 +2316,18 @@ impl ChatTuiApp {
             }
             match message.role.as_str() {
                 "user" => render_user_message(&mut lines, &message.content),
-                "assistant" => render_assistant_message(&mut lines, &message.content),
+                "assistant" => render_assistant_message(
+                    &mut lines,
+                    self.show_reasoning,
+                    message.reasoning_content.as_deref(),
+                    &message.content,
+                ),
                 other => render_system_message(&mut lines, other, &message.content),
             }
             previous_role = Some(message.role.as_str());
         }
 
-        if self.sending && self.pending_response.is_empty() {
+        if self.sending && self.pending_response.is_empty() && self.pending_reasoning.is_empty() {
             if should_add_message_spacing(previous_role, "assistant") {
                 push_message_spacing(&mut lines);
             }
@@ -2280,12 +2339,18 @@ impl ChatTuiApp {
                     .map(|started_at| started_at.elapsed())
                     .unwrap_or_default(),
             );
-        } else if !self.pending_response.is_empty() {
+        } else if !self.pending_response.is_empty() || !self.pending_reasoning.is_empty() {
             if should_add_message_spacing(previous_role, "assistant") {
                 push_message_spacing(&mut lines);
             }
             render_assistant_streaming(
                 &mut lines,
+                self.show_reasoning,
+                if self.pending_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(self.pending_reasoning.as_str())
+                },
                 &self.pending_response,
                 self.sending,
                 self.frame_tick,
@@ -2333,17 +2398,15 @@ impl ChatTuiApp {
         if let Some(menu) = self.visible_command_menu() {
             let current_rows = menu.entries.len().clamp(1, COMMAND_MENU_MAX_ROWS);
             let grew = current_rows > self.command_menu.last_row_count;
-            let placement = if grew || self.command_menu.placement.is_none() {
-                let (_, placement) =
-                    command_menu_area(composer_area, outer, menu.entries.len(), None);
-                placement
+            let preferred = if grew {
+                None
             } else {
-                self.command_menu.placement.unwrap()
+                self.command_menu.placement
             };
+            let (area, placement) =
+                command_menu_area(composer_area, outer, menu.entries.len(), preferred);
             self.command_menu.placement = Some(placement);
             self.command_menu.last_row_count = current_rows;
-            let (area, _) =
-                command_menu_area(composer_area, outer, menu.entries.len(), Some(placement));
             self.render_command_menu(frame, area, &menu);
         }
         let body = outer;
@@ -2419,7 +2482,11 @@ impl ChatTuiApp {
 
         frame.render_widget(Clear, chunks[0]);
 
-        if self.history.is_empty() && self.pending_response.is_empty() && !self.sending {
+        if self.history.is_empty()
+            && self.pending_response.is_empty()
+            && self.pending_reasoning.is_empty()
+            && !self.sending
+        {
             self.render_empty_state(frame, transcript_area);
         } else {
             let transcript_widget = Paragraph::new(transcript.text)
@@ -2495,7 +2562,11 @@ impl ChatTuiApp {
 
     fn desired_transcript_height(&self, width: u16, max_height: u16) -> u16 {
         let min_height = self.empty_state_height(width).clamp(1, max_height);
-        if self.history.is_empty() && self.pending_response.is_empty() && !self.sending {
+        if self.history.is_empty()
+            && self.pending_response.is_empty()
+            && self.pending_reasoning.is_empty()
+            && !self.sending
+        {
             return min_height;
         }
 
@@ -2599,11 +2670,13 @@ impl ChatTuiApp {
                 Span::styled("Resume loading…", Style::default().fg(FAINT))
             } else if self.sending {
                 Span::styled("", Style::default())
-            } else {
+            } else if self.has_reasoning_content() {
                 Span::styled(
-                    " Ask anything · / for commands",
+                    " Ask anything · / for commands · Ctrl+T toggle think",
                     Style::default().fg(FAINT),
                 )
+            } else {
+                Span::styled(" Ask anything · / for commands", Style::default().fg(FAINT))
             };
             return Text::from(vec![Line::from(vec![prompt, placeholder])]);
         }
@@ -2705,6 +2778,16 @@ impl ChatTuiApp {
             format_token_count(self.context_tokens, self.last_usage),
             color,
         )
+    }
+
+    fn has_reasoning_content(&self) -> bool {
+        !self.pending_reasoning.trim().is_empty()
+            || self.history.iter().any(|message| {
+                message
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())
+            })
     }
 
     fn render_picker(&mut self, frame: &mut Frame<'_>, area: Rect, picker: &PickerState) {
@@ -3010,6 +3093,10 @@ impl ChatTuiApp {
                 Span::styled("      clear prompt", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
+                Span::styled("Ctrl+T", key_style),
+                Span::styled("      toggle thinking blocks", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
                 Span::styled("Tab", key_style),
                 Span::styled("         complete slash command", Style::default().fg(TEXT)),
             ]),
@@ -3266,26 +3353,100 @@ fn render_user_message(lines: &mut Vec<StyledLine>, content: &str) {
     }
 }
 
-fn render_assistant_message(lines: &mut Vec<StyledLine>, content: &str) {
-    lines.extend(render_markdown_lines(content));
+fn render_reasoning_block(lines: &mut Vec<StyledLine>, reasoning: &str, show_reasoning: bool) {
+    if !show_reasoning {
+        return;
+    }
+
+    lines.push(line_with_plain(vec![Span::styled(
+        "Thinking".to_string(),
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )]));
+
+    let reasoning_lines = normalized_reasoning_lines(reasoning);
+    let mut had_line = false;
+    for raw_line in reasoning_lines {
+        lines.push(line_with_plain(vec![
+            Span::styled("  ".to_string(), Style::default()),
+            Span::styled(
+                raw_line,
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+        had_line = true;
+    }
+
+    if !had_line {
+        push_styled_line(
+            lines,
+            "  ".to_string(),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        );
+    }
+}
+
+fn normalized_reasoning_lines(reasoning: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for raw_line in reasoning.lines() {
+        let trimmed = raw_line.trim();
+        if !trimmed.is_empty() {
+            lines.push(trimmed.to_string());
+        }
+    }
+
+    lines
+}
+
+fn extend_without_leading_blank(lines: &mut Vec<StyledLine>, mut rendered: Vec<StyledLine>) {
+    while rendered
+        .first()
+        .is_some_and(|line| line.plain.trim().is_empty())
+    {
+        rendered.remove(0);
+    }
+    lines.extend(rendered);
+}
+
+fn render_assistant_message(
+    lines: &mut Vec<StyledLine>,
+    show_reasoning: bool,
+    reasoning: Option<&str>,
+    content: &str,
+) {
+    if let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) {
+        render_reasoning_block(lines, reasoning, show_reasoning);
+        if show_reasoning && !content.is_empty() {
+            push_styled_line(lines, "", Style::default());
+        }
+    }
+
+    if !content.is_empty() {
+        extend_without_leading_blank(lines, render_markdown_lines(content));
+    }
 }
 
 fn render_assistant_streaming(
     lines: &mut Vec<StyledLine>,
+    show_reasoning: bool,
+    reasoning: Option<&str>,
     content: &str,
-    sending: bool,
+    _sending: bool,
     _frame_tick: usize,
     _reduce_motion: bool,
 ) {
-    let rendered = render_markdown_lines(content);
-    if rendered.is_empty() {
-        if sending {
+    if let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) {
+        render_reasoning_block(lines, reasoning, show_reasoning);
+        if show_reasoning && !content.is_empty() {
             push_styled_line(lines, "", Style::default());
         }
-        return;
     }
 
-    lines.extend(rendered);
+    let rendered = render_markdown_lines(content);
+    if !rendered.is_empty() {
+        extend_without_leading_blank(lines, rendered);
+        return;
+    }
 }
 
 fn render_pending_status(
@@ -4051,18 +4212,17 @@ fn command_menu_area(
 
 fn command_menu_item_line(
     command: SlashCommandSpec,
+    label: &str,
     selected: bool,
     width: u16,
     label_column_width: usize,
 ) -> Line<'static> {
-    const SELECT_TEXT: Color = Color::Rgb(255, 228, 194);
-    const PREFIX_WIDTH: usize = 2;
+    const SELECT_TEXT: Color = SELECT_WARM;
     const COLUMN_GAP: usize = 2;
 
     let content_width = usize::from(width.max(1))
-        .saturating_sub(PREFIX_WIDTH)
+        .saturating_sub(PICKER_ROW_PREFIX_WIDTH)
         .max(1);
-    let label = command.command_label();
     let description_width = content_width
         .saturating_sub(label_column_width)
         .saturating_sub(COLUMN_GAP);
@@ -4142,20 +4302,28 @@ fn render_command_menu_rows(menu: &VisibleCommandMenu, width: u16) -> Vec<Line<'
             .min(menu.entries.len().saturating_sub(COMMAND_MENU_MAX_ROWS))
     };
     let end = (start + COMMAND_MENU_MAX_ROWS).min(menu.entries.len());
-    let content_width = usize::from(width.max(1)).saturating_sub(2).max(1);
-    let label_column_width = menu.entries[start..end]
+    let content_width = usize::from(width.max(1))
+        .saturating_sub(PICKER_ROW_PREFIX_WIDTH)
+        .max(1);
+    let labels: Vec<String> = menu.entries[start..end]
         .iter()
-        .map(|command| display_width(&command.command_label()))
+        .map(|command| command.command_label())
+        .collect();
+    let label_column_width = labels
+        .iter()
+        .map(|label| display_width(label))
         .max()
         .unwrap_or(0)
         .min(content_width.saturating_sub(8))
         .max(4);
     menu.entries[start..end]
         .iter()
+        .zip(labels.iter())
         .enumerate()
-        .map(|(index, command)| {
+        .map(|(index, (command, label))| {
             command_menu_item_line(
                 **command,
+                label,
                 start + index == selected,
                 width,
                 label_column_width,
@@ -4192,14 +4360,14 @@ fn key_search_text(key: &ApiKey) -> String {
 fn key_picker_item_line(key: &ApiKey, selected: bool, width: u16) -> Line<'static> {
     const SELECT_BG: Color = Color::Rgb(78, 108, 136);
     const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
-    const SELECT_ACCENT: Color = Color::Rgb(255, 228, 194);
-    const PREFIX_WIDTH: usize = 2;
+    const SELECT_ACCENT: Color = SELECT_WARM;
+
     const SEPARATOR: &str = " · ";
 
     let name = key.display_name().to_string();
     let endpoint = key.base_url.clone();
     let content_width = usize::from(width.max(1))
-        .saturating_sub(PREFIX_WIDTH)
+        .saturating_sub(PICKER_ROW_PREFIX_WIDTH)
         .max(1);
     let separator_width = display_width(SEPARATOR);
     let name_width = display_width(&name);
@@ -4270,15 +4438,14 @@ fn session_picker_item_lines(
 ) -> Vec<Line<'static>> {
     const SELECT_BG: Color = Color::Rgb(78, 108, 136);
     const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
-    const SELECT_TIME: Color = Color::Rgb(255, 228, 194);
+    const SELECT_TIME: Color = SELECT_WARM;
     const DELETE_BG: Color = Color::Rgb(104, 63, 63);
     const DELETE_TEXT: Color = Color::Rgb(255, 241, 233);
     const DELETE_TIME: Color = Color::Rgb(255, 198, 176);
-    const PREFIX_WIDTH: usize = 2;
 
     let time = format_session_time(&preview.updated_at);
     let content_width = usize::from(width.max(1))
-        .saturating_sub(PREFIX_WIDTH)
+        .saturating_sub(PICKER_ROW_PREFIX_WIDTH)
         .max(1);
     let time_width = display_width(&time);
     let preview_width = content_width
@@ -4416,11 +4583,10 @@ fn picker_entry_lines(item: &PickerEntry, selected: bool, width: u16) -> Vec<Lin
         _ => {
             const SELECT_BG: Color = Color::Rgb(78, 108, 136);
             const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
-            const SELECT_ACCENT: Color = Color::Rgb(255, 228, 194);
-            const PREFIX_WIDTH: usize = 2;
+            const SELECT_ACCENT: Color = SELECT_WARM;
 
             let content_width = usize::from(width.max(1))
-                .saturating_sub(PREFIX_WIDTH)
+                .saturating_sub(PICKER_ROW_PREFIX_WIDTH)
                 .max(1);
             let label = truncate_for_display_width(&item.label, content_width);
             let fill_width = content_width.saturating_sub(display_width(&label));
@@ -4960,7 +5126,9 @@ mod tests {
             session_id: String::new(),
             overlay: Overlay::None,
             notice: None,
+            show_reasoning: true,
             pending_response: String::new(),
+            pending_reasoning: String::new(),
             pending_submit: None,
             sending: false,
             request_started_at: None,
@@ -5000,7 +5168,7 @@ mod tests {
     #[test]
     fn test_render_assistant_streaming_does_not_append_cursor_glyph() {
         let mut lines = Vec::new();
-        render_assistant_streaming(&mut lines, "- item", true, 0, false);
+        render_assistant_streaming(&mut lines, true, None, "- item", true, 0, false);
 
         let plain = lines
             .into_iter()
@@ -5009,6 +5177,75 @@ mod tests {
             .join("\n");
         assert!(!plain.contains('▋'));
         assert!(plain.contains("• item"));
+    }
+
+    #[test]
+    fn test_build_transcript_shows_streaming_reasoning_before_content() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.sending = true;
+        app.pending_reasoning = "Inspecting the request".to_string();
+
+        let transcript = app.build_transcript();
+        let plain = transcript
+            .text
+            .lines
+            .iter()
+            .map(|line| plain_text_from_spans(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(plain.contains("Thinking"));
+        assert!(plain.contains("Inspecting the request"));
+        assert!(!plain.contains("esc to interrupt"));
+    }
+
+    #[test]
+    fn test_build_transcript_hides_reasoning_when_hidden() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.sending = true;
+        app.show_reasoning = false;
+        app.pending_reasoning = "Inspecting the request".to_string();
+
+        let transcript = app.build_transcript();
+        let plain = transcript
+            .text
+            .lines
+            .iter()
+            .map(|line| plain_text_from_spans(&line.spans))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!plain.contains("Inspecting the request"));
+        assert!(!plain.contains("Thinking hidden"));
+    }
+
+    #[test]
+    fn test_hidden_reasoning_hint_moves_to_composer_placeholder() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: "answer".to_string(),
+            reasoning_content: Some("private reasoning".to_string()),
+        });
+
+        let line = app.render_composer_text().lines[0].clone();
+        let plain = plain_text_from_spans(&line.spans);
+
+        assert_eq!(
+            plain,
+            ">  Ask anything · / for commands · Ctrl+T toggle think"
+        );
+    }
+
+    #[test]
+    fn test_normalized_reasoning_lines_trims_and_removes_blank_runs() {
+        assert_eq!(
+            normalized_reasoning_lines("\nalpha\n\n\nbeta\n\n"),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
     }
 
     #[test]
@@ -5318,6 +5555,7 @@ mod tests {
         let mut history = vec![ChatMessage {
             role: "user".to_string(),
             content: "draft".to_string(),
+            reasoning_content: None,
         }];
         let mut draft = String::new();
         let mut pending_submit = Some("draft".to_string());
@@ -5336,6 +5574,7 @@ mod tests {
         app.history.push(ChatMessage {
             role: "user".to_string(),
             content: "draft".to_string(),
+            reasoning_content: None,
         });
         app.pending_submit = Some("draft".to_string());
         app.pending_response = "partial".to_string();
@@ -5367,6 +5606,7 @@ mod tests {
         app.history.push(ChatMessage {
             role: "user".to_string(),
             content: "draft".to_string(),
+            reasoning_content: None,
         });
         app.pending_submit = Some("draft".to_string());
         app.pending_response = "partial".to_string();
@@ -5440,10 +5680,12 @@ mod tests {
                     ChatMessage {
                         role: "assistant".to_string(),
                         content: "Hi".to_string(),
+                        reasoning_content: None,
                     },
                     ChatMessage {
                         role: "user".to_string(),
                         content: "What is the deployment status for api gateway?".to_string(),
+                        reasoning_content: None,
                     },
                 ],
                 "claude",
@@ -5464,10 +5706,12 @@ mod tests {
                 ChatMessage {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: "assistant".to_string(),
                     content: "hi there".to_string(),
+                    reasoning_content: None,
                 },
             ],
             "claude",
@@ -5529,6 +5773,7 @@ mod tests {
         app.history.push(ChatMessage {
             role: "user".to_string(),
             content: "old".to_string(),
+            reasoning_content: None,
         });
         app.pending_response = "pending".to_string();
         app.draft = "draft".to_string();
@@ -5575,10 +5820,12 @@ mod tests {
                     crate::services::session_store::StoredChatMessage {
                         role: "user".to_string(),
                         content: "hello".to_string(),
+                        reasoning_content: None,
                     },
                     crate::services::session_store::StoredChatMessage {
                         role: "assistant".to_string(),
                         content: "hi there".to_string(),
+                        reasoning_content: None,
                     },
                 ],
             )
@@ -5644,6 +5891,7 @@ mod tests {
                 &[crate::services::session_store::StoredChatMessage {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    reasoning_content: None,
                 }],
             )
             .await
@@ -5709,6 +5957,7 @@ mod tests {
         app.history.push(ChatMessage {
             role: "user".to_string(),
             content: "old".to_string(),
+            reasoning_content: None,
         });
         let preview = SessionPreview {
             key_id: app.key.id.clone(),
