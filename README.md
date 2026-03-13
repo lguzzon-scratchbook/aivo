@@ -5,8 +5,8 @@ A lightweight CLI for managing API keys and running Claude Code, Codex, and Gemi
 
 ## What it does
 
-- Launches `claude`, `codex`, `gemini`, and `opencode` easily with provider-specific env wiring.
-- Stores multiple API keys locally and lets you switch between them quickly.
+- Securely manages multiple API keys for different providers.
+- Runs `claude`, `codex`, and `gemini` CLI tools seamlessly.
 - Provides a simple chat TUI and a one-shot `-x` mode.
 - Can expose the active provider as a local OpenAI-compatible server.
 
