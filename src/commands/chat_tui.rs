@@ -961,12 +961,8 @@ impl ChatTuiApp {
     }
 
     fn selected_command(&self) -> Option<SlashCommandSpec> {
-        let Some(menu) = self.visible_command_menu() else {
-            return None;
-        };
-        let Some(selected) = menu.selected else {
-            return None;
-        };
+        let menu = self.visible_command_menu()?;
+        let selected = menu.selected?;
         menu.entries.get(selected).copied().copied()
     }
 
@@ -1397,11 +1393,10 @@ impl ChatTuiApp {
             return Ok(false);
         }
 
-        if matches!(key.code, KeyCode::Enter) && !key.modifiers.contains(KeyModifiers::CONTROL) {
-            if command_menu_visible {
+        if matches!(key.code, KeyCode::Enter) && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && command_menu_visible {
                 return self.execute_selected_command().await;
             }
-        }
 
         if matches!(key.code, KeyCode::Tab) && self.insert_selected_command() {
             return Ok(false);
@@ -3380,7 +3375,6 @@ fn render_assistant_streaming(
     let rendered = render_markdown_lines(content);
     if !rendered.is_empty() {
         extend_without_leading_blank(lines, rendered);
-        return;
     }
 }
 
@@ -4129,7 +4123,7 @@ fn command_menu_area(
         .y
         .saturating_add(frame_area.height)
         .saturating_sub(composer_area.y.saturating_add(composer_area.height));
-    let placement = preferred_placement.unwrap_or_else(|| {
+    let placement = preferred_placement.unwrap_or({
         if above_space >= height || above_space >= below_space {
             CommandMenuPlacement::Above
         } else {
@@ -4163,7 +4157,7 @@ fn command_menu_item_line(
     let description_width = content_width
         .saturating_sub(label_column_width)
         .saturating_sub(COLUMN_GAP);
-    let rendered_label = truncate_for_display_width(&label, label_column_width.max(1));
+    let rendered_label = truncate_for_display_width(label, label_column_width.max(1));
     let rendered_description = if description_width >= 8 {
         truncate_for_display_width(command.description, description_width)
     } else {
@@ -4456,10 +4450,7 @@ fn render_session_picker_rows(
             "No matches"
         };
         return (
-            vec![Line::from(Span::styled(
-                msg,
-                Style::default().fg(MUTED),
-            ))],
+            vec![Line::from(Span::styled(msg, Style::default().fg(MUTED)))],
             Vec::new(),
         );
     }

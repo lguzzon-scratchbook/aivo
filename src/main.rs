@@ -333,7 +333,7 @@ async fn print_active_key(session_store: &SessionStore) {
     };
 
     println!("{}", style::bold("Active key:"));
-    let id_padded = format!("{:<4}", active_key.id);
+    let id_padded = format!("{:<3}", active_key.short_id());
     println!(
         "  {} {}  {}  {}",
         style::bullet_symbol(),

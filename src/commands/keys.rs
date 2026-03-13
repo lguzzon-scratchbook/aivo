@@ -36,7 +36,11 @@ fn truncate_url(url: &str, max_len: usize) -> String {
     }
     let keep_suffix = 15.min(max_len / 3);
     let keep_prefix = max_len.saturating_sub(keep_suffix + 1);
-    format!("{}…{}", &url[..keep_prefix], &url[url.len() - keep_suffix..])
+    format!(
+        "{}…{}",
+        &url[..keep_prefix],
+        &url[url.len() - keep_suffix..]
+    )
 }
 
 // Creates a safe preview of an API key, handling short keys without panicking.
@@ -151,14 +155,14 @@ impl KeysCommand {
             } else {
                 style::empty_bullet_symbol()
             };
-            let id_padded = format!("{:<4}", key.id);
+            let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
             println!(
                 "{} {}  {}  {}",
                 active_indicator,
                 style::cyan(&id_padded),
                 name_padded,
-                style::dim(&truncate_url(&key.base_url, 50))
+                style::dim(truncate_url(&key.base_url, 50))
             );
         }
 
@@ -268,7 +272,7 @@ impl KeysCommand {
 
         // Name
         let current_name = if key.name.is_empty() {
-            format!("unnamed; shown as {}", key.id)
+            format!("unnamed; shown as {}", key.short_id())
         } else {
             key.name.clone()
         };
@@ -354,7 +358,11 @@ impl KeysCommand {
         println!(
             "{} Updated key: {}",
             style::success_symbol(),
-            style::cyan(if name.is_empty() { &key.id } else { &name })
+            style::cyan(if name.is_empty() {
+                key.short_id()
+            } else {
+                &name
+            })
         );
 
         Ok(ExitCode::Success)
@@ -567,7 +575,7 @@ impl KeysCommand {
             KeySelection::NotFound => return Ok(ExitCode::UserError),
         };
 
-        // Show confirmation
+        // Show confirmation — display full stored ID (not short form) before a destructive action
         println!("ID:  {}", style::cyan(&key_to_remove.id));
         println!("URL: {}", style::dim(&key_to_remove.base_url));
         println!();
@@ -607,7 +615,10 @@ impl KeysCommand {
         }
 
         let selected = if let Some(key_id_or_name) = key_id_or_name {
-            if let Some(key) = all_keys.iter().find(|k| k.id == key_id_or_name) {
+            if let Some(key) = all_keys
+                .iter()
+                .find(|k| k.id == key_id_or_name || k.short_id() == key_id_or_name)
+            {
                 Some(key.clone())
             } else {
                 let name_matches: Vec<ApiKey> = all_keys
@@ -684,7 +695,7 @@ impl KeysCommand {
 pub(crate) fn format_key_choice(key: &ApiKey) -> String {
     format!(
         "{}  {}  {}",
-        style::cyan(format!("{:<4}", key.id)),
+        style::cyan(format!("{:<3}", key.short_id())),
         key.display_name(),
         style::dim(&key.base_url)
     )
@@ -890,7 +901,7 @@ mod tests {
         let keys = store.get_keys().await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].name, "");
-        assert_eq!(keys[0].display_name(), keys[0].id);
+        assert_eq!(keys[0].display_name(), keys[0].short_id());
 
         let active = store.get_active_key().await.unwrap().unwrap();
         assert_eq!(active.id, keys[0].id);
@@ -990,7 +1001,7 @@ mod tests {
     #[test]
     fn test_format_key_choice_uses_id_for_unnamed_keys() {
         let key = ApiKey::new_with_protocol(
-            "1a2b".to_string(),
+            "a2b".to_string(),
             String::new(),
             "https://openrouter.ai/api/v1".to_string(),
             None,
@@ -999,7 +1010,7 @@ mod tests {
 
         let choice = format_key_choice(&key);
 
-        assert!(choice.contains("1a2b"));
+        assert!(choice.contains("a2b"));
         assert!(choice.contains("https://openrouter.ai/api/v1"));
     }
 }

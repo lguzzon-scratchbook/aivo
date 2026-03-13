@@ -293,7 +293,7 @@ impl ChatCommand {
                                 if current_section.is_some() {
                                     print!("\n\n");
                                 }
-                                print!("Thinking:\n");
+                                println!("Thinking:");
                                 current_section = Some("thinking");
                             }
                             print!("{text}");

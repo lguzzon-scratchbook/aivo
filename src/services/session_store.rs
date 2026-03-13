@@ -52,7 +52,7 @@ mod zeroizing_string {
 const IV_LENGTH: usize = 16;
 const SALT_LENGTH: usize = 32;
 const KEY_LENGTH: usize = 32;
-const KEY_ID_LENGTH: usize = 4;
+const KEY_ID_LENGTH: usize = 3;
 const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
 
 /// Wrapper for encryption keys that automatically zeroizes on drop
@@ -158,9 +158,13 @@ impl ApiKey {
         }
     }
 
+    pub fn short_id(&self) -> &str {
+        &self.id[..self.id.len().min(3)]
+    }
+
     pub fn display_name(&self) -> &str {
         if self.name.is_empty() {
-            &self.id
+            self.short_id()
         } else {
             &self.name
         }
@@ -1375,8 +1379,12 @@ impl SessionStore {
     pub async fn resolve_key_by_id_or_name(&self, id_or_name: &str) -> Result<ApiKey> {
         let keys = self.get_keys().await?;
 
-        // Try exact ID match first
-        if let Some(mut key) = keys.iter().find(|k| k.id == id_or_name).cloned() {
+        // Try exact ID match first, then short (first-3) ID match
+        if let Some(mut key) = keys
+            .iter()
+            .find(|k| k.id == id_or_name || k.short_id() == id_or_name)
+            .cloned()
+        {
             Self::decrypt_key_secret(&mut key)?;
             return Ok(key);
         }
@@ -1634,7 +1642,13 @@ impl SessionStore {
             .load_session_file(session_id)
             .await
             .ok()
-            .and_then(|s| if s.created_at.is_empty() { None } else { Some(s.created_at) })
+            .and_then(|s| {
+                if s.created_at.is_empty() {
+                    None
+                } else {
+                    Some(s.created_at)
+                }
+            })
             .unwrap_or_else(|| now.clone());
         let state = ChatSessionState {
             session_id: session_id.to_string(),
@@ -1776,7 +1790,7 @@ mod tests {
             .add_key_with_protocol("my-key", "http://localhost:8080", None, "sk-test123")
             .await
             .unwrap();
-        assert_eq!(id.len(), 4);
+        assert_eq!(id.len(), 3);
 
         // Verify it was saved
         let keys = store.get_keys().await.unwrap();
@@ -1973,14 +1987,14 @@ mod tests {
     #[test]
     fn test_api_key_display_name_falls_back_to_id() {
         let key = ApiKey::new_with_protocol(
-            "1a2b".to_string(),
+            "a2b".to_string(),
             String::new(),
             "https://example.com".to_string(),
             None,
             "sk-test".to_string(),
         );
 
-        assert_eq!(key.display_name(), "1a2b");
+        assert_eq!(key.display_name(), "a2b");
     }
 
     #[tokio::test]
