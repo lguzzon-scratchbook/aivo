@@ -3811,12 +3811,14 @@ fn compact_styled_lines(lines: &mut Vec<StyledLine>) {
 fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> String {
     if let Some(usage) = usage {
         let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
-        return format!("{} token", format_token_count_value(total));
+        let label = if total == 1 { "token" } else { "tokens" };
+        return format!("{} {}", format_token_count_value(total), label);
     }
     if tokens == 0 {
-        "0 token".to_string()
+        "0 tokens".to_string()
     } else {
-        format!("~{} token", format_token_count_value(tokens))
+        let label = if tokens == 1 { "token" } else { "tokens" };
+        format!("~{} {}", format_token_count_value(tokens), label)
     }
 }
 
@@ -5218,7 +5220,7 @@ mod tests {
         app.context_tokens = 5_120;
 
         let (label, color) = app.footer_status_label();
-        assert_eq!(label, "~5.1k token");
+        assert_eq!(label, "~5.1k tokens");
         assert_eq!(color, MUTED);
     }
 
@@ -5232,7 +5234,7 @@ mod tests {
                     completion_tokens: 11
                 })
             ),
-            "35 token"
+            "35 tokens"
         );
         assert_eq!(
             format_token_count(
@@ -5242,16 +5244,16 @@ mod tests {
                     completion_tokens: 120
                 })
             ),
-            "5.1k token"
+            "5.1k tokens"
         );
     }
 
     #[test]
     fn test_format_token_count_marks_estimates() {
-        assert_eq!(format_token_count(0, None), "0 token");
-        assert_eq!(format_token_count(105, None), "~105 token");
-        assert_eq!(format_token_count(5_000, None), "~5k token");
-        assert_eq!(format_token_count(12_345, None), "~12.3k token");
+        assert_eq!(format_token_count(0, None), "0 tokens");
+        assert_eq!(format_token_count(105, None), "~105 tokens");
+        assert_eq!(format_token_count(5_000, None), "~5k tokens");
+        assert_eq!(format_token_count(12_345, None), "~12.3k tokens");
     }
 
     #[test]
