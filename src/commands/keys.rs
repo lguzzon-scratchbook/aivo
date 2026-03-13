@@ -298,7 +298,10 @@ impl KeysCommand {
                 input
             };
             if value.is_empty() {
-                eprintln!("{} API Key cannot be empty", style::red("Error:"));
+                let prompt = style::yellow("Save without an API key?");
+                if confirm(&prompt)? {
+                    break String::new();
+                }
             } else {
                 break value;
             }
