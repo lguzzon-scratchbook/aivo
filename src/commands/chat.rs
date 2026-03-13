@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::tui::FuzzySelect;
 use anyhow::Result;
+use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -554,18 +555,15 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
             role: message.role.clone(),
             content: message.content.clone(),
             reasoning_content: message.reasoning_content.clone(),
+            id: Some(new_chat_session_id()),
+            timestamp: Some(Utc::now().to_rfc3339()),
+            attachments: None,
         })
         .collect()
 }
 
 fn new_chat_session_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .to_string()
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn normalize_reasoning_content(reasoning: String) -> Option<String> {

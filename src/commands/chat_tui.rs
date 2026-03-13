@@ -152,25 +152,20 @@ fn decrypt_to_chat_messages(
 }
 
 impl SessionPreview {
-    fn from_state(
-        state: crate::services::session_store::ChatSessionState,
+    fn from_index_entry(
+        entry: crate::services::session_store::SessionIndexEntry,
         key: &ApiKey,
-    ) -> Result<Self> {
-        let messages = decrypt_to_chat_messages(&state)?;
-
-        let title = session_title_from_messages(&messages, &state.model);
-        let preview_text = session_preview_text_from_messages(&messages, &state.model);
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             key_id: key.id.clone(),
             key_name: key.display_name().to_string(),
             base_url: key.base_url.clone(),
-            session_id: state.session_id,
-            raw_model: state.model,
-            updated_at: state.updated_at,
-            title,
-            preview_text,
-        })
+            session_id: entry.session_id,
+            raw_model: entry.model,
+            updated_at: entry.updated_at,
+            title: entry.title,
+            preview_text: entry.preview,
+        }
     }
 
     fn search_text(&self) -> String {
@@ -1930,10 +1925,6 @@ impl ChatTuiApp {
 
     async fn open_resume_picker(&mut self, query: Option<String>) -> Result<()> {
         let sessions = load_resume_snapshots(&self.session_store, &self.cwd).await?;
-        if sessions.is_empty() {
-            self.notice = Some((ERROR, "No saved chats".to_string()));
-            return Ok(());
-        }
 
         if let Some(query) = &query
             && let Some(snapshot) = sessions.iter().find(|session| session.session_id == *query)
@@ -2016,7 +2007,7 @@ impl ChatTuiApp {
 
         let removed = self
             .session_store
-            .delete_chat_session(&session.key_id, &self.cwd, &session.session_id)
+            .delete_chat_session(&session.session_id)
             .await?;
         if !removed {
             self.notice = Some((ERROR, "Saved chat no longer exists".to_string()));
@@ -2084,6 +2075,9 @@ impl ChatTuiApp {
     }
 
     async fn persist_history(&self) -> Result<()> {
+        let stored = to_stored_messages(&self.history);
+        let title = session_title_from_messages(&self.history, &self.raw_model);
+        let preview = session_preview_text_from_messages(&self.history, &self.raw_model);
         self.session_store
             .save_chat_session_with_id(
                 &self.key.id,
@@ -2091,7 +2085,9 @@ impl ChatTuiApp {
                 &self.cwd,
                 &self.session_id,
                 &self.raw_model,
-                &to_stored_messages(&self.history),
+                &stored,
+                &title,
+                &preview,
             )
             .await
     }
@@ -3127,12 +3123,12 @@ async fn load_session_snapshots(
     key: &ApiKey,
     cwd: &str,
 ) -> Result<Vec<SessionPreview>> {
-    session_store
+    Ok(session_store
         .list_chat_sessions(&key.id, &key.base_url, cwd)
         .await?
         .into_iter()
-        .map(|state| SessionPreview::from_state(state, key))
-        .collect()
+        .map(|entry| SessionPreview::from_index_entry(entry, key))
+        .collect())
 }
 
 async fn load_resume_snapshots(
@@ -3152,11 +3148,11 @@ async fn load_resume_snapshots(
 
 async fn load_resume_session(
     session_store: &SessionStore,
-    cwd: &str,
+    _cwd: &str,
     preview: &SessionPreview,
 ) -> std::result::Result<LoadedSession, String> {
     let session = session_store
-        .get_chat_session(&preview.key_id, &preview.base_url, cwd)
+        .get_chat_session(&preview.session_id)
         .await
         .map_err(|err| err.to_string())?
         .ok_or_else(|| "Saved chat is no longer available".to_string())?;
@@ -4435,9 +4431,14 @@ fn render_session_picker_rows(
 ) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
     let filtered = picker.filtered_items();
     if filtered.is_empty() || max_rows == 0 {
+        let msg = if picker.items.is_empty() {
+            "No saved chats yet"
+        } else {
+            "No matches"
+        };
         return (
             vec![Line::from(Span::styled(
-                "No matches",
+                msg,
                 Style::default().fg(MUTED),
             ))],
             Vec::new(),
@@ -5742,13 +5743,21 @@ mod tests {
                         role: "user".to_string(),
                         content: "hello".to_string(),
                         reasoning_content: None,
+                        id: None,
+                        timestamp: None,
+                        attachments: None,
                     },
                     crate::services::session_store::StoredChatMessage {
                         role: "assistant".to_string(),
                         content: "hi there".to_string(),
                         reasoning_content: None,
+                        id: None,
+                        timestamp: None,
+                        attachments: None,
                     },
                 ],
+                "hello",
+                "hello · hi there",
             )
             .await
             .unwrap();
@@ -5788,7 +5797,7 @@ mod tests {
         );
         let saved = app
             .session_store
-            .get_chat_session(&key_id, "https://api.example.com", "/tmp/demo")
+            .get_chat_session("session-1234")
             .await
             .unwrap();
         assert!(saved.is_none());
@@ -5813,7 +5822,12 @@ mod tests {
                     role: "user".to_string(),
                     content: "hello".to_string(),
                     reasoning_content: None,
+                    id: None,
+                    timestamp: None,
+                    attachments: None,
                 }],
+                "hello",
+                "hello",
             )
             .await
             .unwrap();
@@ -5850,7 +5864,7 @@ mod tests {
 
         let saved = app
             .session_store
-            .get_chat_session(&key_id, "https://api.example.com", "/tmp/demo")
+            .get_chat_session("session-1234")
             .await
             .unwrap();
         assert!(saved.is_some());
@@ -5865,7 +5879,7 @@ mod tests {
 
         let saved = app
             .session_store
-            .get_chat_session(&key_id, "https://api.example.com", "/tmp/demo")
+            .get_chat_session("session-1234")
             .await
             .unwrap();
         assert!(saved.is_none());
