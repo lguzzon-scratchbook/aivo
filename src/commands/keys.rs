@@ -29,6 +29,16 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
     ))
 }
 
+// Truncates a URL for display, preserving domain prefix and path suffix.
+fn truncate_url(url: &str, max_len: usize) -> String {
+    if url.len() <= max_len {
+        return url.to_string();
+    }
+    let keep_suffix = 15.min(max_len / 3);
+    let keep_prefix = max_len.saturating_sub(keep_suffix + 1);
+    format!("{}…{}", &url[..keep_prefix], &url[url.len() - keep_suffix..])
+}
+
 // Creates a safe preview of an API key, handling short keys without panicking.
 fn key_preview(key: &str) -> String {
     if key.len() <= 10 {
@@ -148,7 +158,7 @@ impl KeysCommand {
                 active_indicator,
                 style::cyan(&id_padded),
                 name_padded,
-                style::dim(&key.base_url)
+                style::dim(&truncate_url(&key.base_url, 50))
             );
         }
 
