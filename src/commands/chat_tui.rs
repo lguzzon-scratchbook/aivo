@@ -46,8 +46,6 @@ const QUOTE: Color = Color::Rgb(143, 164, 146);
 const ERROR: Color = Color::Rgb(230, 134, 128);
 const EMPTY_STATE_BOTTOM_GAP: u16 = 1;
 const TRANSCRIPT_BOTTOM_PADDING: u16 = 1;
-const COMPACT_SUGGEST_THRESHOLD: u64 = 120_000;
-const COMPACT_MIN_MESSAGES: usize = 4;
 const COMPOSER_PREFIX_WIDTH: u16 = 2;
 
 const COMMAND_MENU_MAX_ROWS: usize = 7;
@@ -108,12 +106,6 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "help",
         help_label: "/help",
         description: "open help",
-        takes_argument: false,
-    },
-    SlashCommandSpec {
-        name: "compact",
-        help_label: "/compact",
-        description: "summarize history to reduce context",
         takes_argument: false,
     },
 ];
@@ -541,7 +533,6 @@ enum SlashCommand {
     Model(Option<String>),
     Key(Option<String>),
     Help,
-    Compact,
 }
 
 enum RuntimeEvent {
@@ -551,9 +542,6 @@ enum RuntimeEvent {
         format: ChatFormat,
     },
     ModelsLoaded(std::result::Result<Vec<String>, String>),
-    CompactFinished {
-        result: std::result::Result<String, String>,
-    },
     ResumeLoaded {
         request_id: u64,
         result: std::result::Result<LoadedSession, String>,
@@ -1063,14 +1051,7 @@ impl ChatTuiApp {
                                 self.last_usage = None;
                             }
                             self.persist_history().await?;
-                            if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
-                                self.notice = Some((
-                                    ACCENT,
-                                    "Context is large — try /compact to summarize".to_string(),
-                                ));
-                            } else {
-                                self.notice = None;
-                            }
+                            self.notice = None;
                         }
                         Err(err) => {
                             self.pending_response.clear();
@@ -1122,27 +1103,6 @@ impl ChatTuiApp {
                         self.notice = Some((ERROR, err));
                     }
                 },
-                RuntimeEvent::CompactFinished { result } => {
-                    self.sending = false;
-                    self.response_task = None;
-                    match result {
-                        Ok(summary) => {
-                            self.history = vec![ChatMessage {
-                                role: "system".to_string(),
-                                content: summary,
-                                reasoning_content: None,
-                            }];
-                            self.session_id = new_chat_session_id();
-                            self.context_tokens = estimate_context_tokens(&self.history);
-                            self.last_usage = None;
-                            self.persist_history().await?;
-                            self.notice = Some((MUTED, "Conversation compacted".to_string()));
-                        }
-                        Err(err) => {
-                            self.notice = Some((ERROR, err));
-                        }
-                    }
-                }
                 RuntimeEvent::ResumeLoaded { request_id, result } => {
                     let Some(loading) = &self.loading_resume else {
                         continue;
@@ -1707,10 +1667,6 @@ impl ChatTuiApp {
                 self.open_help_overlay();
                 Ok(false)
             }
-            SlashCommand::Compact => {
-                self.start_compact();
-                Ok(false)
-            }
         }
     }
 
@@ -1742,38 +1698,6 @@ impl ChatTuiApp {
         self.context_tokens = 0;
         self.follow_output = true;
         self.notice = None;
-    }
-
-    fn start_compact(&mut self) {
-        if self.history.len() < COMPACT_MIN_MESSAGES {
-            self.notice = Some((MUTED, "Not enough history to compact".to_string()));
-            return;
-        }
-        if self.sending {
-            self.notice = Some((
-                MUTED,
-                "Cannot compact while a request is in progress".to_string(),
-            ));
-            return;
-        }
-
-        self.sending = true;
-        self.notice = Some((MUTED, "Compacting conversation...".to_string()));
-
-        let history = self.history.clone();
-        let client = self.client.clone();
-        let key = self.key.clone();
-        let copilot_tm = self.copilot_tm.clone();
-        let model = self.model.clone();
-        let tx = self.tx.clone();
-
-        let task = tokio::spawn(async move {
-            let result = perform_compact(&client, &key, copilot_tm.as_deref(), &model, &history)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(RuntimeEvent::CompactFinished { result });
-        });
-        self.response_task = Some(task);
     }
 
     fn cancel_inflight_request(&mut self) {
@@ -2771,11 +2695,7 @@ impl ChatTuiApp {
     }
 
     fn footer_status_label(&self) -> (String, Color) {
-        let color = if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
-            ACCENT
-        } else {
-            MUTED
-        };
+        let color = MUTED;
         (
             format_token_count(self.context_tokens, self.last_usage),
             color,
@@ -3504,8 +3424,8 @@ fn render_system_message(lines: &mut Vec<StyledLine>, role: &str, content: &str)
         role.to_string(),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     );
-    for raw_line in content.lines() {
-        push_styled_line(lines, raw_line.to_string(), Style::default().fg(TEXT));
+    if !content.is_empty() {
+        extend_without_leading_blank(lines, render_markdown_lines(content));
     }
 }
 
@@ -4703,7 +4623,6 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "model" => Ok(SlashCommand::Model(argument)),
         "key" => Ok(SlashCommand::Key(argument)),
         "help" => Ok(SlashCommand::Help),
-        "compact" => Ok(SlashCommand::Compact),
         "" => anyhow::bail!("Type a command after '/'"),
         other => anyhow::bail!("Unknown command '/{other}'"),
     }
