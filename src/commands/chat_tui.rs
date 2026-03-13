@@ -1616,23 +1616,40 @@ impl ChatTuiApp {
 
         self.response_task = Some(tokio::spawn(async move {
             let spinning = Arc::new(AtomicBool::new(false));
-            let mut on_chunk = |chunk: ChatResponseChunk| -> Result<()> {
-                tx.send(RuntimeEvent::Delta(chunk)).ok();
-                Ok(())
+            let mut parser = ThinkTagParser::new();
+            let result = {
+                let mut on_chunk = |chunk: ChatResponseChunk| -> Result<()> {
+                    match chunk {
+                        ChatResponseChunk::Content(text) => {
+                            for c in parser.feed(&text) {
+                                tx.send(RuntimeEvent::Delta(c)).ok();
+                            }
+                        }
+                        other => {
+                            tx.send(RuntimeEvent::Delta(other)).ok();
+                        }
+                    }
+                    Ok(())
+                };
+
+                send_message_turn(
+                    &client,
+                    &key,
+                    copilot_tm.as_deref(),
+                    &model,
+                    &history,
+                    &mut format,
+                    &spinning,
+                    &mut on_chunk,
+                )
+                .await
             };
 
-            let result = send_message_turn(
-                &client,
-                &key,
-                copilot_tm.as_deref(),
-                &model,
-                &history,
-                &mut format,
-                &spinning,
-                &mut on_chunk,
-            )
-            .await
-            .map_err(|err| err.to_string());
+            for chunk in parser.flush() {
+                tx.send(RuntimeEvent::Delta(chunk)).ok();
+            }
+
+            let result = result.map_err(|err| err.to_string());
 
             tx.send(RuntimeEvent::Finished { result, format }).ok();
         }));

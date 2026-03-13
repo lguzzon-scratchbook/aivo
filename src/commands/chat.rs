@@ -1157,6 +1157,99 @@ fn parse_sse_chunk(data: &str) -> Option<ChatResponseChunk> {
         })
 }
 
+/// Extracts `<think>...</think>` blocks that some LLMs embed inline in their content stream,
+/// re-routing them as `Reasoning` chunks. Handles partial tags split across streaming chunks.
+pub(super) struct ThinkTagParser {
+    inside_think: bool,
+    buf: String,
+}
+
+impl ThinkTagParser {
+    fn new() -> Self {
+        Self {
+            inside_think: false,
+            buf: String::new(),
+        }
+    }
+
+    /// Feed a content string; returns re-routed chunks to emit.
+    fn feed(&mut self, text: &str) -> Vec<ChatResponseChunk> {
+        self.buf.push_str(text);
+        let mut out = Vec::new();
+        loop {
+            if self.inside_think {
+                const CLOSE: &str = "</think>";
+                if let Some(pos) = self.buf.find(CLOSE) {
+                    let reasoning = self.buf[..pos].to_string();
+                    if !reasoning.trim().is_empty() {
+                        out.push(ChatResponseChunk::Reasoning(reasoning));
+                    }
+                    self.buf = self.buf[pos + CLOSE.len()..].to_string();
+                    if self.buf.starts_with('\n') {
+                        self.buf = self.buf[1..].to_string();
+                    }
+                    self.inside_think = false;
+                } else {
+                    let keep = longest_suffix_prefix_len(&self.buf, CLOSE);
+                    let emit_end = self.buf.len() - keep;
+                    if emit_end > 0 {
+                        out.push(ChatResponseChunk::Reasoning(
+                            self.buf[..emit_end].to_string(),
+                        ));
+                    }
+                    self.buf = self.buf[emit_end..].to_string();
+                    break;
+                }
+            } else {
+                const OPEN: &str = "<think>";
+                if let Some(pos) = self.buf.find(OPEN) {
+                    if pos > 0 {
+                        out.push(ChatResponseChunk::Content(self.buf[..pos].to_string()));
+                    }
+                    self.buf = self.buf[pos + OPEN.len()..].to_string();
+                    self.inside_think = true;
+                } else {
+                    let keep = longest_suffix_prefix_len(&self.buf, OPEN);
+                    let emit_end = self.buf.len() - keep;
+                    if emit_end > 0 {
+                        out.push(ChatResponseChunk::Content(self.buf[..emit_end].to_string()));
+                    }
+                    self.buf = self.buf[emit_end..].to_string();
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Flush remaining buffered content after the stream ends.
+    fn flush(&mut self) -> Vec<ChatResponseChunk> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.buf);
+        if self.inside_think {
+            vec![ChatResponseChunk::Reasoning(text)]
+        } else {
+            vec![ChatResponseChunk::Content(text)]
+        }
+    }
+}
+
+/// Returns the length of the longest suffix of `text` that is also a prefix of `tag`.
+/// Used to avoid splitting a potential partial tag across chunk boundaries.
+fn longest_suffix_prefix_len(text: &str, tag: &str) -> usize {
+    let text_bytes = text.as_bytes();
+    let tag_bytes = tag.as_bytes();
+    let max_check = tag_bytes.len().min(text_bytes.len());
+    for len in (1..=max_check).rev() {
+        if text_bytes[text_bytes.len() - len..] == tag_bytes[..len] {
+            return len;
+        }
+    }
+    0
+}
+
 /// Trims chat history to keep at most `max_messages` messages.
 /// If there's a system message at the start, it's always preserved.
 /// Drops the oldest non-system messages first.
