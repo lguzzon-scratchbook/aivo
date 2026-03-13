@@ -2327,7 +2327,9 @@ impl ChatTuiApp {
             previous_role = Some(message.role.as_str());
         }
 
-        if self.sending && self.pending_response.is_empty() && self.pending_reasoning.is_empty() {
+        let has_visible_streaming = !self.pending_response.is_empty()
+            || (!self.pending_reasoning.is_empty() && self.show_reasoning);
+        if self.sending && !has_visible_streaming {
             if should_add_message_spacing(previous_role, "assistant") {
                 push_message_spacing(&mut lines);
             }
@@ -2339,7 +2341,7 @@ impl ChatTuiApp {
                     .map(|started_at| started_at.elapsed())
                     .unwrap_or_default(),
             );
-        } else if !self.pending_response.is_empty() || !self.pending_reasoning.is_empty() {
+        } else if has_visible_streaming {
             if should_add_message_spacing(previous_role, "assistant") {
                 push_message_spacing(&mut lines);
             }
