@@ -50,14 +50,70 @@ const COMPACT_SUGGEST_THRESHOLD: u64 = 120_000;
 const COMPACT_MIN_MESSAGES: usize = 4;
 const COMPOSER_PREFIX_WIDTH: u16 = 2;
 
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("new", "start a fresh chat"),
-    ("exit", "leave chat"),
-    ("resume", "resume a saved chat"),
-    ("model", "switch model"),
-    ("key", "switch saved key"),
-    ("help", "open help"),
-    ("compact", "summarize history to reduce context"),
+const COMMAND_MENU_MAX_ROWS: usize = 7;
+
+#[derive(Clone, Copy)]
+struct SlashCommandSpec {
+    name: &'static str,
+    help_label: &'static str,
+    description: &'static str,
+    takes_argument: bool,
+}
+
+impl SlashCommandSpec {
+    fn command_label(self) -> String {
+        format!("/{}", self.name)
+    }
+
+    fn insertion_text(self) -> String {
+        let suffix = if self.takes_argument { " " } else { "" };
+        format!("/{}{}", self.name, suffix)
+    }
+}
+
+const SLASH_COMMANDS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        name: "new",
+        help_label: "/new",
+        description: "start a fresh chat",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
+        name: "exit",
+        help_label: "/exit",
+        description: "leave chat",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
+        name: "resume",
+        help_label: "/resume [query]",
+        description: "resume a saved chat",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
+        name: "model",
+        help_label: "/model [name]",
+        description: "switch model",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
+        name: "key",
+        help_label: "/key [id|name]",
+        description: "switch saved key",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
+        name: "help",
+        help_label: "/help",
+        description: "open help",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
+        name: "compact",
+        help_label: "/compact",
+        description: "summarize history to reduce context",
+        takes_argument: false,
+    },
 ];
 
 pub(super) struct ChatTuiParams {
@@ -245,7 +301,7 @@ struct ResumeRestoreState {
     history: Vec<ChatMessage>,
     draft: String,
     cursor: usize,
-    slash_hint: Option<String>,
+    command_menu: CommandMenuState,
     draft_history_index: Option<usize>,
     draft_history_stash: Option<String>,
     session_id: String,
@@ -256,6 +312,36 @@ struct ResumeRestoreState {
     context_tokens: u64,
     follow_output: bool,
     transcript_scroll: usize,
+}
+
+#[derive(Clone, Default)]
+struct CommandMenuState {
+    query: String,
+    selected: usize,
+    dismissed: bool,
+    placement: Option<CommandMenuPlacement>,
+    last_row_count: usize,
+}
+
+impl CommandMenuState {
+    fn reset(&mut self) {
+        self.query.clear();
+        self.selected = 0;
+        self.dismissed = false;
+        self.placement = None;
+        self.last_row_count = 0;
+    }
+}
+
+struct VisibleCommandMenu {
+    entries: Vec<&'static SlashCommandSpec>,
+    selected: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandMenuPlacement {
+    Above,
+    Below,
 }
 
 impl ResumeRestoreState {
@@ -269,7 +355,7 @@ impl ResumeRestoreState {
             history: app.history.clone(),
             draft: app.draft.clone(),
             cursor: app.cursor,
-            slash_hint: app.slash_hint.clone(),
+            command_menu: app.command_menu.clone(),
             draft_history_index: app.draft_history_index,
             draft_history_stash: app.draft_history_stash.clone(),
             session_id: app.session_id.clone(),
@@ -480,7 +566,7 @@ struct ChatTuiApp {
     history: Vec<ChatMessage>,
     draft: String,
     cursor: usize,
-    slash_hint: Option<String>,
+    command_menu: CommandMenuState,
     draft_history: Vec<String>,
     draft_history_index: Option<usize>,
     draft_history_stash: Option<String>,
@@ -530,7 +616,7 @@ impl ChatTuiApp {
             history: params.initial_history,
             draft: String::new(),
             cursor: 0,
-            slash_hint: None,
+            command_menu: CommandMenuState::default(),
             draft_history: load_persisted_draft_history(),
             draft_history_index: None,
             draft_history_stash: None,
@@ -593,7 +679,7 @@ impl ChatTuiApp {
         self.history = state.history;
         self.draft = state.draft;
         self.cursor = state.cursor;
-        self.slash_hint = state.slash_hint;
+        self.command_menu = state.command_menu;
         self.draft_history_index = state.draft_history_index;
         self.draft_history_stash = state.draft_history_stash;
         self.session_id = state.session_id;
@@ -623,7 +709,7 @@ impl ChatTuiApp {
         self.history.clear();
         self.draft.clear();
         self.cursor = 0;
-        self.slash_hint = None;
+        self.command_menu.reset();
         self.draft_history_index = None;
         self.draft_history_stash = None;
         self.pending_response.clear();
@@ -785,18 +871,129 @@ impl ChatTuiApp {
         }
     }
 
-    fn update_slash_hint(&mut self) {
-        self.slash_hint = None;
-        if !self.draft.starts_with('/') || self.draft.contains('\n') || self.draft.contains(' ') {
+    fn active_command_query(&self) -> Option<&str> {
+        if self.overlay.blocks_input()
+            || self.is_busy()
+            || !self.draft.starts_with('/')
+            || self.draft.starts_with("//")
+            || self.draft.contains('\n')
+            || self.draft.contains(' ')
+        {
+            return None;
+        }
+        Some(&self.draft[1..])
+    }
+
+    fn visible_command_menu(&self) -> Option<VisibleCommandMenu> {
+        let query = self.active_command_query()?;
+        if self.command_menu.dismissed {
+            return None;
+        }
+        let entries = filter_slash_commands(query);
+        let selected = if entries.is_empty() {
+            None
+        } else {
+            Some(
+                self.command_menu
+                    .selected
+                    .min(entries.len().saturating_sub(1)),
+            )
+        };
+        Some(VisibleCommandMenu { entries, selected })
+    }
+
+    fn sync_command_menu_state(&mut self) {
+        let Some(query) = self.active_command_query() else {
+            self.command_menu.reset();
             return;
-        }
-        let input = &self.draft[1..];
-        for (cmd, _) in SLASH_COMMANDS {
-            if cmd.starts_with(input) && *cmd != input {
-                self.slash_hint = Some(cmd[input.len()..].to_string());
-                return;
+        };
+        let query = query.to_string();
+
+        if self.command_menu.query != query {
+            if self.command_menu.dismissed {
+                self.command_menu.placement = None;
             }
+            self.command_menu.query = query.clone();
+            self.command_menu.selected = 0;
+            self.command_menu.dismissed = false;
         }
+
+        let matches = filter_slash_commands(&query);
+        if matches.is_empty() {
+            self.command_menu.selected = 0;
+        } else {
+            self.command_menu.selected = self.command_menu.selected.min(matches.len() - 1);
+        }
+    }
+
+    fn select_previous_command(&mut self) {
+        let Some(menu) = self.visible_command_menu() else {
+            return;
+        };
+        let Some(selected) = menu.selected else {
+            return;
+        };
+        self.command_menu.selected = if selected == 0 {
+            menu.entries.len() - 1
+        } else {
+            selected - 1
+        };
+    }
+
+    fn select_next_command(&mut self) {
+        let Some(menu) = self.visible_command_menu() else {
+            return;
+        };
+        let Some(selected) = menu.selected else {
+            return;
+        };
+        self.command_menu.selected = if selected + 1 >= menu.entries.len() {
+            0
+        } else {
+            selected + 1
+        };
+    }
+
+    fn dismiss_command_menu(&mut self) -> bool {
+        if self.active_command_query().is_none() || self.command_menu.dismissed {
+            return false;
+        }
+        self.command_menu.dismissed = true;
+        self.command_menu.placement = None;
+        true
+    }
+
+    fn selected_command(&self) -> Option<SlashCommandSpec> {
+        let Some(menu) = self.visible_command_menu() else {
+            return None;
+        };
+        let Some(selected) = menu.selected else {
+            return None;
+        };
+        menu.entries.get(selected).copied().copied()
+    }
+
+    fn insert_selected_command(&mut self) -> bool {
+        let Some(command) = self.selected_command() else {
+            return false;
+        };
+        self.draft = command.insertion_text();
+        self.cursor = self.draft.len();
+        self.command_menu.query = command.name.to_string();
+        self.command_menu.selected = 0;
+        self.command_menu.dismissed = true;
+        self.command_menu.placement = None;
+        true
+    }
+
+    async fn execute_selected_command(&mut self) -> Result<bool> {
+        let Some(command) = self.selected_command() else {
+            return Ok(false);
+        };
+        self.draft = command.command_label();
+        self.cursor = self.draft.len();
+        self.command_menu.reset();
+        self.submit_draft().await
     }
 
     fn composer_border_color(&self) -> Color {
@@ -982,7 +1179,7 @@ impl ChatTuiApp {
                             for ch in text.chars() {
                                 self.insert_char_at_cursor(ch);
                             }
-                            self.update_slash_hint();
+                            self.sync_command_menu_state();
                         }
                     }
                     Ok(_) => {}
@@ -1007,6 +1204,9 @@ impl ChatTuiApp {
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(true);
         }
+
+        let command_menu_shortcuts_active =
+            self.active_command_query().is_some() && !self.command_menu.dismissed;
 
         let mut picker_submit = None;
         let mut picker_delete = None;
@@ -1141,14 +1341,16 @@ impl ChatTuiApp {
             }
             KeyCode::Char('p')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.loading_resume.is_none() =>
+                    && self.loading_resume.is_none()
+                    && !command_menu_shortcuts_active =>
             {
                 self.history_prev();
                 return Ok(false);
             }
             KeyCode::Char('n')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.loading_resume.is_none() =>
+                    && self.loading_resume.is_none()
+                    && !command_menu_shortcuts_active =>
             {
                 self.history_next();
                 return Ok(false);
@@ -1174,35 +1376,60 @@ impl ChatTuiApp {
             return Ok(false);
         }
 
+        let command_menu_visible = self.visible_command_menu().is_some();
+
+        if matches!(key.code, KeyCode::Esc) && self.dismiss_command_menu() {
+            return Ok(false);
+        }
+
+        if matches!(key.code, KeyCode::Char('p'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && command_menu_visible
+        {
+            self.select_previous_command();
+            return Ok(false);
+        }
+
+        if matches!(key.code, KeyCode::Char('n'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && command_menu_visible
+        {
+            self.select_next_command();
+            return Ok(false);
+        }
+
+        if matches!(key.code, KeyCode::Enter) && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            if command_menu_visible {
+                return self.execute_selected_command().await;
+            }
+        }
+
+        if matches!(key.code, KeyCode::Tab) && self.insert_selected_command() {
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.submit_draft().await;
             }
-            KeyCode::Tab => {
-                if let Some(hint) = self.slash_hint.clone() {
-                    for ch in hint.chars() {
-                        self.insert_char_at_cursor(ch);
-                    }
-                    self.update_slash_hint();
-                }
-            }
+            KeyCode::Tab => {}
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.push_newline();
-                self.update_slash_hint();
+                self.sync_command_menu_state();
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.draft.clear();
                 self.cursor = 0;
-                self.slash_hint = None;
+                self.command_menu.reset();
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_history_navigation();
                 self.delete_word_backward();
-                self.update_slash_hint();
+                self.sync_command_menu_state();
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.kill_to_end_of_line();
-                self.update_slash_hint();
+                self.sync_command_menu_state();
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor_home();
@@ -1219,16 +1446,16 @@ impl ChatTuiApp {
             KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_history_navigation();
                 self.delete_word_backward();
-                self.update_slash_hint();
+                self.sync_command_menu_state();
             }
             KeyCode::Backspace => {
                 self.leave_history_navigation();
                 self.delete_char_before_cursor();
-                self.update_slash_hint();
+                self.sync_command_menu_state();
             }
             KeyCode::Delete => {
                 self.delete_char_at_cursor();
-                self.update_slash_hint();
+                self.sync_command_menu_state();
             }
             KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor_word_left();
@@ -1248,6 +1475,12 @@ impl ChatTuiApp {
             KeyCode::End => {
                 self.cursor_end();
             }
+            KeyCode::Up if command_menu_visible => {
+                self.select_previous_command();
+            }
+            KeyCode::Down if command_menu_visible => {
+                self.select_next_command();
+            }
             KeyCode::Up => {
                 if !self.draft.contains('\n') {
                     self.history_prev();
@@ -1265,7 +1498,7 @@ impl ChatTuiApp {
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_history_navigation();
                 self.insert_char_at_cursor(ch);
-                self.update_slash_hint();
+                self.sync_command_menu_state();
             }
             _ => {}
         }
@@ -1328,7 +1561,7 @@ impl ChatTuiApp {
             SubmitAction::Command(command) => {
                 self.draft.clear();
                 self.cursor = 0;
-                self.slash_hint = None;
+                self.command_menu.reset();
                 self.draft_history_index = None;
                 self.draft_history_stash = None;
                 self.execute_slash_command(command).await
@@ -1357,7 +1590,7 @@ impl ChatTuiApp {
         self.record_draft_history(&input);
         self.draft.clear();
         self.cursor = 0;
-        self.slash_hint = None;
+        self.command_menu.reset();
         self.overlay = Overlay::None;
         self.notice = None;
         self.last_usage = None;
@@ -1449,7 +1682,7 @@ impl ChatTuiApp {
         self.history.clear();
         self.draft.clear();
         self.cursor = 0;
-        self.slash_hint = None;
+        self.command_menu.reset();
         self.draft_history_index = None;
         self.draft_history_stash = None;
         self.pending_response.clear();
@@ -1502,7 +1735,7 @@ impl ChatTuiApp {
         }
         restore_cancelled_submission(&mut self.history, &mut self.draft, &mut self.pending_submit);
         self.cursor = self.draft.len();
-        self.slash_hint = None;
+        self.sync_command_menu_state();
         self.sending = false;
         self.request_started_at = None;
         self.pending_response.clear();
@@ -1523,7 +1756,7 @@ impl ChatTuiApp {
         let partial = std::mem::take(&mut self.pending_response);
         self.pending_submit = None;
         self.cursor = self.draft.len();
-        self.slash_hint = None;
+        self.sync_command_menu_state();
         self.sending = false;
         self.request_started_at = None;
         self.follow_output = true;
@@ -1563,7 +1796,7 @@ impl ChatTuiApp {
         self.draft_history_index = Some(next_index);
         self.draft = self.draft_history[next_index].clone();
         self.cursor = self.draft.len();
-        self.update_slash_hint();
+        self.sync_command_menu_state();
     }
 
     fn history_next(&mut self) {
@@ -1576,14 +1809,14 @@ impl ChatTuiApp {
             self.draft_history_index = Some(next_index);
             self.draft = self.draft_history[next_index].clone();
             self.cursor = self.draft.len();
-            self.update_slash_hint();
+            self.sync_command_menu_state();
             return;
         }
 
         self.draft_history_index = None;
         self.draft = self.draft_history_stash.take().unwrap_or_default();
         self.cursor = self.draft.len();
-        self.update_slash_hint();
+        self.sync_command_menu_state();
     }
 
     fn leave_history_navigation(&mut self) {
@@ -1931,7 +2164,7 @@ impl ChatTuiApp {
         self.history = session.messages;
         self.draft.clear();
         self.cursor = 0;
-        self.slash_hint = None;
+        self.command_menu.reset();
         self.draft_history_index = None;
         self.draft_history_stash = None;
         self.pending_response.clear();
@@ -2096,7 +2329,23 @@ impl ChatTuiApp {
     fn render(&mut self, frame: &mut Frame<'_>) {
         let outer = frame.area();
         self.picker_hitbox = None;
-        self.render_main(frame, outer);
+        let composer_area = self.render_main(frame, outer);
+        if let Some(menu) = self.visible_command_menu() {
+            let current_rows = menu.entries.len().clamp(1, COMMAND_MENU_MAX_ROWS);
+            let grew = current_rows > self.command_menu.last_row_count;
+            let placement = if grew || self.command_menu.placement.is_none() {
+                let (_, placement) =
+                    command_menu_area(composer_area, outer, menu.entries.len(), None);
+                placement
+            } else {
+                self.command_menu.placement.unwrap()
+            };
+            self.command_menu.placement = Some(placement);
+            self.command_menu.last_row_count = current_rows;
+            let (area, _) =
+                command_menu_area(composer_area, outer, menu.entries.len(), Some(placement));
+            self.render_command_menu(frame, area, &menu);
+        }
         let body = outer;
 
         match self.overlay.clone() {
@@ -2110,7 +2359,7 @@ impl ChatTuiApp {
         }
     }
 
-    fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {
         let composer_height = self.composer_height();
         let footer_height = 1u16;
         let max_transcript_height = area
@@ -2139,8 +2388,9 @@ impl ChatTuiApp {
 
         let transcript = self.build_transcript();
         let transcript_area = chunks[0];
-        let transcript_line_height =
-            wrapped_text_line_count(transcript.text.clone(), transcript_area.width.max(1)) as u16;
+        let transcript_total_lines =
+            wrapped_text_line_count(transcript.text.clone(), transcript_area.width.max(1));
+        let transcript_line_height = transcript_total_lines as u16;
         let transcript_padding =
             if transcript_area.height > 2 && transcript_line_height > transcript_area.height {
                 TRANSCRIPT_BOTTOM_PADDING
@@ -2160,7 +2410,7 @@ impl ChatTuiApp {
         let width = transcript_content_area.width.max(1);
         self.transcript_width = width;
         self.transcript_view_height = view_height;
-        let max_scroll = self.max_scroll();
+        let max_scroll = transcript_total_lines.saturating_sub(usize::from(view_height));
         if self.follow_output {
             self.transcript_scroll = max_scroll;
         } else {
@@ -2177,7 +2427,7 @@ impl ChatTuiApp {
                 .scroll(((self.transcript_scroll.min(u16::MAX as usize)) as u16, 0))
                 .wrap(Wrap { trim: false });
             frame.render_widget(transcript_widget, transcript_content_area);
-            let total_lines = self.estimated_transcript_height(width);
+            let total_lines = transcript_total_lines;
             if total_lines > usize::from(view_height) {
                 let mut scrollbar_state =
                     ScrollbarState::new(total_lines.saturating_sub(usize::from(view_height)))
@@ -2240,6 +2490,7 @@ impl ChatTuiApp {
         }
 
         self.render_footer(frame, chunks[2]);
+        composer_area
     }
 
     fn desired_transcript_height(&self, width: u16, max_height: u16) -> u16 {
@@ -2253,12 +2504,15 @@ impl ChatTuiApp {
 
     fn empty_state_height(&self, width: u16) -> u16 {
         let content_width = width.saturating_sub(1).max(1);
-        let intro_height =
-            wrapped_text_line_count(plain_lines_to_text(self.empty_state_plain_lines(width)), content_width)
-                as u16;
+        let intro_height = wrapped_text_line_count(
+            plain_lines_to_text(self.empty_state_plain_lines(width)),
+            content_width,
+        ) as u16;
 
         let error_height = error_notice(self.notice.as_ref())
-            .map(|error| wrapped_text_line_count(format!("Error: {error}"), content_width) as u16 + 1)
+            .map(|error| {
+                wrapped_text_line_count(format!("Error: {error}"), content_width) as u16 + 1
+            })
             .unwrap_or(0);
 
         intro_height
@@ -2347,7 +2601,7 @@ impl ChatTuiApp {
                 Span::styled("", Style::default())
             } else {
                 Span::styled(
-                    " Ask anything · / for commands · F1 for help",
+                    " Ask anything · / for commands",
                     Style::default().fg(FAINT),
                 )
             };
@@ -2355,8 +2609,7 @@ impl ChatTuiApp {
         }
 
         let mut lines = Vec::new();
-        let line_count = self.draft.lines().count();
-        for (index, line) in self.draft.lines().enumerate() {
+        for (index, line) in self.draft.split('\n').enumerate() {
             let prefix = if index == 0 {
                 if self.draft_history_index.is_some() {
                     Span::styled(
@@ -2369,30 +2622,10 @@ impl ChatTuiApp {
             } else {
                 Span::raw("  ")
             };
-            let is_last = index == line_count - 1;
-            if is_last && !self.draft.ends_with('\n') {
-                if let Some(hint) = &self.slash_hint {
-                    lines.push(Line::from(vec![
-                        prefix,
-                        Span::styled(line.to_string(), Style::default().fg(TEXT)),
-                        Span::styled(hint.clone(), Style::default().fg(FAINT)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        prefix,
-                        Span::styled(line.to_string(), Style::default().fg(TEXT)),
-                    ]));
-                }
-            } else {
-                lines.push(Line::from(vec![
-                    prefix,
-                    Span::styled(line.to_string(), Style::default().fg(TEXT)),
-                ]));
-            }
-        }
-
-        if self.draft.ends_with('\n') {
-            lines.push(Line::from(vec![Span::raw("  ")]));
+            lines.push(Line::from(vec![
+                prefix,
+                Span::styled(line.to_string(), Style::default().fg(TEXT)),
+            ]));
         }
 
         Text::from(lines)
@@ -2418,13 +2651,60 @@ impl ChatTuiApp {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    fn render_command_menu(&self, frame: &mut Frame<'_>, area: Rect, menu: &VisibleCommandMenu) {
+        frame.render_widget(Clear, area);
+        let shell = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(FAINT));
+        frame.render_widget(shell, area);
+
+        let inner = area.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let footer_height = 1u16;
+        let rows_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height.saturating_sub(footer_height),
+        };
+        let footer_area = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(footer_height),
+            inner.width,
+            footer_height,
+        );
+
+        let lines = render_command_menu_rows(menu, rows_area.width);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(TEXT))
+                .wrap(Wrap { trim: false }),
+            rows_area,
+        );
+
+        let footer_text = if menu.entries.is_empty() {
+            "Esc close · Enter submit"
+        } else {
+            "Esc close · Enter run · Tab insert · ↑/↓ navigate"
+        };
+        frame.render_widget(
+            Paragraph::new(footer_text).style(Style::default().fg(MUTED)),
+            footer_area,
+        );
+    }
+
     fn footer_status_label(&self) -> (String, Color) {
         let color = if self.context_tokens >= COMPACT_SUGGEST_THRESHOLD {
             ACCENT
         } else {
             MUTED
         };
-        (format_token_count(self.context_tokens, self.last_usage), color)
+        (
+            format_token_count(self.context_tokens, self.last_usage),
+            color,
+        )
     }
 
     fn render_picker(&mut self, frame: &mut Frame<'_>, area: Rect, picker: &PickerState) {
@@ -2660,43 +2940,23 @@ impl ChatTuiApp {
 
         let cmd_style = Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD);
         let key_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-        let lines = vec![
+        let mut lines = vec![
             Line::from(Span::styled(
                 "Slash commands",
                 Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("/new", cmd_style),
-                Span::styled("  start a fresh chat", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("/exit", cmd_style),
-                Span::styled("  leave chat", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("/resume [query]", cmd_style),
-                Span::styled("  resume a saved chat", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("/model [name]", cmd_style),
-                Span::styled("  switch model", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("/key [id|name]", cmd_style),
-                Span::styled("  switch saved key", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("/compact", cmd_style),
+        ];
+        for command in SLASH_COMMANDS {
+            lines.push(Line::from(vec![
+                Span::styled(command.help_label, cmd_style),
                 Span::styled(
-                    "  summarize history to reduce context",
+                    format!("  {}", command.description),
                     Style::default().fg(TEXT),
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("/help", cmd_style),
-                Span::styled("  open this help", Style::default().fg(TEXT)),
-            ]),
+            ]));
+        }
+        lines.extend([
             Line::from(""),
             Line::from(Span::styled(
                 "Keybindings",
@@ -2705,7 +2965,10 @@ impl ChatTuiApp {
             Line::from(""),
             Line::from(vec![
                 Span::styled("Enter", key_style),
-                Span::styled("       send message", Style::default().fg(TEXT)),
+                Span::styled(
+                    "       send message / run command",
+                    Style::default().fg(TEXT),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Ctrl+J", key_style),
@@ -2714,7 +2977,7 @@ impl ChatTuiApp {
             Line::from(vec![
                 Span::styled("↑/↓", key_style),
                 Span::styled(
-                    "         history · line nav (multiline)",
+                    "         command list / history / line nav",
                     Style::default().fg(TEXT),
                 ),
             ]),
@@ -2782,7 +3045,7 @@ impl ChatTuiApp {
                 "Esc closes this overlay",
                 Style::default().fg(MUTED),
             )),
-        ];
+        ]);
 
         frame.render_widget(
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
@@ -3605,7 +3868,9 @@ fn wrapped_text_line_count(text: impl Into<Text<'static>>, width: u16) -> usize 
         return 0;
     }
 
-    Paragraph::new(text).wrap(Wrap { trim: false }).line_count(width)
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
 }
 
 fn metadata_text_len(value: &str) -> usize {
@@ -3729,6 +3994,174 @@ fn truncate_for_display_width(text: &str, max_width: usize) -> String {
     }
     result.push('…');
     result
+}
+
+fn filter_slash_commands(query: &str) -> Vec<&'static SlashCommandSpec> {
+    if query.is_empty() {
+        return SLASH_COMMANDS.iter().collect();
+    }
+
+    let mut prefix_matches = Vec::new();
+    let mut fuzzy_matches = Vec::new();
+    for command in SLASH_COMMANDS {
+        if command.name.starts_with(query) {
+            prefix_matches.push(command);
+        } else if matches_fuzzy(query, command.name) {
+            fuzzy_matches.push(command);
+        }
+    }
+    prefix_matches.extend(fuzzy_matches);
+    prefix_matches
+}
+
+fn command_menu_area(
+    composer_area: Rect,
+    frame_area: Rect,
+    item_count: usize,
+    preferred_placement: Option<CommandMenuPlacement>,
+) -> (Rect, CommandMenuPlacement) {
+    let left_offset = composer_area.x.saturating_sub(frame_area.x);
+    let max_width = frame_area.width.saturating_sub(left_offset).max(1);
+    let min_width = max_width.min(24);
+    let width = composer_area.width.min(max_width).max(min_width);
+    let row_count = item_count.clamp(1, COMMAND_MENU_MAX_ROWS) as u16;
+    let height = row_count.saturating_add(3).min(frame_area.height.max(4));
+    let above_space = composer_area.y.saturating_sub(frame_area.y);
+    let below_space = frame_area
+        .y
+        .saturating_add(frame_area.height)
+        .saturating_sub(composer_area.y.saturating_add(composer_area.height));
+    let placement = preferred_placement.unwrap_or_else(|| {
+        if above_space >= height || above_space >= below_space {
+            CommandMenuPlacement::Above
+        } else {
+            CommandMenuPlacement::Below
+        }
+    });
+    let y = match placement {
+        CommandMenuPlacement::Above => composer_area.y.saturating_sub(height).max(frame_area.y),
+        CommandMenuPlacement::Below => composer_area.y.saturating_add(composer_area.height).min(
+            frame_area
+                .y
+                .saturating_add(frame_area.height.saturating_sub(height)),
+        ),
+    };
+    (Rect::new(composer_area.x, y, width, height), placement)
+}
+
+fn command_menu_item_line(
+    command: SlashCommandSpec,
+    selected: bool,
+    width: u16,
+    label_column_width: usize,
+) -> Line<'static> {
+    const SELECT_TEXT: Color = Color::Rgb(255, 228, 194);
+    const PREFIX_WIDTH: usize = 2;
+    const COLUMN_GAP: usize = 2;
+
+    let content_width = usize::from(width.max(1))
+        .saturating_sub(PREFIX_WIDTH)
+        .max(1);
+    let label = command.command_label();
+    let description_width = content_width
+        .saturating_sub(label_column_width)
+        .saturating_sub(COLUMN_GAP);
+    let rendered_label = truncate_for_display_width(&label, label_column_width.max(1));
+    let rendered_description = if description_width >= 8 {
+        truncate_for_display_width(command.description, description_width)
+    } else {
+        String::new()
+    };
+    let label_padding = label_column_width.saturating_sub(display_width(&rendered_label));
+    let description_gap = if rendered_description.is_empty() {
+        0
+    } else {
+        COLUMN_GAP
+    };
+    let plain = format!(
+        "{}{}{}{}",
+        rendered_label,
+        " ".repeat(label_padding),
+        " ".repeat(description_gap),
+        rendered_description
+    );
+    let fill_width = content_width.saturating_sub(display_width(&plain));
+
+    let prefix_style = if selected {
+        Style::default()
+            .fg(SELECT_TEXT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(FAINT)
+    };
+    let label_style = if selected {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD)
+    };
+    let description_style = if selected {
+        Style::default().fg(TEXT)
+    } else {
+        Style::default().fg(MUTED)
+    };
+
+    let mut spans = vec![Span::styled(
+        if selected { "> " } else { "  " },
+        prefix_style,
+    )];
+    spans.push(Span::styled(rendered_label, label_style));
+    if label_padding > 0 {
+        spans.push(Span::styled(" ".repeat(label_padding), description_style));
+    }
+    if description_gap > 0 {
+        spans.push(Span::styled(" ".repeat(description_gap), description_style));
+    }
+    if !rendered_description.is_empty() {
+        spans.push(Span::styled(rendered_description, description_style));
+    }
+    if fill_width > 0 {
+        spans.push(Span::styled(" ".repeat(fill_width), description_style));
+    }
+    Line::from(spans)
+}
+
+fn render_command_menu_rows(menu: &VisibleCommandMenu, width: u16) -> Vec<Line<'static>> {
+    if menu.entries.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No matching command",
+            Style::default().fg(MUTED),
+        ))];
+    }
+
+    let selected = menu.selected.unwrap_or(0);
+    let start = if menu.entries.len() <= COMMAND_MENU_MAX_ROWS {
+        0
+    } else {
+        selected
+            .saturating_sub(COMMAND_MENU_MAX_ROWS / 2)
+            .min(menu.entries.len().saturating_sub(COMMAND_MENU_MAX_ROWS))
+    };
+    let end = (start + COMMAND_MENU_MAX_ROWS).min(menu.entries.len());
+    let content_width = usize::from(width.max(1)).saturating_sub(2).max(1);
+    let label_column_width = menu.entries[start..end]
+        .iter()
+        .map(|command| display_width(&command.command_label()))
+        .max()
+        .unwrap_or(0)
+        .min(content_width.saturating_sub(8))
+        .max(4);
+    menu.entries[start..end]
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            command_menu_item_line(
+                **command,
+                start + index == selected,
+                width,
+                label_column_width,
+            )
+        })
+        .collect()
 }
 
 fn picker_kind_noun(kind: &PickerKind) -> &'static str {
@@ -4180,7 +4613,10 @@ mod tests {
 
     #[test]
     fn test_cursor_position_uses_display_width_for_cjk() {
-        assert_eq!(cursor_position("最新的软件开发工具", "最新的软件开发工具".len(), 30, 2), (20, 0));
+        assert_eq!(
+            cursor_position("最新的软件开发工具", "最新的软件开发工具".len(), 30, 2),
+            (20, 0)
+        );
     }
 
     #[test]
@@ -4260,25 +4696,216 @@ mod tests {
     }
 
     #[test]
-    fn test_update_slash_hint() {
+    fn test_visible_command_menu_filters_and_hides_escaped_slash() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = make_test_app(tx, rx);
         app.draft = "/mo".to_string();
         app.cursor = 3;
-        app.update_slash_hint();
-        assert_eq!(app.slash_hint, Some("del".to_string()));
+        app.sync_command_menu_state();
+        let menu = app.visible_command_menu().unwrap();
+        assert_eq!(menu.entries.len(), 1);
+        assert_eq!(menu.entries[0].name, "model");
+        assert_eq!(menu.selected, Some(0));
 
-        app.draft = "/model".to_string();
-        app.update_slash_hint();
-        assert_eq!(app.slash_hint, None);
+        app.draft = "//literal".to_string();
+        app.sync_command_menu_state();
+        assert!(app.visible_command_menu().is_none());
 
-        app.draft = "/xyz".to_string();
-        app.update_slash_hint();
-        assert_eq!(app.slash_hint, None);
+        app.draft = "/model claude".to_string();
+        app.sync_command_menu_state();
+        assert!(app.visible_command_menu().is_none());
+    }
 
-        app.draft = "not a command".to_string();
-        app.update_slash_hint();
-        assert_eq!(app.slash_hint, None);
+    #[test]
+    fn test_filter_slash_commands_prefers_prefix_matches() {
+        let matches = filter_slash_commands("m");
+        assert_eq!(matches.first().map(|command| command.name), Some("model"));
+    }
+
+    #[test]
+    fn test_command_menu_area_prefers_below_when_above_space_is_tight() {
+        let composer = Rect::new(2, 1, 40, 2);
+        let frame = Rect::new(0, 0, 80, 20);
+        let (area, placement) = command_menu_area(composer, frame, 6, None);
+        assert_eq!(placement, CommandMenuPlacement::Below);
+        assert!(area.y >= composer.y + composer.height);
+    }
+
+    #[test]
+    fn test_command_menu_area_respects_sticky_placement() {
+        let composer = Rect::new(2, 1, 40, 2);
+        let frame = Rect::new(0, 0, 80, 20);
+        let (area, placement) =
+            command_menu_area(composer, frame, 6, Some(CommandMenuPlacement::Above));
+        assert_eq!(placement, CommandMenuPlacement::Above);
+        assert_eq!(area.y, frame.y);
+    }
+
+    #[test]
+    fn test_command_menu_query_change_keeps_existing_placement_until_reopen() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.command_menu.placement = Some(CommandMenuPlacement::Above);
+        app.draft = "/m".to_string();
+        app.cursor = app.draft.len();
+        app.command_menu.query = "m".to_string();
+        app.command_menu.dismissed = false;
+
+        app.draft = "/mo".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        assert_eq!(
+            app.command_menu.placement,
+            Some(CommandMenuPlacement::Above)
+        );
+
+        app.dismiss_command_menu();
+        app.draft = "/mod".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        assert_eq!(app.command_menu.placement, None);
+    }
+
+    #[test]
+    fn test_bare_slash_filtering_keeps_detected_placement() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft = "/".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+        app.command_menu.placement = Some(CommandMenuPlacement::Below);
+
+        app.draft = "/new".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        assert_eq!(
+            app.command_menu.placement,
+            Some(CommandMenuPlacement::Below)
+        );
+    }
+
+    #[test]
+    fn test_insert_selected_command_uses_argument_space_when_needed() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft = "/m".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        assert!(app.insert_selected_command());
+        assert_eq!(app.draft, "/model ");
+        assert_eq!(app.cursor, app.draft.len());
+        assert!(app.visible_command_menu().is_none());
+    }
+
+    #[test]
+    fn test_insert_selected_command_omits_space_for_zero_arg_command() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft = "/ex".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        assert!(app.insert_selected_command());
+        assert_eq!(app.draft, "/exit");
+        assert_eq!(app.cursor, app.draft.len());
+        assert!(app.visible_command_menu().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_p_navigate_command_menu_before_history() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft_history = vec!["previous prompt".to_string()];
+        app.draft = "/".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let menu = app.visible_command_menu().unwrap();
+        assert_eq!(menu.selected, Some(menu.entries.len() - 1));
+        assert_eq!(app.draft, "/");
+        assert!(app.draft_history_index.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_escape_dismisses_command_menu_until_query_changes() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft = "/mo".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+        assert!(app.visible_command_menu().is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.visible_command_menu().is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.visible_command_menu().is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let menu = app.visible_command_menu().unwrap();
+        assert_eq!(menu.entries[0].name, "model");
+    }
+
+    #[tokio::test]
+    async fn test_enter_executes_selected_command() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft = "/".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let should_exit = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.draft.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert!(should_exit);
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn test_render_command_menu_rows_shows_empty_state() {
+        let menu = VisibleCommandMenu {
+            entries: Vec::new(),
+            selected: None,
+        };
+        let lines = render_command_menu_rows(&menu, 32);
+        let plain = plain_text_from_spans(&lines[0].spans);
+        assert_eq!(plain, "No matching command");
+    }
+
+    #[test]
+    fn test_render_command_menu_rows_aligns_description_column() {
+        let menu = VisibleCommandMenu {
+            entries: vec![&SLASH_COMMANDS[0], &SLASH_COMMANDS[2]],
+            selected: Some(0),
+        };
+        let lines = render_command_menu_rows(&menu, 48);
+        let first = plain_text_from_spans(&lines[0].spans);
+        let second = plain_text_from_spans(&lines[1].spans);
+        let first_desc = first.find("start a fresh chat").unwrap();
+        let second_desc = second.find("resume a saved chat").unwrap();
+        assert_eq!(first_desc, second_desc);
     }
 
     #[test]
@@ -4326,7 +4953,7 @@ mod tests {
             history: Vec::new(),
             draft: String::new(),
             cursor: 0,
-            slash_hint: None,
+            command_menu: CommandMenuState::default(),
             draft_history: Vec::new(),
             draft_history_index: None,
             draft_history_stash: None,
@@ -4767,7 +5394,7 @@ mod tests {
         let app = make_test_app(tx, rx);
         let line = app.render_composer_text().lines[0].clone();
         let plain = plain_text_from_spans(&line.spans);
-        assert_eq!(plain, ">  Ask anything · / for commands · F1 for help");
+        assert_eq!(plain, ">  Ask anything · / for commands");
     }
 
     #[test]
