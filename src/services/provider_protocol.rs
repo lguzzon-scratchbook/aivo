@@ -42,7 +42,23 @@ impl ProviderProtocol {
 
 pub fn normalize_protocol_base(base_url: &str) -> &str {
     let trimmed = base_url.trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed)
+    [
+        "/v1/messages/count_tokens",
+        "/messages/count_tokens",
+        "/v1/messages",
+        "/messages",
+        "/v1/chat/completions",
+        "/chat/completions",
+        "/v1beta/models",
+        "/v1/models",
+        "/models",
+        "/v1beta",
+        "/v1",
+    ]
+    .into_iter()
+    .find_map(|suffix| trimmed.strip_suffix(suffix))
+    .filter(|normalized| !normalized.is_empty())
+    .unwrap_or(trimmed)
 }
 
 pub fn is_anthropic_endpoint(base_url: &str) -> bool {
@@ -72,16 +88,17 @@ pub fn is_protocol_mismatch(status: u16) -> bool {
 }
 
 /// Returns fallback protocol candidates to try after `current` fails.
-/// Excludes Google unless the URL suggests a Google endpoint.
+/// Google is always included as the last fallback so generic gateways can still
+/// auto-switch to Google-native routing if they expose it.
 pub fn fallback_protocols(current: ProviderProtocol, base_url: &str) -> Vec<ProviderProtocol> {
-    let include_google = is_google_endpoint(base_url);
+    let _ = base_url;
     [
         ProviderProtocol::Openai,
         ProviderProtocol::Anthropic,
         ProviderProtocol::Google,
     ]
     .into_iter()
-    .filter(|p| *p != current && (*p != ProviderProtocol::Google || include_google))
+    .filter(|p| *p != current)
     .collect()
 }
 
@@ -97,6 +114,14 @@ mod tests {
         );
         assert_eq!(
             detect_provider_protocol("https://api.minimax.io/anthropic/v1"),
+            ProviderProtocol::Anthropic
+        );
+        assert_eq!(
+            detect_provider_protocol("https://api.minimax.io/anthropic/v1/messages"),
+            ProviderProtocol::Anthropic
+        );
+        assert_eq!(
+            detect_provider_protocol("https://api.minimax.io/anthropic/messages/count_tokens"),
             ProviderProtocol::Anthropic
         );
     }
@@ -132,9 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn fallback_protocols_excludes_current_and_google_for_generic_url() {
+    fn fallback_protocols_includes_google_for_generic_url() {
         let result = fallback_protocols(ProviderProtocol::Openai, "https://api.example.com");
-        assert_eq!(result, vec![ProviderProtocol::Anthropic]);
+        assert_eq!(
+            result,
+            vec![ProviderProtocol::Anthropic, ProviderProtocol::Google]
+        );
     }
 
     #[test]

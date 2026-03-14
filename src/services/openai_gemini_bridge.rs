@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use crate::services::http_utils::current_unix_ts;
+use crate::services::model_names::google_native_model_name;
 
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToGeminiConfig {
@@ -25,6 +26,7 @@ pub fn build_google_stream_generate_content_url(base_url: &str, model: &str) -> 
 
 fn build_google_content_url(base_url: &str, model: &str, stream: bool) -> String {
     let base = base_url.trim_end_matches('/');
+    let model = google_native_model_name(model);
     let suffix = if stream {
         ":streamGenerateContent?alt=sse"
     } else {
@@ -407,7 +409,7 @@ mod tests {
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 "google/gemini-2.5-pro"
             ),
-            "https://generativelanguage.googleapis.com/v1beta/models/google/gemini-2.5-pro:streamGenerateContent?alt=sse"
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
     }
 }

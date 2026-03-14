@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::services::codex_model_map::map_model_for_codex_cli;
+use crate::services::model_names::google_native_model_name;
 use crate::services::provider_profile::{is_direct_openai_base, provider_profile_for_key};
 use crate::services::provider_protocol::{ProviderProtocol, is_anthropic_endpoint};
 use crate::services::session_store::{
@@ -291,7 +292,12 @@ impl EnvironmentInjector {
         }
 
         if let Some(model) = model {
-            env.insert("GEMINI_MODEL".to_string(), model.to_string());
+            let gemini_model = if Self::use_google_native_for_gemini(key) {
+                google_native_model_name(model).to_string()
+            } else {
+                model.to_string()
+            };
+            env.insert("GEMINI_MODEL".to_string(), gemini_model);
         }
 
         env
@@ -956,6 +962,20 @@ mod tests {
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&"https://api.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn test_for_gemini_native_google_strips_provider_prefix_from_model() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
+        let env = injector.for_gemini(&key, Some("google/gemini-2.0-flash"));
+
+        assert_eq!(
+            env.get("GEMINI_MODEL"),
+            Some(&"gemini-2.0-flash".to_string())
+        );
+        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
     }
 
     #[test]

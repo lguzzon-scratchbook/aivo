@@ -69,6 +69,10 @@ pub fn transform_model_for_provider(base_url: &str, model: &str) -> String {
     }
 }
 
+pub fn google_native_model_name(model: &str) -> &str {
+    model.strip_prefix("google/").unwrap_or(model)
+}
+
 pub fn is_gateway_style_endpoint(base_url: &str) -> bool {
     let lower = base_url.trim().to_ascii_lowercase();
     lower.contains("/endpoint") || lower.contains("gateway")
@@ -282,6 +286,15 @@ mod tests {
             transform_model_for_provider("https://api.example.com/v1", "claude-sonnet-4-6"),
             "claude-sonnet-4-6"
         );
+    }
+
+    #[test]
+    fn test_google_native_model_name_strips_provider_prefix() {
+        assert_eq!(
+            google_native_model_name("google/gemini-2.5-pro"),
+            "gemini-2.5-pro"
+        );
+        assert_eq!(google_native_model_name("gemini-2.5-pro"), "gemini-2.5-pro");
     }
 
     #[test]
