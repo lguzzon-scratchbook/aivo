@@ -23,8 +23,7 @@ use crate::services::anthropic_chat_response::{
 };
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::model_names::{
-    infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_protocol,
-    should_preserve_cross_protocol_model,
+    infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_provider_attempt,
 };
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::{
@@ -32,7 +31,9 @@ use crate::services::openai_gemini_bridge::{
     convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
     openai_chat_model,
 };
-use crate::services::provider_protocol::{ProviderProtocol, fallback_protocols, is_protocol_mismatch};
+use crate::services::provider_protocol::{
+    ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+};
 
 #[derive(Clone)]
 pub struct OpenAIRouterConfig {
@@ -115,14 +116,17 @@ async fn run_router(listener: tokio::net::TcpListener, state: OpenAIRouterState)
                 return;
             }
 
-            let response = match handle_anthropic_to_upstream(&request, &config, &client, &active_protocol).await {
-                Ok(response) => response,
-                Err(e) => {
-                    let error = http_utils::http_error_response(500, &e.to_string());
-                    let _ = socket.write_all(error.as_bytes()).await;
-                    return;
-                }
-            };
+            let response =
+                match handle_anthropic_to_upstream(&request, &config, &client, &active_protocol)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(e) => {
+                        let error = http_utils::http_error_response(500, &e.to_string());
+                        let _ = socket.write_all(error.as_bytes()).await;
+                        return;
+                    }
+                };
 
             let _ = write_router_response(&mut socket, response).await;
         });
@@ -352,15 +356,12 @@ fn prepare_gateway_model_metadata(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let selected_model = if should_preserve_cross_protocol_model(
+    let selected_model = select_model_for_provider_attempt(
         &config.target_base_url,
-        &requested_model,
+        Some(&requested_model),
+        None,
         protocol,
-    ) {
-        requested_model.clone()
-    } else {
-        select_model_for_protocol(Some(&requested_model), None, protocol)
-    };
+    );
     simplified["model"] = Value::String(selected_model);
 
     if is_gateway_style_endpoint(&config.target_base_url)

@@ -1,7 +1,7 @@
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, current_unix_ts};
-use crate::services::model_names::select_model_for_protocol;
+use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
     convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
@@ -11,7 +11,9 @@ use crate::services::openai_gemini_bridge::{
     convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
     openai_chat_model,
 };
-use crate::services::provider_protocol::{ProviderProtocol, fallback_protocols, is_protocol_mismatch};
+use crate::services::provider_protocol::{
+    ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+};
 /**
  * Built-in Codex Router service
  *
@@ -29,10 +31,9 @@ use crate::services::provider_protocol::{ProviderProtocol, fallback_protocols, i
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 
 #[derive(Clone)]
 pub struct CodexRouterConfig {
@@ -99,7 +100,15 @@ async fn handle_router_request(request: String, state: Arc<CodexRouterState>) ->
     );
 
     if is_api_path {
-        match handle_api_request(&path, &request, &state.config, state.client.as_ref(), &state.active_protocol).await {
+        match handle_api_request(
+            &path,
+            &request,
+            &state.config,
+            state.client.as_ref(),
+            &state.active_protocol,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => http_utils::http_error_response(500, "Internal Server Error"),
         }
@@ -157,13 +166,15 @@ async fn handle_responses_api_via_chat(
     let mut chat_config = (**config).clone();
     chat_config.actual_model = Some(original_model.clone());
     let chat_body = convert_responses_to_chat_request(body, &chat_config);
-    let chat_response = match forward_openai_chat_request(&chat_body, config, client, false, active_protocol).await?
-    {
-        ForwardedChatResponse::Success(value) => value,
-        ForwardedChatResponse::HttpError { status, body } => {
-            return Ok(http_utils::http_json_response(status, &body));
-        }
-    };
+    let chat_response =
+        match forward_openai_chat_request(&chat_body, config, client, false, active_protocol)
+            .await?
+        {
+            ForwardedChatResponse::Success(value) => value,
+            ForwardedChatResponse::HttpError { status, body } => {
+                return Ok(http_utils::http_json_response(status, &body));
+            }
+        };
     let sse = convert_chat_response_to_responses_sse(
         &chat_response,
         config.requires_reasoning_content,
@@ -196,7 +207,8 @@ async fn handle_chat_completions_with_filter(
         &["max_tokens", "max_output_tokens"],
     );
     if config.copilot_token_manager.is_none() {
-        let selected_model = select_model_for_protocol(
+        let selected_model = select_model_for_provider_attempt(
+            &config.target_base_url,
             body.get("model").and_then(|v| v.as_str()),
             config.actual_model.as_deref(),
             ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed)),
@@ -210,7 +222,9 @@ async fn handle_chat_completions_with_filter(
     }
 
     let chat_response =
-        match forward_openai_chat_request(&body, config, client, requested_stream, active_protocol).await? {
+        match forward_openai_chat_request(&body, config, client, requested_stream, active_protocol)
+            .await?
+        {
             ForwardedChatResponse::Success(value) => value,
             ForwardedChatResponse::HttpError { status, body } => {
                 return Ok(http_utils::http_json_response(status, &body));
@@ -276,8 +290,7 @@ async fn forward_openai_chat_request(
     for (attempt, protocol) in candidates.iter().enumerate() {
         let (status_code, response_text, result) = match protocol {
             ProviderProtocol::Openai => {
-                let target_url =
-                    build_target_url(&config.target_base_url, "/v1/chat/completions");
+                let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
                 let response = http_utils::authorized_openai_post(
                     client,
                     &target_url,
@@ -346,8 +359,7 @@ async fn forward_openai_chat_request(
                     },
                 );
                 let model = openai_chat_model(body, "gemini-2.5-pro");
-                let target_url =
-                    build_google_generate_content_url(&config.target_base_url, &model);
+                let target_url = build_google_generate_content_url(&config.target_base_url, &model);
                 let response = client
                     .post(&target_url)
                     .header("x-goog-api-key", config.api_key.as_str())
@@ -585,7 +597,8 @@ pub fn convert_responses_to_chat_request(body: &Value, config: &CodexRouterConfi
     // Apply model name transform (e.g. openai/ prefix for OpenRouter)
     // Skip transform when using Copilot — model names pass through unchanged
     // If actual_model is set, use that (it was set by environment injector)
-    let selected_model = select_model_for_protocol(
+    let selected_model = select_model_for_provider_attempt(
+        &config.target_base_url,
         body.get("model").and_then(|v| v.as_str()),
         config.actual_model.as_deref(),
         config.target_protocol,

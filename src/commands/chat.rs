@@ -598,7 +598,10 @@ fn attachment_notice(attachments: &[MessageAttachment]) -> Option<String> {
 }
 
 fn build_pending_attachments(paths: &[String]) -> Result<Vec<MessageAttachment>> {
-    paths.iter().map(|path| build_pending_attachment(path)).collect()
+    paths
+        .iter()
+        .map(|path| build_pending_attachment(path))
+        .collect()
 }
 
 fn build_pending_attachment(path: &str) -> Result<MessageAttachment> {

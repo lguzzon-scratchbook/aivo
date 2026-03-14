@@ -2517,11 +2517,7 @@ impl ChatTuiApp {
                 push_message_spacing(&mut lines);
             }
             match message.role.as_str() {
-                "user" => render_user_message(
-                    &mut lines,
-                    &message.content,
-                    &message.attachments,
-                ),
+                "user" => render_user_message(&mut lines, &message.content, &message.attachments),
                 "assistant" => render_assistant_message(
                     &mut lines,
                     self.show_reasoning,
@@ -2604,8 +2600,12 @@ impl ChatTuiApp {
         self.picker_hitbox = None;
         let composer_area = self.render_main(frame, outer);
         if let Some(menu) = self.visible_command_menu() {
-            let (area, placement) =
-                command_menu_area(composer_area, outer, menu.entries.len(), self.command_menu.placement);
+            let (area, placement) = command_menu_area(
+                composer_area,
+                outer,
+                menu.entries.len(),
+                self.command_menu.placement,
+            );
             self.command_menu.placement = Some(placement);
             self.render_command_menu(frame, area, &menu);
         }
@@ -3557,10 +3557,7 @@ fn attachment_kind_label(attachment: &MessageAttachment) -> &'static str {
     }
 }
 
-fn render_user_attachment_lines(
-    lines: &mut Vec<StyledLine>,
-    attachments: &[MessageAttachment],
-) {
+fn render_user_attachment_lines(lines: &mut Vec<StyledLine>, attachments: &[MessageAttachment]) {
     for attachment in attachments {
         push_styled_line(
             lines,
@@ -4547,7 +4544,9 @@ fn command_menu_area(
         CommandMenuPlacement::Above => above_space,
         CommandMenuPlacement::Below => below_space,
     };
-    let height = desired_height.min(available.max(4)).min(frame_area.height.max(4));
+    let height = desired_height
+        .min(available.max(4))
+        .min(frame_area.height.max(4));
     let y = match placement {
         CommandMenuPlacement::Above => composer_area.y.saturating_sub(height).max(frame_area.y),
         CommandMenuPlacement::Below => composer_area.y.saturating_add(composer_area.height),

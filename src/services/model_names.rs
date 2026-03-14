@@ -182,6 +182,25 @@ pub fn select_model_for_protocol(
     }
 }
 
+pub fn select_model_for_provider_attempt(
+    base_url: &str,
+    requested_model: Option<&str>,
+    explicit_model: Option<&str>,
+    target_protocol: ProviderProtocol,
+) -> String {
+    if let Some(model) = explicit_model.filter(|model| !model.trim().is_empty()) {
+        return model.to_string();
+    }
+
+    if let Some(model) = requested_model.filter(|model| !model.trim().is_empty())
+        && should_preserve_cross_protocol_model(base_url, model, target_protocol)
+    {
+        return model.to_string();
+    }
+
+    select_model_for_protocol(requested_model, explicit_model, target_protocol)
+}
+
 fn infer_model_protocol(model: &str) -> Option<ProviderProtocol> {
     let lower = model.to_ascii_lowercase();
     let name_only = lower.split('/').next_back().unwrap_or(&lower);
@@ -366,6 +385,32 @@ mod tests {
                 ProviderProtocol::Anthropic
             ),
             "claude-3-opus"
+        );
+    }
+
+    #[test]
+    fn test_select_model_for_provider_attempt_preserves_cross_protocol_gateway_models() {
+        assert_eq!(
+            select_model_for_provider_attempt(
+                "https://api.ai.example-gateway.net/endpoint",
+                Some("claude-sonnet-4.6"),
+                None,
+                ProviderProtocol::Openai
+            ),
+            "claude-sonnet-4.6"
+        );
+    }
+
+    #[test]
+    fn test_select_model_for_provider_attempt_still_remaps_plain_openai_endpoints() {
+        assert_eq!(
+            select_model_for_provider_attempt(
+                "https://api.openai.com/v1",
+                Some("claude-sonnet-4.6"),
+                None,
+                ProviderProtocol::Openai
+            ),
+            "gpt-4o"
         );
     }
 }

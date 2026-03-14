@@ -6,12 +6,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
-use crate::services::model_names::select_model_for_protocol;
+use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
     convert_openai_chat_to_anthropic_request,
 };
-use crate::services::provider_protocol::{ProviderProtocol, fallback_protocols, is_protocol_mismatch};
+use crate::services::provider_protocol::{
+    ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+};
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
@@ -32,7 +34,6 @@ pub struct GeminiRouterConfig {
 pub struct GeminiRouter {
     config: GeminiRouterConfig,
 }
-
 
 struct GeminiRouterState {
     config: Arc<GeminiRouterConfig>,
@@ -60,7 +61,14 @@ impl GeminiRouter {
 }
 
 async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -> String {
-    match handle_request(&request, &state.config, &state.client, &state.active_protocol).await {
+    match handle_request(
+        &request,
+        &state.config,
+        &state.client,
+        &state.active_protocol,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => http_utils::http_error_response(500, &e.to_string()),
     }
@@ -87,7 +95,8 @@ async fn handle_request(
             );
             // openai_req already has the model from the Gemini request body — don't pre-select here;
             // select_model_for_protocol is applied per-attempt inside forward_to_provider.
-            let openai_response = forward_to_provider(openai_req, config, client, active_protocol).await?;
+            let openai_response =
+                forward_to_provider(openai_req, config, client, active_protocol).await?;
             let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
 
             if is_streaming {
@@ -118,7 +127,8 @@ async fn forward_to_provider(
     for (attempt, protocol) in candidates.into_iter().enumerate() {
         // Select the right model name for this protocol attempt.
         let mut req_body = openai_req.clone();
-        let selected_model = select_model_for_protocol(
+        let selected_model = select_model_for_provider_attempt(
+            &config.target_base_url,
             req_body.get("model").and_then(|v| v.as_str()),
             None,
             protocol,
@@ -134,7 +144,8 @@ async fn forward_to_provider(
                     },
                 );
                 anthropic_req["stream"] = serde_json::json!(false);
-                let target_url = http_utils::build_target_url(&config.target_base_url, "/v1/messages");
+                let target_url =
+                    http_utils::build_target_url(&config.target_base_url, "/v1/messages");
                 let response = client
                     .post(&target_url)
                     .header("Authorization", format!("Bearer {}", config.api_key))

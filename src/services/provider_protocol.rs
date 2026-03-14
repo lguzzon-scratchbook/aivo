@@ -75,10 +75,14 @@ pub fn is_protocol_mismatch(status: u16) -> bool {
 /// Excludes Google unless the URL suggests a Google endpoint.
 pub fn fallback_protocols(current: ProviderProtocol, base_url: &str) -> Vec<ProviderProtocol> {
     let include_google = is_google_endpoint(base_url);
-    [ProviderProtocol::Openai, ProviderProtocol::Anthropic, ProviderProtocol::Google]
-        .into_iter()
-        .filter(|p| *p != current && (*p != ProviderProtocol::Google || include_google))
-        .collect()
+    [
+        ProviderProtocol::Openai,
+        ProviderProtocol::Anthropic,
+        ProviderProtocol::Google,
+    ]
+    .into_iter()
+    .filter(|p| *p != current && (*p != ProviderProtocol::Google || include_google))
+    .collect()
 }
 
 #[cfg(test)]

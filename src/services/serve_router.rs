@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::commands::models::fetch_models;
 use crate::services::codex_router::{
@@ -26,7 +26,9 @@ use crate::services::openai_gemini_bridge::{
     build_google_stream_generate_content_url, convert_gemini_to_openai_chat_response,
     convert_openai_chat_to_gemini_request,
 };
-use crate::services::provider_protocol::{ProviderProtocol, fallback_protocols, is_protocol_mismatch};
+use crate::services::provider_protocol::{
+    ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+};
 use crate::services::session_store::ApiKey;
 
 pub struct ServeRouterConfig {
@@ -151,7 +153,6 @@ enum ResponsesOutputItem {
 }
 
 static RESPONSES_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 
 impl ServeRouter {
     pub fn new(config: ServeRouterConfig, key: ApiKey) -> Self {
