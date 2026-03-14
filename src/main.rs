@@ -119,7 +119,12 @@ async fn main() {
             };
             let command = ChatCommand::new(session_store, models_cache.clone());
             command
-                .execute(chat_args.model, chat_args.execute, key_override)
+                .execute(
+                    chat_args.model,
+                    chat_args.execute,
+                    chat_args.attachments,
+                    key_override,
+                )
                 .await
         }
 

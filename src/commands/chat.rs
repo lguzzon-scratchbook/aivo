@@ -4,7 +4,9 @@
  * OpenAI-compatible /v1/chat/completions, falling back to Anthropic
  * /v1/messages on 404/405.
  */
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -24,7 +26,9 @@ use crate::services::copilot_auth::{
 use crate::services::http_utils::{parse_token_u64, sse_data_payload};
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
-use crate::services::session_store::{ApiKey, SessionStore, StoredChatMessage};
+use crate::services::session_store::{
+    ApiKey, AttachmentStorage, MessageAttachment, SessionStore, StoredChatMessage,
+};
 use crate::style;
 
 #[path = "chat_tui.rs"]
@@ -42,13 +46,8 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default, skip_serializing, skip_deserializing)]
     pub reasoning_content: Option<String>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    stream: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,9 +180,13 @@ impl ChatCommand {
         &self,
         model: Option<String>,
         one_shot: Option<String>,
+        attachments: Vec<String>,
         key_override: Option<ApiKey>,
     ) -> ExitCode {
-        match self.execute_internal(model, one_shot, key_override).await {
+        match self
+            .execute_internal(model, one_shot, attachments, key_override)
+            .await
+        {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -196,6 +199,7 @@ impl ChatCommand {
         &self,
         model_flag: Option<String>,
         one_shot: Option<String>,
+        attachments: Vec<String>,
         key_override: Option<ApiKey>,
     ) -> Result<ExitCode> {
         let key = match key_override {
@@ -248,6 +252,7 @@ impl ChatCommand {
         let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
+        let pending_attachments = build_pending_attachments(&attachments)?;
 
         // Create once so its token cache is reused across messages in the session.
         let copilot_tm = if key.base_url == "copilot" {
@@ -266,11 +271,13 @@ impl ChatCommand {
 
             let stdin_context = read_stdin_if_piped()?;
             let one_shot_input = compose_one_shot_prompt(&input, stdin_context.as_deref());
+            let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
 
             let history = vec![ChatMessage {
                 role: "user".to_string(),
                 content: one_shot_input,
                 reasoning_content: None,
+                attachments: one_shot_attachments,
             }];
             let mut format = ChatFormat::OpenAI;
             self.session_store
@@ -341,7 +348,7 @@ impl ChatCommand {
 
         let initial_session = new_chat_session_id();
         let initial_history = Vec::new();
-        let startup_notice = None;
+        let startup_notice = attachment_notice(&pending_attachments);
 
         self.session_store
             .record_selection(&key.id, "chat", Some(&raw_model))
@@ -358,6 +365,7 @@ impl ChatCommand {
             model,
             initial_session,
             initial_history,
+            initial_draft_attachments: pending_attachments,
             startup_notice,
         })
         .await?;
@@ -367,7 +375,7 @@ impl ChatCommand {
 
     pub fn print_help() {
         println!(
-            "{} aivo chat [--model <model>] [-x <message>]",
+            "{} aivo chat [--model <model>] [-x <message>] [--attach <path> ...]",
             style::bold("Usage:")
         );
         println!();
@@ -384,7 +392,7 @@ impl ChatCommand {
         println!(
             "{}",
             style::dim(
-                "Slash commands are available inside chat: /new, /resume, /model, /key, /help, /exit."
+                "Slash commands are available inside chat: /new, /resume, /model, /key, /attach, /detach, /clear, /help, /exit."
             )
         );
         println!();
@@ -403,6 +411,11 @@ impl ChatCommand {
             "  {}  {}",
             style::cyan("-x, --execute <message>"),
             style::dim("Send one message and exit (uses piped stdin as context)")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("--attach <path>"),
+            style::dim("Queue a text file or image for the next message")
         );
         println!();
         println!("{}", style::bold("Slash Commands:"));
@@ -428,6 +441,21 @@ impl ChatCommand {
         );
         println!(
             "  {}  {}",
+            style::cyan("/attach <path>"),
+            style::dim("Attach a text file or image to the next message")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("/detach <n>"),
+            style::dim("Remove one queued attachment by number")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("/clear"),
+            style::dim("Clear queued attachments from the composer")
+        );
+        println!(
+            "  {}  {}",
             style::cyan("/help / /exit"),
             style::dim("Open command help / leave chat")
         );
@@ -442,6 +470,11 @@ impl ChatCommand {
             "  {}  {}",
             style::cyan("Enter / Ctrl+J"),
             style::dim("Send message / insert newline")
+        );
+        println!(
+            "  {}  {}",
+            style::cyan("Ctrl+V"),
+            style::dim("Paste system clipboard (text or image)")
         );
         println!(
             "  {}  {}",
@@ -473,6 +506,10 @@ impl ChatCommand {
         println!("  {}", style::dim("aivo chat"));
         println!("  {}", style::dim("aivo chat --model gpt-4o"));
         println!("  {}", style::dim("aivo chat -m claude-sonnet-4-5"));
+        println!(
+            "  {}",
+            style::dim("aivo chat --attach README.md --attach screenshot.png")
+        );
         println!(
             "  {}",
             style::dim("aivo chat -x \"Explain Rust lifetimes\"")
@@ -548,6 +585,125 @@ fn compose_one_shot_prompt(prompt: &str, stdin_context: Option<&str>) -> String 
     }
 }
 
+fn attachment_notice(attachments: &[MessageAttachment]) -> Option<String> {
+    if attachments.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{} attachment{} queued. Press Enter to send or use /attach to add more.",
+            attachments.len(),
+            if attachments.len() == 1 { "" } else { "s" }
+        ))
+    }
+}
+
+fn build_pending_attachments(paths: &[String]) -> Result<Vec<MessageAttachment>> {
+    paths.iter().map(|path| build_pending_attachment(path)).collect()
+}
+
+fn build_pending_attachment(path: &str) -> Result<MessageAttachment> {
+    let expanded = crate::services::system_env::expand_tilde(path);
+    let file_path = expanded.as_path();
+    ensure_attachment_exists(file_path)?;
+    let mime_type = guess_attachment_mime_type(file_path)?;
+    Ok(MessageAttachment {
+        name: attachment_name(file_path),
+        mime_type,
+        storage: AttachmentStorage::FileRef {
+            path: path.to_string(),
+        },
+    })
+}
+
+fn ensure_attachment_exists(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| anyhow::anyhow!("Failed to read attachment '{}': {err}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("Attachment '{}' is not a file", path.display());
+    }
+    Ok(())
+}
+
+fn attachment_name(path: &Path) -> String {
+    match path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => name.to_string(),
+        None => path.to_string_lossy().into_owned(),
+    }
+}
+
+fn guess_attachment_mime_type(path: &Path) -> Result<String> {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "json" => "application/json",
+        "md" => "text/markdown",
+        "html" => "text/html",
+        "css" => "text/css",
+        "csv" => "text/csv",
+        "xml" => "application/xml",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
+        "" => "text/plain",
+        _ => "text/plain",
+    };
+    Ok(mime.to_string())
+}
+
+async fn materialize_attachments(
+    attachments: &[MessageAttachment],
+) -> Result<Vec<MessageAttachment>> {
+    let mut resolved = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        resolved.push(materialize_attachment(attachment).await?);
+    }
+    Ok(resolved)
+}
+
+async fn materialize_attachment(attachment: &MessageAttachment) -> Result<MessageAttachment> {
+    match &attachment.storage {
+        AttachmentStorage::Inline { .. } => Ok(attachment.clone()),
+        AttachmentStorage::FileRef { path } => {
+            let storage = if attachment.mime_type.starts_with("image/") {
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("Failed to read image '{}': {err}", path))?;
+                AttachmentStorage::Inline {
+                    data: BASE64.encode(bytes),
+                }
+            } else {
+                let text = tokio::fs::read_to_string(path).await.map_err(|err| {
+                    anyhow::anyhow!(
+                        "Failed to read text attachment '{}': {err}. Files must be UTF-8.",
+                        path
+                    )
+                })?;
+                AttachmentStorage::Inline { data: text }
+            };
+            Ok(MessageAttachment {
+                name: attachment.name.clone(),
+                mime_type: attachment.mime_type.clone(),
+                storage,
+            })
+        }
+    }
+}
+
+fn format_text_attachment_content(name: &str, content: &str) -> String {
+    format!("[Attached file: {name}]\n{content}")
+}
+
 fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
     history
         .iter()
@@ -557,7 +713,7 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
             reasoning_content: message.reasoning_content.clone(),
             id: Some(new_chat_session_id()),
             timestamp: Some(Utc::now().to_rfc3339()),
-            attachments: None,
+            attachments: (!message.attachments.is_empty()).then(|| message.attachments.clone()),
         })
         .collect()
 }
@@ -683,6 +839,147 @@ fn merge_token_usage(usage: &mut Option<TokenUsage>, update: TokenUsageUpdate) {
     }
 }
 
+fn build_openai_chat_request(
+    model: &str,
+    messages: &[ChatMessage],
+    stream: bool,
+) -> Result<serde_json::Value> {
+    let mut encoded_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        encoded_messages.push(build_openai_message(message)?);
+    }
+
+    Ok(serde_json::json!({
+        "model": model,
+        "messages": encoded_messages,
+        "stream": stream,
+    }))
+}
+
+/// Returns the inline data for a materialized attachment, or fails if it is still a FileRef.
+fn require_inline(attachment: &MessageAttachment) -> Result<&str> {
+    match &attachment.storage {
+        AttachmentStorage::Inline { data } => Ok(data),
+        AttachmentStorage::FileRef { path } => anyhow::bail!(
+            "Attachment '{}' is unresolved. Expected inline data before sending.",
+            path
+        ),
+    }
+}
+
+fn build_openai_message(message: &ChatMessage) -> Result<serde_json::Value> {
+    if message.attachments.is_empty() {
+        return Ok(serde_json::json!({
+            "role": message.role,
+            "content": message.content,
+        }));
+    }
+
+    let mut parts = Vec::new();
+    if !message.content.is_empty() {
+        parts.push(serde_json::json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+
+    for attachment in &message.attachments {
+        let data = require_inline(attachment)?;
+        if attachment.mime_type.starts_with("image/") {
+            parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", attachment.mime_type, data),
+                },
+            }));
+        } else {
+            parts.push(serde_json::json!({
+                "type": "text",
+                "text": format_text_attachment_content(&attachment.name, data),
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "role": message.role,
+        "content": parts,
+    }))
+}
+
+fn build_anthropic_request(
+    model: &str,
+    messages: &[ChatMessage],
+    stream: bool,
+) -> Result<serde_json::Value> {
+    let mut system_parts = Vec::new();
+    let mut encoded_messages = Vec::new();
+
+    for message in messages {
+        if message.role == "system" {
+            if !message.content.is_empty() {
+                system_parts.push(message.content.clone());
+            }
+            continue;
+        }
+
+        let role = if message.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+        encoded_messages.push(serde_json::json!({
+            "role": role,
+            "content": build_anthropic_content(message)?,
+        }));
+    }
+
+    let mut request = serde_json::json!({
+        "model": model,
+        "messages": encoded_messages,
+        "max_tokens": 8096,
+        "stream": stream,
+    });
+    if !system_parts.is_empty() {
+        request["system"] = serde_json::json!(system_parts.join("\n\n"));
+    }
+    Ok(request)
+}
+
+fn build_anthropic_content(message: &ChatMessage) -> Result<serde_json::Value> {
+    if message.attachments.is_empty() {
+        return Ok(serde_json::Value::String(message.content.clone()));
+    }
+
+    let mut blocks = Vec::new();
+    if !message.content.is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+
+    for attachment in &message.attachments {
+        let data = require_inline(attachment)?;
+        if attachment.mime_type.starts_with("image/") {
+            blocks.push(serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": attachment.mime_type,
+                    "data": data,
+                },
+            }));
+        } else {
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "text": format_text_attachment_content(&attachment.name, data),
+            }));
+        }
+    }
+
+    Ok(serde_json::Value::Array(blocks))
+}
+
 fn should_retry_status(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::TOO_MANY_REQUESTS
@@ -756,11 +1053,7 @@ where
     let url = format!("{}/v1/chat/completions", base);
 
     // Try streaming first; fall back to non-streaming on server errors
-    let request = ChatRequest {
-        model: model.to_string(),
-        messages: messages.to_vec(),
-        stream: true,
-    };
+    let request = build_openai_chat_request(model, messages, true)?;
 
     let mut response = send_with_retry(|| {
         client
@@ -883,11 +1176,7 @@ async fn send_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = ChatRequest {
-        model: model.to_string(),
-        messages: messages.to_vec(),
-        stream: false,
-    };
+    let request = build_openai_chat_request(model, messages, false)?;
 
     let response = send_with_retry(|| {
         client
@@ -945,11 +1234,7 @@ where
     let (copilot_token, api_endpoint) = tm.get_token().await?;
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
 
-    let request = ChatRequest {
-        model: model.to_string(),
-        messages: messages.to_vec(),
-        stream: true,
-    };
+    let request = build_openai_chat_request(model, messages, true)?;
 
     let mut response = send_with_retry(|| {
         client
@@ -1088,11 +1373,7 @@ async fn send_copilot_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = ChatRequest {
-        model: model.to_string(),
-        messages: messages.to_vec(),
-        stream: false,
-    };
+    let request = build_openai_chat_request(model, messages, false)?;
 
     let response = send_with_retry(|| {
         client
@@ -1303,12 +1584,7 @@ where
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/messages", base);
 
-    let request = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "max_tokens": 8096,
-        "stream": true,
-    });
+    let request = build_anthropic_request(model, messages, true)?;
 
     let mut response = send_with_retry(|| {
         client
@@ -1413,12 +1689,7 @@ async fn send_anthropic_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "max_tokens": 8096,
-        "stream": false,
-    });
+    let request = build_anthropic_request(model, messages, false)?;
 
     let response = send_with_retry(|| {
         client
@@ -1635,11 +1906,74 @@ mod tests {
             role: "user".to_string(),
             content: "hello".to_string(),
             reasoning_content: Some("hidden".to_string()),
+            attachments: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"content\":\"hello\""));
         assert!(!json.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn test_build_openai_chat_request_encodes_file_and_image_attachments() {
+        let request = build_openai_chat_request(
+            "gpt-4o",
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "Review these".to_string(),
+                reasoning_content: None,
+                attachments: vec![
+                    MessageAttachment {
+                        name: "notes.md".to_string(),
+                        mime_type: "text/markdown".to_string(),
+                        storage: AttachmentStorage::Inline {
+                            data: "# hello".to_string(),
+                        },
+                    },
+                    MessageAttachment {
+                        name: "diagram.png".to_string(),
+                        mime_type: "image/png".to_string(),
+                        storage: AttachmentStorage::Inline {
+                            data: "YWJj".to_string(),
+                        },
+                    },
+                ],
+            }],
+            true,
+        )
+        .unwrap();
+
+        let parts = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[1]["text"].as_str().unwrap().contains("notes.md"));
+        assert_eq!(parts[2]["type"], "image_url");
+        assert_eq!(parts[2]["image_url"]["url"], "data:image/png;base64,YWJj");
+    }
+
+    #[test]
+    fn test_build_anthropic_request_encodes_image_attachment() {
+        let request = build_anthropic_request(
+            "claude-sonnet-4-5",
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: String::new(),
+                reasoning_content: None,
+                attachments: vec![MessageAttachment {
+                    name: "diagram.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    storage: AttachmentStorage::Inline {
+                        data: "YWJj".to_string(),
+                    },
+                }],
+            }],
+            false,
+        )
+        .unwrap();
+
+        let blocks = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], "YWJj");
     }
 
     #[test]

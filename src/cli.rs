@@ -164,6 +164,10 @@ pub struct ChatArgs {
     /// Send one message, print response, then exit (non-interactive)
     #[arg(short = 'x', long = "execute", value_name = "MESSAGE", value_parser = non_empty())]
     pub execute: Option<String>,
+
+    /// Attach a file or image to the next chat message (repeatable)
+    #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]
+    pub attachments: Vec<String>,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE

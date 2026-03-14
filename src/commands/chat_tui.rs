@@ -1,6 +1,7 @@
 use std::env;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -103,6 +104,24 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "attach",
+        help_label: "/attach <path>",
+        description: "attach a file or image",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
+        name: "detach",
+        help_label: "/detach <n>",
+        description: "remove one queued attachment",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
+        name: "clear",
+        help_label: "/clear",
+        description: "clear queued attachments",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
         name: "help",
         help_label: "/help",
         description: "open help",
@@ -121,6 +140,7 @@ pub(super) struct ChatTuiParams {
     pub model: String,
     pub initial_session: String,
     pub initial_history: Vec<ChatMessage>,
+    pub initial_draft_attachments: Vec<MessageAttachment>,
     pub startup_notice: Option<String>,
 }
 
@@ -146,6 +166,7 @@ fn decrypt_to_chat_messages(
             role: m.role,
             content: m.content,
             reasoning_content: m.reasoning_content,
+            attachments: m.attachments.unwrap_or_default(),
         })
         .collect();
     Ok(messages)
@@ -290,6 +311,7 @@ struct ResumeRestoreState {
     format: ChatFormat,
     history: Vec<ChatMessage>,
     draft: String,
+    draft_attachments: Vec<MessageAttachment>,
     cursor: usize,
     command_menu: CommandMenuState,
     draft_history_index: Option<usize>,
@@ -299,11 +321,17 @@ struct ResumeRestoreState {
     show_reasoning: bool,
     pending_response: String,
     pending_reasoning: String,
-    pending_submit: Option<String>,
+    pending_submit: Option<PendingSubmission>,
     last_usage: Option<TokenUsage>,
     context_tokens: u64,
     follow_output: bool,
     transcript_scroll: usize,
+}
+
+#[derive(Clone)]
+struct PendingSubmission {
+    content: String,
+    attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Clone, Default)]
@@ -312,7 +340,6 @@ struct CommandMenuState {
     selected: usize,
     dismissed: bool,
     placement: Option<CommandMenuPlacement>,
-    last_row_count: usize,
 }
 
 impl CommandMenuState {
@@ -321,12 +348,48 @@ impl CommandMenuState {
         self.selected = 0;
         self.dismissed = false;
         self.placement = None;
-        self.last_row_count = 0;
+    }
+}
+
+#[derive(Clone)]
+struct PathMenuEntry {
+    label: String,
+    is_dir: bool,
+    description: String,
+    insertion_text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuKind {
+    Commands,
+    AttachPath,
+}
+
+#[derive(Clone)]
+enum ComposerMenuEntry {
+    Command(&'static SlashCommandSpec),
+    Path(PathMenuEntry),
+}
+
+impl ComposerMenuEntry {
+    fn label(&self) -> String {
+        match self {
+            Self::Command(command) => command.command_label(),
+            Self::Path(path) => path.label.clone(),
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Self::Command(command) => command.description,
+            Self::Path(path) => &path.description,
+        }
     }
 }
 
 struct VisibleCommandMenu {
-    entries: Vec<&'static SlashCommandSpec>,
+    kind: MenuKind,
+    entries: Vec<ComposerMenuEntry>,
     selected: Option<usize>,
 }
 
@@ -346,6 +409,7 @@ impl ResumeRestoreState {
             format: app.format.clone(),
             history: app.history.clone(),
             draft: app.draft.clone(),
+            draft_attachments: app.draft_attachments.clone(),
             cursor: app.cursor,
             command_menu: app.command_menu.clone(),
             draft_history_index: app.draft_history_index,
@@ -520,6 +584,12 @@ enum SubmitAction {
     Command(SlashCommand),
 }
 
+enum ClipboardPayload {
+    Text(String),
+    Attachment(MessageAttachment),
+    Empty,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlashCommand {
     New,
@@ -527,6 +597,9 @@ enum SlashCommand {
     Resume(Option<String>),
     Model(Option<String>),
     Key(Option<String>),
+    Attach(String),
+    Detach(usize),
+    Clear,
     Help,
 }
 
@@ -555,6 +628,7 @@ struct ChatTuiApp {
     format: ChatFormat,
     history: Vec<ChatMessage>,
     draft: String,
+    draft_attachments: Vec<MessageAttachment>,
     cursor: usize,
     command_menu: CommandMenuState,
     draft_history: Vec<String>,
@@ -566,7 +640,7 @@ struct ChatTuiApp {
     show_reasoning: bool,
     pending_response: String,
     pending_reasoning: String,
-    pending_submit: Option<String>,
+    pending_submit: Option<PendingSubmission>,
     sending: bool,
     request_started_at: Option<Instant>,
     last_usage: Option<TokenUsage>,
@@ -607,6 +681,7 @@ impl ChatTuiApp {
             format: ChatFormat::OpenAI,
             history: params.initial_history,
             draft: String::new(),
+            draft_attachments: params.initial_draft_attachments,
             cursor: 0,
             command_menu: CommandMenuState::default(),
             draft_history: load_persisted_draft_history(),
@@ -672,6 +747,7 @@ impl ChatTuiApp {
         self.format = state.format;
         self.history = state.history;
         self.draft = state.draft;
+        self.draft_attachments = state.draft_attachments;
         self.cursor = state.cursor;
         self.command_menu = state.command_menu;
         self.draft_history_index = state.draft_history_index;
@@ -704,6 +780,7 @@ impl ChatTuiApp {
     fn clear_for_resume_loading(&mut self) {
         self.history.clear();
         self.draft.clear();
+        self.draft_attachments.clear();
         self.cursor = 0;
         self.command_menu.reset();
         self.draft_history_index = None;
@@ -830,6 +907,14 @@ impl ChatTuiApp {
         self.cursor += ch.len_utf8();
     }
 
+    fn insert_pasted_text(&mut self, text: &str) {
+        self.leave_history_navigation();
+        for ch in text.chars() {
+            self.insert_char_at_cursor(ch);
+        }
+        self.sync_command_menu_state();
+    }
+
     fn delete_char_before_cursor(&mut self) {
         if self.cursor == 0 {
             return;
@@ -881,12 +966,43 @@ impl ChatTuiApp {
         Some(&self.draft[1..])
     }
 
+    fn active_attach_query(&self) -> Option<&str> {
+        if self.overlay.blocks_input()
+            || self.is_busy()
+            || !self.draft.starts_with("/attach ")
+            || self.draft.starts_with("//")
+            || self.draft.contains('\n')
+        {
+            return None;
+        }
+        Some(&self.draft["/attach ".len()..])
+    }
+
     fn visible_command_menu(&self) -> Option<VisibleCommandMenu> {
-        let query = self.active_command_query()?;
         if self.command_menu.dismissed {
             return None;
         }
-        let entries = filter_slash_commands(query);
+        let (kind, query, entries) = if let Some(query) = self.active_command_query() {
+            (
+                MenuKind::Commands,
+                query.to_string(),
+                filter_slash_commands(query)
+                    .into_iter()
+                    .map(ComposerMenuEntry::Command)
+                    .collect::<Vec<_>>(),
+            )
+        } else if let Some(query) = self.active_attach_query() {
+            (
+                MenuKind::AttachPath,
+                query.to_string(),
+                collect_attach_path_suggestions(&self.cwd, query)
+                    .into_iter()
+                    .map(ComposerMenuEntry::Path)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            return None;
+        };
         let selected = if entries.is_empty() {
             None
         } else {
@@ -896,15 +1012,23 @@ impl ChatTuiApp {
                     .min(entries.len().saturating_sub(1)),
             )
         };
-        Some(VisibleCommandMenu { entries, selected })
+        let _ = query;
+        Some(VisibleCommandMenu {
+            kind,
+            entries,
+            selected,
+        })
     }
 
     fn sync_command_menu_state(&mut self) {
-        let Some(query) = self.active_command_query() else {
+        let query = if let Some(query) = self.active_command_query() {
+            query.to_string()
+        } else if let Some(query) = self.active_attach_query() {
+            query.to_string()
+        } else {
             self.command_menu.reset();
             return;
         };
-        let query = query.to_string();
 
         if self.command_menu.query != query {
             if self.command_menu.dismissed {
@@ -915,11 +1039,15 @@ impl ChatTuiApp {
             self.command_menu.dismissed = false;
         }
 
-        let matches = filter_slash_commands(&query);
-        if matches.is_empty() {
+        let matches = if self.active_command_query().is_some() {
+            filter_slash_commands(&query).len()
+        } else {
+            collect_attach_path_suggestions(&self.cwd, &query).len()
+        };
+        if matches == 0 {
             self.command_menu.selected = 0;
         } else {
-            self.command_menu.selected = self.command_menu.selected.min(matches.len() - 1);
+            self.command_menu.selected = self.command_menu.selected.min(matches - 1);
         }
     }
 
@@ -952,7 +1080,9 @@ impl ChatTuiApp {
     }
 
     fn dismiss_command_menu(&mut self) -> bool {
-        if self.active_command_query().is_none() || self.command_menu.dismissed {
+        if (self.active_command_query().is_none() && self.active_attach_query().is_none())
+            || self.command_menu.dismissed
+        {
             return false;
         }
         self.command_menu.dismissed = true;
@@ -960,36 +1090,84 @@ impl ChatTuiApp {
         true
     }
 
-    fn selected_command(&self) -> Option<SlashCommandSpec> {
+    fn selected_menu_entry(&self) -> Option<ComposerMenuEntry> {
         let menu = self.visible_command_menu()?;
         let selected = menu.selected?;
-        menu.entries.get(selected).copied().copied()
+        menu.entries.get(selected).cloned()
     }
 
     fn insert_selected_command(&mut self) -> bool {
-        let Some(command) = self.selected_command() else {
+        let Some(entry) = self.selected_menu_entry() else {
             return false;
         };
-        self.draft = command.insertion_text();
-        self.cursor = self.draft.len();
         self.command_menu.selected = 0;
-        self.command_menu.dismissed = true;
-        self.command_menu.placement = None;
+        match entry {
+            ComposerMenuEntry::Command(command) => {
+                self.draft = command.insertion_text();
+                self.cursor = self.draft.len();
+                self.command_menu.dismissed = true;
+                self.command_menu.placement = None;
+            }
+            ComposerMenuEntry::Path(path) => {
+                self.draft = path.insertion_text;
+                self.cursor = self.draft.len();
+                // Keep the menu open for directories so the user can continue
+                // navigating into the selected directory with subsequent Tab presses.
+                self.command_menu.dismissed = !path.is_dir;
+                // Only reset placement when dismissing — same rule as dismiss_command_menu.
+                // When the menu stays open (directory), preserve placement to avoid jumping.
+                if !path.is_dir {
+                    self.command_menu.placement = None;
+                }
+            }
+        }
         true
     }
 
     async fn execute_selected_command(&mut self) -> Result<bool> {
-        let Some(command) = self.selected_command() else {
+        let Some(entry) = self.selected_menu_entry() else {
             return Ok(false);
         };
-        self.draft = command.command_label();
-        self.cursor = self.draft.len();
-        self.command_menu.reset();
-        self.submit_draft().await
+        match entry {
+            ComposerMenuEntry::Command(command) => {
+                self.draft = command.command_label();
+                self.cursor = self.draft.len();
+                self.command_menu.reset();
+                self.submit_draft().await
+            }
+            ComposerMenuEntry::Path(path) => {
+                self.draft = path.insertion_text;
+                self.cursor = self.draft.len();
+                self.command_menu.reset();
+                Ok(false)
+            }
+        }
     }
 
     fn composer_border_color(&self) -> Color {
         FAINT
+    }
+
+    fn paste_system_clipboard(&mut self) -> Result<()> {
+        match read_system_clipboard()? {
+            ClipboardPayload::Text(text) => {
+                if text.is_empty() {
+                    self.notice = Some((MUTED, "Clipboard is empty".to_string()));
+                } else {
+                    self.insert_pasted_text(&text);
+                }
+            }
+            ClipboardPayload::Attachment(attachment) => {
+                let kind = attachment_kind_label(&attachment);
+                let name = attachment.name.clone();
+                self.draft_attachments.push(attachment);
+                self.notice = Some((MUTED, format!("Pasted {kind}: {name}")));
+            }
+            ClipboardPayload::Empty => {
+                self.notice = Some((MUTED, "Clipboard is empty".to_string()));
+            }
+        }
+        Ok(())
     }
 
     async fn handle_runtime_events(&mut self) -> Result<()> {
@@ -1025,6 +1203,7 @@ impl ChatTuiApp {
                                 role: "assistant".to_string(),
                                 content,
                                 reasoning_content,
+                                attachments: vec![],
                             });
                             if let Some(usage) = turn.usage {
                                 self.session_store
@@ -1057,7 +1236,8 @@ impl ChatTuiApp {
                             if let Some(submitted) = self.pending_submit.take()
                                 && self.draft.is_empty()
                             {
-                                self.draft = submitted;
+                                self.draft = submitted.content;
+                                self.draft_attachments = submitted.attachments;
                             }
                             self.notice = Some((ERROR, err));
                         }
@@ -1164,10 +1344,7 @@ impl ChatTuiApp {
                     Ok(Event::Resize(_, _)) => {}
                     Ok(Event::Paste(text)) => {
                         if !self.overlay.blocks_input() && !self.is_busy() {
-                            for ch in text.chars() {
-                                self.insert_char_at_cursor(ch);
-                            }
-                            self.sync_command_menu_state();
+                            self.insert_pasted_text(&text);
                         }
                     }
                     Ok(_) => {}
@@ -1193,8 +1370,9 @@ impl ChatTuiApp {
             return Ok(true);
         }
 
-        let command_menu_shortcuts_active =
-            self.active_command_query().is_some() && !self.command_menu.dismissed;
+        let command_menu_shortcuts_active = (self.active_command_query().is_some()
+            || self.active_attach_query().is_some())
+            && !self.command_menu.dismissed;
 
         let mut picker_submit = None;
         let mut picker_delete = None;
@@ -1413,6 +1591,11 @@ impl ChatTuiApp {
                 self.push_newline();
                 self.sync_command_menu_state();
             }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Err(err) = self.paste_system_clipboard() {
+                    self.notice = Some((ERROR, err.to_string()));
+                }
+            }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.draft.clear();
                 self.cursor = 0;
@@ -1551,24 +1734,36 @@ impl ChatTuiApp {
 
         match action {
             SubmitAction::Send(input) => {
-                self.send_user_message(input);
+                if let Err(err) = self.send_user_message(input).await {
+                    self.notice = Some((ERROR, err.to_string()));
+                }
                 Ok(false)
             }
-            SubmitAction::Command(command) => {
-                self.draft.clear();
-                self.cursor = 0;
-                self.command_menu.reset();
-                self.draft_history_index = None;
-                self.draft_history_stash = None;
-                self.execute_slash_command(command).await
-            }
+            SubmitAction::Command(command) => match self.execute_slash_command(command).await {
+                Ok(should_exit) => {
+                    self.draft.clear();
+                    self.cursor = 0;
+                    self.command_menu.reset();
+                    self.draft_history_index = None;
+                    self.draft_history_stash = None;
+                    Ok(should_exit)
+                }
+                Err(err) => {
+                    self.notice = Some((ERROR, err.to_string()));
+                    Ok(false)
+                }
+            },
         }
     }
 
     fn prepare_submit_action(&self) -> Result<Option<SubmitAction>> {
         let trimmed = self.draft.trim();
         if trimmed.is_empty() {
-            return Ok(None);
+            return if self.draft_attachments.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(SubmitAction::Send(String::new())))
+            };
         }
         if self.draft.contains('\n') {
             return Ok(Some(SubmitAction::Send(trimmed.to_string())));
@@ -1582,9 +1777,11 @@ impl ChatTuiApp {
         Ok(Some(SubmitAction::Send(trimmed.to_string())))
     }
 
-    fn send_user_message(&mut self, input: String) {
+    async fn send_user_message(&mut self, input: String) -> Result<()> {
+        let attachments = materialize_attachments(&self.draft_attachments).await?;
         self.record_draft_history(&input);
         self.draft.clear();
+        self.draft_attachments.clear();
         self.cursor = 0;
         self.command_menu.reset();
         self.overlay = Overlay::None;
@@ -1592,12 +1789,16 @@ impl ChatTuiApp {
         self.last_usage = None;
         self.pending_response.clear();
         self.pending_reasoning.clear();
-        self.pending_submit = Some(input.clone());
+        self.pending_submit = Some(PendingSubmission {
+            content: input.clone(),
+            attachments: attachments.clone(),
+        });
         self.request_started_at = Some(Instant::now());
         self.history.push(ChatMessage {
             role: "user".to_string(),
             content: input,
             reasoning_content: None,
+            attachments,
         });
         trim_history(&mut self.history, MAX_HISTORY_MESSAGES);
         self.sending = true;
@@ -1650,6 +1851,54 @@ impl ChatTuiApp {
 
             tx.send(RuntimeEvent::Finished { result, format }).ok();
         }));
+        Ok(())
+    }
+
+    fn queue_attachment(&mut self, path: String) -> Result<()> {
+        let attachment = build_pending_attachment(&path)?;
+        let name = attachment.name.clone();
+        let kind = attachment_kind_label(&attachment);
+        self.draft_attachments.push(attachment);
+        self.notice = Some((MUTED, format!("Queued {kind}: {name}")));
+        Ok(())
+    }
+
+    fn detach_attachment(&mut self, index: usize) -> Result<()> {
+        if index == 0 {
+            anyhow::bail!("Usage: /detach <n> where n starts at 1");
+        }
+        let remove_at = index - 1;
+        if remove_at >= self.draft_attachments.len() {
+            anyhow::bail!(
+                "No queued attachment #{index}. There {} {} queued.",
+                if self.draft_attachments.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                },
+                self.draft_attachments.len()
+            );
+        }
+        let attachment = self.draft_attachments.remove(remove_at);
+        let kind = attachment_kind_label(&attachment);
+        self.notice = Some((MUTED, format!("Removed {kind}: {}", attachment.name)));
+        Ok(())
+    }
+
+    fn clear_draft_attachments(&mut self) {
+        let count = self.draft_attachments.len();
+        self.draft_attachments.clear();
+        self.notice = Some((
+            MUTED,
+            if count == 0 {
+                "No queued attachments".to_string()
+            } else {
+                format!(
+                    "Cleared {count} attachment{}",
+                    if count == 1 { "" } else { "s" }
+                )
+            },
+        ));
     }
 
     async fn execute_slash_command(&mut self, command: SlashCommand) -> Result<bool> {
@@ -1672,6 +1921,18 @@ impl ChatTuiApp {
                 self.open_or_switch_key(query).await?;
                 Ok(false)
             }
+            SlashCommand::Attach(path) => {
+                self.queue_attachment(path)?;
+                Ok(false)
+            }
+            SlashCommand::Detach(index) => {
+                self.detach_attachment(index)?;
+                Ok(false)
+            }
+            SlashCommand::Clear => {
+                self.clear_draft_attachments();
+                Ok(false)
+            }
             SlashCommand::Help => {
                 self.open_help_overlay();
                 Ok(false)
@@ -1692,6 +1953,7 @@ impl ChatTuiApp {
         self.overlay = Overlay::None;
         self.history.clear();
         self.draft.clear();
+        self.draft_attachments.clear();
         self.cursor = 0;
         self.command_menu.reset();
         self.draft_history_index = None;
@@ -1713,7 +1975,12 @@ impl ChatTuiApp {
         if let Some(task) = self.response_task.take() {
             task.abort();
         }
-        restore_cancelled_submission(&mut self.history, &mut self.draft, &mut self.pending_submit);
+        restore_cancelled_submission(
+            &mut self.history,
+            &mut self.draft,
+            &mut self.draft_attachments,
+            &mut self.pending_submit,
+        );
         self.cursor = self.draft.len();
         self.sync_command_menu_state();
         self.sending = false;
@@ -1746,6 +2013,7 @@ impl ChatTuiApp {
             role: "assistant".to_string(),
             content: partial,
             reasoning_content: normalize_reasoning_content(reasoning),
+            attachments: vec![],
         });
         self.context_tokens = estimate_context_tokens(&self.history);
         self.last_usage = None;
@@ -2249,7 +2517,11 @@ impl ChatTuiApp {
                 push_message_spacing(&mut lines);
             }
             match message.role.as_str() {
-                "user" => render_user_message(&mut lines, &message.content),
+                "user" => render_user_message(
+                    &mut lines,
+                    &message.content,
+                    &message.attachments,
+                ),
                 "assistant" => render_assistant_message(
                     &mut lines,
                     self.show_reasoning,
@@ -2332,17 +2604,9 @@ impl ChatTuiApp {
         self.picker_hitbox = None;
         let composer_area = self.render_main(frame, outer);
         if let Some(menu) = self.visible_command_menu() {
-            let current_rows = menu.entries.len().clamp(1, COMMAND_MENU_MAX_ROWS);
-            let grew = current_rows > self.command_menu.last_row_count;
-            let preferred = if grew {
-                None
-            } else {
-                self.command_menu.placement
-            };
             let (area, placement) =
-                command_menu_area(composer_area, outer, menu.entries.len(), preferred);
+                command_menu_area(composer_area, outer, menu.entries.len(), self.command_menu.placement);
             self.command_menu.placement = Some(placement);
-            self.command_menu.last_row_count = current_rows;
             self.render_command_menu(frame, area, &menu);
         }
         let body = outer;
@@ -2480,12 +2744,15 @@ impl ChatTuiApp {
         frame.render_widget(composer, composer_area);
 
         if self.should_show_input_cursor() {
-            let (cursor_x, cursor_y) = cursor_position(
-                &self.draft,
-                self.cursor,
-                composer_area.width.max(1),
-                COMPOSER_PREFIX_WIDTH,
-            );
+            let (cursor_x, cursor_y) = {
+                let (x, y) = cursor_position(
+                    &self.draft,
+                    self.cursor,
+                    composer_area.width.max(1),
+                    COMPOSER_PREFIX_WIDTH,
+                );
+                (x, y.saturating_add(self.draft_attachments.len() as u16))
+            };
             frame.set_cursor_position((
                 composer_area.x + cursor_x,
                 composer_area.y + cursor_y.min(composer_area.height.saturating_sub(1)),
@@ -2601,6 +2868,7 @@ impl ChatTuiApp {
         } else {
             Span::styled("> ", Style::default().fg(USER).add_modifier(Modifier::BOLD))
         };
+        let mut lines = composer_attachment_lines(&self.draft_attachments);
         if self.draft.is_empty() {
             let placeholder = if self.loading_resume.is_some() {
                 Span::styled("Resume loading…", Style::default().fg(FAINT))
@@ -2614,10 +2882,10 @@ impl ChatTuiApp {
             } else {
                 Span::styled(" Ask anything · / for commands", Style::default().fg(FAINT))
             };
-            return Text::from(vec![Line::from(vec![prompt, placeholder])]);
+            lines.push(Line::from(vec![prompt, placeholder]));
+            return Text::from(lines);
         }
 
-        let mut lines = Vec::new();
         for (index, line) in self.draft.split('\n').enumerate() {
             let prefix = if index == 0 {
                 if self.draft_history_index.is_some() {
@@ -2695,6 +2963,8 @@ impl ChatTuiApp {
 
         let footer_text = if menu.entries.is_empty() {
             "Esc close · Enter submit"
+        } else if menu.kind == MenuKind::AttachPath {
+            "Esc close · Enter/Tab insert · ↑/↓ navigate"
         } else {
             "Esc close · Enter run · Tab insert · ↑/↓ navigate"
         };
@@ -2990,9 +3260,16 @@ impl ChatTuiApp {
                 Span::styled("      insert newline", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
+                Span::styled("Ctrl+V", key_style),
+                Span::styled(
+                    "      paste system clipboard text/image",
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("↑/↓", key_style),
                 Span::styled(
-                    "         command list / history / line nav",
+                    "         command/path list / history / line nav",
                     Style::default().fg(TEXT),
                 ),
             ]),
@@ -3030,7 +3307,10 @@ impl ChatTuiApp {
             ]),
             Line::from(vec![
                 Span::styled("Tab", key_style),
-                Span::styled("         complete slash command", Style::default().fg(TEXT)),
+                Span::styled(
+                    "         complete command or attach path",
+                    Style::default().fg(TEXT),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("PgUp/PgDn", key_style),
@@ -3073,7 +3353,7 @@ impl ChatTuiApp {
     }
 
     fn composer_height(&self) -> u16 {
-        let lines = self.draft.lines().count().max(1) as u16;
+        let lines = (self.draft.lines().count().max(1) + self.draft_attachments.len()) as u16;
         (lines + 2).clamp(3, 9)
     }
 }
@@ -3269,7 +3549,57 @@ fn should_add_message_spacing(previous_role: Option<&str>, next_role: &str) -> b
     previous_role.is_some() && !next_role.is_empty()
 }
 
-fn render_user_message(lines: &mut Vec<StyledLine>, content: &str) {
+fn attachment_kind_label(attachment: &MessageAttachment) -> &'static str {
+    if attachment.mime_type.starts_with("image/") {
+        "image"
+    } else {
+        "file"
+    }
+}
+
+fn render_user_attachment_lines(
+    lines: &mut Vec<StyledLine>,
+    attachments: &[MessageAttachment],
+) {
+    for attachment in attachments {
+        push_styled_line(
+            lines,
+            format!(
+                "  [{}] {}",
+                attachment_kind_label(attachment),
+                attachment.name
+            ),
+            Style::default().fg(MUTED),
+        );
+    }
+}
+
+fn composer_attachment_lines(attachments: &[MessageAttachment]) -> Vec<Line<'static>> {
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            Line::from(vec![
+                Span::styled("· ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!(
+                        "{}. [{}] {}",
+                        index + 1,
+                        attachment_kind_label(attachment),
+                        attachment.name
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn render_user_message(
+    lines: &mut Vec<StyledLine>,
+    content: &str,
+    attachments: &[MessageAttachment],
+) {
     let mut had_line = false;
     for (idx, raw_line) in content.lines().enumerate() {
         let prefix = if idx == 0 { "> " } else { "  " };
@@ -3283,6 +3613,7 @@ fn render_user_message(lines: &mut Vec<StyledLine>, content: &str) {
     if !had_line {
         push_styled_line(lines, "> ", Style::default().fg(USER));
     }
+    render_user_attachment_lines(lines, attachments);
 }
 
 fn render_reasoning_block(lines: &mut Vec<StyledLine>, reasoning: &str, show_reasoning: bool) {
@@ -3833,10 +4164,22 @@ fn format_token_count_value(tokens: u64) -> String {
     }
 }
 
+/// Approximate char overhead for JSON framing around one attachment block.
+const ATTACHMENT_OVERHEAD_CHARS: usize = 64;
+/// Approximate char overhead for JSON framing around one message (role, braces, newlines).
+const MESSAGE_OVERHEAD_CHARS: usize = 20;
+
 fn estimate_context_tokens(history: &[ChatMessage]) -> u64 {
     let total_chars: usize = history
         .iter()
-        .map(|m| m.role.len() + m.content.len() + 20)
+        .map(|m| {
+            let attachment_chars = m
+                .attachments
+                .iter()
+                .map(|a| a.name.len() + ATTACHMENT_OVERHEAD_CHARS)
+                .sum::<usize>();
+            m.role.len() + m.content.len() + attachment_chars + MESSAGE_OVERHEAD_CHARS
+        })
         .sum();
     (total_chars / 4) as u64
 }
@@ -3859,12 +4202,14 @@ fn build_footer_text(model: &str, base_url: &str, cwd: &str, width: u16) -> Stri
 fn restore_cancelled_submission(
     history: &mut Vec<ChatMessage>,
     draft: &mut String,
-    pending_submit: &mut Option<String>,
+    draft_attachments: &mut Vec<MessageAttachment>,
+    pending_submit: &mut Option<PendingSubmission>,
 ) {
     if let Some(submitted) = pending_submit.take()
         && draft.is_empty()
     {
-        *draft = submitted;
+        *draft = submitted.content;
+        *draft_attachments = submitted.attachments;
     }
 
     if history.last().is_some_and(|message| message.role == "user") {
@@ -3905,6 +4250,11 @@ fn session_title_from_messages(messages: &[ChatMessage], raw_model: &str) -> Str
         .rev()
         .find(|message| message.role == "user" && !message.content.trim().is_empty())
         .map(|message| first_non_empty_line(&message.content));
+    let last_attachment = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|m| m.attachments.first().map(|a| a.name.clone()));
     let fallback = messages
         .iter()
         .rev()
@@ -3912,6 +4262,7 @@ fn session_title_from_messages(messages: &[ChatMessage], raw_model: &str) -> Str
         .map(|message| first_non_empty_line(&message.content));
 
     last_user
+        .or(last_attachment)
         .or(fallback)
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| raw_model.to_string())
@@ -3921,9 +4272,14 @@ fn session_preview_text_from_messages(messages: &[ChatMessage], raw_model: &str)
     let snippets = messages
         .iter()
         .rev()
-        .filter(|message| !message.content.trim().is_empty())
+        .filter_map(|message| {
+            if !message.content.trim().is_empty() {
+                Some(collapse_whitespace(&message.content))
+            } else {
+                message.attachments.first().map(|a| a.name.clone())
+            }
+        })
         .take(2)
-        .map(|message| collapse_whitespace(&message.content))
         .collect::<Vec<_>>();
 
     let joined = snippets
@@ -4108,6 +4464,59 @@ fn filter_slash_commands(query: &str) -> Vec<&'static SlashCommandSpec> {
     prefix_matches
 }
 
+fn collect_attach_path_suggestions(cwd: &str, query: &str) -> Vec<PathMenuEntry> {
+    let trimmed = query.trim_start();
+    let (dir_part, prefix) = match trimmed.rfind('/') {
+        Some(index) => (&trimmed[..=index], &trimmed[index + 1..]),
+        None => ("", trimmed),
+    };
+
+    let dir_path = {
+        let expanded = crate::services::system_env::expand_tilde(dir_part);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            Path::new(cwd).join(dir_part)
+        }
+    };
+
+    let Ok(read_dir) = std::fs::read_dir(&dir_path) else {
+        return Vec::new();
+    };
+
+    let mut entries = read_dir
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !prefix.is_empty() && !name.starts_with(prefix) && !matches_fuzzy(prefix, &name) {
+                return None;
+            }
+            let file_type = entry.file_type().ok()?;
+            let is_dir = file_type.is_dir();
+            let suffix = if is_dir { "/" } else { "" };
+            let display_name = format!("{name}{suffix}");
+            Some(PathMenuEntry {
+                label: display_name.clone(),
+                is_dir,
+                description: if is_dir { "directory" } else { "file" }.to_string(),
+                insertion_text: format!("/attach {dir_part}{display_name}"),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|a, b| {
+        // Prefix matches rank above fuzzy-only matches, then dirs before files, then alphabetical.
+        let a_prefix = a.label.starts_with(prefix);
+        let b_prefix = b.label.starts_with(prefix);
+        b_prefix
+            .cmp(&a_prefix)
+            .then_with(|| b.is_dir.cmp(&a.is_dir))
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+    });
+    entries.truncate(64);
+    entries
+}
+
 fn command_menu_area(
     composer_area: Rect,
     frame_area: Rect,
@@ -4119,33 +4528,36 @@ fn command_menu_area(
     let min_width = max_width.min(24);
     let width = composer_area.width.min(max_width).max(min_width);
     let row_count = item_count.clamp(1, COMMAND_MENU_MAX_ROWS) as u16;
-    let height = row_count.saturating_add(3).min(frame_area.height.max(4));
+    let desired_height = row_count.saturating_add(3);
     let above_space = composer_area.y.saturating_sub(frame_area.y);
     let below_space = frame_area
         .y
         .saturating_add(frame_area.height)
         .saturating_sub(composer_area.y.saturating_add(composer_area.height));
     let placement = preferred_placement.unwrap_or({
-        if above_space >= height || above_space >= below_space {
+        if above_space >= desired_height || above_space >= below_space {
             CommandMenuPlacement::Above
         } else {
             CommandMenuPlacement::Below
         }
     });
+    // Cap height to the available space in the chosen direction so the menu never
+    // overlaps the composer when space is tight.
+    let available = match placement {
+        CommandMenuPlacement::Above => above_space,
+        CommandMenuPlacement::Below => below_space,
+    };
+    let height = desired_height.min(available.max(4)).min(frame_area.height.max(4));
     let y = match placement {
         CommandMenuPlacement::Above => composer_area.y.saturating_sub(height).max(frame_area.y),
-        CommandMenuPlacement::Below => composer_area.y.saturating_add(composer_area.height).min(
-            frame_area
-                .y
-                .saturating_add(frame_area.height.saturating_sub(height)),
-        ),
+        CommandMenuPlacement::Below => composer_area.y.saturating_add(composer_area.height),
     };
     (Rect::new(composer_area.x, y, width, height), placement)
 }
 
 fn command_menu_item_line(
-    command: SlashCommandSpec,
     label: &str,
+    description: &str,
     selected: bool,
     width: u16,
     label_column_width: usize,
@@ -4161,7 +4573,7 @@ fn command_menu_item_line(
         .saturating_sub(COLUMN_GAP);
     let rendered_label = truncate_for_display_width(label, label_column_width.max(1));
     let rendered_description = if description_width >= 8 {
-        truncate_for_display_width(command.description, description_width)
+        truncate_for_display_width(description, description_width)
     } else {
         String::new()
     };
@@ -4221,7 +4633,10 @@ fn command_menu_item_line(
 fn render_command_menu_rows(menu: &VisibleCommandMenu, width: u16) -> Vec<Line<'static>> {
     if menu.entries.is_empty() {
         return vec![Line::from(Span::styled(
-            "No matching command",
+            match menu.kind {
+                MenuKind::Commands => "No matching command",
+                MenuKind::AttachPath => "No matching path",
+            },
             Style::default().fg(MUTED),
         ))];
     }
@@ -4240,7 +4655,7 @@ fn render_command_menu_rows(menu: &VisibleCommandMenu, width: u16) -> Vec<Line<'
         .max(1);
     let labels: Vec<String> = menu.entries[start..end]
         .iter()
-        .map(|command| command.command_label())
+        .map(ComposerMenuEntry::label)
         .collect();
     let label_column_width = labels
         .iter()
@@ -4253,10 +4668,10 @@ fn render_command_menu_rows(menu: &VisibleCommandMenu, width: u16) -> Vec<Line<'
         .iter()
         .zip(labels.iter())
         .enumerate()
-        .map(|(index, (command, label))| {
+        .map(|(index, (entry, label))| {
             command_menu_item_line(
-                **command,
                 label,
+                entry.description(),
                 start + index == selected,
                 width,
                 label_column_width,
@@ -4600,6 +5015,84 @@ fn cursor_position(text: &str, cursor: usize, width: u16, line_prefix_width: u16
     (x as u16, y as u16)
 }
 
+fn read_system_clipboard() -> Result<ClipboardPayload> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(attachment) = read_macos_clipboard_image()? {
+            return Ok(ClipboardPayload::Attachment(attachment));
+        }
+
+        let text = read_command_stdout("pbpaste", &[])?;
+        if text.is_empty() {
+            Ok(ClipboardPayload::Empty)
+        } else {
+            Ok(ClipboardPayload::Text(text))
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(ClipboardPayload::Empty)
+    }
+}
+
+fn read_command_stdout(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| anyhow::anyhow!("Failed to run '{}': {err}", program))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            anyhow::bail!("'{}' exited with {}", program, output.status);
+        }
+        anyhow::bail!("'{}' failed: {}", program, stderr);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_clipboard_image() -> Result<Option<MessageAttachment>> {
+    let script = r#"import AppKit
+import Foundation
+
+let pasteboard = NSPasteboard.general
+if let data = pasteboard.data(forType: .png) {
+    print(data.base64EncodedString())
+} else if
+    let tiff = pasteboard.data(forType: .tiff),
+    let image = NSImage(data: tiff),
+    let tiffData = image.tiffRepresentation,
+    let bitmap = NSBitmapImageRep(data: tiffData),
+    let png = bitmap.representation(using: .png, properties: [:])
+{
+    print(png.base64EncodedString())
+}
+"#;
+
+    let mut command = Command::new("swift");
+    command.env("CLANG_MODULE_CACHE_PATH", "/tmp/clang-module-cache");
+    command.arg("-e").arg(script);
+
+    let output = command
+        .output()
+        .map_err(|err| anyhow::anyhow!("Failed to access clipboard image: {err}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let data = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(MessageAttachment {
+        name: format!("clipboard-{}.png", Utc::now().format("%Y%m%d-%H%M%S")),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::Inline { data },
+    }))
+}
+
 fn format_time_ago_short(updated_at: &str) -> String {
     let parsed = DateTime::parse_from_rfc3339(updated_at)
         .map(|value| value.with_timezone(&Utc))
@@ -4635,6 +5128,16 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "resume" => Ok(SlashCommand::Resume(argument)),
         "model" => Ok(SlashCommand::Model(argument)),
         "key" => Ok(SlashCommand::Key(argument)),
+        "attach" => Ok(SlashCommand::Attach(
+            argument.ok_or_else(|| anyhow::anyhow!("Usage: /attach <path>"))?,
+        )),
+        "detach" => Ok(SlashCommand::Detach(
+            argument
+                .ok_or_else(|| anyhow::anyhow!("Usage: /detach <n>"))?
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("Usage: /detach <n>"))?,
+        )),
+        "clear" => Ok(SlashCommand::Clear),
         "help" => Ok(SlashCommand::Help),
         "" => anyhow::bail!("Type a command after '/'"),
         other => anyhow::bail!("Unknown command '/{other}'"),
@@ -4725,6 +5228,27 @@ mod tests {
     }
 
     #[test]
+    fn test_composer_cursor_position_offsets_attachment_rows() {
+        let (x, y) = cursor_position("hello", 5, 20, 2);
+        assert_eq!((x, y.saturating_add(1)), (7, 1));
+        let (x, y) = cursor_position("", 0, 20, 2);
+        assert_eq!((x, y.saturating_add(2)), (2, 2));
+    }
+
+    #[test]
+    fn test_insert_pasted_text_updates_draft_and_cursor() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft = "abc".to_string();
+        app.cursor = 1;
+
+        app.insert_pasted_text("XYZ");
+
+        assert_eq!(app.draft, "aXYZbc");
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
     fn test_question_mark_is_not_help_shortcut() {
         let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
         let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
@@ -4804,7 +5328,10 @@ mod tests {
         app.sync_command_menu_state();
         let menu = app.visible_command_menu().unwrap();
         assert_eq!(menu.entries.len(), 1);
-        assert_eq!(menu.entries[0].name, "model");
+        assert!(matches!(
+            menu.entries[0],
+            ComposerMenuEntry::Command(command) if command.name == "model"
+        ));
         assert_eq!(menu.selected, Some(0));
 
         app.draft = "//literal".to_string();
@@ -4958,7 +5485,10 @@ mod tests {
             .await
             .unwrap();
         let menu = app.visible_command_menu().unwrap();
-        assert_eq!(menu.entries[0].name, "model");
+        assert!(matches!(
+            menu.entries[0],
+            ComposerMenuEntry::Command(command) if command.name == "model"
+        ));
     }
 
     #[tokio::test]
@@ -4986,6 +5516,7 @@ mod tests {
     #[test]
     fn test_render_command_menu_rows_shows_empty_state() {
         let menu = VisibleCommandMenu {
+            kind: MenuKind::Commands,
             entries: Vec::new(),
             selected: None,
         };
@@ -4997,7 +5528,11 @@ mod tests {
     #[test]
     fn test_render_command_menu_rows_aligns_description_column() {
         let menu = VisibleCommandMenu {
-            entries: vec![&SLASH_COMMANDS[0], &SLASH_COMMANDS[2]],
+            kind: MenuKind::Commands,
+            entries: vec![
+                ComposerMenuEntry::Command(&SLASH_COMMANDS[0]),
+                ComposerMenuEntry::Command(&SLASH_COMMANDS[2]),
+            ],
             selected: Some(0),
         };
         let lines = render_command_menu_rows(&menu, 48);
@@ -5006,6 +5541,38 @@ mod tests {
         let first_desc = first.find("start a fresh chat").unwrap();
         let second_desc = second.find("resume a saved chat").unwrap();
         assert_eq!(first_desc, second_desc);
+    }
+
+    #[test]
+    fn test_collect_attach_path_suggestions_lists_matching_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("alpha.txt"), "hi").unwrap();
+        std::fs::create_dir(temp_dir.path().join("assets")).unwrap();
+
+        let entries = collect_attach_path_suggestions(temp_dir.path().to_str().unwrap(), "a");
+
+        assert!(entries.iter().any(|entry| entry.label == "assets/"));
+        assert!(entries.iter().any(|entry| entry.label == "alpha.txt"));
+    }
+
+    #[test]
+    fn test_attach_query_uses_path_menu_and_tab_inserts_selected_path() {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::create_dir(temp_dir.path().join("assets")).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.cwd = temp_dir.path().to_string_lossy().into_owned();
+        app.draft = "/attach a".to_string();
+        app.cursor = app.draft.len();
+        app.sync_command_menu_state();
+
+        let menu = app.visible_command_menu().unwrap();
+        assert_eq!(menu.kind, MenuKind::AttachPath);
+        assert!(app.insert_selected_command());
+        assert_eq!(app.draft, "/attach assets/");
+        // Menu stays open after tab on a directory so the user can continue navigating.
+        assert!(app.visible_command_menu().is_some());
     }
 
     #[test]
@@ -5052,6 +5619,7 @@ mod tests {
             format: ChatFormat::OpenAI,
             history: Vec::new(),
             draft: String::new(),
+            draft_attachments: Vec::new(),
             cursor: 0,
             command_menu: CommandMenuState::default(),
             draft_history: Vec::new(),
@@ -5163,6 +5731,7 @@ mod tests {
             role: "assistant".to_string(),
             content: "answer".to_string(),
             reasoning_content: Some("private reasoning".to_string()),
+            attachments: vec![],
         });
 
         let line = app.render_composer_text().lines[0].clone();
@@ -5473,9 +6042,18 @@ mod tests {
             SlashCommand::Model(Some("claude-sonnet-4".to_string()))
         );
         assert_eq!(
+            parse_slash_command("attach ./README.md").unwrap(),
+            SlashCommand::Attach("./README.md".to_string())
+        );
+        assert_eq!(
             parse_slash_command("resume").unwrap(),
             SlashCommand::Resume(None)
         );
+        assert_eq!(
+            parse_slash_command("detach 2").unwrap(),
+            SlashCommand::Detach(2)
+        );
+        assert_eq!(parse_slash_command("clear").unwrap(), SlashCommand::Clear);
     }
 
     #[test]
@@ -5490,15 +6068,105 @@ mod tests {
             role: "user".to_string(),
             content: "draft".to_string(),
             reasoning_content: None,
+            attachments: vec![],
         }];
         let mut draft = String::new();
-        let mut pending_submit = Some("draft".to_string());
+        let mut draft_attachments = Vec::new();
+        let mut pending_submit = Some(PendingSubmission {
+            content: "draft".to_string(),
+            attachments: Vec::new(),
+        });
 
-        restore_cancelled_submission(&mut history, &mut draft, &mut pending_submit);
+        restore_cancelled_submission(
+            &mut history,
+            &mut draft,
+            &mut draft_attachments,
+            &mut pending_submit,
+        );
 
         assert!(history.is_empty());
         assert_eq!(draft, "draft");
+        assert!(draft_attachments.is_empty());
         assert!(pending_submit.is_none());
+    }
+
+    #[test]
+    fn test_prepare_submit_action_allows_attachment_only_message() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft_attachments.push(MessageAttachment {
+            name: "notes.md".to_string(),
+            mime_type: "text/markdown".to_string(),
+            storage: AttachmentStorage::FileRef {
+                path: "./notes.md".to_string(),
+            },
+        });
+
+        assert!(matches!(
+            app.prepare_submit_action().unwrap(),
+            Some(SubmitAction::Send(input)) if input.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_detach_attachment_removes_selected_item() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft_attachments = vec![
+            MessageAttachment {
+                name: "one.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                storage: AttachmentStorage::FileRef {
+                    path: "./one.txt".to_string(),
+                },
+            },
+            MessageAttachment {
+                name: "two.png".to_string(),
+                mime_type: "image/png".to_string(),
+                storage: AttachmentStorage::FileRef {
+                    path: "./two.png".to_string(),
+                },
+            },
+        ];
+
+        app.detach_attachment(2).unwrap();
+
+        assert_eq!(app.draft_attachments.len(), 1);
+        assert_eq!(app.draft_attachments[0].name, "one.txt");
+        assert_eq!(
+            app.notice.as_ref().map(|(_, text)| text.as_str()),
+            Some("Removed image: two.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_draft_keeps_failed_attach_command_and_shows_notice() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.draft = "/attach ./definitely-missing-file.txt".to_string();
+        app.cursor = app.draft.len();
+
+        let should_exit = app.submit_draft().await.unwrap();
+
+        assert!(!should_exit);
+        assert_eq!(app.draft, "/attach ./definitely-missing-file.txt");
+        assert!(app.draft_attachments.is_empty());
+        assert!(app.notice.as_ref().is_some_and(
+            |(color, text)| *color == ERROR && text.contains("Failed to read attachment")
+        ));
+    }
+
+    #[test]
+    fn test_composer_attachment_lines_show_indices() {
+        let lines = composer_attachment_lines(&[MessageAttachment {
+            name: "hi.css".to_string(),
+            mime_type: "text/css".to_string(),
+            storage: AttachmentStorage::FileRef {
+                path: "./hi.css".to_string(),
+            },
+        }]);
+        let plain = plain_text_from_spans(&lines[0].spans);
+        assert_eq!(plain, "· 1. [file] hi.css");
     }
 
     #[test]
@@ -5509,8 +6177,12 @@ mod tests {
             role: "user".to_string(),
             content: "draft".to_string(),
             reasoning_content: None,
+            attachments: vec![],
         });
-        app.pending_submit = Some("draft".to_string());
+        app.pending_submit = Some(PendingSubmission {
+            content: "draft".to_string(),
+            attachments: Vec::new(),
+        });
         app.pending_response = "partial".to_string();
         app.sending = true;
         app.request_started_at = Some(Instant::now());
@@ -5541,8 +6213,12 @@ mod tests {
             role: "user".to_string(),
             content: "draft".to_string(),
             reasoning_content: None,
+            attachments: vec![],
         });
-        app.pending_submit = Some("draft".to_string());
+        app.pending_submit = Some(PendingSubmission {
+            content: "draft".to_string(),
+            attachments: Vec::new(),
+        });
         app.pending_response = "partial".to_string();
         app.sending = true;
         app.request_started_at = Some(Instant::now());
@@ -5615,11 +6291,13 @@ mod tests {
                         role: "assistant".to_string(),
                         content: "Hi".to_string(),
                         reasoning_content: None,
+                        attachments: vec![],
                     },
                     ChatMessage {
                         role: "user".to_string(),
                         content: "What is the deployment status for api gateway?".to_string(),
                         reasoning_content: None,
+                        attachments: vec![],
                     },
                 ],
                 "claude",
@@ -5641,11 +6319,13 @@ mod tests {
                     role: "user".to_string(),
                     content: "hello".to_string(),
                     reasoning_content: None,
+                    attachments: vec![],
                 },
                 ChatMessage {
                     role: "assistant".to_string(),
                     content: "hi there".to_string(),
                     reasoning_content: None,
+                    attachments: vec![],
                 },
             ],
             "claude",
@@ -5708,6 +6388,7 @@ mod tests {
             role: "user".to_string(),
             content: "old".to_string(),
             reasoning_content: None,
+            attachments: vec![],
         });
         app.pending_response = "pending".to_string();
         app.draft = "draft".to_string();
@@ -5905,6 +6586,7 @@ mod tests {
             role: "user".to_string(),
             content: "old".to_string(),
             reasoning_content: None,
+            attachments: vec![],
         });
         let preview = SessionPreview {
             key_id: app.key.id.clone(),

@@ -63,6 +63,20 @@ pub fn username() -> Option<String> {
     }
 }
 
+/// Expands a leading `~` to the user's home directory.
+/// Returns the path unchanged (as a `PathBuf`) if expansion is not needed or not possible.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
 /// Best-effort current working directory lookup with canonicalization when possible.
 pub fn current_dir() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
