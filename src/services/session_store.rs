@@ -98,6 +98,16 @@ pub enum GeminiProviderProtocol {
     Anthropic,
 }
 
+impl GeminiProviderProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenAICompatibilityMode {

@@ -404,9 +404,16 @@ impl AILauncher {
         let first = key.gemini_protocol.unwrap_or(preferred);
         let candidates = ordered_gemini_protocol_candidates(first, preferred);
 
-        for candidate in candidates {
+        for (index, candidate) in candidates.into_iter().enumerate() {
             match probe_gemini_protocol(&key, candidate).await {
                 ClaudeProtocolProbeOutcome::Supported => {
+                    if index > 0 {
+                        eprintln!(
+                            "  {} Gemini protocol auto-switched to {}",
+                            crate::style::bullet_symbol(),
+                            candidate.as_str()
+                        );
+                    }
                     if key.gemini_protocol != Some(candidate) {
                         key.gemini_protocol = Some(candidate);
                         if persist {
@@ -643,12 +650,24 @@ fn ordered_claude_protocol_candidates(
     preferred: ClaudeProviderProtocol,
 ) -> Vec<ClaudeProviderProtocol> {
     let mut candidates = vec![first];
-    for protocol in [
-        preferred,
-        ClaudeProviderProtocol::Openai,
-        ClaudeProviderProtocol::Anthropic,
-        ClaudeProviderProtocol::Google,
-    ] {
+    // Only include Google as a fallback when the URL looks like a Google endpoint.
+    // A generic GET probe to an unknown path can return 401 on any server, causing
+    // false positives when Google is tried as a last resort.
+    let pool = if preferred == ClaudeProviderProtocol::Google {
+        vec![
+            preferred,
+            ClaudeProviderProtocol::Openai,
+            ClaudeProviderProtocol::Anthropic,
+            ClaudeProviderProtocol::Google,
+        ]
+    } else {
+        vec![
+            preferred,
+            ClaudeProviderProtocol::Openai,
+            ClaudeProviderProtocol::Anthropic,
+        ]
+    };
+    for protocol in pool {
         if !candidates.contains(&protocol) {
             candidates.push(protocol);
         }
@@ -661,12 +680,22 @@ fn ordered_gemini_protocol_candidates(
     preferred: GeminiProviderProtocol,
 ) -> Vec<GeminiProviderProtocol> {
     let mut candidates = vec![first];
-    for protocol in [
-        preferred,
-        GeminiProviderProtocol::Google,
-        GeminiProviderProtocol::Openai,
-        GeminiProviderProtocol::Anthropic,
-    ] {
+    // Only include Google as a fallback when the URL looks like a Google endpoint.
+    let pool = if preferred == GeminiProviderProtocol::Google {
+        vec![
+            preferred,
+            GeminiProviderProtocol::Google,
+            GeminiProviderProtocol::Openai,
+            GeminiProviderProtocol::Anthropic,
+        ]
+    } else {
+        vec![
+            preferred,
+            GeminiProviderProtocol::Openai,
+            GeminiProviderProtocol::Anthropic,
+        ]
+    };
+    for protocol in pool {
         if !candidates.contains(&protocol) {
             candidates.push(protocol);
         }
