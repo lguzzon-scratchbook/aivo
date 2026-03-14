@@ -73,6 +73,30 @@ pub fn google_native_model_name(model: &str) -> &str {
     model.strip_prefix("google/").unwrap_or(model)
 }
 
+pub fn anthropic_native_model_name(model: &str) -> String {
+    let stripped = model.strip_prefix("anthropic/").unwrap_or(model);
+    if !stripped.starts_with("claude-") {
+        return stripped.to_string();
+    }
+
+    if let Some(dot_pos) = stripped.find('.')
+        && stripped[..dot_pos]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_digit())
+        && stripped[dot_pos + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    {
+        let mut normalized = stripped.to_string();
+        normalized.replace_range(dot_pos..=dot_pos, "-");
+        return normalized;
+    }
+
+    stripped.to_string()
+}
+
 pub fn is_gateway_style_endpoint(base_url: &str) -> bool {
     let lower = base_url.trim().to_ascii_lowercase();
     lower.contains("/endpoint") || lower.contains("gateway")
@@ -295,6 +319,19 @@ mod tests {
             "gemini-2.5-pro"
         );
         assert_eq!(google_native_model_name("gemini-2.5-pro"), "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn test_anthropic_native_model_name_normalizes_claude_versions() {
+        assert_eq!(
+            anthropic_native_model_name("anthropic/claude-sonnet-4.6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            anthropic_native_model_name("claude-haiku-4.5-20251001"),
+            "claude-haiku-4-5-20251001"
+        );
+        assert_eq!(anthropic_native_model_name("MiniMax-M1"), "MiniMax-M1");
     }
 
     #[test]

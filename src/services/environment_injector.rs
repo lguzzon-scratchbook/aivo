@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::services::codex_model_map::map_model_for_codex_cli;
-use crate::services::model_names::google_native_model_name;
+use crate::services::model_names::{anthropic_native_model_name, google_native_model_name};
 use crate::services::provider_profile::{is_direct_openai_base, provider_profile_for_key};
 use crate::services::provider_protocol::{ProviderProtocol, is_anthropic_endpoint};
 use crate::services::session_store::{
@@ -146,23 +146,30 @@ impl EnvironmentInjector {
         );
 
         if let Some(model) = model {
-            // Router handles OpenRouter model names transformation internally
-            // Send the model name as-is; the router will transform it
-            env.insert("ANTHROPIC_MODEL".to_string(), model.to_string());
-            env.insert("ANTHROPIC_SMALL_FAST_MODEL".to_string(), model.to_string());
+            let anthropic_model = if Self::use_direct_anthropic_for_claude(key) {
+                anthropic_native_model_name(model)
+            } else {
+                // Routers handle provider-specific model-name transformation internally.
+                model.to_string()
+            };
+            env.insert("ANTHROPIC_MODEL".to_string(), anthropic_model.clone());
+            env.insert(
+                "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
+                anthropic_model.clone(),
+            );
             env.insert(
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-                model.to_string(),
+                anthropic_model.clone(),
             );
             env.insert(
                 "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
-                model.to_string(),
+                anthropic_model.clone(),
             );
             env.insert(
                 "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
-                model.to_string(),
+                anthropic_model.clone(),
             );
-            env.insert("ANTHROPIC_REASONING_MODEL".to_string(), model.to_string());
+            env.insert("ANTHROPIC_REASONING_MODEL".to_string(), anthropic_model);
         }
 
         env
@@ -517,6 +524,23 @@ mod tests {
             Some(&"1".to_string())
         );
         assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_claude_anthropic_native_direct_normalizes_dotted_claude_model() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.anthropic.com/v1".to_string();
+        let env = injector.for_claude(&key, Some("claude-sonnet-4.6"));
+
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-sonnet-4-6".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&"claude-sonnet-4-6".to_string())
+        );
     }
 
     #[test]
