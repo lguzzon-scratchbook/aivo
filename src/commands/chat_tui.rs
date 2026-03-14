@@ -1393,10 +1393,12 @@ impl ChatTuiApp {
             return Ok(false);
         }
 
-        if matches!(key.code, KeyCode::Enter) && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && command_menu_visible {
-                return self.execute_selected_command().await;
-            }
+        if matches!(key.code, KeyCode::Enter)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && command_menu_visible
+        {
+            return self.execute_selected_command().await;
+        }
 
         if matches!(key.code, KeyCode::Tab) && self.insert_selected_command() {
             return Ok(false);

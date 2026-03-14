@@ -6,115 +6,12 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::services::provider_protocol::{
-    ProviderProtocol, detect_provider_protocol, is_anthropic_endpoint,
-};
+use crate::services::codex_model_map::map_model_for_codex_cli;
+use crate::services::provider_profile::{is_direct_openai_base, provider_profile_for_key};
+use crate::services::provider_protocol::{ProviderProtocol, is_anthropic_endpoint};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
 };
-
-/// Provider-specific routing quirks inferred from the base URL.
-///
-/// Some providers have non-standard requirements that cannot be expressed through
-/// the `ClaudeProviderProtocol` / `OpenAICompatibilityMode` enums alone.  Rather
-/// than scattering `base_url.contains(...)` checks throughout every `for_*` method
-/// this struct centralises the detection in one place.
-struct ProviderQuirks {
-    /// Cloudflare Workers AI requires a `@cf/` prefix on all model names.
-    pub model_prefix: Option<&'static str>,
-    /// Provider requires `reasoning_content` to be round-tripped on assistant turns
-    /// (Moonshot, DeepSeek reasoning models).
-    pub requires_reasoning_content: bool,
-    /// Hard upper bound on `max_tokens` imposed by the provider (e.g. DeepSeek = 8192).
-    pub max_tokens_cap: Option<u64>,
-}
-
-impl ProviderQuirks {
-    fn for_base_url(base_url: &str) -> Self {
-        let model_prefix = if base_url.contains("cloudflare.com") {
-            Some("@cf/")
-        } else {
-            None
-        };
-        let requires_reasoning_content = base_url.contains("moonshot.cn")
-            || base_url.contains("moonshot.ai")
-            || base_url.contains("deepseek.com");
-        let max_tokens_cap = if base_url.contains("deepseek.com") {
-            Some(8192)
-        } else {
-            None
-        };
-        Self {
-            model_prefix,
-            requires_reasoning_content,
-            max_tokens_cap,
-        }
-    }
-
-    /// Injects the quirk env vars into `env` using the given key prefix (e.g. `"AIVO_OPENAI_ROUTER"`).
-    fn inject(&self, env: &mut std::collections::HashMap<String, String>, prefix: &str) {
-        if let Some(pfx) = self.model_prefix {
-            env.insert(format!("{prefix}_MODEL_PREFIX"), pfx.to_string());
-        }
-        if self.requires_reasoning_content {
-            env.insert(format!("{prefix}_REQUIRE_REASONING"), "1".to_string());
-        }
-        if let Some(cap) = self.max_tokens_cap {
-            env.insert(format!("{prefix}_MAX_TOKENS_CAP"), cap.to_string());
-        }
-    }
-}
-
-/// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
-/// This prevents the "Model metadata not found" warning from Codex CLI.
-fn map_model_for_codex_cli(model: &str) -> String {
-    let model_lower = model.to_lowercase();
-
-    // OpenAI models pass through unchanged
-    if model_lower.starts_with("gpt-")
-        || model_lower.starts_with("o1")
-        || model_lower.starts_with("o3")
-        || model_lower.starts_with("o4")
-        || model_lower.starts_with("chatgpt")
-    {
-        return model.to_string();
-    }
-
-    // Strip provider prefix (e.g., "moonshot/kimi-k2.5" -> "kimi-k2.5")
-    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
-
-    // High-capability/reasoning models -> o1 (for reasoning) or gpt-4o (for general)
-    let is_high_capability = name_only.contains("opus")
-        || name_only.contains("405b")
-        || name_only.contains("r1")
-        || name_only.contains("reasoner")
-        || name_only.contains("k2.5")
-        || name_only.contains("k2-5")
-        || name_only.contains("large")
-        || name_only.contains("pro");
-
-    // Lightweight/fast models -> gpt-4o-mini
-    let is_lightweight = name_only.contains("flash")
-        || name_only.contains("haiku")
-        || name_only.contains("small")
-        || name_only.contains("mini")
-        || name_only.contains("8b")
-        || name_only.contains("11b");
-
-    if is_high_capability {
-        // Reasoning-focused models get o1, others get gpt-4o
-        if name_only.contains("reasoner") || name_only.contains("r1") {
-            "o1".to_string()
-        } else {
-            "gpt-4o".to_string()
-        }
-    } else if is_lightweight {
-        "gpt-4o-mini".to_string()
-    } else {
-        // Default fallback for everything else
-        "gpt-4o".to_string()
-    }
-}
 
 /// EnvironmentInjector prepares tool-specific environment variables for AI tools
 #[derive(Debug, Clone, Default)]
@@ -138,7 +35,7 @@ impl EnvironmentInjector {
         match key.codex_mode {
             Some(OpenAICompatibilityMode::Direct) => true,
             Some(OpenAICompatibilityMode::Router) => false,
-            None => key.base_url.contains("api.openai.com"),
+            None => is_direct_openai_base(&key.base_url),
         }
     }
 
@@ -146,7 +43,7 @@ impl EnvironmentInjector {
         match key.gemini_protocol {
             Some(GeminiProviderProtocol::Google) => true,
             Some(GeminiProviderProtocol::Openai | GeminiProviderProtocol::Anthropic) => false,
-            None => detect_provider_protocol(&key.base_url) == ProviderProtocol::Google,
+            None => provider_profile_for_key(key).default_protocol == ProviderProtocol::Google,
         }
     }
 
@@ -159,7 +56,7 @@ impl EnvironmentInjector {
             Some(ClaudeProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
             Some(ClaudeProviderProtocol::Openai) => ProviderProtocol::Openai,
             Some(ClaudeProviderProtocol::Google) => ProviderProtocol::Google,
-            None => detect_provider_protocol(&key.base_url),
+            None => provider_profile_for_key(key).default_protocol,
         }
     }
 
@@ -168,7 +65,7 @@ impl EnvironmentInjector {
             Some(GeminiProviderProtocol::Google) => ProviderProtocol::Google,
             Some(GeminiProviderProtocol::Openai) => ProviderProtocol::Openai,
             Some(GeminiProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
-            None => detect_provider_protocol(&key.base_url),
+            None => provider_profile_for_key(key).default_protocol,
         }
     }
 
@@ -185,9 +82,10 @@ impl EnvironmentInjector {
     /// For OpenRouter, uses AnthropicRouter if available, otherwise applies model name transformation.
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
+        let profile = provider_profile_for_key(key);
 
         // For GitHub Copilot, use the built-in CopilotRouter (Anthropic → OpenAI conversion + token management)
-        if key.base_url == "copilot" {
+        if profile.serve_flags.is_copilot {
             // Placeholder URL - AI launcher overwrites with the actual random port after binding
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -197,7 +95,7 @@ impl EnvironmentInjector {
             env.insert("AIVO_USE_COPILOT_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
         // For OpenRouter, use the built-in router (needs model name transformation + API proxying)
-        } else if key.base_url.contains("openrouter") {
+        } else if profile.serve_flags.is_openrouter {
             // Placeholder URL - AI launcher overwrites with the actual random port after binding
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -238,7 +136,7 @@ impl EnvironmentInjector {
                 "AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 Self::routed_protocol_for_claude(key).as_str().to_string(),
             );
-            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_OPENAI_ROUTER");
+            profile.quirks.inject(&mut env, "AIVO_OPENAI_ROUTER");
         }
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
         env.insert(
@@ -276,8 +174,9 @@ impl EnvironmentInjector {
     /// For official OpenAI (api.openai.com), connects directly.
     pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
+        let profile = provider_profile_for_key(key);
 
-        if key.base_url == "copilot" {
+        if profile.serve_flags.is_copilot {
             // GitHub Copilot: use CodexRouter with CopilotTokenManager for auth
             // Placeholder URL — AI launcher overwrites with actual random port after binding
             env.insert(
@@ -303,9 +202,9 @@ impl EnvironmentInjector {
             );
             env.insert(
                 "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                detect_provider_protocol(&key.base_url).as_str().to_string(),
+                profile.default_protocol.as_str().to_string(),
             );
-            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_CODEX_ROUTER");
+            profile.quirks.inject(&mut env, "AIVO_CODEX_ROUTER");
         } else {
             // Official OpenAI: direct connection, no proxy needed
             env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
@@ -344,8 +243,9 @@ impl EnvironmentInjector {
     /// When model is provided, sets GEMINI_MODEL.
     pub fn for_gemini(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         let mut env = HashMap::new();
+        let profile = provider_profile_for_key(key);
 
-        if key.base_url == "copilot" {
+        if profile.serve_flags.is_copilot {
             env.insert(
                 "GOOGLE_GEMINI_BASE_URL".to_string(),
                 "http://127.0.0.1:0".to_string(),
@@ -387,7 +287,7 @@ impl EnvironmentInjector {
                 "AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 Self::routed_protocol_for_gemini(key).as_str().to_string(),
             );
-            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_GEMINI_ROUTER");
+            profile.quirks.inject(&mut env, "AIVO_GEMINI_ROUTER");
         }
 
         if let Some(model) = model {
@@ -408,10 +308,11 @@ impl EnvironmentInjector {
         discovered_models: Option<&[String]>,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
+        let profile = provider_profile_for_key(key);
 
         // For GitHub Copilot, the base_url is the magic string "copilot" — not a real URL.
         // Use a placeholder that ai_launcher will overwrite with the actual CopilotRouter port.
-        let (base_url, api_key) = if key.base_url == "copilot" {
+        let (base_url, api_key) = if profile.serve_flags.is_copilot {
             env.insert(
                 "AIVO_USE_OPENCODE_COPILOT_ROUTER".to_string(),
                 "1".to_string(),
@@ -427,9 +328,9 @@ impl EnvironmentInjector {
             );
             env.insert(
                 "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                detect_provider_protocol(&key.base_url).as_str().to_string(),
+                profile.default_protocol.as_str().to_string(),
             );
-            ProviderQuirks::for_base_url(&key.base_url).inject(&mut env, "AIVO_CODEX_ROUTER");
+            profile.quirks.inject(&mut env, "AIVO_CODEX_ROUTER");
             ("http://127.0.0.1:0".to_string(), key.key.to_string())
         } else {
             (key.base_url.clone(), key.key.to_string())

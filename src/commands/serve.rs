@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::net::IpAddr;
 
 use crate::errors::ExitCode;
-use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
+use crate::services::provider_profile::provider_profile_for_key;
 use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -43,13 +43,10 @@ impl ServeCommand {
             },
         };
 
-        let is_copilot = key.base_url == "copilot";
-        let is_openrouter = key.base_url.contains("openrouter");
-        let upstream_protocol = if is_copilot {
-            ProviderProtocol::Openai
-        } else {
-            detect_provider_protocol(&key.base_url)
-        };
+        let profile = provider_profile_for_key(&key);
+        let is_copilot = profile.serve_flags.is_copilot;
+        let is_openrouter = profile.serve_flags.is_openrouter;
+        let upstream_protocol = profile.default_protocol;
 
         if is_self_proxy_target(&key.base_url, port) {
             anyhow::bail!(

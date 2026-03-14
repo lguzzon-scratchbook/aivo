@@ -13,9 +13,13 @@ use tokio::signal;
 
 use crate::commands::normalize_base_url;
 use crate::errors::{CLIError, ErrorCategory};
+use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::environment_injector::EnvironmentInjector;
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
+use crate::services::provider_profile::{
+    is_copilot_base, is_direct_openai_base, provider_profile_for_base_url,
+};
 use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode, SessionStore,
@@ -318,7 +322,8 @@ impl AILauncher {
         persist: bool,
         model: Option<&str>,
     ) -> Result<ApiKey> {
-        if key.base_url == "copilot" || key.base_url.contains("openrouter") {
+        let profile = provider_profile_for_base_url(&key.base_url);
+        if profile.serve_flags.is_copilot || profile.serve_flags.is_openrouter {
             return Ok(key);
         }
 
@@ -360,7 +365,7 @@ impl AILauncher {
     }
 
     async fn resolve_codex_mode(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
-        if key.base_url == "copilot" {
+        if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
 
@@ -391,7 +396,7 @@ impl AILauncher {
     }
 
     async fn resolve_gemini_protocol(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
-        if key.base_url == "copilot" {
+        if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
 
@@ -426,7 +431,7 @@ impl AILauncher {
     }
 
     async fn resolve_opencode_mode(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
-        if key.base_url == "copilot" {
+        if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
 
@@ -602,7 +607,7 @@ impl AILauncher {
 }
 
 fn preferred_claude_protocol(base_url: &str) -> ClaudeProviderProtocol {
-    match detect_provider_protocol(base_url) {
+    match provider_profile_for_base_url(base_url).default_protocol {
         ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
         ProviderProtocol::Google => ClaudeProviderProtocol::Google,
         ProviderProtocol::Openai => ClaudeProviderProtocol::Openai,
@@ -610,8 +615,7 @@ fn preferred_claude_protocol(base_url: &str) -> ClaudeProviderProtocol {
 }
 
 fn preferred_codex_mode(base_url: &str) -> OpenAICompatibilityMode {
-    let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
-    if normalized.contains("api.openai.com") {
+    if is_direct_openai_base(base_url) {
         OpenAICompatibilityMode::Direct
     } else {
         OpenAICompatibilityMode::Router
@@ -619,7 +623,7 @@ fn preferred_codex_mode(base_url: &str) -> OpenAICompatibilityMode {
 }
 
 fn preferred_gemini_protocol(base_url: &str) -> GeminiProviderProtocol {
-    match detect_provider_protocol(base_url) {
+    match provider_profile_for_base_url(base_url).default_protocol {
         ProviderProtocol::Google => GeminiProviderProtocol::Google,
         ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
         ProviderProtocol::Openai => GeminiProviderProtocol::Openai,
@@ -627,7 +631,7 @@ fn preferred_gemini_protocol(base_url: &str) -> GeminiProviderProtocol {
 }
 
 fn preferred_opencode_mode(base_url: &str) -> OpenAICompatibilityMode {
-    if detect_provider_protocol(base_url) == ProviderProtocol::Openai {
+    if provider_profile_for_base_url(base_url).default_protocol == ProviderProtocol::Openai {
         OpenAICompatibilityMode::Direct
     } else {
         OpenAICompatibilityMode::Router
@@ -1163,54 +1167,6 @@ fn inject_codex_model(model: Option<&str>, args: &[String], use_router: bool) ->
     let mut new_args = vec!["-m".to_string(), codex_model];
     new_args.extend_from_slice(args);
     new_args
-}
-
-/// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
-fn map_model_for_codex_cli(model: &str) -> String {
-    let model_lower = model.to_lowercase();
-
-    // OpenAI models pass through unchanged
-    if model_lower.starts_with("gpt-")
-        || model_lower.starts_with("o1")
-        || model_lower.starts_with("o3")
-        || model_lower.starts_with("o4")
-        || model_lower.starts_with("chatgpt")
-    {
-        return model.to_string();
-    }
-
-    // Strip provider prefix (e.g., "moonshot/kimi-k2.5" -> "kimi-k2.5")
-    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
-
-    // High-capability/reasoning models -> o1 (for reasoning) or gpt-4o (for general)
-    let is_high_capability = name_only.contains("opus")
-        || name_only.contains("405b")
-        || name_only.contains("r1")
-        || name_only.contains("reasoner")
-        || name_only.contains("k2.5")
-        || name_only.contains("k2-5")
-        || name_only.contains("large")
-        || name_only.contains("pro");
-
-    // Lightweight/fast models -> gpt-4o-mini
-    let is_lightweight = name_only.contains("flash")
-        || name_only.contains("haiku")
-        || name_only.contains("small")
-        || name_only.contains("mini")
-        || name_only.contains("8b")
-        || name_only.contains("11b");
-
-    if is_high_capability {
-        if name_only.contains("reasoner") || name_only.contains("r1") {
-            "o1".to_string()
-        } else {
-            "gpt-4o".to_string()
-        }
-    } else if is_lightweight {
-        "gpt-4o-mini".to_string()
-    } else {
-        "gpt-4o".to_string()
-    }
 }
 
 /// Injects `--config model_catalog_json="<path>"` for Codex unless already provided.

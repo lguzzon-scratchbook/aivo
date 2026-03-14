@@ -1,3 +1,4 @@
+use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, current_unix_ts};
 use crate::services::model_names::select_model_for_protocol;
@@ -422,54 +423,6 @@ fn transform_model_str(model: &str, base_url: &str, model_prefix: Option<&str>) 
         format!("openai/{}", with_prefix)
     } else {
         with_prefix
-    }
-}
-
-/// Maps non-OpenAI model names to OpenAI equivalents that Codex CLI recognizes.
-/// This is ONLY used in the response back to Codex, NOT in requests to providers.
-fn map_model_for_codex_cli(model: &str) -> String {
-    // OpenAI models pass through unchanged
-    let model_lower = model.to_lowercase();
-    if model_lower.starts_with("gpt-")
-        || model_lower.starts_with("o1")
-        || model_lower.starts_with("o3")
-    {
-        return model.to_string();
-    }
-
-    // Strip provider prefix (e.g., "moonshot/kimi-k2.5" -> "kimi-k2.5")
-    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
-
-    // High-capability/reasoning models -> o1 (for reasoning) or gpt-4o (for general)
-    let is_high_capability = name_only.contains("opus")
-        || name_only.contains("405b")
-        || name_only.contains("r1")
-        || name_only.contains("reasoner")
-        || name_only.contains("k2.5")
-        || name_only.contains("k2-5")
-        || name_only.contains("large")
-        || name_only.contains("pro");
-
-    // Lightweight/fast models -> gpt-4o-mini
-    let is_lightweight = name_only.contains("flash")
-        || name_only.contains("haiku")
-        || name_only.contains("small")
-        || name_only.contains("mini")
-        || name_only.contains("8b")
-        || name_only.contains("11b");
-
-    if is_high_capability {
-        // Reasoning-focused models get o1, others get gpt-4o
-        if name_only.contains("reasoner") || name_only.contains("r1") {
-            "o1".to_string()
-        } else {
-            "gpt-4o".to_string()
-        }
-    } else if is_lightweight {
-        "gpt-4o-mini".to_string()
-    } else {
-        // Default fallback for everything else
-        "gpt-4o".to_string()
     }
 }
 
