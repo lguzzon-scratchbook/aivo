@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use crate::commands::models::fetch_models;
 use crate::services::codex_router::{
@@ -26,7 +26,7 @@ use crate::services::openai_gemini_bridge::{
     build_google_stream_generate_content_url, convert_gemini_to_openai_chat_response,
     convert_openai_chat_to_gemini_request,
 };
-use crate::services::provider_protocol::ProviderProtocol;
+use crate::services::provider_protocol::{ProviderProtocol, fallback_protocols, is_protocol_mismatch};
 use crate::services::session_store::ApiKey;
 
 pub struct ServeRouterConfig {
@@ -47,6 +47,7 @@ struct ServeState {
     client: reqwest::Client,
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
+    active_protocol: Arc<AtomicU8>,
 }
 
 enum RouterResponse {
@@ -151,6 +152,7 @@ enum ResponsesOutputItem {
 
 static RESPONSES_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+
 impl ServeRouter {
     pub fn new(config: ServeRouterConfig, key: ApiKey) -> Self {
         Self { config, key }
@@ -169,11 +171,14 @@ impl ServeRouter {
             None
         };
 
+        let initial_protocol = self.config.upstream_protocol;
+
         let state = Arc::new(ServeState {
             config: Arc::new(self.config),
             client: router_http_client(),
             key: self.key,
             copilot_tokens,
+            active_protocol: Arc::new(AtomicU8::new(initial_protocol.to_u8())),
         });
 
         Ok(tokio::spawn(run_accept_loop(listener, state)))
@@ -280,7 +285,16 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let mut chat_body = convert_responses_to_chat_request(&body, &responses_router_config(state));
+    // Use `actual_model` to pin the model name to the raw user-supplied value.  The config's
+    // `target_protocol` is snapshotted here, before `handle_chat_body` runs the fallback loop;
+    // if the loop switches protocol, any protocol-based model-name transformation done by
+    // `convert_responses_to_chat_request` would have used the wrong protocol.  Setting
+    // `actual_model` causes `select_model_for_protocol` to return it verbatim, so the model
+    // field in `chat_body` is always the original string and `handle_chat_body` transforms it
+    // for the protocol that is actually selected.
+    let mut config = responses_router_config(state);
+    config.actual_model = Some(original_model.clone());
+    let mut chat_body = convert_responses_to_chat_request(&body, &config);
     chat_body["stream"] = json!(client_wants_stream);
     let chat_response = handle_chat_body(chat_body, state).await?;
 
@@ -340,26 +354,82 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
     }
 }
 
-async fn handle_chat_body(mut body: Value, state: &ServeState) -> Result<RouterResponse> {
+async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
     let client_wants_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    match state.config.upstream_protocol {
-        ProviderProtocol::Anthropic => {
-            handle_chat_anthropic(&body, client_wants_stream, state).await
-        }
-        ProviderProtocol::Google => handle_chat_gemini(&mut body, client_wants_stream, state).await,
-        ProviderProtocol::Openai => handle_chat_openai(&mut body, client_wants_stream, state).await,
+    // Skip fallback for copilot/openrouter — these have fixed protocols
+    if state.config.is_copilot || state.config.is_openrouter {
+        let mut body = body;
+        return match ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed)) {
+            ProviderProtocol::Anthropic => {
+                handle_chat_anthropic(&body, client_wants_stream, state).await
+            }
+            ProviderProtocol::Google => {
+                handle_chat_gemini(&mut body, client_wants_stream, state).await
+            }
+            ProviderProtocol::Openai => {
+                handle_chat_openai(&mut body, client_wants_stream, state).await
+            }
+        };
     }
+
+    let current = ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed));
+    let candidates: Vec<ProviderProtocol> = std::iter::once(current)
+        .chain(fallback_protocols(current, &state.config.upstream_base_url))
+        .collect();
+
+    let mut last_response: Option<RouterResponse> = None;
+    for (attempt, protocol) in candidates.into_iter().enumerate() {
+        let mut body_clone = body.clone();
+        let response = match protocol {
+            ProviderProtocol::Anthropic => {
+                handle_chat_anthropic(&body_clone, client_wants_stream, state).await?
+            }
+            ProviderProtocol::Google => {
+                handle_chat_gemini(&mut body_clone, client_wants_stream, state).await?
+            }
+            ProviderProtocol::Openai => {
+                handle_chat_openai(&mut body_clone, client_wants_stream, state).await?
+            }
+        };
+
+        let status = match &response {
+            RouterResponse::Buffered { status, .. } => *status,
+            // Streaming is only produced when the upstream returned 200 (see each handle_chat_* handler);
+            // a protocol mismatch (404/405/415) always results in a Buffered error response.
+            RouterResponse::Streaming { .. } => 200,
+        };
+
+        if is_protocol_mismatch(status) {
+            last_response = Some(response);
+            continue;
+        }
+
+        // Not a mismatch — return this response
+        if attempt > 0 {
+            state
+                .active_protocol
+                .store(protocol.to_u8(), Ordering::Relaxed);
+            eprintln!("  \u{2022} Protocol auto-switched to {}", protocol.as_str());
+        }
+        return Ok(response);
+    }
+
+    Ok(last_response.unwrap_or(buffered_response(
+        503,
+        "application/json",
+        br#"{"error":{"message":"No compatible protocol found"}}"#.to_vec(),
+    )))
 }
 
 fn responses_router_config(state: &ServeState) -> CodexRouterConfig {
     CodexRouterConfig {
         target_base_url: state.config.upstream_base_url.clone(),
         api_key: state.config.upstream_api_key.clone(),
-        target_protocol: state.config.upstream_protocol,
+        target_protocol: ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed)),
         copilot_token_manager: state.copilot_tokens.clone(),
         model_prefix: None,
         requires_reasoning_content: false,
