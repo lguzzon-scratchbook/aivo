@@ -307,7 +307,7 @@ impl AILauncher {
                 2 => Some(false),
                 _ => None,
             };
-            if final_val != resolved.key.codex_responses_api {
+            if final_val.is_some() && final_val != resolved.key.codex_responses_api {
                 let _ = self
                     .session_store
                     .set_key_codex_responses_api(&resolved.key.id, final_val)

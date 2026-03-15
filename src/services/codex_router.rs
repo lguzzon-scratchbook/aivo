@@ -246,22 +246,23 @@ async fn try_responses_api_passthrough(
         )));
     }
 
-    // Validate the response looks like a real Responses API response.
-    // Some gateways return 200 on /v1/responses but produce Chat Completions
-    // or incomplete output; detect that and fall back to conversion.
-    let looks_like_responses_api = if content_type.contains("text/event-stream") {
-        response_body.contains("response.completed")
-    } else {
-        response_body.contains("\"object\":\"response\"")
-            || response_body.contains("\"object\": \"response\"")
-    };
+    // Only validate on the first probe (unknown state).  Once confirmed,
+    // skip the scan over the full response body on every subsequent request.
+    if responses_api_supported.load(Ordering::Relaxed) != 1 {
+        let looks_like_responses_api = if content_type.contains("text/event-stream") {
+            response_body.contains("response.completed")
+        } else {
+            response_body.contains("\"object\":\"response\"")
+                || response_body.contains("\"object\": \"response\"")
+        };
 
-    if !looks_like_responses_api {
-        responses_api_supported.store(2, Ordering::Relaxed);
-        return None;
+        if !looks_like_responses_api {
+            responses_api_supported.store(2, Ordering::Relaxed);
+            return None;
+        }
+
+        responses_api_supported.store(1, Ordering::Relaxed);
     }
-
-    responses_api_supported.store(1, Ordering::Relaxed);
     Some(Ok(http_utils::http_response(
         status,
         &content_type,
