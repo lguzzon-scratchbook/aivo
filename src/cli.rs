@@ -97,7 +97,13 @@ pub struct RunArgs {
     pub model: Option<String>,
 
     /// Select API key by ID or name
-    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "ID|NAME",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub key: Option<String>,
 
     /// Enable debug output
@@ -122,7 +128,13 @@ pub struct RunArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ModelsArgs {
     /// Select API key by ID or name
-    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "ID|NAME",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub key: Option<String>,
 
     /// Bypass cache and fetch fresh model list from the provider
@@ -138,7 +150,13 @@ pub struct ServeArgs {
     pub port: u16,
 
     /// Select API key by ID or name
-    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "ID|NAME",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub key: Option<String>,
 }
 
@@ -158,11 +176,23 @@ pub struct ChatArgs {
     pub model: Option<String>,
 
     /// Select API key by ID or name
-    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "ID|NAME",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub key: Option<String>,
 
     /// Send one message, print response, then exit (non-interactive)
-    #[arg(short = 'x', long = "execute", value_name = "MESSAGE", value_parser = non_empty())]
+    #[arg(
+        short = 'x',
+        long = "execute",
+        value_name = "MESSAGE",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub execute: Option<String>,
 
     /// Attach a file or image to the next chat message (repeatable)
@@ -601,6 +631,16 @@ mod tests {
     }
 
     #[test]
+    fn test_run_args_key_no_value() {
+        let cli = Cli::try_parse_from(["aivo", "run", "claude", "-k"]).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.key, Some(String::new()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
     fn test_run_args_key_equals_syntax() {
         let cli = Cli::try_parse_from(["aivo", "run", "claude", "--key=my-key"]).unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
@@ -631,6 +671,36 @@ mod tests {
     }
 
     #[test]
+    fn test_models_args_key_no_value() {
+        let cli = Cli::try_parse_from(["aivo", "models", "-k"]).unwrap();
+        if let Some(Commands::Models(models_args)) = cli.command {
+            assert_eq!(models_args.key, Some(String::new()));
+        } else {
+            panic!("Expected Models command");
+        }
+    }
+
+    #[test]
+    fn test_serve_args_key_no_value() {
+        let cli = Cli::try_parse_from(["aivo", "serve", "-k"]).unwrap();
+        if let Some(Commands::Serve(serve_args)) = cli.command {
+            assert_eq!(serve_args.key, Some(String::new()));
+        } else {
+            panic!("Expected Serve command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_key_no_value() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-k"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.key, Some(String::new()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
     fn test_chat_args_key_with_model() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o"]).unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
@@ -646,6 +716,16 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello"]).unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
             assert_eq!(chat_args.execute, Some("hello".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_execute_no_value() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-x"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.execute, Some(String::new()));
         } else {
             panic!("Expected Chat command");
         }
@@ -669,6 +749,17 @@ mod tests {
             assert_eq!(chat_args.key, Some("my-key".to_string()));
             assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
             assert_eq!(chat_args.execute, Some("hi".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_empty_key_and_model_force_pickers() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-k", "-m"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.key, Some(String::new()));
+            assert_eq!(chat_args.model, Some(String::new()));
         } else {
             panic!("Expected Chat command");
         }

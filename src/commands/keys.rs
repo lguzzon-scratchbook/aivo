@@ -712,6 +712,22 @@ fn prompt_pick_key(keys: &[ApiKey], prompt: &str, default: usize) -> Result<Opti
     Ok(selection.map(|idx| keys[idx].clone()))
 }
 
+// Prompts the user to select a key from the given list without changing the active key.
+#[allow(dead_code)]
+pub(crate) fn prompt_pick_key_without_activation(
+    keys: &[ApiKey],
+    prompt: &str,
+    default: usize,
+) -> Result<Option<ApiKey>> {
+    match prompt_pick_key(keys, prompt, default)? {
+        Some(mut key) => {
+            SessionStore::decrypt_key_secret(&mut key)?;
+            Ok(Some(key))
+        }
+        None => Ok(None),
+    }
+}
+
 // Prompts the user to select a key from the given list and activates it.
 // Returns `Ok(Some(key))` if selected, `Ok(None)` if cancelled.
 #[allow(dead_code)]

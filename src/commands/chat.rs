@@ -221,6 +221,7 @@ impl ChatCommand {
         let raw_model = match self.resolve_model(&key.id, model_flag).await? {
             Some(m) => m,
             None => {
+                ensure_picker_terminal("model", "--model <name>")?;
                 // No model set for this key — prompt user to select one
                 let models_list = self.fetch_models_for_select(&client, &key).await;
 
@@ -264,13 +265,13 @@ impl ChatCommand {
         };
 
         if let Some(input) = one_shot {
-            let input = input.trim().to_string();
-            if input.is_empty() {
-                anyhow::bail!("Message for -x/--execute cannot be empty");
-            }
-
-            let stdin_context = read_stdin_if_piped()?;
-            let one_shot_input = compose_one_shot_prompt(&input, stdin_context.as_deref());
+            let one_shot_input = if input.is_empty() {
+                sanitize_one_shot_message(read_one_shot_message_from_stdin()?)?
+            } else {
+                let input = sanitize_one_shot_message(input)?;
+                let stdin_context = read_stdin_if_piped()?;
+                compose_one_shot_prompt(&input, stdin_context.as_deref())
+            };
             let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
 
             let history = vec![ChatMessage {
@@ -405,12 +406,12 @@ impl ChatCommand {
         println!(
             "  {}  {}",
             style::cyan("-k, --key <id|name>"),
-            style::dim("Select API key by ID or name")
+            style::dim("Select API key by ID or name (-k opens key picker)")
         );
         println!(
             "  {}  {}",
             style::cyan("-x, --execute <message>"),
-            style::dim("Send one message and exit (uses piped stdin as context)")
+            style::dim("Send one message and exit (-x with no value reads stdin until Ctrl-D)")
         );
         println!(
             "  {}  {}",
@@ -514,6 +515,8 @@ impl ChatCommand {
             "  {}",
             style::dim("aivo chat -x \"Explain Rust lifetimes\"")
         );
+        println!("  {}", style::dim("aivo chat -x"));
+        println!("  {}", style::dim("aivo -x \"Summarize this repository\""));
         println!(
             "  {}",
             style::dim("git diff --cached | aivo chat -x \"Summarize changes in one sentence\"")
@@ -578,11 +581,41 @@ fn read_stdin_if_piped() -> Result<Option<String>> {
     }
 }
 
+fn read_one_shot_message_from_stdin() -> Result<String> {
+    if io::stdin().is_terminal() {
+        eprintln!(
+            "{}",
+            style::dim("Enter message, then press Ctrl-D to send.")
+        );
+    }
+
+    let mut buf = String::new();
+    io::stdin().read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
 fn compose_one_shot_prompt(prompt: &str, stdin_context: Option<&str>) -> String {
     match stdin_context.map(str::trim).filter(|c| !c.is_empty()) {
         Some(ctx) => format!("{prompt}\n\nContext from stdin:\n{ctx}"),
         None => prompt.to_string(),
     }
+}
+
+fn sanitize_one_shot_message(message: String) -> Result<String> {
+    if message.trim().is_empty() {
+        anyhow::bail!("Message for -x/--execute cannot be empty");
+    }
+    Ok(message)
+}
+
+fn ensure_picker_terminal(kind: &str, explicit_flag: &str) -> Result<()> {
+    if io::stderr().is_terminal() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Cannot open {kind} picker without a terminal. Run in a terminal or pass {explicit_flag}."
+    );
 }
 
 fn attachment_notice(attachments: &[MessageAttachment]) -> Option<String> {
@@ -1894,6 +1927,18 @@ mod tests {
     fn test_compose_one_shot_prompt_ignores_empty_stdin() {
         let out = compose_one_shot_prompt("Summarize", Some("   \n  "));
         assert_eq!(out, "Summarize");
+    }
+
+    #[test]
+    fn test_sanitize_one_shot_message_rejects_whitespace() {
+        let err = sanitize_one_shot_message(" \n\t ".to_string()).unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_sanitize_one_shot_message_preserves_content() {
+        let out = sanitize_one_shot_message("hello\nworld\n".to_string()).unwrap();
+        assert_eq!(out, "hello\nworld\n");
     }
 
     #[test]

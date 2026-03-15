@@ -76,6 +76,7 @@ Use a different saved key without changing the active one:
 ```bash
 aivo claude --key openrouter
 aivo codex --key copilot
+aivo claude --key              # open key picker for this run only
 ```
 
 Inject extra env vars into the child process:
@@ -134,12 +135,19 @@ Model lists are cached for one hour. `--refresh` bypasses the cache.
 
 ## Chat
 
-`aivo chat` starts the full-screen chat UI. `-x` runs a single prompt and exits.
+`aivo chat` starts the full-screen chat UI. `-x` sends a single prompt and exits.
 
 ```bash
 aivo chat
 aivo chat -x "Summarize this repository"
 git diff --cached | aivo chat -x "Write a one-line commit message"
+```
+
+Omit the message to read from stdin instead (Ctrl-D to send):
+
+```bash
+aivo chat -x
+aivo -x "hello"
 ```
 
 The selected chat model is remembered per saved key.

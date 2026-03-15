@@ -2,6 +2,7 @@ use anyhow::Result;
 use console::{Key, Term};
 
 use crate::cli::parse_env_vars;
+use crate::commands::keys::prompt_pick_key_without_activation;
 use crate::commands::models::fetch_models_for_select;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
@@ -114,6 +115,10 @@ impl StartCommand {
         key_arg: Option<&str>,
         remembered: Option<&DirectoryStartRecord>,
     ) -> Result<Resolved<ApiKey>> {
+        if matches!(key_arg, Some("")) {
+            return self.prompt_select_key(remembered).await;
+        }
+
         if let Some(key_id_or_name) = key_arg {
             return Ok(Resolved {
                 value: self
@@ -152,26 +157,51 @@ impl StartCommand {
                 })
             }
             _ => {
-                let items = keys
-                    .iter()
-                    .map(|key| format!("{}  {}", key.display_name(), key.base_url))
-                    .collect::<Vec<_>>();
-                let selected = FuzzySelect::new()
-                    .with_prompt("Select key")
-                    .items(&items)
-                    .default(0)
-                    .interact_opt()
-                    .ok()
-                    .flatten();
-                match selected {
-                    Some(idx) => {
-                        let mut key = keys[idx].clone();
-                        SessionStore::decrypt_key_secret(&mut key)?;
-                        Ok(Resolved {
-                            value: key,
-                            interactive: true,
-                        })
-                    }
+                match prompt_pick_key_without_activation(&keys, "Select key", 0)? {
+                    Some(key) => Ok(Resolved {
+                        value: key,
+                        interactive: true,
+                    }),
+                    None => Err(anyhow::anyhow!("Cancelled")),
+                }
+            }
+        }
+    }
+
+    async fn prompt_select_key(
+        &self,
+        remembered: Option<&DirectoryStartRecord>,
+    ) -> Result<Resolved<ApiKey>> {
+        let keys = self.session_store.get_keys().await?;
+        match keys.len() {
+            0 => anyhow::bail!("No API key configured. Run 'aivo keys add' first."),
+            1 => {
+                let mut key = keys[0].clone();
+                SessionStore::decrypt_key_secret(&mut key)?;
+                Ok(Resolved {
+                    value: key,
+                    interactive: false,
+                })
+            }
+            _ => {
+                let active_key_id = self
+                    .session_store
+                    .get_active_key_info()
+                    .await?
+                    .map(|active_key| active_key.id);
+                let default_idx = remembered
+                    .and_then(|record| keys.iter().position(|key| key.id == record.key_id))
+                    .or_else(|| {
+                        active_key_id
+                            .as_ref()
+                            .and_then(|active_id| keys.iter().position(|key| &key.id == active_id))
+                    })
+                    .unwrap_or(0);
+                match prompt_pick_key_without_activation(&keys, "Select key", default_idx)? {
+                    Some(key) => Ok(Resolved {
+                        value: key,
+                        interactive: true,
+                    }),
                     None => Err(anyhow::anyhow!("Cancelled")),
                 }
             }

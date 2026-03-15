@@ -2,6 +2,7 @@
  * Main entry point for the aivo CLI.
  * Initializes services with dependency injection and routes commands to handlers.
  */
+use std::io::{self, IsTerminal};
 use std::process;
 
 use clap::Parser;
@@ -29,19 +30,8 @@ const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode"];
 /// Main entry point for the CLI
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Rewrite `aivo <tool> ...` to `aivo run <tool> ...` for known tool aliases
     let raw_args: Vec<String> = std::env::args().collect();
-    let args = if raw_args.len() > 1 && TOOL_ALIASES.contains(&raw_args[1].as_str()) {
-        let mut rewritten = vec![raw_args[0].clone(), "run".to_string()];
-        rewritten.extend_from_slice(&raw_args[1..]);
-        Cli::parse_from(rewritten)
-    } else if raw_args.len() > 1 && raw_args[1] == "use" {
-        let mut rewritten = vec![raw_args[0].clone(), "keys".to_string(), "use".to_string()];
-        rewritten.extend_from_slice(&raw_args[2..]);
-        Cli::parse_from(rewritten)
-    } else {
-        Cli::parse()
-    };
+    let args = Cli::parse_from(rewrite_cli_args(raw_args));
 
     // Initialize services early so we can show active key in help
     let session_store = SessionStore::new();
@@ -99,24 +89,14 @@ async fn main() {
         }
 
         Commands::Chat(chat_args) => {
-            // Handle --key flag: resolve key for temporary use (not persisted)
-            let key_override = if let Some(ref key_id_or_name) = chat_args.key {
-                match session_store
-                    .resolve_key_by_id_or_name(key_id_or_name)
-                    .await
-                {
-                    Ok(key) => Some(key),
-                    Err(e) => {
-                        eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(ExitCode::UserError.code());
-                    }
-                }
-            } else {
-                match resolve_active_key_or_prompt(&session_store).await {
-                    Some(key) => Some(key),
-                    None => process::exit(ExitCode::AuthError.code()),
-                }
-            };
+            let key_override = key_or_exit(
+                resolve_key_override(
+                    &session_store,
+                    chat_args.key.as_deref(),
+                    KeyLookupMode::RequireActiveOrPrompt,
+                )
+                .await,
+            );
             let command = ChatCommand::new(session_store, models_cache.clone());
             command
                 .execute(
@@ -176,24 +156,14 @@ async fn main() {
             } else {
                 let command = RunCommand::new(ai_launcher, models_cache);
 
-                // Handle --key flag: resolve key for temporary use (not persisted)
-                let key_override = if let Some(ref key_id_or_name) = key_flag {
-                    match session_store
-                        .resolve_key_by_id_or_name(key_id_or_name)
-                        .await
-                    {
-                        Ok(key) => Some(key),
-                        Err(e) => {
-                            eprintln!("{} {}", style::red("Error:"), e);
-                            process::exit(ExitCode::UserError.code());
-                        }
-                    }
-                } else {
-                    match resolve_active_key_or_prompt(&session_store).await {
-                        Some(key) => Some(key),
-                        None => process::exit(ExitCode::AuthError.code()),
-                    }
-                };
+                let key_override = key_or_exit(
+                    resolve_key_override(
+                        &session_store,
+                        key_flag.as_deref(),
+                        KeyLookupMode::RequireActiveOrPrompt,
+                    )
+                    .await,
+                );
 
                 let env = if !env_strings.is_empty() {
                     let mut map = std::collections::HashMap::new();
@@ -227,41 +197,33 @@ async fn main() {
         }
 
         Commands::Models(models_args) => {
-            let key_override = if let Some(ref key_id_or_name) = models_args.key {
-                match session_store
-                    .resolve_key_by_id_or_name(key_id_or_name)
-                    .await
-                {
-                    Ok(key) => Some(key),
-                    Err(e) => {
-                        eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(ExitCode::UserError.code());
-                    }
-                }
-            } else {
-                match resolve_active_key_or_prompt(&session_store).await {
-                    Some(key) => Some(key),
-                    None => process::exit(ExitCode::AuthError.code()),
-                }
-            };
+            let key_override = key_or_exit(
+                resolve_key_override(
+                    &session_store,
+                    models_args.key.as_deref(),
+                    KeyLookupMode::RequireActiveOrPrompt,
+                )
+                .await,
+            );
             let command = ModelsCommand::new(session_store, models_cache);
             command.execute(key_override, models_args.refresh).await
         }
 
         Commands::Serve(serve_args) => {
-            let key_override = if let Some(ref key_id_or_name) = serve_args.key {
-                match session_store
-                    .resolve_key_by_id_or_name(key_id_or_name)
-                    .await
-                {
-                    Ok(key) => Some(key),
-                    Err(e) => {
-                        eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(ExitCode::UserError.code());
-                    }
+            let key_override = match resolve_key_override(
+                &session_store,
+                serve_args.key.as_deref(),
+                KeyLookupMode::AllowNone,
+            )
+            .await
+            {
+                Ok(ChatKeyResolution::Selected(key)) => Some(key),
+                Ok(ChatKeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
+                Ok(ChatKeyResolution::MissingAuth) => None,
+                Err(e) => {
+                    eprintln!("{} {}", style::red("Error:"), e);
+                    process::exit(ExitCode::UserError.code());
                 }
-            } else {
-                None
             };
             let command = ServeCommand::new(session_store);
             command.execute(serve_args.port, key_override).await
@@ -281,6 +243,111 @@ async fn main() {
     };
 
     process::exit(exit_code.code());
+}
+
+fn key_or_exit(result: anyhow::Result<ChatKeyResolution>) -> Option<ApiKey> {
+    match result {
+        Ok(ChatKeyResolution::Selected(key)) => Some(key),
+        Ok(ChatKeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
+        Ok(ChatKeyResolution::MissingAuth) => process::exit(ExitCode::AuthError.code()),
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            process::exit(ExitCode::UserError.code());
+        }
+    }
+}
+
+fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
+    if raw_args.len() <= 1 {
+        return raw_args;
+    }
+
+    if TOOL_ALIASES.contains(&raw_args[1].as_str()) {
+        let mut rewritten = vec![raw_args[0].clone(), "run".to_string()];
+        rewritten.extend_from_slice(&raw_args[1..]);
+        return rewritten;
+    }
+
+    if raw_args[1] == "use" {
+        let mut rewritten = vec![raw_args[0].clone(), "keys".to_string(), "use".to_string()];
+        rewritten.extend_from_slice(&raw_args[2..]);
+        return rewritten;
+    }
+
+    if raw_args[1] == "-x" || raw_args[1] == "--execute" {
+        let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
+        rewritten.extend_from_slice(&raw_args[1..]);
+        return rewritten;
+    }
+
+    raw_args
+}
+
+enum ChatKeyResolution {
+    Selected(ApiKey),
+    Cancelled,
+    MissingAuth,
+}
+
+enum KeyLookupMode {
+    RequireActiveOrPrompt,
+    AllowNone,
+}
+
+async fn resolve_key_override(
+    session_store: &SessionStore,
+    key_flag: Option<&str>,
+    mode: KeyLookupMode,
+) -> anyhow::Result<ChatKeyResolution> {
+    match key_flag {
+        Some("") => prompt_temporary_key_override(session_store).await,
+        Some(key_id_or_name) => Ok(ChatKeyResolution::Selected(
+            session_store
+                .resolve_key_by_id_or_name(key_id_or_name)
+                .await?,
+        )),
+        None => match mode {
+            KeyLookupMode::RequireActiveOrPrompt => {
+                match resolve_active_key_or_prompt(session_store).await {
+                    Some(key) => Ok(ChatKeyResolution::Selected(key)),
+                    None => Ok(ChatKeyResolution::MissingAuth),
+                }
+            }
+            KeyLookupMode::AllowNone => Ok(ChatKeyResolution::MissingAuth),
+        },
+    }
+}
+
+async fn prompt_temporary_key_override(
+    session_store: &SessionStore,
+) -> anyhow::Result<ChatKeyResolution> {
+    let all_keys = session_store.get_keys().await?;
+    if all_keys.is_empty() {
+        eprintln!("{} No API keys configured.", style::yellow("Note:"));
+        eprintln!();
+        eprintln!("  Run {} to add one.", style::cyan("aivo keys add"));
+        return Ok(ChatKeyResolution::MissingAuth);
+    }
+    if !io::stderr().is_terminal() {
+        anyhow::bail!(
+            "Cannot open key picker without a terminal. Run in a terminal or pass --key <id|name>."
+        );
+    }
+
+    let default_idx = session_store
+        .get_active_key_info()
+        .await?
+        .and_then(|active_key| all_keys.iter().position(|key| key.id == active_key.id))
+        .unwrap_or(0);
+
+    match commands::keys::prompt_pick_key_without_activation(
+        &all_keys,
+        "Select a key",
+        default_idx,
+    )? {
+        Some(key) => Ok(ChatKeyResolution::Selected(key)),
+        None => Ok(ChatKeyResolution::Cancelled),
+    }
 }
 
 /// When no active key is set, prompts the user to select one (if keys exist)
@@ -312,6 +379,14 @@ async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<Ap
         style::yellow("Note:")
     );
     eprintln!();
+
+    if !io::stderr().is_terminal() {
+        eprintln!(
+            "{} Cannot open key picker without a terminal. Run in a terminal or activate a key first.",
+            style::red("Error:")
+        );
+        return None;
+    }
 
     match commands::keys::prompt_select_key(session_store, &all_keys, "Select a key", 0).await {
         Ok(Some(key)) => {
@@ -471,7 +546,7 @@ fn extract_aivo_flags(
     }
     if let Some((true, ref v)) = key_flag {
         remaining_args.push(v.clone());
-        key_flag = None;
+        key_flag = Some((false, String::new()));
     }
 
     let mut model: Option<String> = model.map(|(_, v)| v);
@@ -505,7 +580,7 @@ fn extract_aivo_flags(
                 key_flag = Some(passthrough_args[i + 1].clone());
                 i += 1;
             } else {
-                remaining_args.push(arg.clone());
+                key_flag = Some(String::new());
             }
         } else if arg == "--debug" {
             debug = true;
@@ -624,8 +699,14 @@ mod tests {
     #[test]
     fn key_flag_as_value_corrected() {
         let r = extract_aivo_flags(None, Some("--something".to_string()), false, vec![], &[]);
-        assert_eq!(r.key_flag, None);
+        assert_eq!(r.key_flag, Some(String::new()));
         assert_eq!(r.remaining_args, args(&["--something"]));
+    }
+
+    #[test]
+    fn key_no_value_triggers_picker() {
+        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-k"]));
+        assert_eq!(r.key_flag, Some(String::new()));
     }
 
     #[test]
@@ -709,5 +790,37 @@ mod tests {
         assert_eq!(r.model, Some("gpt-4o".to_string()));
         assert!(r.debug);
         assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "file.ts"]));
+    }
+
+    #[test]
+    fn rewrite_injects_chat_for_top_level_execute() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "-x", "hello"])),
+            args(&["aivo", "chat", "-x", "hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_injects_chat_for_long_execute() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "--execute", "hello"])),
+            args(&["aivo", "chat", "--execute", "hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_explicit_chat() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "chat", "-x", "hello"])),
+            args(&["aivo", "chat", "-x", "hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_tool_alias_precedence() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "claude", "--model", "gpt-5"])),
+            args(&["aivo", "run", "claude", "--model", "gpt-5"])
+        );
     }
 }

@@ -127,7 +127,7 @@ impl ServeCommand {
         println!(
             "  {}   {}",
             style::cyan("-k, --key <id|name>"),
-            style::dim("Select API key by ID or name")
+            style::dim("Select API key by ID or name (-k opens key picker)")
         );
         println!();
         println!("{}", style::bold("Examples:"));
