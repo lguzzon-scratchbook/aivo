@@ -436,6 +436,7 @@ fn responses_router_config(state: &ServeState) -> CodexRouterConfig {
         requires_reasoning_content: false,
         actual_model: None,
         max_tokens_cap: None,
+        responses_api_supported: None,
     }
 }
 

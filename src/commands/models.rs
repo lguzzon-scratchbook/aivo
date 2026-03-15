@@ -508,6 +508,7 @@ mod tests {
             base_url: url.to_string(),
             claude_protocol: None,
             gemini_protocol: None,
+            codex_responses_api: None,
             codex_mode: None,
             opencode_mode: None,
             key: Zeroizing::new("sk-test".to_string()),

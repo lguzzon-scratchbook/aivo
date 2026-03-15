@@ -53,6 +53,9 @@ pub struct CodexRouterConfig {
     /// Cap applied to `max_tokens` / `max_output_tokens` before forwarding to the provider.
     /// Use for providers with hard limits (e.g., DeepSeek: 8192).
     pub max_tokens_cap: Option<u64>,
+    /// Persisted Responses API support state: None = unknown, Some(true) = supported,
+    /// Some(false) = not supported.  Avoids a wasted probe request on every session.
+    pub responses_api_supported: Option<bool>,
 }
 
 pub struct CodexRouter {
@@ -81,19 +84,25 @@ impl CodexRouter {
     /// Returns the actual port number so callers can set OPENAI_BASE_URL.
     pub async fn start_background(
         &self,
-    ) -> Result<(u16, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
+    ) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let active_protocol = Arc::new(AtomicU8::new(self.config.target_protocol.to_u8()));
+        let initial_responses = match self.config.responses_api_supported {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        };
+        let responses_api_supported = Arc::new(AtomicU8::new(initial_responses));
         let state = CodexRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
             active_protocol: active_protocol.clone(),
-            responses_api_supported: Arc::new(AtomicU8::new(0)),
+            responses_api_supported: responses_api_supported.clone(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
         });
-        Ok((port, active_protocol, handle))
+        Ok((port, active_protocol, responses_api_supported, handle))
     }
 }
 
@@ -1450,6 +1459,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
+                responses_api_supported: None,
             },
         );
 
@@ -1479,6 +1489,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
+                responses_api_supported: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1511,6 +1522,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
+                responses_api_supported: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1545,6 +1557,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
+                responses_api_supported: None,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1574,6 +1587,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
+                responses_api_supported: None,
             },
         );
         let tools = chat["tools"].as_array().unwrap();
@@ -1595,6 +1609,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
+                responses_api_supported: None,
             },
         );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
@@ -1618,6 +1633,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: Some(8192),
+                responses_api_supported: None,
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -1641,6 +1657,7 @@ mod tests {
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: Some(8192),
+                responses_api_supported: None,
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -1879,6 +1896,7 @@ mod tests {
             requires_reasoning_content: false,
             actual_model: None,
             max_tokens_cap: None,
+            responses_api_supported: None,
         };
         assert!(config.copilot_token_manager.is_none());
     }
@@ -1897,6 +1915,7 @@ mod tests {
             requires_reasoning_content: false,
             actual_model: None,
             max_tokens_cap: None,
+            responses_api_supported: None,
         };
         // Non-copilot with non-openrouter URL: no transform
         let chat = convert_responses_to_chat_request(&body, &config);

@@ -124,6 +124,7 @@ impl AILauncher {
 
         // Track the router's active protocol so we can persist discoveries after the child exits
         let mut router_protocol: Option<Arc<AtomicU8>> = None;
+        let mut codex_responses_api: Option<Arc<AtomicU8>> = None;
 
         // Start AnthropicRouter for OpenRouter + Claude, update ANTHROPIC_BASE_URL with actual port
         if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
@@ -155,7 +156,8 @@ impl AILauncher {
 
         // Start CodexRouter for non-OpenAI providers, update OPENAI_BASE_URL with actual port
         if options.tool == AIToolType::Codex && env.contains_key("AIVO_USE_CODEX_ROUTER") {
-            let (port, _active) = start_codex_router(&env).await?;
+            let (port, _active, responses_api) = start_codex_router(&env).await?;
+            codex_responses_api = Some(responses_api);
             env.insert(
                 "OPENAI_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{}", port),
@@ -205,7 +207,7 @@ impl AILauncher {
 
         // Start CodexRouter for OpenCode when the provider needs compatibility routing
         if options.tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
-            let (port, _active) = start_codex_router(&env).await?;
+            let (port, _active, _responses_api) = start_codex_router(&env).await?;
             let real_url = format!("http://127.0.0.1:{}", port);
             if let Some(content) = env.get("OPENCODE_CONFIG_CONTENT").cloned() {
                 let patched = content.replace("http://127.0.0.1:0", &real_url);
@@ -293,6 +295,23 @@ impl AILauncher {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Persist Responses API support discovered by the codex router
+        if let Some(active) = codex_responses_api
+            && options.key_override.is_none()
+        {
+            let final_val = match active.load(Ordering::Relaxed) {
+                1 => Some(true),
+                2 => Some(false),
+                _ => None,
+            };
+            if final_val != resolved.key.codex_responses_api {
+                let _ = self
+                    .session_store
+                    .set_key_codex_responses_api(&resolved.key.id, final_val)
+                    .await;
             }
         }
 
@@ -888,7 +907,9 @@ async fn start_openai_router(env: &HashMap<String, String>) -> Result<(u16, Arc<
 }
 
 /// Starts the built-in CodexRouter for non-OpenAI providers and returns the port it bound to
-async fn start_codex_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
+async fn start_codex_router(
+    env: &HashMap<String, String>,
+) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>)> {
     use crate::services::{CodexRouter, CodexRouterConfig};
 
     let api_key = env
@@ -914,6 +935,11 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<(u16, Arc<A
         .get("AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL")
         .and_then(|value| ProviderProtocol::parse(value))
         .unwrap_or_else(|| detect_provider_protocol(&base_url));
+    let responses_api_supported = match env.get("AIVO_CODEX_ROUTER_RESPONSES_API").map(|v| v.as_str()) {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    };
 
     let router = CodexRouter::new(CodexRouterConfig {
         target_base_url: base_url,
@@ -924,14 +950,15 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<(u16, Arc<A
         requires_reasoning_content,
         actual_model,
         max_tokens_cap,
+        responses_api_supported,
     });
-    let (port, active_protocol, handle) = router.start_background().await?;
+    let (port, active_protocol, responses_api, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: codex router exited unexpectedly: {e}");
         }
     });
-    Ok((port, active_protocol))
+    Ok((port, active_protocol, responses_api))
 }
 
 /// Starts the built-in GeminiRouter for non-Google providers and returns the port it bound to
@@ -1054,8 +1081,9 @@ async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16
         requires_reasoning_content: false,
         actual_model: None,
         max_tokens_cap: None,
+        responses_api_supported: None,
     });
-    let (port, _active_protocol, handle) = router.start_background().await?;
+    let (port, _active_protocol, _responses_api, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: codex copilot router exited unexpectedly: {e}");

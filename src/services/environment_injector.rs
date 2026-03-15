@@ -212,6 +212,12 @@ impl EnvironmentInjector {
                 "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 profile.default_protocol.as_str().to_string(),
             );
+            if let Some(supported) = key.codex_responses_api {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_RESPONSES_API".to_string(),
+                    if supported { "1" } else { "0" }.to_string(),
+                );
+            }
             profile.quirks.inject(&mut env, "AIVO_CODEX_ROUTER");
         } else {
             // Official OpenAI: direct connection, no proxy needed
@@ -343,6 +349,12 @@ impl EnvironmentInjector {
                 "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 profile.default_protocol.as_str().to_string(),
             );
+            if let Some(supported) = key.codex_responses_api {
+                env.insert(
+                    "AIVO_CODEX_ROUTER_RESPONSES_API".to_string(),
+                    if supported { "1" } else { "0" }.to_string(),
+                );
+            }
             profile.quirks.inject(&mut env, "AIVO_CODEX_ROUTER");
             ("http://127.0.0.1:0".to_string(), key.key.to_string())
         } else {

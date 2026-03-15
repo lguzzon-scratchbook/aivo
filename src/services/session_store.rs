@@ -113,6 +113,12 @@ pub struct ApiKey {
         skip_serializing_if = "Option::is_none"
     )]
     pub gemini_protocol: Option<GeminiProviderProtocol>,
+    #[serde(
+        rename = "codexResponsesApi",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_responses_api: Option<bool>,
     #[serde(rename = "codexMode", default, skip_serializing_if = "Option::is_none")]
     pub codex_mode: Option<OpenAICompatibilityMode>,
     #[serde(
@@ -141,6 +147,7 @@ impl ApiKey {
             base_url,
             claude_protocol,
             gemini_protocol: None,
+            codex_responses_api: None,
             codex_mode: None,
             opencode_mode: None,
             key: Zeroizing::new(key),
@@ -1322,6 +1329,15 @@ impl SessionStore {
         gemini_protocol: Option<GeminiProviderProtocol>,
     ) -> Result<bool> {
         self.update_key_field(id, |entry| entry.gemini_protocol = gemini_protocol)
+            .await
+    }
+
+    pub async fn set_key_codex_responses_api(
+        &self,
+        id: &str,
+        codex_responses_api: Option<bool>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.codex_responses_api = codex_responses_api)
             .await
     }
 
