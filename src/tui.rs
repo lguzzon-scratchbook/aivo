@@ -71,7 +71,10 @@ impl FuzzySelect {
 
             let end_idx = (page_start + page_size).min(count);
 
-            term.write_line(&format!("{}: {}", crate::style::bold(&self.prompt), query))?;
+            let term_width = term.size().1 as usize;
+
+            let prompt_line = format!("{}: {}", crate::style::bold(&self.prompt), query);
+            term.write_line(&truncate_to_width(&prompt_line, term_width))?;
 
             let items_drawn = if count == 0 {
                 term.write_line(&format!("  {}", crate::style::dim("(no matches)")))?;
@@ -90,7 +93,8 @@ impl FuzzySelect {
                     } else {
                         crate::style::dim(item)
                     };
-                    term.write_line(&format!("{} {}", symbol, styled_item))?;
+                    let line = format!("{} {}", symbol, styled_item);
+                    term.write_line(&truncate_to_width(&line, term_width))?;
                     lines += 1;
                 }
                 lines
@@ -166,6 +170,35 @@ fn is_next_key(key: &Key) -> bool {
 
 fn matches_application_arrow(key: &Key, direction: char) -> bool {
     matches!(key, Key::UnknownEscSeq(seq) if seq.as_slice() == ['O', direction])
+}
+
+/// Truncate a string to fit within terminal width, accounting for ANSI escape codes.
+/// ANSI sequences are not visible characters, so we track visible width separately.
+fn truncate_to_width(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut visible = 0;
+    let mut result = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+            result.push(c);
+        } else if in_escape {
+            result.push(c);
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            if visible >= width {
+                break;
+            }
+            result.push(c);
+            visible += 1;
+        }
+    }
+    result
 }
 
 pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
