@@ -6,6 +6,8 @@ use reqwest::Client;
 use serde_json::json;
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use tokio::process::Command;
 #[cfg(unix)]
 use tokio::signal;
@@ -159,6 +161,9 @@ impl AILauncher {
             self.env_injector
                 .merge(&tool_config.env_vars, options.env.as_ref(), options.debug);
 
+        // Track the router's active protocol so we can persist discoveries after the child exits
+        let mut router_protocol: Option<Arc<AtomicU8>> = None;
+
         // Start AnthropicRouter for OpenRouter + Claude, update ANTHROPIC_BASE_URL with actual port
         if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
             let port = start_anthropic_router(&env).await?;
@@ -170,7 +175,8 @@ impl AILauncher {
 
         // Start OpenAI router for OpenAI-compatible providers (Cloudflare, etc.), update ANTHROPIC_BASE_URL
         if options.tool == AIToolType::Claude && env.contains_key("AIVO_USE_OPENAI_ROUTER") {
-            let port = start_openai_router(&env).await?;
+            let (port, active) = start_openai_router(&env).await?;
+            router_protocol = Some(active);
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{}", port),
@@ -188,7 +194,7 @@ impl AILauncher {
 
         // Start CodexRouter for non-OpenAI providers, update OPENAI_BASE_URL with actual port
         if options.tool == AIToolType::Codex && env.contains_key("AIVO_USE_CODEX_ROUTER") {
-            let port = start_codex_router(&env).await?;
+            let (port, _active) = start_codex_router(&env).await?;
             env.insert(
                 "OPENAI_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{}", port),
@@ -206,7 +212,8 @@ impl AILauncher {
 
         // Start GeminiRouter for non-Google providers, update GOOGLE_GEMINI_BASE_URL with actual port
         if options.tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_ROUTER") {
-            let port = start_gemini_router(&env).await?;
+            let (port, active) = start_gemini_router(&env).await?;
+            router_protocol = Some(active);
             env.insert(
                 "GOOGLE_GEMINI_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{}", port),
@@ -237,7 +244,7 @@ impl AILauncher {
 
         // Start CodexRouter for OpenCode when the provider needs compatibility routing
         if options.tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
-            let port = start_codex_router(&env).await?;
+            let (port, _active) = start_codex_router(&env).await?;
             let real_url = format!("http://127.0.0.1:{}", port);
             if let Some(content) = env.get("OPENCODE_CONFIG_CONTENT").cloned() {
                 let patched = content.replace("http://127.0.0.1:0", &real_url);
@@ -287,6 +294,58 @@ impl AILauncher {
 
         let result = self.wait_for_process(&mut child).await;
 
+        // Persist protocol discovered by router fallback so the next run starts correctly
+        if let Some(active) = router_protocol
+            && options.key_override.is_none()
+        {
+            let final_protocol = ProviderProtocol::from_u8(active.load(Ordering::Relaxed));
+                match options.tool {
+                    AIToolType::Claude => {
+                        let current = key
+                            .claude_protocol
+                            .map(|p| match p {
+                                ClaudeProviderProtocol::Openai => ProviderProtocol::Openai,
+                                ClaudeProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
+                                ClaudeProviderProtocol::Google => ProviderProtocol::Google,
+                            })
+                            .unwrap_or(ProviderProtocol::Openai);
+                        if final_protocol != current {
+                            let cp = match final_protocol {
+                                ProviderProtocol::Openai => ClaudeProviderProtocol::Openai,
+                                ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
+                                ProviderProtocol::Google => ClaudeProviderProtocol::Google,
+                            };
+                            let _ = self
+                                .session_store
+                                .set_key_claude_protocol(&key.id, Some(cp))
+                                .await;
+                        }
+                    }
+                    AIToolType::Gemini => {
+                        let current = key
+                            .gemini_protocol
+                            .map(|p| match p {
+                                GeminiProviderProtocol::Google => ProviderProtocol::Google,
+                                GeminiProviderProtocol::Openai => ProviderProtocol::Openai,
+                                GeminiProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
+                            })
+                            .unwrap_or(ProviderProtocol::Openai);
+                        if final_protocol != current {
+                            let gp = match final_protocol {
+                                ProviderProtocol::Google => GeminiProviderProtocol::Google,
+                                ProviderProtocol::Openai => GeminiProviderProtocol::Openai,
+                                ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
+                            };
+                            let _ = self
+                                .session_store
+                                .set_key_gemini_protocol(&key.id, Some(gp))
+                                .await;
+                        }
+                    }
+                    _ => {}
+                }
+        }
+
         if let Some(ref path) = codex_model_catalog_path {
             let _ = tokio::fs::remove_file(path).await;
         }
@@ -309,7 +368,7 @@ impl AILauncher {
     async fn resolve_claude_protocol(
         &self,
         mut key: ApiKey,
-        _persist: bool,
+        persist: bool,
         _model: Option<&str>,
     ) -> Result<ApiKey> {
         let profile = provider_profile_for_base_url(&key.base_url);
@@ -318,36 +377,60 @@ impl AILauncher {
         }
         if key.claude_protocol.is_none() {
             key.claude_protocol = Some(preferred_claude_protocol(&key.base_url));
+            if persist {
+                let _ = self
+                    .session_store
+                    .set_key_claude_protocol(&key.id, key.claude_protocol)
+                    .await;
+            }
         }
         Ok(key)
     }
 
-    async fn resolve_codex_mode(&self, mut key: ApiKey, _persist: bool) -> Result<ApiKey> {
+    async fn resolve_codex_mode(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
         if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
         if key.codex_mode.is_none() {
             key.codex_mode = Some(preferred_codex_mode(&key.base_url));
+            if persist {
+                let _ = self
+                    .session_store
+                    .set_key_codex_mode(&key.id, key.codex_mode)
+                    .await;
+            }
         }
         Ok(key)
     }
 
-    async fn resolve_gemini_protocol(&self, mut key: ApiKey, _persist: bool) -> Result<ApiKey> {
+    async fn resolve_gemini_protocol(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
         if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
         if key.gemini_protocol.is_none() {
             key.gemini_protocol = Some(preferred_gemini_protocol(&key.base_url));
+            if persist {
+                let _ = self
+                    .session_store
+                    .set_key_gemini_protocol(&key.id, key.gemini_protocol)
+                    .await;
+            }
         }
         Ok(key)
     }
 
-    async fn resolve_opencode_mode(&self, mut key: ApiKey, _persist: bool) -> Result<ApiKey> {
+    async fn resolve_opencode_mode(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
         if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
         if key.opencode_mode.is_none() {
             key.opencode_mode = Some(preferred_opencode_mode(&key.base_url));
+            if persist {
+                let _ = self
+                    .session_store
+                    .set_key_opencode_mode(&key.id, key.opencode_mode)
+                    .await;
+            }
         }
         Ok(key)
     }
@@ -562,7 +645,9 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
 
 /// Starts the built-in OpenAI router for OpenAI-compatible providers (Cloudflare, etc.)
 /// Returns the port it bound to
-async fn start_openai_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_openai_router(
+    env: &HashMap<String, String>,
+) -> Result<(u16, Arc<AtomicU8>)> {
     use crate::services::{OpenAIRouter, OpenAIRouterConfig};
 
     let api_key = env
@@ -597,17 +682,17 @@ async fn start_openai_router(env: &HashMap<String, String>) -> Result<u16> {
     };
 
     let router = OpenAIRouter::new(config);
-    let (port, handle) = router.start_background().await?;
+    let (port, active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: openai router exited unexpectedly: {e}");
         }
     });
-    Ok(port)
+    Ok((port, active_protocol))
 }
 
 /// Starts the built-in CodexRouter for non-OpenAI providers and returns the port it bound to
-async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_codex_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
     use crate::services::{CodexRouter, CodexRouterConfig};
 
     let api_key = env
@@ -644,17 +729,19 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<u16> {
         actual_model,
         max_tokens_cap,
     });
-    let (port, handle) = router.start_background().await?;
+    let (port, active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: codex router exited unexpectedly: {e}");
         }
     });
-    Ok(port)
+    Ok((port, active_protocol))
 }
 
 /// Starts the built-in GeminiRouter for non-Google providers and returns the port it bound to
-async fn start_gemini_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_gemini_router(
+    env: &HashMap<String, String>,
+) -> Result<(u16, Arc<AtomicU8>)> {
     use crate::services::{GeminiRouter, GeminiRouterConfig};
 
     let api_key = env
@@ -687,20 +774,19 @@ async fn start_gemini_router(env: &HashMap<String, String>) -> Result<u16> {
         requires_reasoning_content,
         max_tokens_cap,
     });
-    let (port, handle) = router.start_background().await?;
+    let (port, active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: gemini router exited unexpectedly: {e}");
         }
     });
-    Ok(port)
+    Ok((port, active_protocol))
 }
 
 /// Starts a GeminiRouter configured for GitHub Copilot and returns the port it bound to
 async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
     use crate::services::copilot_auth::CopilotTokenManager;
     use crate::services::{GeminiRouter, GeminiRouterConfig};
-    use std::sync::Arc;
 
     let github_token = env
         .get("AIVO_COPILOT_GITHUB_TOKEN")
@@ -726,7 +812,7 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         requires_reasoning_content: false,
         max_tokens_cap: None,
     });
-    let (port, handle) = router.start_background().await?;
+    let (port, _active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: gemini copilot router exited unexpectedly: {e}");
@@ -775,7 +861,7 @@ async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16
         actual_model: None,
         max_tokens_cap: None,
     });
-    let (port, handle) = router.start_background().await?;
+    let (port, _active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: codex copilot router exited unexpectedly: {e}");

@@ -1307,6 +1307,15 @@ impl SessionStore {
         }
     }
 
+    pub async fn set_key_claude_protocol(
+        &self,
+        id: &str,
+        claude_protocol: Option<ClaudeProviderProtocol>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.claude_protocol = claude_protocol)
+            .await
+    }
+
     pub async fn set_key_gemini_protocol(
         &self,
         id: &str,
@@ -2243,6 +2252,28 @@ mod tests {
 
         let key = store.get_key_by_id(&id).await.unwrap().unwrap();
         assert_eq!(key.codex_mode, Some(OpenAICompatibilityMode::Router));
+    }
+
+    #[tokio::test]
+    async fn test_set_key_claude_protocol_updates_existing_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .set_key_claude_protocol(&id, Some(ClaudeProviderProtocol::Anthropic))
+                .await
+                .unwrap()
+        );
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.claude_protocol, Some(ClaudeProviderProtocol::Anthropic));
     }
 
     #[tokio::test]

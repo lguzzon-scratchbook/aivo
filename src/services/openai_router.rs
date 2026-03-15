@@ -77,15 +77,18 @@ impl OpenAIRouter {
 
     /// Binds to a random available port and starts the router in the background.
     /// Returns the actual port number so callers can set ANTHROPIC_BASE_URL.
-    pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
+    pub async fn start_background(
+        &self,
+    ) -> Result<(u16, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
+        let active_protocol = Arc::new(AtomicU8::new(self.config.target_protocol.to_u8()));
         let state = OpenAIRouterState {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
-            active_protocol: Arc::new(AtomicU8::new(self.config.target_protocol.to_u8())),
+            active_protocol: active_protocol.clone(),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
-        Ok((port, handle))
+        Ok((port, active_protocol, handle))
     }
 }
 

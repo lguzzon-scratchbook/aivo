@@ -46,17 +46,20 @@ impl GeminiRouter {
         Self { config }
     }
 
-    pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
+    pub async fn start_background(
+        &self,
+    ) -> Result<(u16, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
+        let active_protocol = Arc::new(AtomicU8::new(self.config.upstream_protocol.to_u8()));
         let state = GeminiRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
-            active_protocol: Arc::new(AtomicU8::new(self.config.upstream_protocol.to_u8())),
+            active_protocol: active_protocol.clone(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
         });
-        Ok((port, handle))
+        Ok((port, active_protocol, handle))
     }
 }
 
