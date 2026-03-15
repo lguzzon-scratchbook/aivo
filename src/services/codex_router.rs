@@ -68,6 +68,8 @@ struct CodexRouterState {
     config: Arc<CodexRouterConfig>,
     client: Arc<reqwest::Client>,
     active_protocol: Arc<AtomicU8>,
+    /// Tri-state: 0 = unknown, 1 = supported, 2 = not supported
+    responses_api_supported: Arc<AtomicU8>,
 }
 
 impl CodexRouter {
@@ -86,6 +88,7 @@ impl CodexRouter {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
             active_protocol: active_protocol.clone(),
+            responses_api_supported: Arc::new(AtomicU8::new(0)),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
@@ -109,6 +112,7 @@ async fn handle_router_request(request: String, state: Arc<CodexRouterState>) ->
             &state.config,
             state.client.as_ref(),
             &state.active_protocol,
+            &state.responses_api_supported,
         )
         .await
         {
@@ -132,11 +136,21 @@ async fn handle_api_request(
     config: &Arc<CodexRouterConfig>,
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
+    responses_api_supported: &Arc<AtomicU8>,
 ) -> Result<String> {
     let body_str = http_utils::extract_request_body(request)?;
     let body: Value = serde_json::from_str(body_str)?;
 
     if is_responses_api_format(&body) {
+        // When the upstream supports the Responses API natively, forward directly
+        // to preserve IDs and avoid lossy Chat Completions round-trip conversion.
+        let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
+        if current == ProviderProtocol::Openai
+            && let Some(result) =
+                try_responses_api_passthrough(&body, config, client, responses_api_supported).await
+        {
+            return result;
+        }
         handle_responses_api_via_chat(path, &body, config, client, active_protocol).await
     } else {
         handle_chat_completions_with_filter(path, &body, config, client, active_protocol).await
@@ -144,8 +158,68 @@ async fn handle_api_request(
 }
 
 // =============================================================================
-// RESPONSES API PATH: convert request → chat completions → convert response back
+// RESPONSES API PATH: passthrough or convert
 // =============================================================================
+
+/// Tries to forward a Responses API request directly to the upstream `/v1/responses`
+/// endpoint. Returns `Some(Ok(response))` on success or non-protocol HTTP errors,
+/// `None` if the upstream doesn't support the Responses API (404/405/415), allowing
+/// fallback to Chat Completions conversion.
+async fn try_responses_api_passthrough(
+    body: &Value,
+    config: &Arc<CodexRouterConfig>,
+    client: &reqwest::Client,
+    responses_api_supported: &Arc<AtomicU8>,
+) -> Option<Result<String>> {
+    if responses_api_supported.load(Ordering::Relaxed) == 2 {
+        return None;
+    }
+
+    let mut body = body.clone();
+    filter_tools(&mut body);
+    // Strip Chat Completions-only parameters that the Responses API doesn't accept
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("stream_options");
+    }
+    apply_max_tokens_cap_to_fields(&mut body, config.max_tokens_cap, &["max_output_tokens"]);
+    if config.copilot_token_manager.is_none() {
+        let selected_model = select_model_for_provider_attempt(
+            &config.target_base_url,
+            body.get("model").and_then(|v| v.as_str()),
+            config.actual_model.as_deref(),
+            ProviderProtocol::Openai,
+        );
+        body["model"] = Value::String(selected_model);
+        transform_model(
+            &mut body,
+            &config.target_base_url,
+            config.model_prefix.as_deref(),
+        );
+    }
+
+    let target_url = build_target_url(&config.target_base_url, "/v1/responses");
+    let response = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+    )
+    .await
+    .ok()?
+    .json(&body)
+    .send()
+    .await
+    .ok()?;
+
+    let status = response.status().as_u16();
+    if is_protocol_mismatch(status) {
+        responses_api_supported.store(2, Ordering::Relaxed);
+        return None;
+    }
+
+    responses_api_supported.store(1, Ordering::Relaxed);
+    Some(http_utils::buffered_reqwest_to_http_response(response).await)
+}
 
 /// Handles Responses API requests by converting to Chat Completions format,
 /// forwarding to the provider, and converting the response back to Responses
