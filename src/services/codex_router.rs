@@ -176,7 +176,10 @@ async fn try_responses_api_passthrough(
     }
 
     let mut body = body.clone();
-    filter_tools(&mut body);
+    // Don't filter_tools here — the upstream Responses API supports all tool types
+    // (computer_use_preview, web_search_preview, code_interpreter, etc.).
+    // Tool filtering is only needed for the Chat Completions conversion path.
+
     // Strip Chat Completions-only parameters that the Responses API doesn't accept
     if let Some(obj) = body.as_object_mut() {
         obj.remove("stream_options");
@@ -212,13 +215,49 @@ async fn try_responses_api_passthrough(
     .ok()?;
 
     let status = response.status().as_u16();
-    if is_protocol_mismatch(status) {
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let response_body = response.text().await.ok()?;
+
+    if status != 200 {
+        if responses_api_supported.load(Ordering::Relaxed) == 0 || is_protocol_mismatch(status) {
+            // Still probing or clear protocol mismatch — mark unsupported, fall through
+            responses_api_supported.store(2, Ordering::Relaxed);
+            return None;
+        }
+        // Known supported but got an error — return it to the client
+        return Some(Ok(http_utils::http_response(
+            status,
+            &content_type,
+            &response_body,
+        )));
+    }
+
+    // Validate the response looks like a real Responses API response.
+    // Some gateways return 200 on /v1/responses but produce Chat Completions
+    // or incomplete output; detect that and fall back to conversion.
+    let looks_like_responses_api = if content_type.contains("text/event-stream") {
+        response_body.contains("response.completed")
+    } else {
+        response_body.contains("\"object\":\"response\"")
+            || response_body.contains("\"object\": \"response\"")
+    };
+
+    if !looks_like_responses_api {
         responses_api_supported.store(2, Ordering::Relaxed);
         return None;
     }
 
     responses_api_supported.store(1, Ordering::Relaxed);
-    Some(http_utils::buffered_reqwest_to_http_response(response).await)
+    Some(Ok(http_utils::http_response(
+        status,
+        &content_type,
+        &response_body,
+    )))
 }
 
 /// Handles Responses API requests by converting to Chat Completions format,
