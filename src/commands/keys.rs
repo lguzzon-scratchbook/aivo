@@ -4,6 +4,7 @@
 use anyhow::Result;
 
 use crate::cli::KeysArgs;
+use crate::commands::truncate_url_for_display;
 use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
@@ -27,20 +28,6 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
         input.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-// Truncates a URL for display, preserving domain prefix and path suffix.
-fn truncate_url(url: &str, max_len: usize) -> String {
-    if url.len() <= max_len {
-        return url.to_string();
-    }
-    let keep_suffix = 15.min(max_len / 3);
-    let keep_prefix = max_len.saturating_sub(keep_suffix + 1);
-    format!(
-        "{}…{}",
-        &url[..keep_prefix],
-        &url[url.len() - keep_suffix..]
-    )
 }
 
 // Creates a safe preview of an API key, handling short keys without panicking.
@@ -162,7 +149,7 @@ impl KeysCommand {
                 active_indicator,
                 style::cyan(&id_padded),
                 name_padded,
-                style::dim(truncate_url(&key.base_url, 50))
+                style::dim(truncate_url_for_display(&key.base_url, 50))
             );
         }
 

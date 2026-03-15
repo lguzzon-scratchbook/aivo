@@ -18,7 +18,7 @@ mod version;
 use cli::{Cli, Commands};
 use commands::{
     ChatCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand, StartCommand, StartFlowArgs,
-    UpdateCommand,
+    UpdateCommand, truncate_url_for_display,
 };
 use errors::ExitCode;
 use services::session_store::ApiKey;
@@ -419,7 +419,7 @@ async fn print_active_key(session_store: &SessionStore) {
         style::bullet_symbol(),
         style::cyan(&id_padded),
         active_key.display_name(),
-        style::dim(&active_key.base_url)
+        style::dim(truncate_url_for_display(&active_key.base_url, 50))
     );
 }
 

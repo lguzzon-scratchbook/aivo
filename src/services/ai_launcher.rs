@@ -6,8 +6,8 @@ use reqwest::Client;
 use serde_json::json;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::process::Command;
 #[cfg(unix)]
 use tokio::signal;
@@ -299,51 +299,51 @@ impl AILauncher {
             && options.key_override.is_none()
         {
             let final_protocol = ProviderProtocol::from_u8(active.load(Ordering::Relaxed));
-                match options.tool {
-                    AIToolType::Claude => {
-                        let current = key
-                            .claude_protocol
-                            .map(|p| match p {
-                                ClaudeProviderProtocol::Openai => ProviderProtocol::Openai,
-                                ClaudeProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
-                                ClaudeProviderProtocol::Google => ProviderProtocol::Google,
-                            })
-                            .unwrap_or(ProviderProtocol::Openai);
-                        if final_protocol != current {
-                            let cp = match final_protocol {
-                                ProviderProtocol::Openai => ClaudeProviderProtocol::Openai,
-                                ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
-                                ProviderProtocol::Google => ClaudeProviderProtocol::Google,
-                            };
-                            let _ = self
-                                .session_store
-                                .set_key_claude_protocol(&key.id, Some(cp))
-                                .await;
-                        }
+            match options.tool {
+                AIToolType::Claude => {
+                    let current = key
+                        .claude_protocol
+                        .map(|p| match p {
+                            ClaudeProviderProtocol::Openai => ProviderProtocol::Openai,
+                            ClaudeProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
+                            ClaudeProviderProtocol::Google => ProviderProtocol::Google,
+                        })
+                        .unwrap_or(ProviderProtocol::Openai);
+                    if final_protocol != current {
+                        let cp = match final_protocol {
+                            ProviderProtocol::Openai => ClaudeProviderProtocol::Openai,
+                            ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
+                            ProviderProtocol::Google => ClaudeProviderProtocol::Google,
+                        };
+                        let _ = self
+                            .session_store
+                            .set_key_claude_protocol(&key.id, Some(cp))
+                            .await;
                     }
-                    AIToolType::Gemini => {
-                        let current = key
-                            .gemini_protocol
-                            .map(|p| match p {
-                                GeminiProviderProtocol::Google => ProviderProtocol::Google,
-                                GeminiProviderProtocol::Openai => ProviderProtocol::Openai,
-                                GeminiProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
-                            })
-                            .unwrap_or(ProviderProtocol::Openai);
-                        if final_protocol != current {
-                            let gp = match final_protocol {
-                                ProviderProtocol::Google => GeminiProviderProtocol::Google,
-                                ProviderProtocol::Openai => GeminiProviderProtocol::Openai,
-                                ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
-                            };
-                            let _ = self
-                                .session_store
-                                .set_key_gemini_protocol(&key.id, Some(gp))
-                                .await;
-                        }
-                    }
-                    _ => {}
                 }
+                AIToolType::Gemini => {
+                    let current = key
+                        .gemini_protocol
+                        .map(|p| match p {
+                            GeminiProviderProtocol::Google => ProviderProtocol::Google,
+                            GeminiProviderProtocol::Openai => ProviderProtocol::Openai,
+                            GeminiProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
+                        })
+                        .unwrap_or(ProviderProtocol::Openai);
+                    if final_protocol != current {
+                        let gp = match final_protocol {
+                            ProviderProtocol::Google => GeminiProviderProtocol::Google,
+                            ProviderProtocol::Openai => GeminiProviderProtocol::Openai,
+                            ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
+                        };
+                        let _ = self
+                            .session_store
+                            .set_key_gemini_protocol(&key.id, Some(gp))
+                            .await;
+                    }
+                }
+                _ => {}
+            }
         }
 
         if let Some(ref path) = codex_model_catalog_path {
@@ -645,9 +645,7 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
 
 /// Starts the built-in OpenAI router for OpenAI-compatible providers (Cloudflare, etc.)
 /// Returns the port it bound to
-async fn start_openai_router(
-    env: &HashMap<String, String>,
-) -> Result<(u16, Arc<AtomicU8>)> {
+async fn start_openai_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
     use crate::services::{OpenAIRouter, OpenAIRouterConfig};
 
     let api_key = env
@@ -739,9 +737,7 @@ async fn start_codex_router(env: &HashMap<String, String>) -> Result<(u16, Arc<A
 }
 
 /// Starts the built-in GeminiRouter for non-Google providers and returns the port it bound to
-async fn start_gemini_router(
-    env: &HashMap<String, String>,
-) -> Result<(u16, Arc<AtomicU8>)> {
+async fn start_gemini_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
     use crate::services::{GeminiRouter, GeminiRouterConfig};
 
     let api_key = env

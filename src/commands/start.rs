@@ -156,15 +156,13 @@ impl StartCommand {
                     interactive: false,
                 })
             }
-            _ => {
-                match prompt_pick_key_without_activation(&keys, "Select key", 0)? {
-                    Some(key) => Ok(Resolved {
-                        value: key,
-                        interactive: true,
-                    }),
-                    None => Err(anyhow::anyhow!("Cancelled")),
-                }
-            }
+            _ => match prompt_pick_key_without_activation(&keys, "Select key", 0)? {
+                Some(key) => Ok(Resolved {
+                    value: key,
+                    interactive: true,
+                }),
+                None => Err(anyhow::anyhow!("Cancelled")),
+            },
         }
     }
 
