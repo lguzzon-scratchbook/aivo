@@ -83,6 +83,7 @@ impl ServeCommand {
             port
         );
         eprintln!("  {} · {}", display_name, style::dim(&display_host));
+        print_supported_paths();
         eprintln!("  {}", style::dim("Press Ctrl+C to stop"));
 
         tokio::select! {
@@ -135,6 +136,15 @@ impl ServeCommand {
         println!("  {}", style::dim("aivo serve -p 8080"));
         println!("  {}", style::dim("aivo serve -k openrouter"));
     }
+}
+
+fn print_supported_paths() {
+    eprintln!();
+    eprintln!("{}", style::bold("Supported paths"));
+    eprintln!("  {}", style::blue("/v1/models"));
+    eprintln!("  {}", style::blue("/v1/chat/completions"));
+    eprintln!("  {}", style::blue("/v1/responses"));
+    eprintln!();
 }
 
 fn is_self_proxy_target(base_url: &str, port: u16) -> bool {

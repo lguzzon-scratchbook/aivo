@@ -7,6 +7,7 @@ use anyhow::Result;
 use reqwest::Client;
 
 use crate::commands::models::fetch_models_for_select;
+use crate::commands::print_launch_preview;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::http_utils;
@@ -67,17 +68,19 @@ impl RunCommand {
     }
 
     /// Executes the run command with the specified AI tool
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         tool: Option<&str>,
         args: Vec<String>,
         debug: bool,
+        dry_run: bool,
         model: Option<String>,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
     ) -> ExitCode {
         match self
-            .execute_internal(tool, args, debug, model, env, key_override)
+            .execute_internal(tool, args, debug, dry_run, model, env, key_override)
             .await
         {
             Ok(code) => code,
@@ -88,11 +91,13 @@ impl RunCommand {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_internal(
         &self,
         tool: Option<&str>,
         args: Vec<String>,
         debug: bool,
+        dry_run: bool,
         model: Option<String>,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
@@ -162,6 +167,12 @@ impl RunCommand {
             key_override,
         };
 
+        if dry_run {
+            let plan = self.ai_launcher.prepare_launch(&options).await?;
+            print_launch_preview(&plan);
+            return Ok(ExitCode::Success);
+        }
+
         let exit_code = self.ai_launcher.launch(&options).await?;
         Ok(match exit_code {
             0 => ExitCode::Success,
@@ -208,6 +219,11 @@ impl RunCommand {
             "  {}              {}",
             style::cyan("--debug"),
             style::dim("Enable debug output")
+        );
+        println!(
+            "  {}            {}",
+            style::cyan("--dry-run"),
+            style::dim("Print resolved command and environment without launching")
         );
         println!();
         println!("{}", style::bold("Tools:"));

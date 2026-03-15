@@ -51,6 +51,9 @@ pub enum Commands {
     /// Serve an OpenAI-compatible API that proxies to the active provider
     Serve(ServeArgs),
 
+    /// Show a compact status view of keys, tools, and current directory state
+    Ls,
+
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
 }
@@ -110,6 +113,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub debug: bool,
 
+    /// Print the resolved command and environment without launching
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Inject environment variable (KEY=VALUE)
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     pub envs: Vec<String>,
@@ -140,6 +147,10 @@ pub struct ModelsArgs {
     /// Bypass cache and fetch fresh model list from the provider
     #[arg(short = 'r', long)]
     pub refresh: bool,
+
+    /// Search models by substring
+    #[arg(short = 's', long, value_name = "QUERY", value_parser = non_empty())]
+    pub search: Option<String>,
 }
 
 /// Arguments for the serve command
@@ -216,7 +227,9 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
 /// Get the list of valid commands
 #[allow(dead_code)]
 pub fn get_valid_commands() -> Vec<&'static str> {
-    vec!["update", "keys", "run", "chat", "models", "serve", "use"]
+    vec![
+        "update", "keys", "run", "chat", "models", "serve", "ls", "use",
+    ]
 }
 
 /// Check if a command is a passthrough command (passes all args to underlying tool)
@@ -273,6 +286,7 @@ mod tests {
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.tool, Some("claude".to_string()));
             assert!(run_args.debug);
+            assert!(!run_args.dry_run);
             assert!(!run_args.args.contains(&"--debug".to_string()));
         } else {
             panic!("Expected Run command");
@@ -286,6 +300,17 @@ mod tests {
             assert_eq!(run_args.tool, None);
             assert_eq!(run_args.model, Some("gpt-5".to_string()));
             assert!(run_args.debug);
+            assert!(!run_args.dry_run);
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_run_args_dry_run_flag() {
+        let cli = Cli::try_parse_from(["aivo", "run", "claude", "--dry-run"]).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert!(run_args.dry_run);
         } else {
             panic!("Expected Run command");
         }
@@ -496,6 +521,26 @@ mod tests {
         let args = rewrite_alias(&["aivo", "keys"]);
         let cli = Cli::try_parse_from(&args).unwrap();
         assert!(matches!(cli.command, Some(Commands::Keys(_))));
+    }
+
+    #[test]
+    fn test_models_search_option() {
+        let cli = Cli::try_parse_from(["aivo", "models", "-s", "sonnet"]).unwrap();
+        if let Some(Commands::Models(models_args)) = cli.command {
+            assert_eq!(models_args.search.as_deref(), Some("sonnet"));
+        } else {
+            panic!("Expected Models command");
+        }
+    }
+
+    #[test]
+    fn test_serve_port_flag() {
+        let cli = Cli::try_parse_from(["aivo", "serve", "--port", "8080"]).unwrap();
+        if let Some(Commands::Serve(serve_args)) = cli.command {
+            assert_eq!(serve_args.port, 8080);
+        } else {
+            panic!("Expected Serve command");
+        }
     }
 
     /// Helper to simulate the 'use' alias rewriting done in main.rs

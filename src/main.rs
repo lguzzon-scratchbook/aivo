@@ -17,8 +17,8 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    ChatCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand, StartCommand, StartFlowArgs,
-    UpdateCommand, truncate_url_for_display,
+    ChatCommand, KeysCommand, LsCommand, ModelsCommand, RunCommand, ServeCommand, StartCommand,
+    StartFlowArgs, UpdateCommand, truncate_url_for_display,
 };
 use errors::ExitCode;
 use services::session_store::ApiKey;
@@ -54,6 +54,9 @@ async fn main() {
             }
             Some(Commands::Serve(_)) => {
                 ServeCommand::print_help();
+            }
+            Some(Commands::Ls) => {
+                LsCommand::print_help();
             }
             Some(Commands::Update(_)) => {
                 UpdateCommand::print_help();
@@ -120,12 +123,14 @@ async fn main() {
                 run_args.model,
                 run_args.key,
                 run_args.debug,
+                run_args.dry_run,
                 run_args.envs,
                 &run_args.args,
             );
             let model = extracted.model;
             let key_flag = extracted.key_flag;
             let debug = extracted.debug;
+            let dry_run = extracted.dry_run;
             let env_strings = extracted.env_strings;
             let remaining_args = extracted.remaining_args;
 
@@ -149,6 +154,7 @@ async fn main() {
                         key: key_flag,
                         tool: None,
                         debug,
+                        dry_run,
                         yes: false,
                         envs: env_strings,
                     })
@@ -188,6 +194,7 @@ async fn main() {
                         run_args.tool.as_deref(),
                         remaining_args,
                         debug,
+                        dry_run,
                         model,
                         env,
                         key_override,
@@ -206,7 +213,9 @@ async fn main() {
                 .await,
             );
             let command = ModelsCommand::new(session_store, models_cache);
-            command.execute(key_override, models_args.refresh).await
+            command
+                .execute(key_override, models_args.refresh, models_args.search)
+                .await
         }
 
         Commands::Serve(serve_args) => {
@@ -227,6 +236,11 @@ async fn main() {
             };
             let command = ServeCommand::new(session_store);
             command.execute(serve_args.port, key_override).await
+        }
+
+        Commands::Ls => {
+            let command = LsCommand::new(session_store, models_cache);
+            command.execute().await
         }
 
         Commands::Update(update_args) => match UpdateCommand::new() {
@@ -466,6 +480,11 @@ fn print_help() {
         style::dim("Start a local OpenAI-compatible API server")
     );
     println!(
+        "  {}              {}",
+        style::cyan("ls"),
+        style::dim("Show saved keys, tools, and current directory state")
+    );
+    println!(
         "  {}          {}",
         style::cyan("update"),
         style::dim("Update to the latest version")
@@ -502,11 +521,12 @@ struct ExtractedFlags {
     model: Option<String>,
     key_flag: Option<String>,
     debug: bool,
+    dry_run: bool,
     env_strings: Vec<String>,
     remaining_args: Vec<String>,
 }
 
-/// Extracts aivo-owned flags (`--model`/`-m`, `--key`/`-k`, `--debug`, `--env`/`-e`) from
+/// Extracts aivo-owned flags (`--model`/`-m`, `--key`/`-k`, `--debug`, `--dry-run`, `--env`/`-e`) from
 /// the passthrough `args` slice that clap's `trailing_var_arg` may have swallowed.
 ///
 /// Flags already parsed by clap are supplied via `initial_*` parameters so that the
@@ -515,6 +535,7 @@ fn extract_aivo_flags(
     initial_model: Option<String>,
     initial_key: Option<String>,
     initial_debug: bool,
+    initial_dry_run: bool,
     initial_envs: Vec<String>,
     passthrough_args: &[String],
 ) -> ExtractedFlags {
@@ -536,6 +557,7 @@ fn extract_aivo_flags(
     };
 
     let mut debug = initial_debug;
+    let mut dry_run = initial_dry_run;
     let mut env_strings = initial_envs;
     let mut remaining_args: Vec<String> = Vec::new();
 
@@ -584,6 +606,8 @@ fn extract_aivo_flags(
             }
         } else if arg == "--debug" {
             debug = true;
+        } else if arg == "--dry-run" {
+            dry_run = true;
         } else if let Some(value) = arg
             .strip_prefix("--env=")
             .or_else(|| arg.strip_prefix("-e="))
@@ -604,6 +628,7 @@ fn extract_aivo_flags(
         model,
         key_flag,
         debug,
+        dry_run,
         env_strings,
         remaining_args,
     }
@@ -623,6 +648,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             vec![],
             &args(&["--model=gpt-4o", "file.ts"]),
         );
@@ -636,6 +662,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             vec![],
             &args(&["--model", "gpt-4o", "file.ts"]),
         );
@@ -645,21 +672,28 @@ mod tests {
 
     #[test]
     fn model_short_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-m", "gpt-4o"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["-m", "gpt-4o"]));
         assert_eq!(r.model, Some("gpt-4o".to_string()));
         assert!(r.remaining_args.is_empty());
     }
 
     #[test]
     fn model_no_value_triggers_picker() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--model"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["--model"]));
         assert_eq!(r.model, Some(String::new()));
     }
 
     #[test]
     fn model_flag_as_value_corrected() {
         // Clap swallowed `--resume` as the value of -m
-        let r = extract_aivo_flags(Some("--resume".to_string()), None, false, vec![], &[]);
+        let r = extract_aivo_flags(
+            Some("--resume".to_string()),
+            None,
+            false,
+            false,
+            vec![],
+            &[],
+        );
         assert_eq!(r.model, Some(String::new())); // picker triggered
         assert_eq!(r.remaining_args, args(&["--resume"]));
     }
@@ -671,6 +705,7 @@ mod tests {
             Some("gpt-4o".to_string()),
             None,
             false,
+            false,
             vec![],
             &args(&["--model", "other"]),
         );
@@ -680,69 +715,96 @@ mod tests {
 
     #[test]
     fn key_inline_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--key=mykey"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["--key=mykey"]));
         assert_eq!(r.key_flag, Some("mykey".to_string()));
     }
 
     #[test]
     fn key_space_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--key", "mykey"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["--key", "mykey"]));
         assert_eq!(r.key_flag, Some("mykey".to_string()));
     }
 
     #[test]
     fn key_short_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-k", "mykey"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["-k", "mykey"]));
         assert_eq!(r.key_flag, Some("mykey".to_string()));
     }
 
     #[test]
     fn key_flag_as_value_corrected() {
-        let r = extract_aivo_flags(None, Some("--something".to_string()), false, vec![], &[]);
+        let r = extract_aivo_flags(
+            None,
+            Some("--something".to_string()),
+            false,
+            false,
+            vec![],
+            &[],
+        );
         assert_eq!(r.key_flag, Some(String::new()));
         assert_eq!(r.remaining_args, args(&["--something"]));
     }
 
     #[test]
     fn key_no_value_triggers_picker() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-k"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["-k"]));
         assert_eq!(r.key_flag, Some(String::new()));
     }
 
     #[test]
     fn debug_flag() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--debug", "file.ts"]));
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            false,
+            vec![],
+            &args(&["--debug", "file.ts"]),
+        );
         assert!(r.debug);
         assert_eq!(r.remaining_args, args(&["file.ts"]));
     }
 
     #[test]
     fn debug_already_set_preserved() {
-        let r = extract_aivo_flags(None, None, true, vec![], &[]);
+        let r = extract_aivo_flags(None, None, true, false, vec![], &[]);
         assert!(r.debug);
     }
 
     #[test]
+    fn dry_run_flag() {
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["--dry-run"]));
+        assert!(r.dry_run);
+    }
+
+    #[test]
     fn env_inline_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--env=FOO=bar"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["--env=FOO=bar"]));
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
     }
 
     #[test]
     fn env_short_inline_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-e=FOO=bar"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["-e=FOO=bar"]));
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
     }
 
     #[test]
     fn env_space_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["--env", "FOO=bar"]));
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            false,
+            vec![],
+            &args(&["--env", "FOO=bar"]),
+        );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
     }
 
     #[test]
     fn env_short_space_form() {
-        let r = extract_aivo_flags(None, None, false, vec![], &args(&["-e", "FOO=bar"]));
+        let r = extract_aivo_flags(None, None, false, false, vec![], &args(&["-e", "FOO=bar"]));
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
     }
 
@@ -751,6 +813,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             None,
+            false,
             false,
             vec!["PRE=1".to_string()],
             &args(&["-e", "POST=2"]),
@@ -764,6 +827,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             vec![],
             &args(&["--agent-name", "foo", "--resume"]),
         );
@@ -776,6 +840,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             None,
+            false,
             false,
             vec![],
             &args(&[

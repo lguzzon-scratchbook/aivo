@@ -78,6 +78,17 @@ pub struct ToolConfig {
     pub env_vars: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedLaunch {
+    pub tool: AIToolType,
+    pub key: ApiKey,
+    pub command: String,
+    pub model: Option<String>,
+    pub args: Vec<String>,
+    pub env_vars: HashMap<String, String>,
+    pub notes: Vec<String>,
+}
+
 /// AILauncher spawns AI tool processes with configured environment and stdio passthrough
 #[derive(Debug, Clone)]
 pub struct AILauncher {
@@ -102,64 +113,14 @@ impl AILauncher {
 
     /// Spawns an AI tool with configured environment and stdio passthrough
     pub async fn launch(&self, options: &LaunchOptions) -> Result<i32> {
-        let mut key = match &options.key_override {
-            Some(k) => k.clone(),
-            None => match self.session_store.get_active_key().await? {
-                Some(k) => k,
-                None => {
-                    return Err(CLIError::new(
-                        "No API key configured. Please add a key with 'aivo keys add'.",
-                        ErrorCategory::Auth,
-                        None::<String>,
-                        Some("Run 'aivo keys add' to add an API key"),
-                    )
-                    .into());
-                }
-            },
-        };
+        let resolved = self.resolve_launch_context(options, true).await?;
+        self.output_key_info(&resolved.key);
 
-        if options.tool == AIToolType::Claude {
-            key = self
-                .resolve_claude_protocol(
-                    key,
-                    options.key_override.is_none(),
-                    options.model.as_deref(),
-                )
-                .await?;
-        } else if options.tool == AIToolType::Codex {
-            key = self
-                .resolve_codex_mode(key, options.key_override.is_none())
-                .await?;
-        } else if options.tool == AIToolType::Gemini {
-            key = self
-                .resolve_gemini_protocol(key, options.key_override.is_none())
-                .await?;
-        } else if options.tool == AIToolType::Opencode {
-            key = self
-                .resolve_opencode_mode(key, options.key_override.is_none())
-                .await?;
-        }
-
-        self.output_key_info(&key);
-
-        let (model, opencode_models) = if options.tool == AIToolType::Opencode {
-            let (selected_model, discovered_models) = self
-                .resolve_opencode_model_config(&key, options.model.as_deref())
-                .await?;
-            (selected_model, Some(discovered_models))
-        } else {
-            (options.model.clone(), None)
-        };
-        let tool_config = self.get_tool_config(
-            options.tool,
-            &key,
-            model.as_deref(),
-            opencode_models.as_deref(),
+        let mut env = self.env_injector.merge(
+            &resolved.tool_config.env_vars,
+            options.env.as_ref(),
+            options.debug,
         );
-
-        let mut env =
-            self.env_injector
-                .merge(&tool_config.env_vars, options.env.as_ref(), options.debug);
 
         // Track the router's active protocol so we can persist discoveries after the child exits
         let mut router_protocol: Option<Arc<AtomicU8>> = None;
@@ -252,42 +213,29 @@ impl AILauncher {
             }
         }
 
-        // For Claude, inject --teammate-mode in-process to run in single window
-        let args = inject_claude_teammate_mode(options.tool, &options.args);
+        let runtime_args =
+            build_runtime_args(options.tool, &options.args, resolved.model.as_deref(), &env)
+                .await?;
 
-        // For Codex with routed non-OpenAI providers, optionally provide a local model catalog
-        // entry for custom models to avoid fallback metadata mode.
-        let use_codex_router = env.contains_key("AIVO_USE_CODEX_ROUTER")
-            || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER");
-        let codex_model_catalog_path = if options.tool == AIToolType::Codex {
-            maybe_write_codex_model_catalog(model.as_deref(), use_codex_router).await?
-        } else {
-            None
-        };
-
-        // For Codex, inject -m <model> if model is specified via --model flag
-        let args = if options.tool == AIToolType::Codex {
-            let args = inject_codex_model(model.as_deref(), &args, use_codex_router);
-            inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args)
-        } else {
-            args
-        };
-
-        let mut child = self.spawn_child(&tool_config.command, &args, env)?;
+        let mut child = self.spawn_child(&resolved.tool_config.command, &runtime_args.args, env)?;
 
         let _ = self
             .session_store
-            .record_selection(&key.id, options.tool.as_str(), model.as_deref())
+            .record_selection(
+                &resolved.key.id,
+                options.tool.as_str(),
+                resolved.model.as_deref(),
+            )
             .await;
         if let Some(cwd) = crate::services::system_env::current_dir_string() {
             let _ = self
                 .session_store
                 .set_directory_start(
                     &cwd,
-                    &key.id,
-                    &key.base_url,
+                    &resolved.key.id,
+                    &resolved.key.base_url,
                     options.tool.as_str(),
-                    model.as_deref(),
+                    resolved.model.as_deref(),
                 )
                 .await;
         }
@@ -301,7 +249,8 @@ impl AILauncher {
             let final_protocol = ProviderProtocol::from_u8(active.load(Ordering::Relaxed));
             match options.tool {
                 AIToolType::Claude => {
-                    let current = key
+                    let current = resolved
+                        .key
                         .claude_protocol
                         .map(|p| match p {
                             ClaudeProviderProtocol::Openai => ProviderProtocol::Openai,
@@ -317,12 +266,13 @@ impl AILauncher {
                         };
                         let _ = self
                             .session_store
-                            .set_key_claude_protocol(&key.id, Some(cp))
+                            .set_key_claude_protocol(&resolved.key.id, Some(cp))
                             .await;
                     }
                 }
                 AIToolType::Gemini => {
-                    let current = key
+                    let current = resolved
+                        .key
                         .gemini_protocol
                         .map(|p| match p {
                             GeminiProviderProtocol::Google => ProviderProtocol::Google,
@@ -338,7 +288,7 @@ impl AILauncher {
                         };
                         let _ = self
                             .session_store
-                            .set_key_gemini_protocol(&key.id, Some(gp))
+                            .set_key_gemini_protocol(&resolved.key.id, Some(gp))
                             .await;
                     }
                 }
@@ -346,11 +296,102 @@ impl AILauncher {
             }
         }
 
-        if let Some(ref path) = codex_model_catalog_path {
+        if let Some(ref path) = runtime_args.codex_model_catalog_path {
             let _ = tokio::fs::remove_file(path).await;
         }
 
         result
+    }
+
+    pub async fn prepare_launch(&self, options: &LaunchOptions) -> Result<PreparedLaunch> {
+        let resolved = self.resolve_launch_context(options, false).await?;
+        let env_vars = merge_preview_env(&resolved.tool_config.env_vars, options.env.as_ref());
+        let args = preview_args(
+            options.tool,
+            &options.args,
+            resolved.model.as_deref(),
+            &resolved.tool_config.env_vars,
+        );
+        let notes = build_preview_notes(
+            options.tool,
+            &options.args,
+            resolved.model.as_deref(),
+            &resolved.tool_config.env_vars,
+        );
+
+        Ok(PreparedLaunch {
+            tool: options.tool,
+            key: resolved.key,
+            command: resolved.tool_config.command,
+            model: resolved.model,
+            args,
+            env_vars,
+            notes,
+        })
+    }
+
+    async fn resolve_launch_context(
+        &self,
+        options: &LaunchOptions,
+        persist: bool,
+    ) -> Result<ResolvedLaunchContext> {
+        let mut key = match &options.key_override {
+            Some(k) => k.clone(),
+            None => match self.session_store.get_active_key().await? {
+                Some(k) => k,
+                None => {
+                    return Err(CLIError::new(
+                        "No API key configured. Please add a key with 'aivo keys add'.",
+                        ErrorCategory::Auth,
+                        None::<String>,
+                        Some("Run 'aivo keys add' to add an API key"),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        if options.tool == AIToolType::Claude {
+            key = self
+                .resolve_claude_protocol(
+                    key,
+                    persist && options.key_override.is_none(),
+                    options.model.as_deref(),
+                )
+                .await?;
+        } else if options.tool == AIToolType::Codex {
+            key = self
+                .resolve_codex_mode(key, persist && options.key_override.is_none())
+                .await?;
+        } else if options.tool == AIToolType::Gemini {
+            key = self
+                .resolve_gemini_protocol(key, persist && options.key_override.is_none())
+                .await?;
+        } else if options.tool == AIToolType::Opencode {
+            key = self
+                .resolve_opencode_mode(key, persist && options.key_override.is_none())
+                .await?;
+        }
+
+        let (model, opencode_models) = if options.tool == AIToolType::Opencode {
+            let (selected_model, discovered_models) = self
+                .resolve_opencode_model_config(&key, options.model.as_deref())
+                .await?;
+            (selected_model, Some(discovered_models))
+        } else {
+            (options.model.clone(), None)
+        };
+        let tool_config = self.get_tool_config(
+            options.tool,
+            &key,
+            model.as_deref(),
+            opencode_models.as_deref(),
+        );
+        Ok(ResolvedLaunchContext {
+            key,
+            model,
+            tool_config,
+        })
     }
 
     /// Outputs information about which key is being used
@@ -580,6 +621,163 @@ impl AILauncher {
         let status = child.wait().await?;
         Ok(status.code().unwrap_or(1))
     }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedLaunchContext {
+    key: ApiKey,
+    model: Option<String>,
+    tool_config: ToolConfig,
+}
+
+fn merge_preview_env(
+    tool_env: &HashMap<String, String>,
+    manual_env: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut merged = tool_env.clone();
+    if let Some(manual) = manual_env {
+        for (key, value) in manual {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    merged
+}
+
+fn preview_args(
+    tool: AIToolType,
+    raw_args: &[String],
+    model: Option<&str>,
+    env: &HashMap<String, String>,
+) -> Vec<String> {
+    let args = inject_claude_teammate_mode(tool, raw_args);
+    if tool != AIToolType::Codex {
+        return args;
+    }
+
+    let use_codex_router = env.contains_key("AIVO_USE_CODEX_ROUTER")
+        || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER");
+    let args = inject_codex_model(model, &args, use_codex_router);
+    if should_preview_codex_model_catalog(model, use_codex_router) {
+        let mut preview = vec![
+            "--config".to_string(),
+            "model_catalog_json=\"<temp:aivo-codex-model-catalog.json>\"".to_string(),
+        ];
+        preview.extend(args);
+        return preview;
+    }
+    args
+}
+
+fn build_preview_notes(
+    tool: AIToolType,
+    raw_args: &[String],
+    model: Option<&str>,
+    env: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+
+    if tool == AIToolType::Claude
+        && !raw_args
+            .iter()
+            .any(|arg| arg == "--teammate-mode" || arg.starts_with("--teammate-mode="))
+    {
+        notes.push("injects `--teammate-mode in-process` for Claude".to_string());
+    }
+
+    if env.contains_key("AIVO_USE_ROUTER") {
+        notes.push("starts an Anthropic compatibility router on a random local port".to_string());
+    }
+    if env.contains_key("AIVO_USE_OPENAI_ROUTER") {
+        notes.push(
+            "starts an OpenAI/Gemini compatibility router on a random local port".to_string(),
+        );
+    }
+    if env.contains_key("AIVO_USE_COPILOT_ROUTER") {
+        notes.push("starts a Copilot router on a random local port".to_string());
+    }
+    if env.contains_key("AIVO_USE_CODEX_ROUTER") {
+        notes.push("starts a Codex router on a random local port".to_string());
+    }
+    if env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER") {
+        notes.push("starts a Copilot-backed Codex router on a random local port".to_string());
+    }
+    if env.contains_key("AIVO_USE_GEMINI_ROUTER") {
+        notes.push("starts a Gemini router on a random local port".to_string());
+    }
+    if env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER") {
+        notes.push("starts a Copilot-backed Gemini router on a random local port".to_string());
+    }
+    if env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
+        notes.push("starts an OpenCode compatibility router on a random local port".to_string());
+    }
+    if env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER") {
+        notes.push("starts a Copilot-backed OpenCode router on a random local port".to_string());
+    }
+
+    let use_codex_router = env.contains_key("AIVO_USE_CODEX_ROUTER")
+        || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER");
+    if tool == AIToolType::Codex
+        && model.is_some()
+        && !raw_args.iter().any(|arg| {
+            arg == "--model" || arg == "-m" || arg.starts_with("--model=") || arg.starts_with("-m=")
+        })
+    {
+        notes.push("injects `-m <model>` for Codex".to_string());
+    }
+    if tool == AIToolType::Codex && should_preview_codex_model_catalog(model, use_codex_router) {
+        notes.push("writes a temporary Codex model catalog file at launch time".to_string());
+    }
+
+    notes
+}
+
+async fn build_runtime_args(
+    tool: AIToolType,
+    raw_args: &[String],
+    model: Option<&str>,
+    env: &HashMap<String, String>,
+) -> Result<RuntimeArgs> {
+    let args = inject_claude_teammate_mode(tool, raw_args);
+    if tool != AIToolType::Codex {
+        return Ok(RuntimeArgs {
+            args,
+            codex_model_catalog_path: None,
+        });
+    }
+
+    let use_codex_router = env.contains_key("AIVO_USE_CODEX_ROUTER")
+        || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER");
+    let codex_model_catalog_path = maybe_write_codex_model_catalog(model, use_codex_router).await?;
+    let args = inject_codex_model(model, &args, use_codex_router);
+    let args = inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args);
+
+    Ok(RuntimeArgs {
+        args,
+        codex_model_catalog_path,
+    })
+}
+
+fn should_preview_codex_model_catalog(model: Option<&str>, uses_non_openai_router: bool) -> bool {
+    let model = match model {
+        Some(model) if !model.is_empty() => model,
+        _ => return false,
+    };
+
+    if !uses_non_openai_router {
+        return false;
+    }
+
+    let model_lower = model.to_lowercase();
+    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
+    !(name_only.starts_with("gpt-")
+        || name_only.starts_with("o1")
+        || name_only.starts_with("o3")
+        || name_only.starts_with("o4"))
+}
+
+struct RuntimeArgs {
+    args: Vec<String>,
+    codex_model_catalog_path: Option<String>,
 }
 
 fn preferred_claude_protocol(base_url: &str) -> ClaudeProviderProtocol {

@@ -77,8 +77,13 @@ impl ModelsCommand {
         }
     }
 
-    pub async fn execute(&self, key_override: Option<ApiKey>, refresh: bool) -> ExitCode {
-        match self.execute_internal(key_override, refresh).await {
+    pub async fn execute(
+        &self,
+        key_override: Option<ApiKey>,
+        refresh: bool,
+        search: Option<String>,
+    ) -> ExitCode {
+        match self.execute_internal(key_override, refresh, search).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -91,6 +96,7 @@ impl ModelsCommand {
         &self,
         key_override: Option<ApiKey>,
         refresh: bool,
+        search: Option<String>,
     ) -> Result<ExitCode> {
         let key = match key_override {
             Some(k) => k,
@@ -117,14 +123,39 @@ impl ModelsCommand {
         .await?;
         models.sort();
 
-        eprintln!(
-            "{} {} models via {}",
-            style::success_symbol(),
-            models.len(),
-            style::dim(&key.base_url)
-        );
-        for model in &models {
-            println!("{}", model);
+        match search {
+            Some(search) => {
+                let query = search.trim().to_lowercase();
+                if query.is_empty() {
+                    anyhow::bail!("Search query cannot be empty");
+                }
+
+                let filtered: Vec<_> = models
+                    .into_iter()
+                    .filter(|model| model.to_lowercase().contains(&query))
+                    .collect();
+
+                eprintln!(
+                    "{} {} matches via {}",
+                    style::success_symbol(),
+                    filtered.len(),
+                    style::dim(&key.base_url)
+                );
+                for model in &filtered {
+                    println!("{}", model);
+                }
+            }
+            None => {
+                eprintln!(
+                    "{} {} models via {}",
+                    style::success_symbol(),
+                    models.len(),
+                    style::dim(&key.base_url)
+                );
+                for model in &models {
+                    println!("{}", model);
+                }
+            }
         }
 
         Ok(ExitCode::Success)
@@ -155,9 +186,15 @@ impl ModelsCommand {
             style::cyan("-r, --refresh"),
             style::dim("Bypass cache and fetch fresh model list")
         );
+        println!(
+            "  {} {}",
+            style::cyan("-s, --search <query>"),
+            style::dim("Filter models by substring match")
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo models"));
+        println!("  {}", style::dim("aivo models -s sonnet"));
         println!("  {}", style::dim("aivo models --key openrouter"));
         println!("  {}", style::dim("aivo models --refresh"));
     }

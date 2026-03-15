@@ -4,6 +4,7 @@ use console::{Key, Term};
 use crate::cli::parse_env_vars;
 use crate::commands::keys::prompt_pick_key_without_activation;
 use crate::commands::models::fetch_models_for_select;
+use crate::commands::print_launch_preview;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::http_utils;
@@ -19,6 +20,7 @@ pub struct StartFlowArgs {
     pub key: Option<String>,
     pub tool: Option<String>,
     pub debug: bool,
+    pub dry_run: bool,
     pub yes: bool,
     pub envs: Vec<String>,
 }
@@ -75,6 +77,22 @@ impl StartCommand {
         let env = parse_env_vars(&args.envs);
         let skip_confirm =
             remembered.is_some() || (key.interactive && tool.interactive && model.interactive);
+
+        if args.dry_run {
+            let plan = self
+                .ai_launcher
+                .prepare_launch(&LaunchOptions {
+                    tool: tool.value,
+                    args: Vec::new(),
+                    debug: args.debug,
+                    model: model.value,
+                    env: (!env.is_empty()).then_some(env),
+                    key_override: Some(key.value),
+                })
+                .await?;
+            print_launch_preview(&plan);
+            return Ok(ExitCode::Success);
+        }
 
         if !args.yes {
             let provider = normalize_provider_label(&key.value.base_url);

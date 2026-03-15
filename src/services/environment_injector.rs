@@ -468,7 +468,7 @@ fn strip_aivo_prefix(model: &str) -> &str {
     model.strip_prefix("aivo/").unwrap_or(model)
 }
 
-fn redact_env_value(key: &str, value: &str) -> String {
+pub(crate) fn redact_env_value(key: &str, value: &str) -> String {
     if key == "OPENCODE_CONFIG_CONTENT" {
         return "<redacted>".to_string();
     }

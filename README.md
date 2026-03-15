@@ -79,6 +79,13 @@ aivo codex --key copilot
 aivo claude --key              # open key picker for this run only
 ```
 
+Preview what `aivo` would launch without starting the tool:
+
+```bash
+aivo claude --dry-run
+aivo run codex --model gpt-5 --dry-run
+```
+
 Inject extra env vars into the child process:
 
 ```bash
@@ -129,9 +136,19 @@ List models for the active provider:
 aivo models
 aivo models --refresh
 aivo models --key openrouter
+aivo models -s sonnet
 ```
 
 Model lists are cached for one hour. `--refresh` bypasses the cache.
+
+## Status
+
+`aivo ls` shows a compact status view of:
+
+- saved keys and the active key
+- installed tool binaries on `PATH`
+- the remembered tool/model for the current directory
+- the saved chat model and cached model count for the active key
 
 ## Chat
 
