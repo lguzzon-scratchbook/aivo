@@ -11,6 +11,11 @@ use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
     convert_openai_chat_to_anthropic_request,
 };
+use crate::services::openai_gemini_bridge::{
+    OpenAIToGeminiConfig, build_google_generate_content_url,
+    convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
+    openai_chat_model,
+};
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch,
 };
@@ -33,6 +38,11 @@ pub struct GeminiRouterConfig {
 
 pub struct GeminiRouter {
     config: GeminiRouterConfig,
+}
+
+enum ForwardResult {
+    Success(Value),
+    ProviderError { status: u16, body: String },
 }
 
 struct GeminiRouterState {
@@ -98,20 +108,26 @@ async fn handle_request(
             );
             // openai_req already has the model from the Gemini request body — don't pre-select here;
             // select_model_for_protocol is applied per-attempt inside forward_to_provider.
-            let openai_response =
-                forward_to_provider(openai_req, config, client, active_protocol).await?;
-            let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
-
-            if is_streaming {
-                let sse = convert_openai_to_gemini_sse(&openai_response);
-                Ok(http_utils::http_response(200, "text/event-stream", &sse))
-            } else {
-                let gemini = convert_openai_to_gemini(&openai_response);
-                let json = serde_json::to_string(&gemini)?;
-                Ok(http_utils::http_json_response(200, &json))
+            match forward_to_provider(openai_req, config, client, active_protocol).await? {
+                ForwardResult::Success(openai_response) => {
+                    let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
+                    if is_streaming {
+                        let sse = convert_openai_to_gemini_sse(&openai_response);
+                        Ok(http_utils::http_response(200, "text/event-stream", &sse))
+                    } else {
+                        let gemini = convert_openai_to_gemini(&openai_response);
+                        let json = serde_json::to_string(&gemini)?;
+                        Ok(http_utils::http_json_response(200, &json))
+                    }
+                }
+                ForwardResult::ProviderError { status, body } => {
+                    Ok(http_utils::http_response(status, "application/json", &body))
+                }
             }
         }
-        None => Ok(http_utils::http_error_response(404, "not found")),
+        None => {
+            Ok(http_utils::http_error_response(404, "not found"))
+        }
     }
 }
 
@@ -120,13 +136,15 @@ async fn forward_to_provider(
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
     active_protocol: &Arc<AtomicU8>,
-) -> Result<Value> {
+) -> Result<ForwardResult> {
     let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
     let candidates: Vec<ProviderProtocol> = std::iter::once(current)
         .chain(fallback_protocols(current, &config.target_base_url))
         .collect();
 
-    let mut last_err = String::from("No protocol candidates");
+    let mut last_status = 0u16;
+    let mut last_body = String::new();
+
     for (attempt, protocol) in candidates.into_iter().enumerate() {
         // Select the right model name for this protocol attempt.
         let mut req_body = openai_req.clone();
@@ -138,7 +156,7 @@ async fn forward_to_provider(
         );
         req_body["model"] = serde_json::json!(selected_model);
 
-        let (status, body_text) = match protocol {
+        let (status, body_text, parsed) = match protocol {
             ProviderProtocol::Anthropic => {
                 let mut anthropic_req = convert_openai_chat_to_anthropic_request(
                     &req_body,
@@ -158,10 +176,53 @@ async fn forward_to_provider(
                     .json(&anthropic_req)
                     .send()
                     .await?;
-                (response.status().as_u16(), response.text().await?)
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    let anthropic_response: Value = serde_json::from_str(&body_text)?;
+                    Some(convert_anthropic_to_openai_chat_response(
+                        &anthropic_response,
+                        req_body
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("gemini-2.5-pro"),
+                    ))
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
             }
-            _ => {
-                // OpenAI protocol
+            ProviderProtocol::Google => {
+                let google_body = convert_openai_chat_to_gemini_request(
+                    &req_body,
+                    &OpenAIToGeminiConfig {
+                        default_model: "gemini-2.5-pro",
+                    },
+                );
+                let model = openai_chat_model(&req_body, "gemini-2.5-pro");
+                let target_url =
+                    build_google_generate_content_url(&config.target_base_url, &model);
+                let response = client
+                    .post(&target_url)
+                    .header("x-goog-api-key", config.api_key.as_str())
+                    .header("Content-Type", "application/json")
+                    .json(&google_body)
+                    .send()
+                    .await?;
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    let google_response: Value = serde_json::from_str(&body_text)?;
+                    Some(convert_gemini_to_openai_chat_response(
+                        &google_response,
+                        &model,
+                    ))
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
+            }
+            ProviderProtocol::Openai => {
                 let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
                 let response = http_utils::authorized_openai_post(
                     client.as_ref(),
@@ -173,41 +234,41 @@ async fn forward_to_provider(
                 .json(&req_body)
                 .send()
                 .await?;
-                (response.status().as_u16(), response.text().await?)
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    Some(serde_json::from_str(&body_text)?)
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
             }
         };
 
+        if let Some(openai_response) = parsed {
+            if attempt > 0 {
+                active_protocol.store(protocol.to_u8(), Ordering::Relaxed);
+                eprintln!("  • Protocol auto-switched to {}", protocol.as_str());
+            }
+            return Ok(ForwardResult::Success(openai_response));
+        }
+
         if is_protocol_mismatch(status) {
-            last_err = format!("Protocol mismatch ({})", status);
+            last_status = status;
+            last_body = body_text;
             continue;
         }
 
-        if status != 200 {
-            anyhow::bail!("Provider error {}: {}", status, body_text);
-        }
-
-        // Success
-        if attempt > 0 {
-            active_protocol.store(protocol.to_u8(), Ordering::Relaxed);
-            eprintln!("  • Protocol auto-switched to {}", protocol.as_str());
-        }
-
-        return match protocol {
-            ProviderProtocol::Anthropic => {
-                let anthropic_response: Value = serde_json::from_str(&body_text)?;
-                Ok(convert_anthropic_to_openai_chat_response(
-                    &anthropic_response,
-                    req_body
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("gemini-2.5-pro"),
-                ))
-            }
-            _ => Ok(serde_json::from_str(&body_text)?),
-        };
+        return Ok(ForwardResult::ProviderError {
+            status,
+            body: body_text,
+        });
     }
 
-    anyhow::bail!("All protocol candidates failed: {}", last_err)
+    Ok(ForwardResult::ProviderError {
+        status: last_status,
+        body: last_body,
+    })
 }
 
 /// Parses a Gemini API request path and extracts (model_name, is_streaming).
@@ -593,11 +654,6 @@ fn convert_parts_to_messages(
             "content": if content_str.is_empty() { Value::Null } else { Value::String(content_str) },
             "tool_calls": tool_calls,
         });
-        if msg["content"].is_null()
-            && let Some(obj) = msg.as_object_mut()
-        {
-            obj.remove("content");
-        }
         if openai_role == "assistant" && requires_reasoning_content {
             let rc = if text_parts.is_empty() {
                 " "
@@ -760,29 +816,38 @@ pub fn convert_openai_to_gemini_sse(body: &Value) -> String {
 
 /// Converts an OpenAI message to Gemini parts array.
 fn message_to_gemini_parts(message: &Value) -> Vec<Value> {
-    // Tool calls → functionCall parts
-    if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
-        return tool_calls
-            .iter()
-            .map(|tc| {
-                let name = tc["function"]["name"].as_str().unwrap_or("");
-                // Some providers return arguments as a JSON string; others as an object
-                let args: Value = match &tc["function"]["arguments"] {
-                    Value::String(s) => serde_json::from_str(s).unwrap_or(serde_json::json!({})),
-                    obj @ Value::Object(_) => obj.clone(),
-                    _ => serde_json::json!({}),
-                };
-                serde_json::json!({"functionCall": {"name": name, "args": args}})
-            })
-            .collect();
+    let mut parts = Vec::new();
+
+    // Text content → text part (preserved alongside tool calls)
+    if let Some(text) = message.get("content").and_then(|c| c.as_str())
+        && !text.is_empty()
+    {
+        parts.push(serde_json::json!({"text": text}));
     }
 
-    // Text content → text part
-    let text = message
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    vec![serde_json::json!({"text": text})]
+    // Tool calls → functionCall parts
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tool_calls {
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            // Some providers return arguments as a JSON string; others as an object
+            let args: Value = match &tc["function"]["arguments"] {
+                Value::String(s) => serde_json::from_str(s).unwrap_or(serde_json::json!({})),
+                obj @ Value::Object(_) => obj.clone(),
+                _ => serde_json::json!({}),
+            };
+            parts.push(serde_json::json!({"functionCall": {"name": name, "args": args}}));
+        }
+    }
+
+    if parts.is_empty() {
+        let text = message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        parts.push(serde_json::json!({"text": text}));
+    }
+
+    parts
 }
 
 #[cfg(test)]
@@ -1014,6 +1079,31 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_openai_to_gemini_tool_call_with_text() {
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me check the weather.",
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"location\":\"SF\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let result = convert_openai_to_gemini(&response);
+        let parts = result["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "Let me check the weather.");
+        assert_eq!(parts[1]["functionCall"]["name"], "get_weather");
+    }
+
+    #[test]
     fn test_convert_openai_to_gemini_length_finish_reason() {
         let response = serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": "..."}, "finish_reason": "length"}]
@@ -1100,6 +1190,9 @@ mod tests {
         // user message, assistant tool_call message, tool result message
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "assistant");
+        // content must be present (null) for strict providers like Cloudflare
+        assert!(messages[1].get("content").is_some(), "assistant tool_call message must retain content field");
+        assert!(messages[1]["content"].is_null());
         assert!(messages[1]["tool_calls"].is_array());
         let tc = &messages[1]["tool_calls"][0];
         assert_eq!(tc["function"]["name"], "get_weather");
