@@ -2,7 +2,8 @@
 //!
 //! Provides common functions for reading HTTP requests from raw TCP streams,
 //! parsing headers, extracting bodies, and formatting responses.
-//! Used by: anthropic_router, openai_router, copilot_router, codex_router, gemini_router.
+//! Used by: anthropic_router, anthropic_to_openai_router, copilot_router,
+//! responses_to_chat_router, gemini_router.
 
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};

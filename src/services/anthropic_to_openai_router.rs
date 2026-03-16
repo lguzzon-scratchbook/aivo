@@ -1,12 +1,12 @@
 /**
- * OpenAI-Compatible Router Service
+ * Anthropic-to-OpenAI router service
  *
- * Acts as an HTTP proxy that intercepts Claude Code requests (Anthropic format)
- * and routes them to OpenAI-compatible providers (like Cloudflare Workers AI),
- * handling all necessary API transformations.
+ * Acts as an HTTP proxy that accepts Anthropic-format requests and routes them
+ * to OpenAI-compatible providers (like Cloudflare Workers AI), handling the
+ * required request and response transformations.
  *
  * Flow:
- * Claude Code (Anthropic /v1/messages) → Router → OpenAI /v1/chat/completions → Cloudflare
+ * Anthropic /v1/messages → Router → OpenAI /v1/chat/completions
  */
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -42,7 +42,7 @@ use crate::services::provider_protocol::{
 };
 
 #[derive(Clone)]
-pub struct OpenAIRouterConfig {
+pub struct AnthropicToOpenAIRouterConfig {
     /// The target OpenAI-compatible provider base URL (e.g., Cloudflare)
     pub target_base_url: String,
     /// API key for the target provider
@@ -58,12 +58,12 @@ pub struct OpenAIRouterConfig {
     pub max_tokens_cap: Option<u64>,
 }
 
-pub struct OpenAIRouter {
-    config: OpenAIRouterConfig,
+pub struct AnthropicToOpenAIRouter {
+    config: AnthropicToOpenAIRouterConfig,
 }
 
-struct OpenAIRouterState {
-    config: Arc<OpenAIRouterConfig>,
+struct AnthropicToOpenAIRouterState {
+    config: Arc<AnthropicToOpenAIRouterConfig>,
     client: reqwest::Client,
     active_protocol: Arc<AtomicU8>,
 }
@@ -76,8 +76,8 @@ enum RouterResponse {
     },
 }
 
-impl OpenAIRouter {
-    pub fn new(config: OpenAIRouterConfig) -> Self {
+impl AnthropicToOpenAIRouter {
+    pub fn new(config: AnthropicToOpenAIRouterConfig) -> Self {
         Self { config }
     }
 
@@ -88,7 +88,7 @@ impl OpenAIRouter {
     ) -> Result<(u16, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let active_protocol = Arc::new(AtomicU8::new(self.config.target_protocol.to_u8()));
-        let state = OpenAIRouterState {
+        let state = AnthropicToOpenAIRouterState {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
             active_protocol: active_protocol.clone(),
@@ -98,7 +98,10 @@ impl OpenAIRouter {
     }
 }
 
-async fn run_router(listener: tokio::net::TcpListener, state: OpenAIRouterState) -> Result<()> {
+async fn run_router(
+    listener: tokio::net::TcpListener,
+    state: AnthropicToOpenAIRouterState,
+) -> Result<()> {
     loop {
         let (mut socket, _) = listener.accept().await?;
         let config = state.config.clone();
@@ -174,7 +177,7 @@ fn apply_model_prefix(model: &str, prefix: Option<&str>) -> String {
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
 async fn handle_anthropic_to_upstream(
     request: &str,
-    config: &Arc<OpenAIRouterConfig>,
+    config: &Arc<AnthropicToOpenAIRouterConfig>,
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
 ) -> Result<RouterResponse> {
@@ -465,7 +468,7 @@ fn convert_responses_to_chat_response(resp: &Value) -> Value {
 fn prepare_gateway_model_metadata(
     simplified: &mut Value,
     passthrough_headers: &mut HeaderMap,
-    config: &OpenAIRouterConfig,
+    config: &AnthropicToOpenAIRouterConfig,
     protocol: ProviderProtocol,
 ) {
     let requested_model = simplified
@@ -1152,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_prepare_gateway_model_metadata_preserves_gateway_claude_model() {
-        let config = OpenAIRouterConfig {
+        let config = AnthropicToOpenAIRouterConfig {
             target_base_url: "https://api.ai.example-gateway.net/endpoint".to_string(),
             target_api_key: "test".to_string(),
             target_protocol: ProviderProtocol::Openai,
@@ -1174,7 +1177,7 @@ mod tests {
 
     #[test]
     fn test_prepare_gateway_model_metadata_remaps_plain_openai_endpoint() {
-        let config = OpenAIRouterConfig {
+        let config = AnthropicToOpenAIRouterConfig {
             target_base_url: "https://api.openai.com/v1".to_string(),
             target_api_key: "test".to_string(),
             target_protocol: ProviderProtocol::Openai,

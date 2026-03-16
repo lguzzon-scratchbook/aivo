@@ -10,13 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::commands::models::fetch_models;
-use crate::services::codex_router::{
-    CodexRouterConfig, convert_chat_response_to_responses_sse, convert_responses_to_chat_request,
-};
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+};
+use crate::services::responses_to_chat_router::{
+    ResponsesToChatRouterConfig, convert_chat_response_to_responses_sse,
+    convert_responses_to_chat_request,
 };
 use crate::services::serve_responses::{
     OpenAIToResponsesStreamConverter, convert_chat_response_to_responses_json,
@@ -321,8 +322,8 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
     )))
 }
 
-fn responses_router_config(state: &ServeState) -> CodexRouterConfig {
-    CodexRouterConfig {
+fn responses_router_config(state: &ServeState) -> ResponsesToChatRouterConfig {
+    ResponsesToChatRouterConfig {
         target_base_url: state.config.upstream_base_url.clone(),
         api_key: state.config.upstream_api_key.clone(),
         target_protocol: ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed)),

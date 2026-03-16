@@ -6,8 +6,8 @@ pub mod anthropic_chat_request;
 pub mod anthropic_chat_response;
 pub mod anthropic_route_pipeline;
 pub mod anthropic_router;
+pub mod anthropic_to_openai_router;
 pub mod codex_model_map;
-pub mod codex_router;
 pub mod copilot_auth;
 pub mod copilot_router;
 pub mod environment_injector;
@@ -20,9 +20,9 @@ pub mod models_cache;
 pub mod openai_anthropic_bridge;
 pub mod openai_gemini_bridge;
 pub mod openai_models;
-pub mod openai_router;
 pub mod provider_profile;
 pub mod provider_protocol;
+pub mod responses_to_chat_router;
 pub mod serve_responses;
 pub mod serve_router;
 pub mod serve_stream_converters;
@@ -34,12 +34,12 @@ pub mod system_env;
 #[allow(unused_imports)]
 pub use ai_launcher::{AILauncher, LaunchOptions, ToolConfig};
 pub use anthropic_router::{AnthropicRouter, AnthropicRouterConfig};
-pub use codex_router::{CodexRouter, CodexRouterConfig};
+pub use anthropic_to_openai_router::{AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig};
 pub use copilot_router::{CopilotRouter, CopilotRouterConfig};
 pub use environment_injector::EnvironmentInjector;
 pub use gemini_router::{GeminiRouter, GeminiRouterConfig};
 pub use models_cache::ModelsCache;
-pub use openai_router::{OpenAIRouter, OpenAIRouterConfig};
+pub use responses_to_chat_router::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
 #[allow(unused_imports)]
 pub use serve_router::{ServeRouter, ServeRouterConfig};
 #[allow(unused_imports)]

@@ -76,10 +76,10 @@ SessionStore → EnvironmentInjector → AILauncher
 | `provider_protocol.rs`        | Protocol detection from base URL                                        |
 | `model_names.rs`              | Model name transformations (e.g. `claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) |
 | `anthropic_router.rs`         | Proxy for Claude + OpenRouter                                           |
-| `openai_router.rs`            | Proxy for Claude + OpenAI-compatible providers                          |
+| `anthropic_to_openai_router.rs` | Proxy for Anthropic-format clients + OpenAI-compatible providers     |
 | `copilot_router.rs`           | Proxy for Claude/Codex/Gemini + GitHub Copilot                          |
 | `copilot_auth.rs`             | GitHub Copilot OAuth device flow and token refresh                      |
-| `codex_router.rs`             | Proxy for Codex + non-OpenAI providers (Responses API → Chat Completions) |
+| `responses_to_chat_router.rs` | Proxy for Responses API clients + non-OpenAI providers (Responses API → Chat Completions) |
 | `gemini_router.rs`            | Proxy for Gemini + non-Google providers (Gemini format → Chat Completions) |
 | `serve_router.rs`             | Shared router server scaffolding                                        |
 | `http_utils.rs`               | Shared HTTP utilities (request parsing, header extraction, SSE)        |

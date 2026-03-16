@@ -12,7 +12,7 @@ use crate::services::session_store::{
 pub(crate) struct LaunchRuntimeState {
     pub(crate) env: HashMap<String, String>,
     pub(crate) router_protocol: Option<Arc<AtomicU8>>,
-    pub(crate) codex_responses_api: Option<Arc<AtomicU8>>,
+    pub(crate) responses_api_support: Option<Arc<AtomicU8>>,
 }
 
 pub(crate) async fn prepare_runtime_env(
@@ -20,15 +20,15 @@ pub(crate) async fn prepare_runtime_env(
     mut env: HashMap<String, String>,
 ) -> Result<LaunchRuntimeState> {
     let mut router_protocol = None;
-    let mut codex_responses_api = None;
+    let mut responses_api_support = None;
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
         let port = start_anthropic_router(&env).await?;
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
 
-    if tool == AIToolType::Claude && env.contains_key("AIVO_USE_OPENAI_ROUTER") {
-        let (port, active) = start_openai_router(&env).await?;
+    if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER") {
+        let (port, active) = start_anthropic_to_openai_router(&env).await?;
         router_protocol = Some(active);
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
@@ -38,14 +38,14 @@ pub(crate) async fn prepare_runtime_env(
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
 
-    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_CODEX_ROUTER") {
-        let (port, _active, responses_api) = start_codex_router(&env).await?;
-        codex_responses_api = Some(responses_api);
+    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
+        let (port, _active, responses_api) = start_responses_to_chat_router(&env).await?;
+        responses_api_support = Some(responses_api);
         set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
     }
 
-    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER") {
-        let port = start_codex_copilot_router(&env).await?;
+    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER") {
+        let port = start_responses_to_chat_copilot_router(&env).await?;
         set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
     }
 
@@ -61,19 +61,19 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER") {
-        let port = start_codex_copilot_router(&env).await?;
+        let port = start_responses_to_chat_copilot_router(&env).await?;
         patch_opencode_config_content(&mut env, port);
     }
 
     if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
-        let (port, _active, _responses_api) = start_codex_router(&env).await?;
+        let (port, _active, _responses_api) = start_responses_to_chat_router(&env).await?;
         patch_opencode_config_content(&mut env, port);
     }
 
     Ok(LaunchRuntimeState {
         env,
         router_protocol,
-        codex_responses_api,
+        responses_api_support,
     })
 }
 
@@ -99,7 +99,7 @@ pub(crate) async fn persist_runtime_discoveries(
     key: &ApiKey,
     key_override_used: bool,
     router_protocol: Option<Arc<AtomicU8>>,
-    codex_responses_api: Option<Arc<AtomicU8>>,
+    responses_api_support: Option<Arc<AtomicU8>>,
 ) {
     if key_override_used {
         return;
@@ -156,15 +156,15 @@ pub(crate) async fn persist_runtime_discoveries(
         }
     }
 
-    if let Some(active) = codex_responses_api {
+    if let Some(active) = responses_api_support {
         let final_val = match active.load(Ordering::Relaxed) {
             1 => Some(true),
             2 => Some(false),
             _ => None,
         };
-        if final_val.is_some() && final_val != key.codex_responses_api {
+        if final_val.is_some() && final_val != key.responses_api_supported {
             let _ = session_store
-                .set_key_codex_responses_api(&key.id, final_val)
+                .set_key_responses_api_supported(&key.id, final_val)
                 .await;
         }
     }
@@ -217,33 +217,37 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
     Ok(port)
 }
 
-async fn start_openai_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
+async fn start_anthropic_to_openai_router(
+    env: &HashMap<String, String>,
+) -> Result<(u16, Arc<AtomicU8>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
-    use crate::services::{OpenAIRouter, OpenAIRouterConfig};
+    use crate::services::{AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig};
 
     let api_key = env
-        .get("AIVO_OPENAI_ROUTER_API_KEY")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_OPENAI_ROUTER_API_KEY"))?
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY")
+        .ok_or_else(|| anyhow::anyhow!("Missing anthropic-to-openai router API key"))?
         .clone();
 
     let base_url = env
-        .get("AIVO_OPENAI_ROUTER_BASE_URL")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_OPENAI_ROUTER_BASE_URL"))?
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL")
+        .ok_or_else(|| anyhow::anyhow!("Missing anthropic-to-openai router base URL"))?
         .clone();
 
-    let model_prefix = env.get("AIVO_OPENAI_ROUTER_MODEL_PREFIX").cloned();
+    let model_prefix = env
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MODEL_PREFIX")
+        .cloned();
     let requires_reasoning_content = env
-        .get("AIVO_OPENAI_ROUTER_REQUIRE_REASONING")
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING")
         .map(|v| v == "1")
         .unwrap_or(false);
     let max_tokens_cap = env
-        .get("AIVO_OPENAI_ROUTER_MAX_TOKENS_CAP")
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAX_TOKENS_CAP")
         .and_then(|v| v.parse::<u64>().ok());
     let target_protocol = env
-        .get("AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL")
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL")
         .and_then(|value| ProviderProtocol::parse(value))
         .unwrap_or_else(|| detect_provider_protocol(&base_url));
-    let config = OpenAIRouterConfig {
+    let config = AnthropicToOpenAIRouterConfig {
         target_base_url: base_url,
         target_api_key: api_key,
         target_protocol,
@@ -252,47 +256,51 @@ async fn start_openai_router(env: &HashMap<String, String>) -> Result<(u16, Arc<
         max_tokens_cap,
     };
 
-    let router = OpenAIRouter::new(config);
+    let router = AnthropicToOpenAIRouter::new(config);
     let (port, active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: openai router exited unexpectedly: {e}");
+            eprintln!("aivo: anthropic-to-openai router exited unexpectedly: {e}");
         }
     });
     Ok((port, active_protocol))
 }
 
-async fn start_codex_router(
+async fn start_responses_to_chat_router(
     env: &HashMap<String, String>,
 ) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
-    use crate::services::{CodexRouter, CodexRouterConfig};
+    use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
 
     let api_key = env
-        .get("AIVO_CODEX_ROUTER_API_KEY")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_CODEX_ROUTER_API_KEY"))?
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
+        .ok_or_else(|| anyhow::anyhow!("Missing responses-to-chat router API key"))?
         .clone();
 
     let base_url = env
-        .get("AIVO_CODEX_ROUTER_BASE_URL")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_CODEX_ROUTER_BASE_URL"))?
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
+        .ok_or_else(|| anyhow::anyhow!("Missing responses-to-chat router base URL"))?
         .clone();
 
-    let model_prefix = env.get("AIVO_CODEX_ROUTER_MODEL_PREFIX").cloned();
+    let model_prefix = env
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MODEL_PREFIX")
+        .cloned();
     let requires_reasoning_content = env
-        .get("AIVO_CODEX_ROUTER_REQUIRE_REASONING")
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_REQUIRE_REASONING")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let actual_model = env.get("AIVO_CODEX_ROUTER_ACTUAL_MODEL").cloned();
+    let actual_model = env
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL")
+        .cloned();
     let max_tokens_cap = env
-        .get("AIVO_CODEX_ROUTER_MAX_TOKENS_CAP")
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MAX_TOKENS_CAP")
         .and_then(|v| v.parse::<u64>().ok());
     let target_protocol = env
-        .get("AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL")
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL")
         .and_then(|value| ProviderProtocol::parse(value))
         .unwrap_or_else(|| detect_provider_protocol(&base_url));
     let responses_api_supported = match env
-        .get("AIVO_CODEX_ROUTER_RESPONSES_API")
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API")
         .map(|v| v.as_str())
     {
         Some("1") => Some(true),
@@ -300,7 +308,7 @@ async fn start_codex_router(
         _ => None,
     };
 
-    let router = CodexRouter::new(CodexRouterConfig {
+    let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
         target_base_url: base_url,
         api_key,
         target_protocol,
@@ -314,7 +322,7 @@ async fn start_codex_router(
     let (port, active_protocol, responses_api, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: codex router exited unexpectedly: {e}");
+            eprintln!("aivo: responses-to-chat router exited unexpectedly: {e}");
         }
     });
     Ok((port, active_protocol, responses_api))
@@ -418,16 +426,16 @@ async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
     Ok(port)
 }
 
-async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
     use crate::services::copilot_auth::CopilotTokenManager;
-    use crate::services::{CodexRouter, CodexRouterConfig};
+    use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
 
     let github_token = env
         .get("AIVO_COPILOT_GITHUB_TOKEN")
         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
         .clone();
 
-    let router = CodexRouter::new(CodexRouterConfig {
+    let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
         target_base_url: String::new(),
         api_key: String::new(),
         target_protocol: ProviderProtocol::Openai,
@@ -441,7 +449,7 @@ async fn start_codex_copilot_router(env: &HashMap<String, String>) -> Result<u16
     let (port, _active_protocol, _responses_api, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: codex copilot router exited unexpectedly: {e}");
+            eprintln!("aivo: responses-to-chat copilot router exited unexpectedly: {e}");
         }
     });
     Ok(port)

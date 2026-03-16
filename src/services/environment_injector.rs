@@ -124,20 +124,25 @@ impl EnvironmentInjector {
                 "http://127.0.0.1:0".to_string(),
             );
             env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
-            env.insert("AIVO_USE_OPENAI_ROUTER".to_string(), "1".to_string());
             env.insert(
-                "AIVO_OPENAI_ROUTER_API_KEY".to_string(),
+                "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER".to_string(),
+                "1".to_string(),
+            );
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY".to_string(),
                 key.key.to_string(),
             );
             env.insert(
-                "AIVO_OPENAI_ROUTER_BASE_URL".to_string(),
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL".to_string(),
                 key.base_url.to_string(),
             );
             env.insert(
-                "AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 Self::routed_protocol_for_claude(key).as_str().to_string(),
             );
-            profile.quirks.inject(&mut env, "AIVO_OPENAI_ROUTER");
+            profile
+                .quirks
+                .inject(&mut env, "AIVO_ANTHROPIC_TO_OPENAI_ROUTER");
         }
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
         env.insert(
@@ -177,7 +182,7 @@ impl EnvironmentInjector {
 
     /// Prepares environment variables for Codex CLI
     ///
-    /// For non-OpenAI providers, activates the CodexRouter to strip unsupported
+    /// For non-OpenAI providers, activates the responses-to-chat router to strip unsupported
     /// built-in tool types (computer_use, file_search, etc.) before forwarding.
     /// For official OpenAI (api.openai.com), connects directly.
     pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
@@ -185,40 +190,51 @@ impl EnvironmentInjector {
         let profile = provider_profile_for_key(key);
 
         if profile.serve_flags.is_copilot {
-            // GitHub Copilot: use CodexRouter with CopilotTokenManager for auth
+            // GitHub Copilot: use the responses-to-chat router with CopilotTokenManager for auth
             // Placeholder URL — AI launcher overwrites with actual random port after binding
             env.insert(
                 "OPENAI_BASE_URL".to_string(),
                 "http://127.0.0.1:0".to_string(),
             );
             env.insert("OPENAI_API_KEY".to_string(), "copilot".to_string());
-            env.insert("AIVO_USE_CODEX_COPILOT_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER".to_string(),
+                "1".to_string(),
+            );
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
         } else if !Self::use_direct_openai_for_codex(key) {
-            // Non-OpenAI provider: use CodexRouter to strip unsupported tool types
+            // Non-OpenAI provider: use the responses-to-chat router to strip unsupported tool types
             // Placeholder URL - AI launcher overwrites with the actual random port after binding
             env.insert(
                 "OPENAI_BASE_URL".to_string(),
                 "http://127.0.0.1:0".to_string(),
             );
             env.insert("OPENAI_API_KEY".to_string(), key.key.to_string());
-            env.insert("AIVO_USE_CODEX_ROUTER".to_string(), "1".to_string());
-            env.insert("AIVO_CODEX_ROUTER_API_KEY".to_string(), key.key.to_string());
             env.insert(
-                "AIVO_CODEX_ROUTER_BASE_URL".to_string(),
+                "AIVO_USE_RESPONSES_TO_CHAT_ROUTER".to_string(),
+                "1".to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
+                key.key.to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
                 key.base_url.clone(),
             );
             env.insert(
-                "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 profile.default_protocol.as_str().to_string(),
             );
-            if let Some(supported) = key.codex_responses_api {
+            if let Some(supported) = key.responses_api_supported {
                 env.insert(
-                    "AIVO_CODEX_ROUTER_RESPONSES_API".to_string(),
+                    "AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API".to_string(),
                     if supported { "1" } else { "0" }.to_string(),
                 );
             }
-            profile.quirks.inject(&mut env, "AIVO_CODEX_ROUTER");
+            profile
+                .quirks
+                .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
         } else {
             // Official OpenAI: direct connection, no proxy needed
             env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
@@ -227,10 +243,11 @@ impl EnvironmentInjector {
 
         if let Some(model) = model {
             // When using a router, pass the original model name so the catalog entry matches.
-            // The router translates it to the actual provider model via AIVO_CODEX_ROUTER_ACTUAL_MODEL.
+            // The router translates it to the actual provider model via
+            // AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL.
             // For direct OpenAI connections, map to a known OpenAI model so Codex CLI finds metadata.
-            let using_router = env.contains_key("AIVO_USE_CODEX_ROUTER")
-                || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER");
+            let using_router = env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER")
+                || env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER");
             let codex_model = if using_router {
                 model.to_string()
             } else {
@@ -241,7 +258,7 @@ impl EnvironmentInjector {
             env.insert("CODEX_MODEL_DEFAULT".to_string(), codex_model.clone());
             // Store the original model for the router to use with the provider
             env.insert(
-                "AIVO_CODEX_ROUTER_ACTUAL_MODEL".to_string(),
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL".to_string(),
                 model.to_string(),
             );
         }
@@ -340,22 +357,27 @@ impl EnvironmentInjector {
             ("http://127.0.0.1:0".to_string(), "copilot".to_string())
         } else if Self::use_router_for_opencode(key) {
             env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
-            env.insert("AIVO_CODEX_ROUTER_API_KEY".to_string(), key.key.to_string());
             env.insert(
-                "AIVO_CODEX_ROUTER_BASE_URL".to_string(),
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
+                key.key.to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
                 key.base_url.clone(),
             );
             env.insert(
-                "AIVO_CODEX_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 profile.default_protocol.as_str().to_string(),
             );
-            if let Some(supported) = key.codex_responses_api {
+            if let Some(supported) = key.responses_api_supported {
                 env.insert(
-                    "AIVO_CODEX_ROUTER_RESPONSES_API".to_string(),
+                    "AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API".to_string(),
                     if supported { "1" } else { "0" }.to_string(),
                 );
             }
-            profile.quirks.inject(&mut env, "AIVO_CODEX_ROUTER");
+            profile
+                .quirks
+                .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
             ("http://127.0.0.1:0".to_string(), key.key.to_string())
         } else {
             (key.base_url.clone(), key.key.to_string())
@@ -535,7 +557,7 @@ mod tests {
             env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
             Some(&"1".to_string())
         );
-        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }
 
     #[test]
@@ -571,7 +593,7 @@ mod tests {
             Some(&"sk-test-key-12345".to_string())
         );
         assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&"MiniMax-M1".to_string()));
-        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }
 
     #[test]
@@ -585,7 +607,7 @@ mod tests {
             env.get("ANTHROPIC_BASE_URL"),
             Some(&"https://api.minimax.io/anthropic".to_string())
         );
-        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }
 
     #[test]
@@ -600,20 +622,23 @@ mod tests {
             env.get("ANTHROPIC_BASE_URL"),
             Some(&"https://api.example.com".to_string())
         );
-        assert!(!env.contains_key("AIVO_USE_OPENAI_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }
 
     #[test]
-    fn test_for_claude_protocol_override_openai_router() {
+    fn test_for_claude_protocol_override_anthropic_to_openai_router() {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.minimax.io/anthropic".to_string();
         key.claude_protocol = Some(ClaudeProviderProtocol::Openai);
         let env = injector.for_claude(&key, Some("MiniMax-M1"));
 
-        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL"),
             Some(&"https://api.minimax.io/anthropic".to_string())
         );
     }
@@ -627,19 +652,22 @@ mod tests {
 
         let env = injector.for_claude(&key, None);
         assert_eq!(
-            env.get("AIVO_OPENAI_ROUTER_UPSTREAM_PROTOCOL"),
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL"),
             Some(&"google".to_string())
         );
     }
 
     #[test]
-    fn test_for_claude_unknown_endpoint_uses_openai_router() {
-        // Any non-Anthropic, non-OpenRouter, non-Copilot URL goes through OpenAIRouter
+    fn test_for_claude_unknown_endpoint_uses_anthropic_to_openai_router() {
+        // Any non-Anthropic, non-OpenRouter, non-Copilot URL goes through the Anthropic-to-OpenAI router.
         let injector = EnvironmentInjector::new();
         let key = test_key(); // http://localhost:8080
         let env = injector.for_claude(&key, None);
 
-        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
             Some(&"http://127.0.0.1:0".to_string())
@@ -783,57 +811,66 @@ mod tests {
     }
 
     #[test]
-    fn test_for_claude_cloudflare_uses_openai_router() {
+    fn test_for_claude_cloudflare_uses_anthropic_to_openai_router() {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string();
         let env = injector.for_claude(&key, Some("llama-3.1-8b"));
 
-        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL"),
             Some(&"https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string())
         );
         assert_eq!(
-            env.get("AIVO_OPENAI_ROUTER_MODEL_PREFIX"),
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MODEL_PREFIX"),
             Some(&"@cf/".to_string())
         );
     }
 
     #[test]
-    fn test_for_claude_openai_uses_openai_router() {
-        // api.openai.com is an OpenAI-compatible endpoint, so it goes through OpenAIRouter
+    fn test_for_claude_openai_uses_anthropic_to_openai_router() {
+        // api.openai.com is an OpenAI-compatible endpoint, so it goes through the Anthropic-to-OpenAI router.
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.openai.com/v1".to_string();
         let env = injector.for_claude(&key, Some("gpt-4o"));
 
-        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
             Some(&"http://127.0.0.1:0".to_string())
         );
         assert_eq!(
-            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL"),
             Some(&"https://api.openai.com/v1".to_string())
         );
     }
 
     #[test]
-    fn test_for_claude_moonshot_uses_openai_router_with_reasoning() {
+    fn test_for_claude_moonshot_uses_anthropic_to_openai_router_with_reasoning() {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.moonshot.cn/v1".to_string();
         let env = injector.for_claude(&key, Some("kimi-k2.5"));
 
-        assert_eq!(env.get("AIVO_USE_OPENAI_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_OPENAI_ROUTER_BASE_URL"),
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL"),
             Some(&"https://api.moonshot.cn/v1".to_string())
         );
-        assert!(!env.contains_key("AIVO_OPENAI_ROUTER_MODEL_PREFIX"));
+        assert!(!env.contains_key("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MODEL_PREFIX"));
         assert_eq!(
-            env.get("AIVO_OPENAI_ROUTER_REQUIRE_REASONING"),
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING"),
             Some(&"1".to_string())
         );
     }
@@ -854,13 +891,16 @@ mod tests {
             env.get("OPENAI_API_KEY"),
             Some(&"sk-test-key-12345".to_string())
         );
-        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_CODEX_ROUTER_API_KEY"),
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY"),
             Some(&"sk-test-key-12345".to_string())
         );
         assert_eq!(
-            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
             Some(&"http://localhost:8080".to_string())
         );
     }
@@ -881,7 +921,7 @@ mod tests {
             env.get("OPENAI_API_KEY"),
             Some(&"sk-test-key-12345".to_string())
         );
-        assert!(!env.contains_key("AIVO_USE_CODEX_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"));
     }
 
     #[test]
@@ -902,9 +942,12 @@ mod tests {
         key.base_url = "https://ai-gateway.vercel.sh/v1".to_string();
         let env = injector.for_codex(&key, None);
 
-        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
             Some(&"https://ai-gateway.vercel.sh/v1".to_string())
         );
     }
@@ -916,9 +959,12 @@ mod tests {
         key.base_url = "https://openrouter.ai/api/v1".to_string();
         let env = injector.for_codex(&key, None);
 
-        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
             Some(&"https://openrouter.ai/api/v1".to_string())
         );
     }
@@ -930,13 +976,16 @@ mod tests {
         key.base_url = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string();
         let env = injector.for_codex(&key, Some("glm-4.7-flash"));
 
-        assert_eq!(env.get("AIVO_USE_CODEX_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
             Some(&"https://api.cloudflare.com/client/v4/accounts/abc/ai/v1".to_string())
         );
         assert_eq!(
-            env.get("AIVO_CODEX_ROUTER_MODEL_PREFIX"),
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_MODEL_PREFIX"),
             Some(&"@cf/".to_string())
         );
         // Model should still be set
@@ -1233,7 +1282,7 @@ mod tests {
 
         assert_eq!(env.get("AIVO_USE_OPENCODE_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("AIVO_CODEX_ROUTER_BASE_URL"),
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
             Some(&"http://localhost:8080".to_string())
         );
 
@@ -1297,7 +1346,7 @@ mod tests {
         key.base_url = "copilot".to_string();
         let env = injector.for_codex(&key, None);
         assert_eq!(
-            env.get("AIVO_USE_CODEX_COPILOT_ROUTER"),
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER"),
             Some(&"1".to_string())
         );
         assert_eq!(
@@ -1310,7 +1359,7 @@ mod tests {
             Some(&"sk-test-key-12345".to_string())
         );
         // Should NOT set the regular codex router
-        assert!(!env.contains_key("AIVO_USE_CODEX_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"));
     }
 
     #[test]
@@ -1320,7 +1369,7 @@ mod tests {
         key.base_url = "copilot".to_string();
         let env = injector.for_codex(&key, Some("gpt-4o"));
         assert_eq!(
-            env.get("AIVO_USE_CODEX_COPILOT_ROUTER"),
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER"),
             Some(&"1".to_string())
         );
         // model env vars should still be set

@@ -3,8 +3,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::services::codex_router::convert_chat_response_to_responses_sse;
 use crate::services::http_utils::{current_unix_ts, sse_data_payload};
+use crate::services::responses_to_chat_router::convert_chat_response_to_responses_sse;
 
 pub(crate) struct OpenAIToResponsesStreamConverter {
     pending: String,

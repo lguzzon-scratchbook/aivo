@@ -156,7 +156,7 @@ impl AILauncher {
             &resolved.key,
             options.key_override.is_some(),
             runtime.router_protocol,
-            runtime.codex_responses_api,
+            runtime.responses_api_support,
         )
         .await;
 

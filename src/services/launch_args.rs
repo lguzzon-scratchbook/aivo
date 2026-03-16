@@ -34,9 +34,9 @@ pub(crate) fn preview_args(
         return args;
     }
 
-    let use_codex_router = uses_codex_router(env);
-    let args = inject_codex_model(model, &args, use_codex_router);
-    if should_preview_codex_model_catalog(model, use_codex_router) {
+    let use_responses_router = uses_responses_to_chat_router(env);
+    let args = inject_codex_model(model, &args, use_responses_router);
+    if should_preview_codex_model_catalog(model, use_responses_router) {
         let mut preview = vec![
             "--config".to_string(),
             "model_catalog_json=\"<temp:aivo-codex-model-catalog.json>\"".to_string(),
@@ -66,59 +66,59 @@ pub(crate) fn build_preview_notes(
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_ROUTER",
+        &["AIVO_USE_ROUTER"],
         "starts an Anthropic compatibility router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_OPENAI_ROUTER",
-        "starts an OpenAI/Gemini compatibility router on a random local port",
+        &["AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"],
+        "starts an Anthropic-to-OpenAI compatibility router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_COPILOT_ROUTER",
+        &["AIVO_USE_COPILOT_ROUTER"],
         "starts a Copilot router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_CODEX_ROUTER",
-        "starts a Codex router on a random local port",
+        &["AIVO_USE_RESPONSES_TO_CHAT_ROUTER"],
+        "starts a Responses-to-Chat router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_CODEX_COPILOT_ROUTER",
-        "starts a Copilot-backed Codex router on a random local port",
+        &["AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER"],
+        "starts a Copilot-backed Responses-to-Chat router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_GEMINI_ROUTER",
+        &["AIVO_USE_GEMINI_ROUTER"],
         "starts a Gemini router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_GEMINI_COPILOT_ROUTER",
+        &["AIVO_USE_GEMINI_COPILOT_ROUTER"],
         "starts a Copilot-backed Gemini router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_OPENCODE_ROUTER",
+        &["AIVO_USE_OPENCODE_ROUTER"],
         "starts an OpenCode compatibility router on a random local port",
     );
     maybe_push_router_note(
         &mut notes,
         env,
-        "AIVO_USE_OPENCODE_COPILOT_ROUTER",
+        &["AIVO_USE_OPENCODE_COPILOT_ROUTER"],
         "starts a Copilot-backed OpenCode router on a random local port",
     );
 
-    let use_codex_router = uses_codex_router(env);
+    let use_responses_router = uses_responses_to_chat_router(env);
     if tool == AIToolType::Codex
         && model.is_some()
         && !raw_args.iter().any(|arg| {
@@ -127,7 +127,8 @@ pub(crate) fn build_preview_notes(
     {
         notes.push("injects `-m <model>` for Codex".to_string());
     }
-    if tool == AIToolType::Codex && should_preview_codex_model_catalog(model, use_codex_router) {
+    if tool == AIToolType::Codex && should_preview_codex_model_catalog(model, use_responses_router)
+    {
         notes.push("writes a temporary Codex model catalog file at launch time".to_string());
     }
 
@@ -148,9 +149,10 @@ pub(crate) async fn build_runtime_args(
         });
     }
 
-    let use_codex_router = uses_codex_router(env);
-    let codex_model_catalog_path = maybe_write_codex_model_catalog(model, use_codex_router).await?;
-    let args = inject_codex_model(model, &args, use_codex_router);
+    let use_responses_router = uses_responses_to_chat_router(env);
+    let codex_model_catalog_path =
+        maybe_write_codex_model_catalog(model, use_responses_router).await?;
+    let args = inject_codex_model(model, &args, use_responses_router);
     let args = inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args);
 
     Ok(RuntimeArgs {
@@ -159,17 +161,18 @@ pub(crate) async fn build_runtime_args(
     })
 }
 
-fn uses_codex_router(env: &HashMap<String, String>) -> bool {
-    env.contains_key("AIVO_USE_CODEX_ROUTER") || env.contains_key("AIVO_USE_CODEX_COPILOT_ROUTER")
+fn uses_responses_to_chat_router(env: &HashMap<String, String>) -> bool {
+    env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER")
+        || env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER")
 }
 
 fn maybe_push_router_note(
     notes: &mut Vec<String>,
     env: &HashMap<String, String>,
-    env_key: &str,
+    env_keys: &[&str],
     note: &str,
 ) {
-    if env.contains_key(env_key) {
+    if env_keys.iter().any(|key| env.contains_key(*key)) {
         notes.push(note.to_string());
     }
 }
