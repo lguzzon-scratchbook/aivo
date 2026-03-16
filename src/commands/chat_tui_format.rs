@@ -209,8 +209,8 @@ pub(super) fn truncate_for_width(text: &str, width: u16) -> String {
 mod tests {
     use super::{
         build_footer_text, display_width, format_request_elapsed, format_session_match_count,
-        format_time_ago_short, format_token_count, truncate_for_display_width,
-        truncate_for_width, wrapped_text_line_count,
+        format_time_ago_short, format_token_count, truncate_for_display_width, truncate_for_width,
+        wrapped_text_line_count,
     };
     use crate::commands::chat::TokenUsage;
     use chrono::{Duration as ChronoDuration, Utc};

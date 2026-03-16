@@ -48,17 +48,17 @@ pub(crate) async fn resolve_key_override(
                     None => Ok(KeyResolution::MissingAuth),
                 }
             }
-            KeyLookupMode::PreferActiveAllowNone => {
-                match session_store.get_active_key().await? {
-                    Some(key) => Ok(KeyResolution::Selected(key)),
-                    None => Ok(KeyResolution::MissingAuth),
-                }
-            }
+            KeyLookupMode::PreferActiveAllowNone => match session_store.get_active_key().await? {
+                Some(key) => Ok(KeyResolution::Selected(key)),
+                None => Ok(KeyResolution::MissingAuth),
+            },
         },
     }
 }
 
-async fn prompt_temporary_key_override(session_store: &SessionStore) -> anyhow::Result<KeyResolution> {
+async fn prompt_temporary_key_override(
+    session_store: &SessionStore,
+) -> anyhow::Result<KeyResolution> {
     let all_keys = session_store.get_keys().await?;
     if all_keys.is_empty() {
         eprintln!("{} No API keys configured.", style::yellow("Note:"));
@@ -78,8 +78,11 @@ async fn prompt_temporary_key_override(session_store: &SessionStore) -> anyhow::
         .and_then(|active_key| all_keys.iter().position(|key| key.id == active_key.id))
         .unwrap_or(0);
 
-    match commands::keys::prompt_pick_key_without_activation(&all_keys, "Select a key", default_idx)?
-    {
+    match commands::keys::prompt_pick_key_without_activation(
+        &all_keys,
+        "Select a key",
+        default_idx,
+    )? {
         Some(key) => Ok(KeyResolution::Selected(key)),
         None => Ok(KeyResolution::Cancelled),
     }
@@ -151,7 +154,12 @@ mod tests {
     async fn prefer_active_allow_none_returns_active_key() {
         let (_temp_dir, store) = temp_store();
         let id = store
-            .add_key_with_protocol("openrouter", "https://openrouter.ai/api/v1", None, "sk-test")
+            .add_key_with_protocol(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                None,
+                "sk-test",
+            )
             .await
             .unwrap();
         store.set_active_key(&id).await.unwrap();

@@ -218,8 +218,8 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
 }
 
 async fn start_openai_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
-    use crate::services::{OpenAIRouter, OpenAIRouterConfig};
     use crate::services::provider_protocol::detect_provider_protocol;
+    use crate::services::{OpenAIRouter, OpenAIRouterConfig};
 
     let api_key = env
         .get("AIVO_OPENAI_ROUTER_API_KEY")
@@ -265,8 +265,8 @@ async fn start_openai_router(env: &HashMap<String, String>) -> Result<(u16, Arc<
 async fn start_codex_router(
     env: &HashMap<String, String>,
 ) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>)> {
-    use crate::services::{CodexRouter, CodexRouterConfig};
     use crate::services::provider_protocol::detect_provider_protocol;
+    use crate::services::{CodexRouter, CodexRouterConfig};
 
     let api_key = env
         .get("AIVO_CODEX_ROUTER_API_KEY")
@@ -321,8 +321,8 @@ async fn start_codex_router(
 }
 
 async fn start_gemini_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
-    use crate::services::{GeminiRouter, GeminiRouterConfig};
     use crate::services::provider_protocol::detect_provider_protocol;
+    use crate::services::{GeminiRouter, GeminiRouterConfig};
 
     let api_key = env
         .get("AIVO_GEMINI_ROUTER_API_KEY")

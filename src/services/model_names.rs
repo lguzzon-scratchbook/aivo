@@ -117,7 +117,9 @@ pub fn infer_provider_name_from_model(model: &str) -> Option<String> {
     match infer_model_protocol(trimmed) {
         Some(ProviderProtocol::Anthropic) => Some("anthropic".to_string()),
         Some(ProviderProtocol::Google) => Some("google".to_string()),
-        Some(ProviderProtocol::Openai) | Some(ProviderProtocol::ResponsesApi) => Some("openai".to_string()),
+        Some(ProviderProtocol::Openai) | Some(ProviderProtocol::ResponsesApi) => {
+            Some("openai".to_string())
+        }
         None => None,
     }
 }
@@ -129,7 +131,8 @@ pub fn should_preserve_cross_protocol_model(
 ) -> bool {
     match infer_model_protocol(model) {
         Some(protocol) if model_family(protocol) != model_family(target_protocol) => {
-            model_family(target_protocol) == ProviderProtocol::Openai && is_gateway_style_endpoint(base_url)
+            model_family(target_protocol) == ProviderProtocol::Openai
+                && is_gateway_style_endpoint(base_url)
         }
         _ => false,
     }

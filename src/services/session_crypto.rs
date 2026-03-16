@@ -163,9 +163,7 @@ mod tests {
         Aes256Gcm16, ENCRYPTION_MARKER, IV_LENGTH, V3_ENCRYPTION_MARKER, decrypt, derive_key,
         encrypt, is_encrypted,
     };
-    use aes_gcm::{
-        aead::{Aead, KeyInit, generic_array::GenericArray},
-    };
+    use aes_gcm::aead::{Aead, KeyInit, generic_array::GenericArray};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use rand::RngCore;
 

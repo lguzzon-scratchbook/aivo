@@ -1,6 +1,10 @@
 use serde_json::{Value, json};
 
 use crate::services::http_utils::current_unix_ts;
+use crate::services::openai_models::{
+    OpenAIChatChoice, OpenAIChatResponse, OpenAIChatResponseMessage, OpenAIChatToolCall,
+    OpenAIChatToolCallFunction, OpenAIChatUsage,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToAnthropicChatConfig {
@@ -90,7 +94,7 @@ pub fn convert_openai_chat_to_anthropic_request(
 
 pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &str) -> Value {
     let mut text_parts: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<OpenAIChatToolCall> = Vec::new();
 
     if let Some(content) = resp.get("content").and_then(|c| c.as_array()) {
         for block in content {
@@ -104,25 +108,28 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
                 }
                 "tool_use" => {
                     let args = block.get("input").cloned().unwrap_or(json!({}));
-                    tool_calls.push(json!({
-                        "id": block.get("id").cloned().unwrap_or(json!("call_0")),
-                        "type": "function",
-                        "function": {
-                            "name": block.get("name").cloned().unwrap_or(json!("")),
-                            "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
-                        }
-                    }));
+                    tool_calls.push(OpenAIChatToolCall {
+                        id: block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("call_0")
+                            .to_string(),
+                        kind: "function".to_string(),
+                        function: OpenAIChatToolCallFunction {
+                            name: block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            arguments: serde_json::to_string(&args)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        },
+                    });
                 }
                 _ => {}
             }
         }
     }
-
-    let content = if text_parts.is_empty() {
-        Value::Null
-    } else {
-        Value::String(text_parts.join("\n"))
-    };
 
     let finish_reason = match resp
         .get("stop_reason")
@@ -133,17 +140,6 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         "max_tokens" => "length",
         _ => "stop",
     };
-
-    let mut message = json!({
-        "role": "assistant",
-        "content": content
-    });
-    if message["content"].is_null() {
-        message.as_object_mut().unwrap().remove("content");
-    }
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = Value::Array(tool_calls);
-    }
 
     let prompt_tokens = resp
         .get("usage")
@@ -156,42 +152,61 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    json!({
-        "id": resp.get("id").cloned().unwrap_or(json!("chatcmpl-aivo")),
-        "object": "chat.completion",
-        "created": resp
-            .get("created")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(current_unix_ts),
-        "model": resp.get("model").and_then(|v| v.as_str()).unwrap_or(fallback_model),
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason
+    let response = OpenAIChatResponse {
+        id: resp
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("chatcmpl-aivo")
+            .to_string(),
+        object: "chat.completion".to_string(),
+        created: Some(
+            resp.get("created")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(current_unix_ts),
+        ),
+        model: resp
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback_model)
+            .to_string(),
+        choices: vec![OpenAIChatChoice {
+            index: 0,
+            message: OpenAIChatResponseMessage {
+                role: "assistant".to_string(),
+                content: (!text_parts.is_empty()).then(|| text_parts.join("\n")),
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            },
+            finish_reason: finish_reason.to_string(),
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
-    })
+        usage: OpenAIChatUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        },
+    };
+
+    serde_json::to_value(response).expect("typed openai chat response should serialize")
 }
 
 pub fn convert_openai_chat_response_to_sse(resp: &Value) -> String {
-    let id = resp.get("id").cloned().unwrap_or(json!("chatcmpl-aivo"));
-    let model = resp.get("model").cloned().unwrap_or(json!("unknown"));
-    let created = resp
-        .get("created")
+    let response: OpenAIChatResponse =
+        serde_json::from_value(resp.clone()).expect("openai chat response should be typed");
+    let id = response.id;
+    let model = response.model;
+    let created = response.created.unwrap_or_else(current_unix_ts);
+    let choice = response.choices.into_iter().next();
+    let message = choice
+        .as_ref()
+        .map(|choice| &choice.message)
         .cloned()
-        .unwrap_or_else(|| json!(current_unix_ts()));
-    let choice = resp
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .cloned()
-        .unwrap_or(json!({}));
-    let message = choice.get("message").cloned().unwrap_or(json!({}));
-    let finish_reason = choice.get("finish_reason").cloned().unwrap_or(Value::Null);
+        .unwrap_or(OpenAIChatResponseMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: None,
+        });
+    let finish_reason = choice
+        .map(|choice| Value::String(choice.finish_reason))
+        .unwrap_or(Value::Null);
 
     let mut events = String::new();
     events.push_str(&format!(
@@ -209,7 +224,7 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> String {
         })
     ));
 
-    if let Some(text) = message.get("content").and_then(|v| v.as_str())
+    if let Some(text) = message.content.as_deref()
         && !text.is_empty()
     {
         events.push_str(&format!(
@@ -228,7 +243,7 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> String {
         ));
     }
 
-    if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array())
+    if let Some(tool_calls) = message.tool_calls
         && !tool_calls.is_empty()
     {
         let delta_calls: Vec<Value> = tool_calls
@@ -237,9 +252,12 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> String {
             .map(|(index, tc)| {
                 json!({
                     "index": index,
-                    "id": tc.get("id").cloned().unwrap_or(json!("call_0")),
-                    "type": "function",
-                    "function": tc.get("function").cloned().unwrap_or(json!({}))
+                    "id": tc.id,
+                    "type": tc.kind,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
                 })
             })
             .collect();

@@ -84,7 +84,12 @@ impl CodexRouter {
     /// Returns the actual port number so callers can set OPENAI_BASE_URL.
     pub async fn start_background(
         &self,
-    ) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
+    ) -> Result<(
+        u16,
+        Arc<AtomicU8>,
+        Arc<AtomicU8>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let active_protocol = Arc::new(AtomicU8::new(self.config.target_protocol.to_u8()));
         let initial_responses = match self.config.responses_api_supported {

@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::services::openai_models::OpenAIChatResponseView;
+
 pub enum UsageValueMode {
     CoerceU64,
     PreserveJson,
@@ -16,21 +18,14 @@ pub fn convert_openai_to_anthropic_message(
     resp: &Value,
     config: &OpenAIToAnthropicConfig<'_>,
 ) -> Value {
-    let choices = resp
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let response: OpenAIChatResponseView =
+        serde_json::from_value(resp.clone()).expect("openai chat response should be typed");
 
     let mut content: Vec<Value> = Vec::new();
     let mut final_finish_reason = "stop";
 
-    for choice in &choices {
-        let message = choice.get("message").cloned().unwrap_or(json!({}));
-        let finish_reason = choice
-            .get("finish_reason")
-            .and_then(|r| r.as_str())
-            .unwrap_or("stop");
+    for choice in &response.choices {
+        let finish_reason = choice.finish_reason.as_deref().unwrap_or("stop");
 
         if finish_reason == "tool_calls" {
             final_finish_reason = "tool_calls";
@@ -38,35 +33,21 @@ pub fn convert_openai_to_anthropic_message(
             final_finish_reason = finish_reason;
         }
 
-        if let Some(text) = message.get("content").and_then(|c| c.as_str())
+        if let Some(text) = choice.message.content.as_deref()
             && !text.is_empty()
         {
             content.push(json!({"type": "text", "text": text}));
         }
 
-        if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+        if let Some(tool_calls) = &choice.message.tool_calls {
             for tc in tool_calls {
-                let id = tc
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                let args_str = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("{}");
-                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let input: Value =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
 
                 content.push(json!({
                     "type": "tool_use",
-                    "id": id,
-                    "name": name,
+                    "id": tc.id,
+                    "name": tc.function.name,
                     "input": input,
                 }));
             }
@@ -78,7 +59,7 @@ pub fn convert_openai_to_anthropic_message(
     }
 
     let mut anthropic_resp = json!({
-        "id": resp.get("id").and_then(|i| i.as_str()).unwrap_or(config.fallback_id),
+        "id": response.id.as_deref().unwrap_or(config.fallback_id),
         "type": "message",
         "role": "assistant",
         "content": content,
@@ -92,9 +73,9 @@ pub fn convert_openai_to_anthropic_message(
     });
 
     if config.include_created
-        && let Some(created) = resp.get("created")
+        && let Some(created) = response.created
     {
-        anthropic_resp["created"] = created.clone();
+        anthropic_resp["created"] = json!(created);
     }
 
     anthropic_resp

@@ -34,14 +34,13 @@ use unicode_width::UnicodeWidthChar;
 use crate::style::spinner_frame;
 use crate::tui::matches_fuzzy;
 
-use super::*;
 use super::chat_tui_format::{
     build_footer_text, display_width, estimate_context_tokens, footer_host_label,
     format_picker_match_count, format_request_elapsed, format_session_group_label,
-    format_session_match_count, format_session_time, format_time_ago_short,
-    format_token_count, truncate_for_display_width, truncate_for_width,
-    wrapped_text_line_count,
+    format_session_match_count, format_session_time, format_time_ago_short, format_token_count,
+    truncate_for_display_width, truncate_for_width, wrapped_text_line_count,
 };
+use super::*;
 
 const TEXT: Color = Color::Rgb(224, 225, 221);
 const MUTED: Color = Color::Rgb(136, 142, 139);

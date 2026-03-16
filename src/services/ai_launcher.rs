@@ -126,17 +126,19 @@ impl AILauncher {
         );
         let runtime = prepare_runtime_env(options.tool, env).await?;
 
-        let runtime_args =
-            build_runtime_args(
-                options.tool,
-                &options.args,
-                resolved.model.as_deref(),
-                &runtime.env,
-            )
-                .await?;
+        let runtime_args = build_runtime_args(
+            options.tool,
+            &options.args,
+            resolved.model.as_deref(),
+            &runtime.env,
+        )
+        .await?;
 
-        let mut child =
-            self.spawn_child(&resolved.tool_config.command, &runtime_args.args, runtime.env)?;
+        let mut child = self.spawn_child(
+            &resolved.tool_config.command,
+            &runtime_args.args,
+            runtime.env,
+        )?;
 
         record_launch_state(
             &self.session_store,

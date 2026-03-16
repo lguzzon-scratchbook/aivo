@@ -125,9 +125,7 @@ async fn handle_request(
                 }
             }
         }
-        None => {
-            Ok(http_utils::http_error_response(404, "not found"))
-        }
+        None => Ok(http_utils::http_error_response(404, "not found")),
     }
 }
 
@@ -200,8 +198,7 @@ async fn forward_to_provider(
                     },
                 );
                 let model = openai_chat_model(&req_body, "gemini-2.5-pro");
-                let target_url =
-                    build_google_generate_content_url(&config.target_base_url, &model);
+                let target_url = build_google_generate_content_url(&config.target_base_url, &model);
                 let response = client
                     .post(&target_url)
                     .header("x-goog-api-key", config.api_key.as_str())
@@ -1194,7 +1191,10 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "assistant");
         // content must be present (null) for strict providers like Cloudflare
-        assert!(messages[1].get("content").is_some(), "assistant tool_call message must retain content field");
+        assert!(
+            messages[1].get("content").is_some(),
+            "assistant tool_call message must retain content field"
+        );
         assert!(messages[1]["content"].is_null());
         assert!(messages[1]["tool_calls"].is_array());
         let tc = &messages[1]["tool_calls"][0];

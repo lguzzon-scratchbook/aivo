@@ -2226,5 +2226,4 @@ mod tests {
         let decoded = session.decrypt_messages().unwrap();
         assert_eq!(decoded, msgs);
     }
-
 }

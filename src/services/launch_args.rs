@@ -122,10 +122,7 @@ pub(crate) fn build_preview_notes(
     if tool == AIToolType::Codex
         && model.is_some()
         && !raw_args.iter().any(|arg| {
-            arg == "--model"
-                || arg == "-m"
-                || arg.starts_with("--model=")
-                || arg.starts_with("-m=")
+            arg == "--model" || arg == "-m" || arg.starts_with("--model=") || arg.starts_with("-m=")
         })
     {
         notes.push("injects `-m <model>` for Codex".to_string());
@@ -218,9 +215,9 @@ fn inject_codex_model(model: Option<&str>, args: &[String], use_router: bool) ->
         _ => return args.to_vec(),
     };
 
-    let has_model_flag = args.iter().any(|a| {
-        a == "--model" || a == "-m" || a.starts_with("--model=") || a.starts_with("-m=")
-    });
+    let has_model_flag = args
+        .iter()
+        .any(|a| a == "--model" || a == "-m" || a.starts_with("--model=") || a.starts_with("-m="));
     if has_model_flag {
         return args.to_vec();
     }
@@ -289,12 +286,14 @@ async fn maybe_write_codex_model_catalog(
     );
     let path = std::env::temp_dir().join(file_name);
 
-    tokio::fs::write(&path, catalog_json).await.with_context(|| {
-        format!(
-            "Failed to write Codex model catalog override at {}",
-            path.display()
-        )
-    })?;
+    tokio::fs::write(&path, catalog_json)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to write Codex model catalog override at {}",
+                path.display()
+            )
+        })?;
 
     Ok(Some(path.to_string_lossy().to_string()))
 }
@@ -419,7 +418,11 @@ mod tests {
     #[test]
     fn test_inject_codex_model_skips_shorthand_flag() {
         let model = Some("o4-mini");
-        let args = vec!["-m".to_string(), "gpt-4o".to_string(), "file.ts".to_string()];
+        let args = vec![
+            "-m".to_string(),
+            "gpt-4o".to_string(),
+            "file.ts".to_string(),
+        ];
         let result = inject_codex_model(model, &args, false);
         assert_eq!(result, vec!["-m", "gpt-4o", "file.ts"]);
     }

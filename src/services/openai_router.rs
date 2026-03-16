@@ -31,6 +31,12 @@ use crate::services::openai_gemini_bridge::{
     convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
     openai_chat_model,
 };
+use crate::services::openai_models::{
+    OpenAIChatChunk, OpenAIChatRequest, ResponsesResponse,
+    convert_chat_to_responses_request as convert_typed_chat_to_responses_request,
+    convert_responses_to_chat_response as convert_typed_responses_to_chat_response,
+    stringify_message_content as stringify_typed_message_content,
+};
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch,
 };
@@ -406,31 +412,23 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value 
             fallback_tool_arguments_json: "{}",
         },
     );
-    stringify_message_content(&mut req);
+    let mut typed_req: OpenAIChatRequest =
+        serde_json::from_value(req).expect("anthropic -> openai request should be typed");
+    stringify_typed_message_content(&mut typed_req);
+    req = serde_json::to_value(typed_req).expect("typed openai request should serialize");
     req
 }
 
 /// Flatten any array-valued `content` fields to plain strings.
 /// Strict OpenAI-compatible providers (e.g. Cloudflare Workers AI) reject
 /// the multi-part content arrays that the standard OpenAI API accepts.
+#[cfg(test)]
 fn stringify_message_content(req: &mut Value) {
-    let Some(messages) = req.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+    let Ok(mut typed_req) = serde_json::from_value::<OpenAIChatRequest>(req.clone()) else {
         return;
     };
-    for msg in messages.iter_mut() {
-        if let Some(arr) = msg.get("content").and_then(Value::as_array) {
-            let text = arr
-                .iter()
-                .filter_map(|p| {
-                    p.get("text")
-                        .and_then(|t| t.as_str())
-                        .or_else(|| p.as_str())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            msg["content"] = Value::String(text);
-        }
-    }
+    stringify_typed_message_content(&mut typed_req);
+    *req = serde_json::to_value(typed_req).expect("typed openai request should serialize");
 }
 
 /// Build /v1/responses URL from a base URL.
@@ -450,227 +448,18 @@ fn is_responses_api_error(body: &str) -> bool {
 
 /// Convert OpenAI Chat Completions request → Responses API request.
 fn convert_chat_to_responses_request(openai_req: &Value) -> Value {
-    let mut input: Vec<Value> = Vec::new();
-    let mut instructions: Option<String> = None;
-
-    if let Some(messages) = openai_req.get("messages").and_then(|m| m.as_array()) {
-        let mut fc_counter = 0u64;
-        for msg in messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            match role {
-                "system" | "developer" => {
-                    let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    if let Some(ref mut inst) = instructions {
-                        inst.push('\n');
-                        inst.push_str(text);
-                    } else {
-                        instructions = Some(text.to_string());
-                    }
-                }
-                "assistant" => {
-                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-                        // Emit text content as a message if present
-                        if let Some(content) = msg.get("content").and_then(|c| c.as_str())
-                            && !content.is_empty()
-                        {
-                            input.push(json!({
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": content}]
-                            }));
-                        }
-                        for tc in tool_calls {
-                            let call_id = tc
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let name = tc
-                                .get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let arguments = tc
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("{}");
-                            fc_counter += 1;
-                            let fc_id = format!("fc_{fc_counter}");
-                            input.push(json!({
-                                "type": "function_call",
-                                "id": fc_id,
-                                "call_id": call_id,
-                                "name": name,
-                                "arguments": arguments,
-                            }));
-                        }
-                    } else {
-                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        input.push(
-                            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": content}]}),
-                        );
-                    }
-                }
-                "tool" => {
-                    let call_id = msg
-                        .get("tool_call_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let output = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": output,
-                    }));
-                }
-                _ => {
-                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    input.push(json!({"type": "message", "role": role, "content": content}));
-                }
-            }
-        }
-    }
-
-    let mut req = json!({
-        "model": openai_req.get("model").cloned().unwrap_or(json!("gpt-4o")),
-        "input": input,
-    });
-
-    if let Some(inst) = instructions {
-        req["instructions"] = Value::String(inst);
-    }
-    if let Some(mt) = openai_req.get("max_tokens") {
-        req["max_output_tokens"] = mt.clone();
-    }
-    if let Some(t) = openai_req.get("temperature") {
-        req["temperature"] = t.clone();
-    }
-    if let Some(tp) = openai_req.get("top_p") {
-        req["top_p"] = tp.clone();
-    }
-
-    // Unwrap tools from Chat Completions {type, function: {…}} to Responses {type, name, …}
-    if let Some(tools) = openai_req.get("tools").and_then(|t| t.as_array()) {
-        let resp_tools: Vec<Value> = tools
-            .iter()
-            .map(|tool| {
-                if let Some(func) = tool.get("function") {
-                    json!({
-                        "type": "function",
-                        "name": func.get("name").cloned().unwrap_or_default(),
-                        "description": func.get("description").cloned().unwrap_or(json!("")),
-                        "parameters": func.get("parameters").cloned().unwrap_or(json!({})),
-                    })
-                } else {
-                    tool.clone()
-                }
-            })
-            .collect();
-        req["tools"] = Value::Array(resp_tools);
-    }
-    if let Some(tc) = openai_req.get("tool_choice") {
-        req["tool_choice"] = tc.clone();
-    }
-
-    // Map reasoning_effort to Responses API reasoning parameter, capping xhigh to high
-    if let Some(effort) = openai_req.get("reasoning_effort").and_then(|v| v.as_str()) {
-        let capped = if effort.eq_ignore_ascii_case("xhigh") {
-            "high"
-        } else {
-            effort
-        };
-        req["reasoning"] = json!({"effort": capped});
-    }
-
-    req
+    let openai_req: OpenAIChatRequest =
+        serde_json::from_value(openai_req.clone()).expect("openai chat request should be typed");
+    serde_json::to_value(convert_typed_chat_to_responses_request(&openai_req))
+        .expect("responses request should serialize")
 }
 
 /// Convert Responses API response → OpenAI Chat Completions response.
 fn convert_responses_to_chat_response(resp: &Value) -> Value {
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
-
-    if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
-        for item in output {
-            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                "message" => match item.get("content") {
-                    Some(Value::String(s)) => text_parts.push(s.clone()),
-                    Some(Value::Array(parts)) => {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                text_parts.push(text.to_string());
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                "function_call" => {
-                    let call_id = item
-                        .get("call_id")
-                        .or_else(|| item.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let arguments =
-                        item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
-                    tool_calls.push(json!({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments}
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let content = if text_parts.is_empty() {
-        Value::Null
-    } else {
-        Value::String(text_parts.join("\n"))
-    };
-    let finish_reason = if !tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
-
-    let mut message = json!({"role": "assistant"});
-    if !content.is_null() {
-        message["content"] = content;
-    }
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = Value::Array(tool_calls);
-    }
-
-    let prompt_tokens = resp
-        .get("usage")
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let completion_tokens = resp
-        .get("usage")
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    json!({
-        "id": resp.get("id").cloned().unwrap_or(json!("chatcmpl-aivo")),
-        "object": "chat.completion",
-        "model": resp.get("model").cloned().unwrap_or(json!("unknown")),
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
-    })
+    let response: ResponsesResponse =
+        serde_json::from_value(resp.clone()).expect("responses response should be typed");
+    serde_json::to_value(convert_typed_responses_to_chat_response(&response))
+        .expect("openai chat response should serialize")
 }
 
 fn prepare_gateway_model_metadata(
@@ -1049,39 +838,34 @@ impl OpenAIStreamConverter {
             return Ok(());
         }
 
-        let chunk = match serde_json::from_str::<Value>(data) {
+        let chunk = match serde_json::from_str::<OpenAIChatChunk>(data) {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
 
-        if let Some(v) = chunk.get("id").and_then(|v| v.as_str())
+        if let Some(v) = chunk.id.as_deref()
             && !v.is_empty()
         {
             self.message_id = v.to_string();
         }
-        if let Some(v) = chunk.get("model").and_then(|v| v.as_str())
+        if let Some(v) = chunk.model.as_deref()
             && !v.is_empty()
         {
             self.model = v.to_string();
         }
-        if let Some(usage) = chunk.get("usage") {
-            if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+        if let Some(usage) = chunk.usage {
+            if let Some(v) = usage.prompt_tokens {
                 self.input_tokens = v;
             }
-            if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            if let Some(v) = usage.completion_tokens {
                 self.output_tokens = v;
             }
         }
 
-        let choices = chunk
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for choice in choices {
-            let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+        for choice in chunk.choices {
+            let delta = choice.delta;
 
-            if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+            if let Some(text) = delta.content.as_deref()
                 && !text.is_empty()
             {
                 ensure_message_start(
@@ -1122,7 +906,7 @@ impl OpenAIStreamConverter {
                 );
             }
 
-            if let Some(function_call) = delta.get("function_call") {
+            if let Some(function_call) = delta.function_call {
                 ensure_message_start(
                     output,
                     &mut self.message_started,
@@ -1135,14 +919,14 @@ impl OpenAIStreamConverter {
                     &mut self.block_count,
                     &mut self.tool_blocks,
                     0,
-                    function_call.get("id").and_then(|v| v.as_str()),
-                    function_call.get("name").and_then(|v| v.as_str()),
-                    function_call.get("arguments").and_then(|v| v.as_str()),
+                    function_call.id.as_deref(),
+                    function_call.name.as_deref(),
+                    function_call.arguments.as_deref(),
                     &mut self.saw_tool_use,
                 );
             }
 
-            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            if let Some(tool_calls) = delta.tool_calls {
                 ensure_message_start(
                     output,
                     &mut self.message_started,
@@ -1151,26 +935,22 @@ impl OpenAIStreamConverter {
                     self.input_tokens,
                 );
                 for tc in tool_calls {
-                    let openai_idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let openai_idx = tc.index.unwrap_or(0) as usize;
                     emit_tool_delta(
                         output,
                         &mut self.block_count,
                         &mut self.tool_blocks,
                         openai_idx,
-                        tc.get("id").and_then(|v| v.as_str()),
-                        tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str()),
-                        tc.get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|v| v.as_str()),
+                        tc.id.as_deref(),
+                        tc.function.as_ref().and_then(|f| f.name.as_deref()),
+                        tc.function.as_ref().and_then(|f| f.arguments.as_deref()),
                         &mut self.saw_tool_use,
                     );
                 }
             }
 
             if !self.finished
-                && let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str())
+                && let Some(finish_reason) = choice.finish_reason.as_deref()
                 && !finish_reason.is_empty()
             {
                 finalize_stream_message(
