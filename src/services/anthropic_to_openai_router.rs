@@ -292,7 +292,7 @@ async fn handle_anthropic_to_upstream(
 
                 let status_code = response.status().as_u16();
                 let response_body = response.text().await?;
-                if is_protocol_mismatch(status_code) {
+                if is_protocol_mismatch(status_code) || status_code == 400 {
                     (status_code, None)
                 } else if status_code >= 400 {
                     let r = RouterResponse::Buffered {
