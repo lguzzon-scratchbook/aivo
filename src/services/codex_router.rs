@@ -193,6 +193,11 @@ async fn try_responses_api_passthrough(
     if let Some(obj) = body.as_object_mut() {
         obj.remove("stream_options");
     }
+    // Cap reasoning effort: xhigh is not supported by most models
+    cap_reasoning_effort(&mut body);
+    // Ensure all message content parts have a `text` field — the Responses API
+    // rejects `output_text` / `input_text` parts that are missing it.
+    sanitize_input_content(&mut body);
     apply_max_tokens_cap_to_fields(&mut body, config.max_tokens_cap, &["max_output_tokens"]);
     if config.copilot_token_manager.is_none() {
         let selected_model = select_model_for_provider_attempt(
@@ -415,7 +420,7 @@ async fn forward_openai_chat_request(
 
     for (attempt, protocol) in candidates.iter().enumerate() {
         let (status_code, response_text, result) = match protocol {
-            ProviderProtocol::Openai => {
+            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
                 let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
                 let response = http_utils::authorized_openai_post(
                     client,
@@ -617,6 +622,57 @@ fn apply_max_tokens_cap_to_fields(body: &mut Value, cap: Option<u64>, fields: &[
     for field in fields {
         if let Some(v) = body.get(*field).cloned() {
             body[*field] = cap_token_value(&v, cap);
+        }
+    }
+}
+
+/// Cap `reasoning.effort` values that most models don't support (e.g. `xhigh` → `high`).
+fn cap_reasoning_effort(body: &mut Value) {
+    if let Some(effort) = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|e| e.as_str())
+    {
+        if effort.eq_ignore_ascii_case("xhigh") {
+            body["reasoning"]["effort"] = json!("high");
+        }
+    } else if let Some(effort) = body.get("reasoning_effort").and_then(|e| e.as_str())
+        && effort.eq_ignore_ascii_case("xhigh")
+    {
+        body["reasoning_effort"] = json!("high");
+    }
+}
+
+/// Ensure every text-bearing content part in `input` messages has a `text` field.
+///
+/// The Responses API rejects `output_text` and `input_text` parts that are
+/// missing `text`.  Codex CLI can echo back content parts from a previous
+/// response where `text` was absent or null; this guard adds an empty string
+/// so the upstream API accepts the request.
+fn sanitize_input_content(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for item in input.iter_mut() {
+        if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let Some(parts) = item.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match part_type {
+                "output_text" | "input_text" | "" => {
+                    if !part
+                        .get("text")
+                        .map_or(false, |t| t.is_string())
+                    {
+                        part["text"] = json!("");
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }

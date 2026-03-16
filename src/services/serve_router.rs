@@ -371,7 +371,7 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
             ProviderProtocol::Google => {
                 handle_chat_gemini(&mut body, client_wants_stream, state).await
             }
-            ProviderProtocol::Openai => {
+            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
                 handle_chat_openai(&mut body, client_wants_stream, state).await
             }
         };
@@ -392,7 +392,7 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
             ProviderProtocol::Google => {
                 handle_chat_gemini(&mut body_clone, client_wants_stream, state).await?
             }
-            ProviderProtocol::Openai => {
+            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
                 handle_chat_openai(&mut body_clone, client_wants_stream, state).await?
             }
         };

@@ -117,7 +117,7 @@ pub fn infer_provider_name_from_model(model: &str) -> Option<String> {
     match infer_model_protocol(trimmed) {
         Some(ProviderProtocol::Anthropic) => Some("anthropic".to_string()),
         Some(ProviderProtocol::Google) => Some("google".to_string()),
-        Some(ProviderProtocol::Openai) => Some("openai".to_string()),
+        Some(ProviderProtocol::Openai) | Some(ProviderProtocol::ResponsesApi) => Some("openai".to_string()),
         None => None,
     }
 }
@@ -128,8 +128,8 @@ pub fn should_preserve_cross_protocol_model(
     target_protocol: ProviderProtocol,
 ) -> bool {
     match infer_model_protocol(model) {
-        Some(protocol) if protocol != target_protocol => {
-            target_protocol == ProviderProtocol::Openai && is_gateway_style_endpoint(base_url)
+        Some(protocol) if model_family(protocol) != model_family(target_protocol) => {
+            model_family(target_protocol) == ProviderProtocol::Openai && is_gateway_style_endpoint(base_url)
         }
         _ => false,
     }
@@ -184,7 +184,7 @@ pub fn copilot_model_name(model: &str) -> String {
 
 pub fn default_model_for_protocol(protocol: ProviderProtocol) -> &'static str {
     match protocol {
-        ProviderProtocol::Openai => "gpt-4o",
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => "gpt-4o",
         ProviderProtocol::Anthropic => "claude-sonnet-4-5",
         ProviderProtocol::Google => "gemini-2.5-pro",
     }
@@ -201,7 +201,7 @@ pub fn select_model_for_protocol(
 
     match requested_model.filter(|model| !model.trim().is_empty()) {
         Some(model) => match infer_model_protocol(model) {
-            Some(protocol) if protocol != target_protocol => {
+            Some(protocol) if model_family(protocol) != model_family(target_protocol) => {
                 default_model_for_protocol(target_protocol).to_string()
             }
             _ => model.to_string(),
@@ -227,6 +227,14 @@ pub fn select_model_for_provider_attempt(
     }
 
     select_model_for_protocol(requested_model, explicit_model, target_protocol)
+}
+
+/// Normalize protocol for model comparison — ResponsesApi uses the same models as Openai.
+fn model_family(p: ProviderProtocol) -> ProviderProtocol {
+    match p {
+        ProviderProtocol::ResponsesApi => ProviderProtocol::Openai,
+        other => other,
+    }
 }
 
 fn infer_model_protocol(model: &str) -> Option<ProviderProtocol> {

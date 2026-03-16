@@ -206,15 +206,8 @@ fn convert_content_blocks(
             }));
         }
     } else if !tool_calls.is_empty() {
-        let content = if text_parts.is_empty() {
-            Value::Null
-        } else {
-            Value::String(text_parts.join("\n"))
-        };
-        let mut msg = json!({"role": role, "tool_calls": tool_calls});
-        if !content.is_null() {
-            msg["content"] = content;
-        }
+        let content = Value::String(text_parts.join("\n"));
+        let mut msg = json!({"role": role, "content": content, "tool_calls": tool_calls});
         if config.include_reasoning_content {
             if role == "assistant" && config.require_non_empty_reasoning_content {
                 let reasoning_content = if !thinking_parts.is_empty() {

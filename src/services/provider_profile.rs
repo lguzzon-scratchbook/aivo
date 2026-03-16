@@ -183,7 +183,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
                 is_openrouter: false,
             },
         },
-        ProviderProtocol::Openai => ProviderProfile {
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => ProviderProfile {
             kind: ProviderKind::OpenAiCompatible,
             default_protocol: ProviderProtocol::Openai,
             quirks,

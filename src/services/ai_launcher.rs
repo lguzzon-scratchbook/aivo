@@ -262,7 +262,7 @@ impl AILauncher {
                         .unwrap_or(ProviderProtocol::Openai);
                     if final_protocol != current {
                         let cp = match final_protocol {
-                            ProviderProtocol::Openai => ClaudeProviderProtocol::Openai,
+                            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => ClaudeProviderProtocol::Openai,
                             ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
                             ProviderProtocol::Google => ClaudeProviderProtocol::Google,
                         };
@@ -285,7 +285,7 @@ impl AILauncher {
                     if final_protocol != current {
                         let gp = match final_protocol {
                             ProviderProtocol::Google => GeminiProviderProtocol::Google,
-                            ProviderProtocol::Openai => GeminiProviderProtocol::Openai,
+                            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => GeminiProviderProtocol::Openai,
                             ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
                         };
                         let _ = self
@@ -803,7 +803,7 @@ fn preferred_claude_protocol(base_url: &str) -> ClaudeProviderProtocol {
     match provider_profile_for_base_url(base_url).default_protocol {
         ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
         ProviderProtocol::Google => ClaudeProviderProtocol::Google,
-        ProviderProtocol::Openai => ClaudeProviderProtocol::Openai,
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => ClaudeProviderProtocol::Openai,
     }
 }
 
@@ -819,7 +819,7 @@ fn preferred_gemini_protocol(base_url: &str) -> GeminiProviderProtocol {
     match provider_profile_for_base_url(base_url).default_protocol {
         ProviderProtocol::Google => GeminiProviderProtocol::Google,
         ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
-        ProviderProtocol::Openai => GeminiProviderProtocol::Openai,
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => GeminiProviderProtocol::Openai,
     }
 }
 

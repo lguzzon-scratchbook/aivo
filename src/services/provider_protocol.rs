@@ -3,6 +3,7 @@ pub enum ProviderProtocol {
     Openai,
     Anthropic,
     Google,
+    ResponsesApi,
 }
 
 impl ProviderProtocol {
@@ -11,6 +12,7 @@ impl ProviderProtocol {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
             Self::Google => "google",
+            Self::ResponsesApi => "responses",
         }
     }
 
@@ -19,6 +21,7 @@ impl ProviderProtocol {
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
             "google" => Some(Self::Google),
+            "responses" => Some(Self::ResponsesApi),
             _ => None,
         }
     }
@@ -28,6 +31,7 @@ impl ProviderProtocol {
             Self::Openai => 0,
             Self::Anthropic => 1,
             Self::Google => 2,
+            Self::ResponsesApi => 3,
         }
     }
 
@@ -35,6 +39,7 @@ impl ProviderProtocol {
         match v {
             1 => Self::Anthropic,
             2 => Self::Google,
+            3 => Self::ResponsesApi,
             _ => Self::Openai,
         }
     }
@@ -94,6 +99,7 @@ pub fn fallback_protocols(current: ProviderProtocol, base_url: &str) -> Vec<Prov
     let _ = base_url;
     [
         ProviderProtocol::Openai,
+        ProviderProtocol::ResponsesApi,
         ProviderProtocol::Anthropic,
         ProviderProtocol::Google,
     ]
@@ -161,7 +167,11 @@ mod tests {
         let result = fallback_protocols(ProviderProtocol::Openai, "https://api.example.com");
         assert_eq!(
             result,
-            vec![ProviderProtocol::Anthropic, ProviderProtocol::Google]
+            vec![
+                ProviderProtocol::ResponsesApi,
+                ProviderProtocol::Anthropic,
+                ProviderProtocol::Google,
+            ]
         );
     }
 

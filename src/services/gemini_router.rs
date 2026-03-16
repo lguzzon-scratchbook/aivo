@@ -222,7 +222,7 @@ async fn forward_to_provider(
                 };
                 (status, body_text, parsed)
             }
-            ProviderProtocol::Openai => {
+            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
                 let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
                 let response = http_utils::authorized_openai_post(
                     client.as_ref(),
@@ -603,7 +603,9 @@ fn convert_parts_to_messages(
 
     for part in parts {
         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-            text_parts.push(text);
+            if !text.is_empty() {
+                text_parts.push(text);
+            }
         } else if let Some(fc) = part.get("functionCall") {
             let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let call_id = extract_part_call_id(fc)
@@ -663,8 +665,9 @@ fn convert_parts_to_messages(
             msg["reasoning_content"] = Value::String(rc.to_string());
         }
         messages.push(msg);
-    } else {
-        // Plain text message
+    } else if !text_parts.is_empty() {
+        // Plain text message (skip turns with only empty text to avoid sending
+        // empty content strings that strict providers / Responses API gateways reject)
         let content = text_parts.join("\n");
         messages.push(serde_json::json!({"role": openai_role, "content": content}));
     }
@@ -1239,6 +1242,48 @@ mod tests {
             messages[4]["tool_call_id"].as_str().unwrap_or(""),
             "call_run_shell_command_2"
         );
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_skips_empty_text_turns() {
+        // Gemini model turns with only empty text (e.g. thinking mode) should be
+        // dropped rather than producing messages with empty content strings that
+        // strict providers / Responses API gateways reject.
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "Hello"}]},
+                {"role": "model", "parts": [{"text": ""}]},
+                {"role": "model", "parts": [{"text": "Hi there!"}]},
+            ]
+        });
+        let result = convert_gemini_to_openai(&body, "gpt-4o", false, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "Hello");
+        assert_eq!(messages[1]["content"], "Hi there!");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_keeps_nonempty_text_in_tool_call_turn() {
+        // When a model turn has both text and functionCall, the text should still
+        // be included (it's non-empty).
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "Do something"}]},
+                {"role": "model", "parts": [
+                    {"text": "Sure, let me check."},
+                    {"functionCall": {"name": "ls", "args": {"path": "."}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "ls", "response": {"files": []}}}
+                ]},
+            ]
+        });
+        let result = convert_gemini_to_openai(&body, "gpt-4o", false, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["content"], "Sure, let me check.");
+        assert!(messages[1]["tool_calls"].is_array());
     }
 
     #[test]

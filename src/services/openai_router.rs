@@ -177,6 +177,12 @@ async fn handle_anthropic_to_upstream(
 
     let body: Value = serde_json::from_str(body_str)?;
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content);
+    // Map Anthropic thinking config to OpenAI reasoning_effort
+    if let Some(thinking) = body.get("thinking")
+        && thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
+    {
+        simplified["reasoning_effort"] = json!("high");
+    }
     cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
     let requested_stream = simplified
         .get("stream")
@@ -261,6 +267,53 @@ async fn handle_anthropic_to_upstream(
                     (status_code, Some(r))
                 }
             }
+            ProviderProtocol::ResponsesApi => {
+                let mut responses_body = convert_chat_to_responses_request(&req_body);
+                responses_body["stream"] = json!(false);
+                let url = build_responses_url(&config.target_base_url);
+                let response = client
+                    .post(&url)
+                    .headers(attempt_headers)
+                    .header("Authorization", format!("Bearer {}", config.target_api_key))
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "aivo-router/1.0")
+                    .json(&responses_body)
+                    .send()
+                    .await?;
+
+                let status_code = response.status().as_u16();
+                let response_body = response.text().await?;
+                if is_protocol_mismatch(status_code) {
+                    (status_code, None)
+                } else if status_code >= 400 {
+                    let r = RouterResponse::Buffered {
+                        status: status_code,
+                        content_type: "application/json".to_string(),
+                        body: response_body.into_bytes(),
+                    };
+                    (status_code, Some(r))
+                } else {
+                    let resp: Value = serde_json::from_str(&response_body)?;
+                    let openai_response = convert_responses_to_chat_response(&resp);
+                    let r = if requested_stream {
+                        let openai_sse = convert_openai_chat_response_to_sse(&openai_response);
+                        let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
+                        RouterResponse::Buffered {
+                            status: 200,
+                            content_type: "text/event-stream".to_string(),
+                            body: anthropic_sse.into_bytes(),
+                        }
+                    } else {
+                        RouterResponse::Buffered {
+                            status: 200,
+                            content_type: "application/json".to_string(),
+                            body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?
+                                .into_bytes(),
+                        }
+                    };
+                    (status_code, Some(r))
+                }
+            }
             _ => {
                 // OpenAI or Anthropic — use chat completions endpoint
                 let url = http_utils::build_chat_completions_url(&config.target_base_url);
@@ -285,26 +338,33 @@ async fn handle_anthropic_to_upstream(
                         .map(|ct| ct.contains("text/event-stream"))
                         .unwrap_or(false);
                     let response_body = response.text().await?;
-                    let r = if status_code == 200
-                        && (is_streaming || response_body.starts_with("data:"))
-                    {
-                        let anthropic_sse =
-                            convert_openai_sse_to_anthropic(&response_body, status_code)?;
-                        RouterResponse::Buffered {
-                            status: 200,
-                            content_type: "text/event-stream".to_string(),
-                            body: anthropic_sse.into_bytes(),
-                        }
+                    // Detect Responses API validation errors leaking through
+                    // Chat Completions — treat as protocol mismatch so the
+                    // ResponsesApi candidate gets a chance.
+                    if status_code == 400 && is_responses_api_error(&response_body) {
+                        (status_code, None)
                     } else {
-                        let anthropic_response =
-                            convert_openai_to_anthropic(&response_body, status_code)?;
-                        RouterResponse::Buffered {
-                            status: status_code,
-                            content_type: "application/json".to_string(),
-                            body: anthropic_response.into_bytes(),
-                        }
-                    };
-                    (status_code, Some(r))
+                        let r = if status_code == 200
+                            && (is_streaming || response_body.starts_with("data:"))
+                        {
+                            let anthropic_sse =
+                                convert_openai_sse_to_anthropic(&response_body, status_code)?;
+                            RouterResponse::Buffered {
+                                status: 200,
+                                content_type: "text/event-stream".to_string(),
+                                body: anthropic_sse.into_bytes(),
+                            }
+                        } else {
+                            let anthropic_response =
+                                convert_openai_to_anthropic(&response_body, status_code)?;
+                            RouterResponse::Buffered {
+                                status: status_code,
+                                content_type: "application/json".to_string(),
+                                body: anthropic_response.into_bytes(),
+                            }
+                        };
+                        (status_code, Some(r))
+                    }
                 }
             }
         };
@@ -334,7 +394,7 @@ async fn handle_anthropic_to_upstream(
 }
 
 fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value {
-    convert_anthropic_to_openai_request(
+    let mut req = convert_anthropic_to_openai_request(
         body,
         &AnthropicToOpenAIConfig {
             default_model: "gpt-4o",
@@ -345,7 +405,272 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value 
             stringify_other_tool_result_content: true,
             fallback_tool_arguments_json: "{}",
         },
-    )
+    );
+    stringify_message_content(&mut req);
+    req
+}
+
+/// Flatten any array-valued `content` fields to plain strings.
+/// Strict OpenAI-compatible providers (e.g. Cloudflare Workers AI) reject
+/// the multi-part content arrays that the standard OpenAI API accepts.
+fn stringify_message_content(req: &mut Value) {
+    let Some(messages) = req.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages.iter_mut() {
+        if let Some(arr) = msg.get("content").and_then(Value::as_array) {
+            let text = arr
+                .iter()
+                .filter_map(|p| {
+                    p.get("text")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| p.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            msg["content"] = Value::String(text);
+        }
+    }
+}
+
+/// Build /v1/responses URL from a base URL.
+fn build_responses_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/responses", base)
+    } else {
+        format!("{}/v1/responses", base)
+    }
+}
+
+/// Detect 400 errors that indicate the provider speaks Responses API, not Chat Completions.
+fn is_responses_api_error(body: &str) -> bool {
+    body.contains("\"input[") || body.contains("begins with 'fc")
+}
+
+/// Convert OpenAI Chat Completions request → Responses API request.
+fn convert_chat_to_responses_request(openai_req: &Value) -> Value {
+    let mut input: Vec<Value> = Vec::new();
+    let mut instructions: Option<String> = None;
+
+    if let Some(messages) = openai_req.get("messages").and_then(|m| m.as_array()) {
+        let mut fc_counter = 0u64;
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            match role {
+                "system" | "developer" => {
+                    let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    if let Some(ref mut inst) = instructions {
+                        inst.push('\n');
+                        inst.push_str(text);
+                    } else {
+                        instructions = Some(text.to_string());
+                    }
+                }
+                "assistant" => {
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                        // Emit text content as a message if present
+                        if let Some(content) = msg.get("content").and_then(|c| c.as_str())
+                            && !content.is_empty()
+                        {
+                            input.push(json!({
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": content}]
+                            }));
+                        }
+                        for tc in tool_calls {
+                            let call_id = tc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let arguments = tc
+                                .get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}");
+                            fc_counter += 1;
+                            let fc_id = format!("fc_{fc_counter}");
+                            input.push(json!({
+                                "type": "function_call",
+                                "id": fc_id,
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": arguments,
+                            }));
+                        }
+                    } else {
+                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        input.push(
+                            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": content}]}),
+                        );
+                    }
+                }
+                "tool" => {
+                    let call_id = msg
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let output = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }));
+                }
+                _ => {
+                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    input.push(json!({"type": "message", "role": role, "content": content}));
+                }
+            }
+        }
+    }
+
+    let mut req = json!({
+        "model": openai_req.get("model").cloned().unwrap_or(json!("gpt-4o")),
+        "input": input,
+    });
+
+    if let Some(inst) = instructions {
+        req["instructions"] = Value::String(inst);
+    }
+    if let Some(mt) = openai_req.get("max_tokens") {
+        req["max_output_tokens"] = mt.clone();
+    }
+    if let Some(t) = openai_req.get("temperature") {
+        req["temperature"] = t.clone();
+    }
+    if let Some(tp) = openai_req.get("top_p") {
+        req["top_p"] = tp.clone();
+    }
+
+    // Unwrap tools from Chat Completions {type, function: {…}} to Responses {type, name, …}
+    if let Some(tools) = openai_req.get("tools").and_then(|t| t.as_array()) {
+        let resp_tools: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                if let Some(func) = tool.get("function") {
+                    json!({
+                        "type": "function",
+                        "name": func.get("name").cloned().unwrap_or_default(),
+                        "description": func.get("description").cloned().unwrap_or(json!("")),
+                        "parameters": func.get("parameters").cloned().unwrap_or(json!({})),
+                    })
+                } else {
+                    tool.clone()
+                }
+            })
+            .collect();
+        req["tools"] = Value::Array(resp_tools);
+    }
+    if let Some(tc) = openai_req.get("tool_choice") {
+        req["tool_choice"] = tc.clone();
+    }
+
+    // Map reasoning_effort to Responses API reasoning parameter, capping xhigh to high
+    if let Some(effort) = openai_req.get("reasoning_effort").and_then(|v| v.as_str()) {
+        let capped = if effort.eq_ignore_ascii_case("xhigh") {
+            "high"
+        } else {
+            effort
+        };
+        req["reasoning"] = json!({"effort": capped});
+    }
+
+    req
+}
+
+/// Convert Responses API response → OpenAI Chat Completions response.
+fn convert_responses_to_chat_response(resp: &Value) -> Value {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
+        for item in output {
+            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "message" => match item.get("content") {
+                    Some(Value::String(s)) => text_parts.push(s.clone()),
+                    Some(Value::Array(parts)) => {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                text_parts.push(text.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                "function_call" => {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments =
+                        item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                    tool_calls.push(json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let content = if text_parts.is_empty() {
+        Value::Null
+    } else {
+        Value::String(text_parts.join("\n"))
+    };
+    let finish_reason = if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+
+    let mut message = json!({"role": "assistant"});
+    if !content.is_null() {
+        message["content"] = content;
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
+    let prompt_tokens = resp
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = resp
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    json!({
+        "id": resp.get("id").cloned().unwrap_or(json!("chatcmpl-aivo")),
+        "object": "chat.completion",
+        "model": resp.get("model").cloned().unwrap_or(json!("unknown")),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    })
 }
 
 fn prepare_gateway_model_metadata(
@@ -1157,5 +1482,49 @@ data: [DONE]\n";
         );
         // No prefix configured
         assert_eq!(apply_model_prefix("llama-3.1-8b", None), "llama-3.1-8b");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_keeps_content_on_tool_call_messages() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "list_files", "input": {"path": "."}}
+                ]
+            }]
+        });
+
+        let req = anthropic_to_openai(&body, false);
+        let messages = req["messages"].as_array().unwrap();
+
+        // content must be present (null) for strict providers like Cloudflare Workers AI
+        assert!(
+            messages[0].get("content").is_some(),
+            "assistant tool_call message must retain content field"
+        );
+        assert!(messages[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn test_stringify_message_content_flattens_arrays() {
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]},
+                {"role": "assistant", "content": "already a string"},
+                {"role": "user", "content": ["plain", "strings"]},
+                {"role": "user", "content": [{"type": "image", "source": {}}]}
+            ]
+        });
+
+        stringify_message_content(&mut req);
+        let messages = req["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["content"], "hello\nworld");
+        assert_eq!(messages[1]["content"], "already a string");
+        assert_eq!(messages[2]["content"], "plain\nstrings");
+        // Array with no extractable text → empty string (not null)
+        assert_eq!(messages[3]["content"], "");
     }
 }
