@@ -1,0 +1,258 @@
+use aes::Aes256;
+use aes_gcm::{
+    AesGcm,
+    aead::{Aead, KeyInit, consts::U16, generic_array::GenericArray},
+};
+use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use pbkdf2::pbkdf2_hmac;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::services::system_env;
+
+pub const ENCRYPTION_MARKER: &str = "enc:";
+pub const V3_ENCRYPTION_MARKER: &str = "enc3:";
+
+const IV_LENGTH: usize = 16;
+const SALT_LENGTH: usize = 32;
+const KEY_LENGTH: usize = 32;
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+struct SecretKey([u8; KEY_LENGTH]);
+
+impl SecretKey {
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[cfg(any(test, feature = "test-fast-crypto"))]
+const ITERATIONS: u32 = 100;
+#[cfg(not(any(test, feature = "test-fast-crypto")))]
+const ITERATIONS: u32 = 100_000;
+
+fn derive_key() -> SecretKey {
+    static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
+    CACHED_KEY.get_or_init(derive_key_inner).clone()
+}
+
+fn derive_key_inner() -> SecretKey {
+    let username = system_env::username().unwrap_or_default();
+    let homedir: String = system_env::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let machine_data = format!("{}:{}", username, homedir);
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"aivo-salt");
+    hasher.update(machine_data.as_bytes());
+    let salt_full = hasher.finalize();
+    let salt = &salt_full[..SALT_LENGTH];
+
+    let mut key = [0u8; KEY_LENGTH];
+    pbkdf2_hmac::<Sha256>(machine_data.as_bytes(), salt, ITERATIONS, &mut key);
+
+    SecretKey(key)
+}
+
+fn derive_key_v3() -> SecretKey {
+    static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
+    CACHED_KEY.get_or_init(derive_key_v3_inner).clone()
+}
+
+fn derive_key_v3_inner() -> SecretKey {
+    let username = system_env::username().unwrap_or_default();
+    let homedir: String = system_env::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let machine_id = system_env::machine_id().unwrap_or_default();
+    let machine_data = format!("{}:{}:{}", username, homedir, machine_id);
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"aivo-salt-v3");
+    hasher.update(machine_data.as_bytes());
+    let salt_full = hasher.finalize();
+    let salt = &salt_full[..SALT_LENGTH];
+
+    let mut key = [0u8; KEY_LENGTH];
+    pbkdf2_hmac::<Sha256>(machine_data.as_bytes(), salt, ITERATIONS, &mut key);
+
+    SecretKey(key)
+}
+
+pub fn is_encrypted(value: &str) -> bool {
+    value.starts_with(V3_ENCRYPTION_MARKER) || value.starts_with(ENCRYPTION_MARKER)
+}
+
+type Aes256Gcm16 = AesGcm<Aes256, U16, U16>;
+
+pub fn encrypt(plaintext: &str) -> Result<String> {
+    if plaintext.is_empty() {
+        return Ok(plaintext.to_string());
+    }
+
+    if is_encrypted(plaintext) {
+        return Ok(plaintext.to_string());
+    }
+
+    let key = derive_key_v3();
+    let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
+
+    let mut iv = [0u8; IV_LENGTH];
+    rand::thread_rng().fill_bytes(&mut iv);
+
+    let nonce = GenericArray::from_slice(&iv);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+
+    let mut combined = Vec::with_capacity(IV_LENGTH + ciphertext.len());
+    combined.extend_from_slice(&iv);
+    combined.extend_from_slice(&ciphertext);
+
+    Ok(format!(
+        "{}{}",
+        V3_ENCRYPTION_MARKER,
+        BASE64.encode(&combined)
+    ))
+}
+
+pub fn decrypt(encrypted_data: &str) -> Result<String> {
+    if encrypted_data.is_empty() {
+        return Ok(encrypted_data.to_string());
+    }
+
+    if !is_encrypted(encrypted_data) {
+        return Err(anyhow::anyhow!("Invalid encrypted data: missing marker"));
+    }
+
+    let (key, marker_len) = if encrypted_data.starts_with(V3_ENCRYPTION_MARKER) {
+        (derive_key_v3(), V3_ENCRYPTION_MARKER.len())
+    } else {
+        (derive_key(), ENCRYPTION_MARKER.len())
+    };
+
+    let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
+
+    let data = BASE64
+        .decode(&encrypted_data[marker_len..])
+        .map_err(|e| anyhow::anyhow!("Base64 decode failed: {}", e))?;
+
+    if data.len() < IV_LENGTH {
+        return Err(anyhow::anyhow!("Invalid encrypted data: too short"));
+    }
+
+    let iv = &data[..IV_LENGTH];
+    let ciphertext = &data[IV_LENGTH..];
+    let nonce = GenericArray::from_slice(iv);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| anyhow::anyhow!("Decryption failed - key may be from different machine"))?;
+
+    String::from_utf8(plaintext)
+        .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in decrypted data: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Aes256Gcm16, ENCRYPTION_MARKER, IV_LENGTH, V3_ENCRYPTION_MARKER, decrypt, derive_key,
+        encrypt, is_encrypted,
+    };
+    use aes_gcm::{
+        aead::{Aead, KeyInit, generic_array::GenericArray},
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use rand::RngCore;
+
+    #[test]
+    fn test_encryption_format() {
+        let plaintext = "test-api-key-12345";
+        let encrypted = encrypt(plaintext).unwrap();
+
+        assert!(encrypted.starts_with(V3_ENCRYPTION_MARKER));
+
+        let data = &encrypted[V3_ENCRYPTION_MARKER.len()..];
+        let decoded = BASE64.decode(data).unwrap();
+        assert!(decoded.len() >= 32);
+    }
+
+    #[test]
+    fn test_encryption_roundtrip() {
+        let test_cases = [
+            "simple-key",
+            "key-with-special-chars-!@#$%",
+            "sk-ant-api03-test123",
+            "unicode-キー-测试",
+        ];
+
+        for plaintext in test_cases {
+            let encrypted = encrypt(plaintext).unwrap();
+            let decrypted = decrypt(&encrypted).unwrap();
+            assert_eq!(decrypted, plaintext);
+        }
+    }
+
+    #[test]
+    fn test_is_encrypted_detection() {
+        assert!(is_encrypted("enc:abc123"));
+        assert!(is_encrypted("enc3:abc123"));
+        assert!(!is_encrypted("plain-text"));
+        assert!(!is_encrypted(""));
+        assert!(!is_encrypted("enc"));
+    }
+
+    #[test]
+    fn test_legacy_v2_decrypt() {
+        let plaintext = "legacy-api-key-v2";
+        let key = derive_key();
+        let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
+
+        let mut iv = [0u8; IV_LENGTH];
+        rand::thread_rng().fill_bytes(&mut iv);
+        let nonce = GenericArray::from_slice(&iv);
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
+
+        let mut combined = Vec::with_capacity(IV_LENGTH + ciphertext.len());
+        combined.extend_from_slice(&iv);
+        combined.extend_from_slice(&ciphertext);
+
+        let v2_encrypted = format!("{}{}", ENCRYPTION_MARKER, BASE64.encode(&combined));
+        let decrypted = decrypt(&v2_encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encryption_never_panics() {
+        let inputs = [
+            "a",
+            "normal-key",
+            "key-with-symbols!@#",
+            "sk-test123456789",
+            "unicode-キー-测试",
+        ];
+
+        for input in inputs {
+            let encrypted = encrypt(input).expect("encryption should not fail");
+            assert!(is_encrypted(&encrypted));
+
+            let decrypted = decrypt(&encrypted).expect("decryption should not fail");
+            assert_eq!(decrypted, input);
+        }
+
+        assert_eq!(encrypt("").unwrap(), "");
+    }
+
+    #[test]
+    fn test_double_encryption_idempotent() {
+        let key = "my-api-key";
+        let encrypted1 = encrypt(key).unwrap();
+        let encrypted2 = encrypt(&encrypted1).unwrap();
+
+        assert_eq!(encrypted1, encrypted2);
+    }
+}

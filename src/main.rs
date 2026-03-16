@@ -2,7 +2,6 @@
  * Main entry point for the aivo CLI.
  * Initializes services with dependency injection and routes commands to handlers.
  */
-use std::io::{self, IsTerminal};
 use std::process;
 
 use clap::Parser;
@@ -10,6 +9,7 @@ use clap::Parser;
 mod cli;
 mod commands;
 mod errors;
+mod key_resolution;
 mod services;
 mod style;
 mod tui;
@@ -21,7 +21,7 @@ use commands::{
     StartFlowArgs, UpdateCommand, truncate_url_for_display,
 };
 use errors::ExitCode;
-use services::session_store::ApiKey;
+use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
 /// Known AI tool names that can be used as shortcut aliases for `run`.
@@ -222,19 +222,19 @@ async fn main() {
             let key_override = match resolve_key_override(
                 &session_store,
                 serve_args.key.as_deref(),
-                KeyLookupMode::AllowNone,
+                KeyLookupMode::PreferActiveAllowNone,
             )
             .await
             {
-                Ok(ChatKeyResolution::Selected(key)) => Some(key),
-                Ok(ChatKeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
-                Ok(ChatKeyResolution::MissingAuth) => None,
+                Ok(KeyResolution::Selected(key)) => Some(key),
+                Ok(KeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
+                Ok(KeyResolution::MissingAuth) => None,
                 Err(e) => {
                     eprintln!("{} {}", style::red("Error:"), e);
                     process::exit(ExitCode::UserError.code());
                 }
             };
-            let command = ServeCommand::new(session_store);
+            let command = ServeCommand::new();
             command.execute(serve_args.port, key_override).await
         }
 
@@ -258,19 +258,6 @@ async fn main() {
 
     process::exit(exit_code.code());
 }
-
-fn key_or_exit(result: anyhow::Result<ChatKeyResolution>) -> Option<ApiKey> {
-    match result {
-        Ok(ChatKeyResolution::Selected(key)) => Some(key),
-        Ok(ChatKeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
-        Ok(ChatKeyResolution::MissingAuth) => process::exit(ExitCode::AuthError.code()),
-        Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
-            process::exit(ExitCode::UserError.code());
-        }
-    }
-}
-
 fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
     if raw_args.len() <= 1 {
         return raw_args;
@@ -296,128 +283,6 @@ fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
 
     raw_args
 }
-
-enum ChatKeyResolution {
-    Selected(ApiKey),
-    Cancelled,
-    MissingAuth,
-}
-
-enum KeyLookupMode {
-    RequireActiveOrPrompt,
-    AllowNone,
-}
-
-async fn resolve_key_override(
-    session_store: &SessionStore,
-    key_flag: Option<&str>,
-    mode: KeyLookupMode,
-) -> anyhow::Result<ChatKeyResolution> {
-    match key_flag {
-        Some("") => prompt_temporary_key_override(session_store).await,
-        Some(key_id_or_name) => Ok(ChatKeyResolution::Selected(
-            session_store
-                .resolve_key_by_id_or_name(key_id_or_name)
-                .await?,
-        )),
-        None => match mode {
-            KeyLookupMode::RequireActiveOrPrompt => {
-                match resolve_active_key_or_prompt(session_store).await {
-                    Some(key) => Ok(ChatKeyResolution::Selected(key)),
-                    None => Ok(ChatKeyResolution::MissingAuth),
-                }
-            }
-            KeyLookupMode::AllowNone => Ok(ChatKeyResolution::MissingAuth),
-        },
-    }
-}
-
-async fn prompt_temporary_key_override(
-    session_store: &SessionStore,
-) -> anyhow::Result<ChatKeyResolution> {
-    let all_keys = session_store.get_keys().await?;
-    if all_keys.is_empty() {
-        eprintln!("{} No API keys configured.", style::yellow("Note:"));
-        eprintln!();
-        eprintln!("  Run {} to add one.", style::cyan("aivo keys add"));
-        return Ok(ChatKeyResolution::MissingAuth);
-    }
-    if !io::stderr().is_terminal() {
-        anyhow::bail!(
-            "Cannot open key picker without a terminal. Run in a terminal or pass --key <id|name>."
-        );
-    }
-
-    let default_idx = session_store
-        .get_active_key_info()
-        .await?
-        .and_then(|active_key| all_keys.iter().position(|key| key.id == active_key.id))
-        .unwrap_or(0);
-
-    match commands::keys::prompt_pick_key_without_activation(
-        &all_keys,
-        "Select a key",
-        default_idx,
-    )? {
-        Some(key) => Ok(ChatKeyResolution::Selected(key)),
-        None => Ok(ChatKeyResolution::Cancelled),
-    }
-}
-
-/// When no active key is set, prompts the user to select one (if keys exist)
-/// or to add one (if no keys exist). Returns the selected key on success.
-async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<ApiKey> {
-    // Already have an active key — nothing to do
-    if let Ok(Some(key)) = session_store.get_active_key().await {
-        return Some(key);
-    }
-
-    let all_keys = match session_store.get_keys().await {
-        Ok(keys) => keys,
-        Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
-            return None;
-        }
-    };
-
-    if all_keys.is_empty() {
-        eprintln!("{} No API keys configured.", style::yellow("Note:"));
-        eprintln!();
-        eprintln!("  Run {} to add one.", style::cyan("aivo keys add"));
-        return None;
-    }
-
-    // Keys exist but none is active — let the user pick
-    eprintln!(
-        "{} No active API key. Select one to continue:",
-        style::yellow("Note:")
-    );
-    eprintln!();
-
-    if !io::stderr().is_terminal() {
-        eprintln!(
-            "{} Cannot open key picker without a terminal. Run in a terminal or activate a key first.",
-            style::red("Error:")
-        );
-        return None;
-    }
-
-    match commands::keys::prompt_select_key(session_store, &all_keys, "Select a key", 0).await {
-        Ok(Some(key)) => {
-            eprintln!();
-            Some(key)
-        }
-        Ok(None) => {
-            eprintln!("{}", style::dim("Cancelled."));
-            None
-        }
-        Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
-            None
-        }
-    }
-}
-
 /// Prints the active key info.
 /// Only prints if there is an active key configured.
 async fn print_active_key(session_store: &SessionStore) {

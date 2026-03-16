@@ -6,16 +6,20 @@ use std::net::IpAddr;
 use crate::errors::ExitCode;
 use crate::services::provider_profile::provider_profile_for_key;
 use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
-use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::session_store::ApiKey;
 use crate::style;
 
-pub struct ServeCommand {
-    session_store: SessionStore,
+pub struct ServeCommand;
+
+impl Default for ServeCommand {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServeCommand {
-    pub fn new(session_store: SessionStore) -> Self {
-        Self { session_store }
+    pub fn new() -> Self {
+        Self
     }
 
     pub async fn execute(&self, port: u16, key_override: Option<ApiKey>) -> ExitCode {
@@ -31,16 +35,13 @@ impl ServeCommand {
     async fn execute_internal(&self, port: u16, key_override: Option<ApiKey>) -> Result<ExitCode> {
         let key = match key_override {
             Some(k) => k,
-            None => match self.session_store.get_active_key().await? {
-                Some(k) => k,
-                None => {
-                    eprintln!(
-                        "{} No API key configured. Run 'aivo keys add' first.",
-                        style::red("Error:")
-                    );
-                    return Ok(ExitCode::AuthError);
-                }
-            },
+            None => {
+                eprintln!(
+                    "{} No API key configured. Run 'aivo keys add' first.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::AuthError);
+            }
         };
 
         let profile = provider_profile_for_key(&key);

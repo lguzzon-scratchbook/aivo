@@ -33,6 +33,8 @@ use crate::style;
 
 #[path = "chat_tui.rs"]
 mod chat_tui;
+#[path = "chat_tui_format.rs"]
+mod chat_tui_format;
 
 /// Maximum number of messages to keep in chat history.
 /// When exceeded, the oldest messages are dropped (keeping any system message).

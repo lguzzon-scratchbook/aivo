@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{DateTime, Local, Utc};
+use chrono::Utc;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -29,12 +29,19 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::style::spinner_frame;
 use crate::tui::matches_fuzzy;
 
 use super::*;
+use super::chat_tui_format::{
+    build_footer_text, display_width, estimate_context_tokens, footer_host_label,
+    format_picker_match_count, format_request_elapsed, format_session_group_label,
+    format_session_match_count, format_session_time, format_time_ago_short,
+    format_token_count, truncate_for_display_width, truncate_for_width,
+    wrapped_text_line_count,
+};
 
 const TEXT: Color = Color::Rgb(224, 225, 221);
 const MUTED: Color = Color::Rgb(136, 142, 139);
@@ -3726,10 +3733,6 @@ fn render_pending_status(
     );
 }
 
-fn format_request_elapsed(elapsed: Duration) -> String {
-    format!("{}s", elapsed.as_secs())
-}
-
 fn spinner_frame_indexed(frame_tick: usize, reduce_motion: bool) -> &'static str {
     if reduce_motion {
         return spinner_frame(0);
@@ -4132,70 +4135,6 @@ fn compact_styled_lines(lines: &mut Vec<StyledLine>) {
     *lines = compacted;
 }
 
-fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> String {
-    if let Some(usage) = usage {
-        let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
-        let label = if total == 1 { "token" } else { "tokens" };
-        return format!("{} {}", format_token_count_value(total), label);
-    }
-    if tokens == 0 {
-        "0 tokens".to_string()
-    } else {
-        let label = if tokens == 1 { "token" } else { "tokens" };
-        format!("~{} {}", format_token_count_value(tokens), label)
-    }
-}
-
-fn format_token_count_value(tokens: u64) -> String {
-    if tokens < 1_000 {
-        return tokens.to_string();
-    }
-
-    let rounded_tenths = (tokens + 50) / 100;
-    let thousands = rounded_tenths / 10;
-    let tenths = rounded_tenths % 10;
-    if tenths == 0 {
-        format!("{thousands}k")
-    } else {
-        format!("{thousands}.{tenths}k")
-    }
-}
-
-/// Approximate char overhead for JSON framing around one attachment block.
-const ATTACHMENT_OVERHEAD_CHARS: usize = 64;
-/// Approximate char overhead for JSON framing around one message (role, braces, newlines).
-const MESSAGE_OVERHEAD_CHARS: usize = 20;
-
-fn estimate_context_tokens(history: &[ChatMessage]) -> u64 {
-    let total_chars: usize = history
-        .iter()
-        .map(|m| {
-            let attachment_chars = m
-                .attachments
-                .iter()
-                .map(|a| a.name.len() + ATTACHMENT_OVERHEAD_CHARS)
-                .sum::<usize>();
-            m.role.len() + m.content.len() + attachment_chars + MESSAGE_OVERHEAD_CHARS
-        })
-        .sum();
-    (total_chars / 4) as u64
-}
-
-fn build_footer_text(model: &str, base_url: &str, cwd: &str, width: u16) -> String {
-    let host = footer_host_label(base_url);
-    let cwd_label = footer_cwd_label(cwd);
-    let candidates = [
-        format!("{model} · {host} · {cwd_label}"),
-        format!("{model} · {host}"),
-        model.to_string(),
-    ];
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.chars().count() <= usize::from(width.max(1)))
-        .unwrap_or_else(|| truncate_for_width(model, width))
-}
-
 fn restore_cancelled_submission(
     history: &mut Vec<ChatMessage>,
     draft: &mut String,
@@ -4212,33 +4151,6 @@ fn restore_cancelled_submission(
     if history.last().is_some_and(|message| message.role == "user") {
         history.pop();
     }
-}
-
-fn footer_host_label(base_url: &str) -> String {
-    if base_url == "copilot" {
-        return "copilot".to_string();
-    }
-
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let without_scheme = trimmed
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(trimmed);
-    without_scheme
-        .split('/')
-        .next()
-        .filter(|host| !host.is_empty())
-        .unwrap_or(trimmed)
-        .to_string()
-}
-
-fn footer_cwd_label(cwd: &str) -> String {
-    Path::new(cwd)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(cwd)
-        .to_string()
 }
 
 fn session_title_from_messages(messages: &[ChatMessage], raw_model: &str) -> String {
@@ -4309,17 +4221,6 @@ fn plain_lines_to_text(lines: Vec<String>) -> Text<'static> {
     Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>())
 }
 
-// Keep transcript height calculations aligned with Ratatui's own word-wrapping rules.
-fn wrapped_text_line_count(text: impl Into<Text<'static>>, width: u16) -> usize {
-    if width == 0 {
-        return 0;
-    }
-
-    Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-}
-
 fn metadata_text_len(value: &str) -> usize {
     value.chars().count()
 }
@@ -4370,77 +4271,6 @@ fn resume_metadata_spans(preview: &SessionPreview, width: u16) -> Vec<Span<'stat
         push_resume_metadata_segment(&mut spans, model_value, ASSISTANT);
     }
     spans
-}
-
-fn format_session_group_label(updated_at: &str) -> String {
-    let parsed = DateTime::parse_from_rfc3339(updated_at)
-        .map(|value| value.with_timezone(&Local))
-        .ok();
-    let Some(parsed) = parsed else {
-        return updated_at.to_string();
-    };
-    let today = Local::now().date_naive();
-    if parsed.date_naive() == today {
-        "Today".to_string()
-    } else {
-        parsed.format("%a %b %d %Y").to_string()
-    }
-}
-
-fn format_session_time(updated_at: &str) -> String {
-    DateTime::parse_from_rfc3339(updated_at)
-        .map(|value| value.with_timezone(&Local).format("%-I:%M %p").to_string())
-        .unwrap_or_else(|_| updated_at.to_string())
-}
-
-fn format_session_match_count(filtered: usize, total: usize) -> String {
-    if total == 0 {
-        return "0 chats".to_string();
-    }
-    if filtered == total {
-        return format!("{total} chats");
-    }
-    format!("{filtered}/{total}")
-}
-
-fn format_picker_match_count(filtered: usize, total: usize, noun: &str) -> String {
-    if total == 0 {
-        return format!("0 {noun}");
-    }
-    if filtered == total {
-        return format!("{total} {noun}");
-    }
-    format!("{filtered}/{total}")
-}
-
-fn display_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
-}
-
-fn truncate_for_display_width(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    if display_width(text) <= max_width {
-        return text.to_string();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let mut result = String::new();
-    let mut used = 0;
-    let limit = max_width - 1;
-    for ch in text.chars() {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + width > limit {
-            break;
-        }
-        used += width;
-        result.push(ch);
-    }
-    result.push('…');
-    result
 }
 
 fn filter_slash_commands(query: &str) -> Vec<&'static SlashCommandSpec> {
@@ -5092,25 +4922,6 @@ if let data = pasteboard.data(forType: .png) {
     }))
 }
 
-fn format_time_ago_short(updated_at: &str) -> String {
-    let parsed = DateTime::parse_from_rfc3339(updated_at)
-        .map(|value| value.with_timezone(&Utc))
-        .ok();
-    let Some(parsed) = parsed else {
-        return updated_at.to_string();
-    };
-    let seconds = (Utc::now() - parsed).num_seconds().max(0);
-    match seconds {
-        0..=59 => "now".to_string(),
-        60..=3599 => format!("{}m", seconds / 60),
-        3600..=86_399 => format!("{}h", seconds / 3600),
-        86_400..=604_799 => format!("{}d", seconds / 86_400),
-        604_800..=2_592_000 => format!("{}w", seconds / 604_800),
-        2_592_001..=31_535_999 => format!("{}mo", seconds / 2_592_000),
-        _ => format!("{}y", seconds / 31_536_000),
-    }
-}
-
 fn parse_slash_command(input: &str) -> Result<SlashCommand> {
     let trimmed = input.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -5154,10 +4965,6 @@ fn is_help_shortcut(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(1))
 }
 
-fn truncate_for_width(text: &str, width: u16) -> String {
-    truncate_for_display_width(text, usize::from(width))
-}
-
 fn first_non_empty_line(text: &str) -> String {
     text.lines()
         .map(str::trim)
@@ -5183,24 +4990,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_wrapped_text_line_count_uses_ratatui_word_wrap() {
-        assert_eq!(wrapped_text_line_count("", 10), 1);
-        assert_eq!(wrapped_text_line_count("hello", 10), 1);
-        assert_eq!(wrapped_text_line_count("abcdefghij", 5), 2);
-        assert_eq!(wrapped_text_line_count("word word word", 8), 3);
-    }
-
-    #[test]
     fn test_matches_fuzzy() {
         assert!(matches_fuzzy("g4", "gpt-4o"));
         assert!(matches_fuzzy("", "anything"));
         assert!(!matches_fuzzy("xyz", "gpt-4o"));
-    }
-
-    #[test]
-    fn test_format_time_ago_short() {
-        let updated_at = (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339();
-        assert_eq!(format_time_ago_short(&updated_at), "5m");
     }
 
     #[test]
@@ -5751,28 +5544,6 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_width() {
-        assert_eq!(truncate_for_width("hello", 10), "hello");
-        assert_eq!(truncate_for_width("hello world", 6), "hello…");
-    }
-
-    #[test]
-    fn test_build_footer_text_prefers_whole_segments() {
-        assert_eq!(
-            build_footer_text("gpt-4o", "https://openrouter.ai/api/v1", "/tmp/project", 80),
-            "gpt-4o · openrouter.ai · project"
-        );
-        assert_eq!(
-            build_footer_text("gpt-4o", "https://openrouter.ai/api/v1", "/tmp/project", 22),
-            "gpt-4o · openrouter.ai"
-        );
-        assert_eq!(
-            build_footer_text("gpt-4o", "https://openrouter.ai/api/v1", "/tmp/project", 6),
-            "gpt-4o"
-        );
-    }
-
-    #[test]
     fn test_footer_status_label_stays_token_count_while_streaming() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = make_test_app(tx, rx);
@@ -5783,38 +5554,6 @@ mod tests {
         let (label, color) = app.footer_status_label();
         assert_eq!(label, "~5.1k tokens");
         assert_eq!(color, MUTED);
-    }
-
-    #[test]
-    fn test_format_token_count_with_usage_shows_total() {
-        assert_eq!(
-            format_token_count(
-                999,
-                Some(TokenUsage {
-                    prompt_tokens: 24,
-                    completion_tokens: 11
-                })
-            ),
-            "35 tokens"
-        );
-        assert_eq!(
-            format_token_count(
-                5_120,
-                Some(TokenUsage {
-                    prompt_tokens: 5_000,
-                    completion_tokens: 120
-                })
-            ),
-            "5.1k tokens"
-        );
-    }
-
-    #[test]
-    fn test_format_token_count_marks_estimates() {
-        assert_eq!(format_token_count(0, None), "0 tokens");
-        assert_eq!(format_token_count(105, None), "~105 tokens");
-        assert_eq!(format_token_count(5_000, None), "~5k tokens");
-        assert_eq!(format_token_count(12_345, None), "~12.3k tokens");
     }
 
     #[test]
@@ -5839,20 +5578,6 @@ mod tests {
                 "/tmp/project".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn test_format_session_match_count() {
-        assert_eq!(format_session_match_count(0, 0), "0 chats");
-        assert_eq!(format_session_match_count(4, 4), "4 chats");
-        assert_eq!(format_session_match_count(2, 5), "2/5");
-    }
-
-    #[test]
-    fn test_truncate_for_display_width_handles_wide_text() {
-        let truncated = truncate_for_display_width("你好🙂 hello", 8);
-        assert!(display_width(&truncated) <= 8);
-        assert!(truncated.ends_with('…'));
     }
 
     #[test]
@@ -6027,11 +5752,6 @@ mod tests {
         assert!(rect_contains(area, (17, 6)));
         assert!(!rect_contains(area, (18, 6)));
         assert!(!rect_contains(area, (17, 7)));
-    }
-
-    #[test]
-    fn test_format_request_elapsed() {
-        assert_eq!(format_request_elapsed(Duration::from_secs(54)), "54s");
     }
 
     #[test]
