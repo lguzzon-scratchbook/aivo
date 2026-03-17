@@ -141,7 +141,7 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         _ => "stop",
     };
 
-    let prompt_tokens = resp
+    let raw_input_tokens = resp
         .get("usage")
         .and_then(|u| u.get("input_tokens"))
         .and_then(|v| v.as_u64())
@@ -151,6 +151,18 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         .and_then(|u| u.get("output_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let cache_read_input_tokens = resp
+        .get("usage")
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_u64());
+    let cache_creation_input_tokens = resp
+        .get("usage")
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_u64());
+    // Normalize: Anthropic's input_tokens excludes cache, OpenAI's prompt_tokens includes it
+    let prompt_tokens = raw_input_tokens
+        + cache_read_input_tokens.unwrap_or(0)
+        + cache_creation_input_tokens.unwrap_or(0);
 
     let response = OpenAIChatResponse {
         id: resp
@@ -182,6 +194,8 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
         },
     };
 

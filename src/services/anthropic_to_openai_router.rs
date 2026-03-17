@@ -21,6 +21,7 @@ use crate::services::anthropic_chat_request::{
 use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
 };
+use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::model_names::{
     infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_provider_attempt,
@@ -186,6 +187,15 @@ async fn handle_anthropic_to_upstream(
 
     let body: Value = serde_json::from_str(body_str)?;
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content);
+    // Only inject cache_control for Claude models — other providers don't support it
+    // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
+    if simplified
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
+    {
+        inject_chat_completions_cache_control(&mut simplified);
+    }
     // Map Anthropic thinking config to OpenAI reasoning_effort
     if let Some(thinking) = body.get("thinking")
         && thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
@@ -547,9 +557,21 @@ fn ensure_message_start(
     message_id: &str,
     model: &str,
     input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
 ) {
     if *started {
         return;
+    }
+    let mut usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": 0
+    });
+    if let Some(value) = cache_read_input_tokens {
+        usage["cache_read_input_tokens"] = json!(value);
+    }
+    if let Some(value) = cache_creation_input_tokens {
+        usage["cache_creation_input_tokens"] = json!(value);
     }
     append_sse_event(
         output,
@@ -564,10 +586,7 @@ fn ensure_message_start(
                 "model": model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0
-                }
+                "usage": usage
             }
         }),
     );
@@ -680,11 +699,21 @@ fn finalize_stream_message(
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
     text_block_idx: &mut Option<usize>,
     tool_blocks: &mut HashMap<usize, StreamToolBlock>,
     stop_reason: &str,
 ) {
-    ensure_message_start(output, message_started, message_id, model, input_tokens);
+    ensure_message_start(
+        output,
+        message_started,
+        message_id,
+        model,
+        input_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+    );
 
     if let Some(idx) = text_block_idx.take() {
         append_sse_event(
@@ -714,6 +743,15 @@ fn finalize_stream_message(
         );
     }
 
+    let mut usage = json!({
+        "output_tokens": output_tokens
+    });
+    if let Some(value) = cache_read_input_tokens {
+        usage["cache_read_input_tokens"] = json!(value);
+    }
+    if let Some(value) = cache_creation_input_tokens {
+        usage["cache_creation_input_tokens"] = json!(value);
+    }
     append_sse_event(
         output,
         "message_delta",
@@ -723,9 +761,7 @@ fn finalize_stream_message(
                 "stop_reason": stop_reason,
                 "stop_sequence": null
             },
-            "usage": {
-                "output_tokens": output_tokens
-            }
+            "usage": usage
         }),
     );
     append_sse_event(
@@ -748,6 +784,8 @@ struct OpenAIStreamConverter {
     model: String,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
     saw_tool_use: bool,
 }
 
@@ -764,6 +802,8 @@ impl OpenAIStreamConverter {
             model: "claude".to_string(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
             saw_tool_use: false,
         }
     }
@@ -803,6 +843,8 @@ impl OpenAIStreamConverter {
                 &self.model,
                 self.input_tokens,
                 self.output_tokens,
+                self.cache_read_input_tokens,
+                self.cache_creation_input_tokens,
                 &mut self.text_block_idx,
                 &mut self.tool_blocks,
                 fallback_stop,
@@ -832,6 +874,8 @@ impl OpenAIStreamConverter {
                     &self.model,
                     self.input_tokens,
                     self.output_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
                     &mut self.text_block_idx,
                     &mut self.tool_blocks,
                     fallback_stop,
@@ -863,6 +907,12 @@ impl OpenAIStreamConverter {
             if let Some(v) = usage.completion_tokens {
                 self.output_tokens = v;
             }
+            if let Some(v) = usage.cache_read_input_tokens {
+                self.cache_read_input_tokens = Some(v);
+            }
+            if let Some(v) = usage.cache_creation_input_tokens {
+                self.cache_creation_input_tokens = Some(v);
+            }
         }
 
         for choice in chunk.choices {
@@ -877,6 +927,8 @@ impl OpenAIStreamConverter {
                     &self.message_id,
                     &self.model,
                     self.input_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
                 );
                 if self.text_block_idx.is_none() {
                     let idx = self.block_count;
@@ -916,6 +968,8 @@ impl OpenAIStreamConverter {
                     &self.message_id,
                     &self.model,
                     self.input_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
                 );
                 emit_tool_delta(
                     output,
@@ -936,6 +990,8 @@ impl OpenAIStreamConverter {
                     &self.message_id,
                     &self.model,
                     self.input_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
                 );
                 for tc in tool_calls {
                     let openai_idx = tc.index.unwrap_or(0) as usize;
@@ -963,6 +1019,8 @@ impl OpenAIStreamConverter {
                     &self.model,
                     self.input_tokens,
                     self.output_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
                     &mut self.text_block_idx,
                     &mut self.tool_blocks,
                     map_openai_finish_reason(finish_reason),
@@ -1025,7 +1083,9 @@ mod tests {
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
-                "total_tokens": 15
+                "total_tokens": 15,
+                "cache_read_input_tokens": 90,
+                "cache_creation_input_tokens": 15
             }
         }"#;
 
@@ -1037,6 +1097,8 @@ mod tests {
         assert_eq!(parsed["created"], 1700000000);
         assert_eq!(parsed["usage"]["input_tokens"], 10);
         assert_eq!(parsed["usage"]["output_tokens"], 5);
+        assert_eq!(parsed["usage"]["cache_read_input_tokens"], 90);
+        assert_eq!(parsed["usage"]["cache_creation_input_tokens"], 15);
     }
 
     #[test]
@@ -1197,7 +1259,7 @@ mod tests {
     #[test]
     fn test_convert_openai_sse_to_anthropic_text() {
         let sse = "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":4}}\n\
+data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":4,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":15}}\n\
 data: [DONE]\n";
         let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
         assert!(result.contains("event: message_start"));
@@ -1205,6 +1267,8 @@ data: [DONE]\n";
         assert!(result.contains("\"text\":\"hello \""));
         assert!(result.contains("\"text\":\"world\""));
         assert!(result.contains("\"stop_reason\":\"end_turn\""));
+        assert!(result.contains("\"cache_read_input_tokens\":90"));
+        assert!(result.contains("\"cache_creation_input_tokens\":15"));
         assert!(result.contains("event: message_stop"));
     }
 

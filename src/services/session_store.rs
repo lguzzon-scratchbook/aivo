@@ -158,14 +158,38 @@ pub struct UsageCounter {
     pub prompt_tokens: u64,
     #[serde(rename = "completionTokens", default, skip_serializing_if = "is_zero")]
     pub completion_tokens: u64,
+    #[serde(
+        rename = "cacheReadInputTokens",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub cache_read_input_tokens: u64,
+    #[serde(
+        rename = "cacheCreationInputTokens",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub cache_creation_input_tokens: u64,
     #[serde(rename = "totalTokens", default, skip_serializing_if = "is_zero")]
     pub total_tokens: u64,
 }
 
 impl UsageCounter {
-    fn add_tokens(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+    fn add_tokens(
+        &mut self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    ) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
         self.completion_tokens = self.completion_tokens.saturating_add(completion_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(cache_creation_input_tokens);
         self.total_tokens = self
             .total_tokens
             .saturating_add(prompt_tokens.saturating_add(completion_tokens));
@@ -184,6 +208,18 @@ pub struct UsageStats {
         skip_serializing_if = "is_zero"
     )]
     pub total_completion_tokens: u64,
+    #[serde(
+        rename = "totalCacheReadInputTokens",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub total_cache_read_input_tokens: u64,
+    #[serde(
+        rename = "totalCacheCreationInputTokens",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub total_cache_creation_input_tokens: u64,
     #[serde(rename = "totalTokens", default, skip_serializing_if = "is_zero")]
     pub total_tokens: u64,
     #[serde(
@@ -230,11 +266,19 @@ impl UsageStats {
         model: Option<&str>,
         prompt_tokens: u64,
         completion_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
     ) {
         self.total_prompt_tokens = self.total_prompt_tokens.saturating_add(prompt_tokens);
         self.total_completion_tokens = self
             .total_completion_tokens
             .saturating_add(completion_tokens);
+        self.total_cache_read_input_tokens = self
+            .total_cache_read_input_tokens
+            .saturating_add(cache_read_input_tokens);
+        self.total_cache_creation_input_tokens = self
+            .total_cache_creation_input_tokens
+            .saturating_add(cache_creation_input_tokens);
         self.total_tokens = self
             .total_tokens
             .saturating_add(prompt_tokens.saturating_add(completion_tokens));
@@ -242,13 +286,23 @@ impl UsageStats {
         self.key_usage
             .entry(key_id.to_string())
             .or_default()
-            .add_tokens(prompt_tokens, completion_tokens);
+            .add_tokens(
+                prompt_tokens,
+                completion_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            );
 
         if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
             self.model_usage
                 .entry(model.to_string())
                 .or_default()
-                .add_tokens(prompt_tokens, completion_tokens);
+                .add_tokens(
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                );
         }
     }
 }
@@ -1384,12 +1438,19 @@ impl SessionStore {
         model: Option<&str>,
         prompt_tokens: u64,
         completion_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
     ) -> Result<()> {
         let _lock = self.acquire_config_lock()?;
         let mut config = self.load().await?;
-        config
-            .stats
-            .record_tokens(key_id, model, prompt_tokens, completion_tokens);
+        config.stats.record_tokens(
+            key_id,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        );
         self.save_raw(&config).await
     }
 
@@ -1914,7 +1975,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .record_tokens(&id, Some("gpt-4o"), 10, 5)
+            .record_tokens(&id, Some("gpt-4o"), 10, 5, 90, 15)
             .await
             .unwrap();
         store
@@ -1941,6 +2002,8 @@ mod tests {
         let stats = store.load().await.unwrap().stats;
         assert_eq!(stats.total_selections, 1);
         assert_eq!(stats.total_tokens, 15);
+        assert_eq!(stats.total_cache_read_input_tokens, 90);
+        assert_eq!(stats.total_cache_creation_input_tokens, 15);
         assert_eq!(stats.tool_counts.get("chat"), Some(&1));
         assert_eq!(
             stats

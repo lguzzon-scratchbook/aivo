@@ -77,9 +77,11 @@ impl ChatTuiApp {
                     Some(&self.raw_model),
                     usage.prompt_tokens,
                     usage.completion_tokens,
+                    usage.cache_read_input_tokens,
+                    usage.cache_creation_input_tokens,
                 )
                 .await?;
-            self.context_tokens = usage.prompt_tokens + usage.completion_tokens;
+            self.context_tokens = usage.total_tokens();
             self.last_usage = Some(usage);
         } else {
             self.context_tokens = estimate_context_tokens(&self.history);
@@ -190,10 +192,10 @@ impl ChatTuiApp {
             match event::poll(Duration::from_millis(0)) {
                 Ok(true) => match event::read() {
                     Ok(event) => {
-                        if let Some(should_exit) = self.handle_terminal_event(event).await? {
-                            if should_exit {
-                                break Ok(());
-                            }
+                        if let Some(should_exit) = self.handle_terminal_event(event).await?
+                            && should_exit
+                        {
+                            break Ok(());
                         }
                     }
                     Err(err) => break Err(err.into()),

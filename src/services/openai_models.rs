@@ -228,6 +228,10 @@ pub(crate) struct ResponsesUsage {
     pub input_tokens: Option<u64>,
     #[serde(default)]
     pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -296,6 +300,10 @@ pub(crate) struct OpenAIChatChunkUsage {
     pub prompt_tokens: Option<u64>,
     #[serde(default)]
     pub completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -357,6 +365,10 @@ pub(crate) struct OpenAIChatUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 pub(crate) fn stringify_message_content(request: &mut OpenAIChatRequest) {
@@ -509,6 +521,8 @@ pub(crate) fn convert_responses_to_chat_response(resp: &ResponsesResponse) -> Op
 
     let prompt_tokens = resp.usage.input_tokens.unwrap_or(0);
     let completion_tokens = resp.usage.output_tokens.unwrap_or(0);
+    let cache_read_input_tokens = resp.usage.cache_read_input_tokens;
+    let cache_creation_input_tokens = resp.usage.cache_creation_input_tokens;
     let content = (!text_parts.is_empty()).then(|| text_parts.join("\n"));
     let tool_calls = (!tool_calls.is_empty()).then_some(tool_calls);
     let finish_reason = if tool_calls.is_some() {
@@ -538,6 +552,8 @@ pub(crate) fn convert_responses_to_chat_response(resp: &ResponsesResponse) -> Op
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
         },
     }
 }
@@ -749,6 +765,8 @@ mod tests {
             usage: ResponsesUsage {
                 input_tokens: Some(12),
                 output_tokens: Some(7),
+                cache_read_input_tokens: Some(90),
+                cache_creation_input_tokens: Some(15),
             },
         };
 
@@ -758,6 +776,9 @@ mod tests {
         assert_eq!(chat.model, "gpt-4o");
         assert_eq!(chat.usage.prompt_tokens, 12);
         assert_eq!(chat.usage.completion_tokens, 7);
+        assert_eq!(chat.usage.cache_read_input_tokens, Some(90));
+        assert_eq!(chat.usage.cache_creation_input_tokens, Some(15));
+        assert_eq!(chat.usage.total_tokens, 19);
         assert_eq!(chat.choices[0].finish_reason, "tool_calls");
         assert_eq!(
             chat.choices[0].message.content.as_deref(),

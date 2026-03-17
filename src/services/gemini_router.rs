@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
 use crate::services::model_names::select_model_for_provider_attempt;
@@ -156,6 +157,13 @@ async fn forward_to_provider(
 
         let (status, body_text, parsed) = match protocol {
             ProviderProtocol::Anthropic => {
+                if req_body
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
+                {
+                    inject_chat_completions_cache_control(&mut req_body);
+                }
                 let mut anthropic_req = convert_openai_chat_to_anthropic_request(
                     &req_body,
                     &OpenAIToAnthropicChatConfig {
@@ -796,11 +804,20 @@ pub fn convert_openai_to_gemini(body: &Value) -> Value {
 
     // Usage metadata
     if let Some(usage) = body.get("usage") {
-        result["usageMetadata"] = serde_json::json!({
+        let mut usage_metadata = serde_json::json!({
             "promptTokenCount": usage.get("prompt_tokens").cloned().unwrap_or(Value::Null),
             "candidatesTokenCount": usage.get("completion_tokens").cloned().unwrap_or(Value::Null),
             "totalTokenCount": usage.get("total_tokens").cloned().unwrap_or(Value::Null),
         });
+        if let Some(value) = usage.get("cache_read_input_tokens").cloned().or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .cloned()
+        }) {
+            usage_metadata["cachedContentTokenCount"] = value;
+        }
+        result["usageMetadata"] = usage_metadata;
     }
 
     result
@@ -1044,7 +1061,7 @@ mod tests {
     fn test_convert_openai_to_gemini_text() {
         let response = serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 98, "cache_read_input_tokens": 90}
         });
         let result = convert_openai_to_gemini(&response);
         let candidates = result["candidates"].as_array().unwrap();
@@ -1054,6 +1071,7 @@ mod tests {
         assert_eq!(candidates[0]["finishReason"], "STOP");
         assert_eq!(result["usageMetadata"]["promptTokenCount"], 5);
         assert_eq!(result["usageMetadata"]["candidatesTokenCount"], 3);
+        assert_eq!(result["usageMetadata"]["cachedContentTokenCount"], 90);
     }
 
     #[test]

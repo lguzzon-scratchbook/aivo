@@ -283,6 +283,19 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         .and_then(|u| u.get("candidatesTokenCount"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let cache_read_input_tokens = resp
+        .get("usageMetadata")
+        .and_then(|u| u.get("cachedContentTokenCount"))
+        .and_then(|v| v.as_u64());
+
+    let mut usage = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens
+    });
+    if let Some(value) = cache_read_input_tokens {
+        usage["cache_read_input_tokens"] = json!(value);
+    }
 
     json!({
         "id": resp.get("responseId").cloned().unwrap_or(json!("chatcmpl-aivo")),
@@ -294,11 +307,7 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
             "message": message,
             "finish_reason": finish_reason
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
+        "usage": usage
     })
 }
 
@@ -383,7 +392,8 @@ mod tests {
             }],
             "usageMetadata": {
                 "promptTokenCount": 10,
-                "candidatesTokenCount": 4
+                "candidatesTokenCount": 4,
+                "cachedContentTokenCount": 90
             }
         });
 
@@ -393,6 +403,7 @@ mod tests {
             converted["choices"][0]["message"]["tool_calls"][0]["id"],
             "call_1"
         );
+        assert_eq!(converted["usage"]["cache_read_input_tokens"], 90);
     }
 
     #[test]

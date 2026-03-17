@@ -1,3 +1,4 @@
+use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, current_unix_ts};
@@ -490,8 +491,17 @@ async fn forward_anthropic_protocol(
     client: &reqwest::Client,
     force_non_streaming: bool,
 ) -> Result<ProtocolAttemptResult> {
+    let mut body_with_cache = body.clone();
+    if body_with_cache
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
+    {
+        inject_chat_completions_cache_control(&mut body_with_cache);
+    }
+
     let mut anthropic_body = convert_openai_chat_to_anthropic_request(
-        body,
+        &body_with_cache,
         &OpenAIToAnthropicChatConfig {
             default_model: "claude-sonnet-4-5",
         },
@@ -1217,20 +1227,56 @@ pub fn convert_chat_response_to_responses_sse(
     }
 
     // response.completed — required closing event with full output array
+    let mut response = json!({
+        "id": resp_id, "object": "response",
+        "model": codex_model,
+        "created_at": created_at, "status": "completed",
+        "output": output_items
+    });
+    if let Some(usage) = chat_usage_to_responses_usage(chat) {
+        response["usage"] = usage;
+    }
     sse.push_str(&sse_event(
         "response.completed",
         &json!({
             "type": "response.completed",
-            "response": {
-                "id": resp_id, "object": "response",
-                "model": codex_model,
-                "created_at": created_at, "status": "completed",
-                "output": output_items
-            }
+            "response": response
         }),
     ));
 
     sse
+}
+
+fn chat_usage_to_responses_usage(chat: &Value) -> Option<Value> {
+    let usage = chat.get("usage")?;
+
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let output_tokens = usage
+        .get("completion_tokens")
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let total_tokens = usage
+        .get("total_tokens")
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+
+    let mut response_usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens
+    });
+
+    if let Some(value) = usage.get("cache_read_input_tokens").cloned() {
+        response_usage["cache_read_input_tokens"] = value;
+    }
+    if let Some(value) = usage.get("cache_creation_input_tokens").cloned() {
+        response_usage["cache_creation_input_tokens"] = value;
+    }
+
+    Some(response_usage)
 }
 
 /// Extracts assistant text and tool calls from provider chat completion payloads.
@@ -1827,6 +1873,11 @@ mod tests {
     #[test]
     fn test_convert_response_text_contains_required_events() {
         let chat = json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cache_read_input_tokens": 90
+            },
             "choices": [{"message": {"role": "assistant", "content": "Here are your files."}}]
         });
         let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
@@ -1835,6 +1886,7 @@ mod tests {
         assert!(sse.contains("event: response.output_text.done\n"));
         assert!(sse.contains("event: response.completed\n"));
         assert!(sse.contains("Here are your files."));
+        assert!(sse.contains("\"cache_read_input_tokens\":90"));
     }
 
     #[test]

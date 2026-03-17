@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
+use crate::services::anthropic_route_pipeline::inject_cache_control_on_last_block;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
@@ -86,17 +87,30 @@ struct AssistantResponse {
 struct TokenUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TokenUsageUpdate {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
 }
 
 impl TokenUsageUpdate {
     fn is_empty(self) -> bool {
-        self.prompt_tokens.is_none() && self.completion_tokens.is_none()
+        self.prompt_tokens.is_none()
+            && self.completion_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
+    }
+}
+
+impl TokenUsage {
+    fn total_tokens(self) -> u64 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
     }
 }
 
@@ -333,6 +347,8 @@ impl ChatCommand {
                                 Some(&raw_model),
                                 usage.prompt_tokens,
                                 usage.completion_tokens,
+                                usage.cache_read_input_tokens,
+                                usage.cache_creation_input_tokens,
                             )
                             .await?;
                     }
@@ -820,6 +836,8 @@ fn extract_openai_usage(body: &serde_json::Value) -> Option<TokenUsage> {
     Some(TokenUsage {
         prompt_tokens: update.prompt_tokens.unwrap_or(0),
         completion_tokens: update.completion_tokens.unwrap_or(0),
+        cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
+        cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
     })
 }
 
@@ -828,6 +846,8 @@ fn extract_anthropic_usage(body: &serde_json::Value) -> Option<TokenUsage> {
     Some(TokenUsage {
         prompt_tokens: update.prompt_tokens.unwrap_or(0),
         completion_tokens: update.completion_tokens.unwrap_or(0),
+        cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
+        cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
     })
 }
 
@@ -836,6 +856,18 @@ fn extract_openai_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpd
     let update = TokenUsageUpdate {
         prompt_tokens: usage.get("prompt_tokens").and_then(parse_token_u64),
         completion_tokens: usage.get("completion_tokens").and_then(parse_token_u64),
+        cache_read_input_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(parse_token_u64)
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(parse_token_u64)
+            }),
+        cache_creation_input_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(parse_token_u64),
     };
     if update.is_empty() {
         None
@@ -846,9 +878,23 @@ fn extract_openai_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpd
 
 fn extract_anthropic_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
     let usage = body.get("usage")?;
+    let raw_input = usage.get("input_tokens").and_then(parse_token_u64);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(parse_token_u64);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(parse_token_u64);
+    // Normalize: Anthropic's input_tokens excludes cache, so add cache to get total input
+    let prompt_tokens = raw_input.map(|it| {
+        it.saturating_add(cache_read.unwrap_or(0))
+            .saturating_add(cache_creation.unwrap_or(0))
+    });
     let update = TokenUsageUpdate {
-        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
+        prompt_tokens,
         completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
     };
     if update.is_empty() {
         None
@@ -874,6 +920,12 @@ fn merge_token_usage(usage: &mut Option<TokenUsage>, update: TokenUsageUpdate) {
     }
     if let Some(tokens) = update.completion_tokens {
         current.completion_tokens = tokens;
+    }
+    if let Some(tokens) = update.cache_read_input_tokens {
+        current.cache_read_input_tokens = tokens;
+    }
+    if let Some(tokens) = update.cache_creation_input_tokens {
+        current.cache_creation_input_tokens = tokens;
     }
 }
 
@@ -978,8 +1030,25 @@ fn build_anthropic_request(
         "stream": stream,
     });
     if !system_parts.is_empty() {
-        request["system"] = serde_json::json!(system_parts.join("\n\n"));
+        request["system"] = serde_json::json!([{
+            "type": "text",
+            "text": system_parts.join("\n\n"),
+            "cache_control": {"type": "ephemeral"}
+        }]);
     }
+
+    // Add cache_control to the last user message for Anthropic prompt caching
+    for msg in encoded_messages.iter_mut().rev() {
+        if msg["role"] != "user" {
+            continue;
+        }
+        if let Some(content) = msg.get_mut("content") {
+            inject_cache_control_on_last_block(content);
+        }
+        break;
+    }
+
+    request["messages"] = serde_json::json!(encoded_messages);
     Ok(request)
 }
 
@@ -2079,7 +2148,9 @@ mod tests {
             usage,
             Some(TokenUsage {
                 prompt_tokens: 24,
-                completion_tokens: 11
+                completion_tokens: 11,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         );
     }
@@ -2100,7 +2171,9 @@ mod tests {
             usage,
             Some(TokenUsage {
                 prompt_tokens: 12,
-                completion_tokens: 7
+                completion_tokens: 7,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         );
     }
@@ -2118,7 +2191,9 @@ mod tests {
             extract_openai_usage(&body),
             Some(TokenUsage {
                 prompt_tokens: 10,
-                completion_tokens: 5
+                completion_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         );
     }
@@ -2128,15 +2203,42 @@ mod tests {
         let body = serde_json::json!({
             "usage": {
                 "input_tokens": "8",
-                "output_tokens": "3"
+                "output_tokens": "3",
+                "cache_read_input_tokens": "90",
+                "cache_creation_input_tokens": "15"
             }
         });
 
         assert_eq!(
             extract_anthropic_usage(&body),
             Some(TokenUsage {
-                prompt_tokens: 8,
-                completion_tokens: 3
+                prompt_tokens: 113,
+                completion_tokens: 3,
+                cache_read_input_tokens: 90,
+                cache_creation_input_tokens: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_openai_usage_reads_cached_tokens_details() {
+        let body = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {
+                    "cached_tokens": 90
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_openai_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cache_read_input_tokens: 90,
+                cache_creation_input_tokens: 0,
             })
         );
     }

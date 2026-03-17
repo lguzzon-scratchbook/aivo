@@ -78,6 +78,9 @@ pub fn convert_openai_to_anthropic_message(
         anthropic_resp["created"] = json!(created);
     }
 
+    copy_optional_usage_field(resp, &mut anthropic_resp, "cache_read_input_tokens");
+    copy_optional_usage_field(resp, &mut anthropic_resp, "cache_creation_input_tokens");
+
     anthropic_resp
 }
 
@@ -104,6 +107,12 @@ fn usage_value(resp: &Value, key: &str, mode: &UsageValueMode) -> Value {
             .and_then(|u| u.get(key))
             .cloned()
             .unwrap_or(json!(0)),
+    }
+}
+
+fn copy_optional_usage_field(resp: &Value, anthropic_resp: &mut Value, key: &str) {
+    if let Some(value) = resp.get("usage").and_then(|usage| usage.get(key)).cloned() {
+        anthropic_resp["usage"][key] = value;
     }
 }
 
@@ -134,7 +143,12 @@ mod tests {
                     "finish_reason": "tool_calls"
                 }
             ],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 7}
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "cache_read_input_tokens": 90,
+                "cache_creation_input_tokens": 15
+            }
         });
 
         let result = convert_openai_to_anthropic_message(
@@ -154,6 +168,8 @@ mod tests {
         assert_eq!(result["stop_reason"], "tool_use");
         assert_eq!(result["usage"]["input_tokens"], 12);
         assert_eq!(result["usage"]["output_tokens"], 7);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 90);
+        assert_eq!(result["usage"]["cache_creation_input_tokens"], 15);
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "Let me check.");

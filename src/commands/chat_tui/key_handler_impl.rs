@@ -13,23 +13,20 @@ impl ChatTuiApp {
             return Ok(true);
         }
 
-        match self.handle_overlay_key(key).await? {
-            Some(should_exit) => return Ok(should_exit),
-            None => {}
+        if let Some(should_exit) = self.handle_overlay_key(key).await? {
+            return Ok(should_exit);
         }
 
-        match self.handle_global_key(key).await? {
-            Some(should_exit) => return Ok(should_exit),
-            None => {}
+        if let Some(should_exit) = self.handle_global_key(key).await? {
+            return Ok(should_exit);
         }
 
         if self.is_busy() {
             return Ok(false);
         }
 
-        match self.handle_command_menu_key(key).await? {
-            Some(should_exit) => return Ok(should_exit),
-            None => {}
+        if let Some(should_exit) = self.handle_command_menu_key(key).await? {
+            return Ok(should_exit);
         }
 
         self.handle_editor_key(key).await

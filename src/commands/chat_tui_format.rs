@@ -14,7 +14,7 @@ pub(super) fn format_request_elapsed(elapsed: Duration) -> String {
 
 pub(super) fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> String {
     if let Some(usage) = usage {
-        let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        let total = usage.total_tokens();
         let label = if total == 1 { "token" } else { "tokens" };
         return format!("{} {}", format_token_count_value(total), label);
     }
@@ -252,11 +252,13 @@ mod tests {
             format_token_count(
                 999,
                 Some(TokenUsage {
-                    prompt_tokens: 24,
+                    prompt_tokens: 129,
                     completion_tokens: 11,
+                    cache_read_input_tokens: 90,
+                    cache_creation_input_tokens: 15,
                 }),
             ),
-            "35 tokens"
+            "140 tokens"
         );
         assert_eq!(
             format_token_count(
@@ -264,6 +266,8 @@ mod tests {
                 Some(TokenUsage {
                     prompt_tokens: 5_000,
                     completion_tokens: 120,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 }),
             ),
             "5.1k tokens"

@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
 use crate::services::model_names::{copilot_model_name, transform_model_for_openrouter};
@@ -79,8 +80,17 @@ pub(crate) async fn send_anthropic_chat(
         .unwrap_or("claude-sonnet-4-5")
         .to_string();
 
+    let mut body_with_cache = body.clone();
+    if body_with_cache
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
+    {
+        inject_chat_completions_cache_control(&mut body_with_cache);
+    }
+
     let mut anthropic_req = convert_openai_chat_to_anthropic_request(
-        body,
+        &body_with_cache,
         &OpenAIToAnthropicChatConfig {
             default_model: "claude-sonnet-4-5",
         },

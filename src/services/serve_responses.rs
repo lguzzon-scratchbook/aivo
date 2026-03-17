@@ -16,6 +16,11 @@ pub(crate) struct OpenAIToResponsesStreamConverter {
     text_item: Option<ResponsesTextItemState>,
     tool_calls: HashMap<usize, ResponsesToolCallState>,
     next_output_index: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    saw_usage: bool,
 }
 
 struct ResponsesTextItemState {
@@ -62,6 +67,11 @@ impl OpenAIToResponsesStreamConverter {
             text_item: None,
             tool_calls: HashMap::new(),
             next_output_index: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            saw_usage: false,
         }
     }
 
@@ -110,6 +120,28 @@ impl OpenAIToResponsesStreamConverter {
             Ok(value) => value,
             Err(_) => return Ok(()),
         };
+
+        if let Some(usage) = chunk.get("usage") {
+            self.saw_usage = true;
+            if let Some(input_tokens) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                self.input_tokens = input_tokens;
+            }
+            if let Some(output_tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                self.output_tokens = output_tokens;
+            }
+            if let Some(cache_read_input_tokens) = usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                self.cache_read_input_tokens = Some(cache_read_input_tokens);
+            }
+            if let Some(cache_creation_input_tokens) = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                self.cache_creation_input_tokens = Some(cache_creation_input_tokens);
+            }
+        }
 
         if let Some(model) = chunk.get("model").and_then(|v| v.as_str())
             && !model.is_empty()
@@ -391,18 +423,27 @@ impl OpenAIToResponsesStreamConverter {
         }
 
         let output_items = self.output_items();
+        let mut response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "model": self.model,
+            "created_at": self.created_at,
+            "status": "completed",
+            "output": output_items
+        });
+        if self.saw_usage {
+            response["usage"] = responses_usage_json(
+                self.input_tokens,
+                self.output_tokens,
+                self.cache_read_input_tokens,
+                self.cache_creation_input_tokens,
+            );
+        }
         output.push_str(&responses_sse_event(
             "response.completed",
             json!({
                 "type": "response.completed",
-                "response": {
-                    "id": self.response_id,
-                    "object": "response",
-                    "model": self.model,
-                    "created_at": self.created_at,
-                    "status": "completed",
-                    "output": output_items
-                }
+                "response": response
             }),
         ));
 
@@ -506,6 +547,26 @@ fn next_responses_id(prefix: &str) -> String {
     format!("{prefix}_{}_{count}", current_unix_ts())
 }
 
+fn responses_usage_json(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+) -> Value {
+    let mut usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens
+    });
+    if let Some(value) = cache_read_input_tokens {
+        usage["cache_read_input_tokens"] = json!(value);
+    }
+    if let Some(value) = cache_creation_input_tokens {
+        usage["cache_creation_input_tokens"] = json!(value);
+    }
+    usage
+}
+
 fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
     let mut saw_completed_event = false;
 
@@ -532,6 +593,11 @@ mod tests {
     #[test]
     fn test_convert_chat_response_to_responses_json_text() {
         let chat = json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cache_read_input_tokens": 90
+            },
             "choices": [{
                 "message": {"role": "assistant", "content": "Hello from responses"}
             }]
@@ -542,6 +608,9 @@ mod tests {
         assert_eq!(response["object"], "response");
         assert_eq!(response["model"], "gpt-4o");
         assert_eq!(response["status"], "completed");
+        assert_eq!(response["usage"]["input_tokens"], 10);
+        assert_eq!(response["usage"]["output_tokens"], 5);
+        assert_eq!(response["usage"]["cache_read_input_tokens"], 90);
         assert_eq!(response["output"][0]["type"], "message");
         assert_eq!(
             response["output"][0]["content"][0]["text"],
@@ -579,7 +648,7 @@ mod tests {
         let chat_sse = concat!(
             "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cache_read_input_tokens\":90}}\n\n",
             "data: [DONE]\n\n",
         );
 
@@ -589,6 +658,7 @@ mod tests {
         assert!(responses_sse.contains("event: response.output_text.delta"));
         assert!(responses_sse.contains("\"delta\":\"Hel\""));
         assert!(responses_sse.contains("\"delta\":\"lo\""));
+        assert!(responses_sse.contains("\"cache_read_input_tokens\":90"));
         assert!(responses_sse.contains("event: response.completed"));
     }
 

@@ -20,6 +20,10 @@ pub(crate) struct AnthropicToOpenAIStreamConverter {
     finished: bool,
     saw_tool_call: bool,
     tool_calls: HashMap<usize, AnthropicToolCallState>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
 }
 
 pub(crate) struct GeminiToOpenAIStreamConverter {
@@ -31,6 +35,9 @@ pub(crate) struct GeminiToOpenAIStreamConverter {
     finished: bool,
     saw_tool_call: bool,
     next_tool_index: usize,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
 }
 
 impl AnthropicToOpenAIStreamConverter {
@@ -45,6 +52,10 @@ impl AnthropicToOpenAIStreamConverter {
             finished: false,
             saw_tool_call: false,
             tool_calls: HashMap::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         }
     }
 
@@ -117,6 +128,19 @@ impl AnthropicToOpenAIStreamConverter {
                     {
                         self.model = model.to_string();
                     }
+                    if let Some(usage) = message.get("usage") {
+                        if let Some(input_tokens) =
+                            usage.get("input_tokens").and_then(|v| v.as_u64())
+                        {
+                            self.input_tokens = input_tokens;
+                        }
+                        self.cache_read_input_tokens = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64());
+                        self.cache_creation_input_tokens = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64());
+                    }
                 }
             }
             "content_block_start" => {
@@ -166,6 +190,7 @@ impl AnthropicToOpenAIStreamConverter {
                             }]
                         }),
                         Value::Null,
+                        None,
                     ));
                 }
             }
@@ -184,6 +209,7 @@ impl AnthropicToOpenAIStreamConverter {
                                 self.model_name(),
                                 json!({ "content": text }),
                                 Value::Null,
+                                None,
                             ));
                         }
                     }
@@ -217,6 +243,7 @@ impl AnthropicToOpenAIStreamConverter {
                                     }]
                                 }),
                                 Value::Null,
+                                None,
                             ));
                         }
                     }
@@ -224,6 +251,24 @@ impl AnthropicToOpenAIStreamConverter {
                 }
             }
             "message_delta" => {
+                if let Some(usage) = event.get("usage") {
+                    if let Some(output_tokens) = usage.get("output_tokens").and_then(|v| v.as_u64())
+                    {
+                        self.output_tokens = output_tokens;
+                    }
+                    if let Some(cache_read_input_tokens) = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                    {
+                        self.cache_read_input_tokens = Some(cache_read_input_tokens);
+                    }
+                    if let Some(cache_creation_input_tokens) = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                    {
+                        self.cache_creation_input_tokens = Some(cache_creation_input_tokens);
+                    }
+                }
                 if let Some(stop_reason) = event
                     .get("delta")
                     .and_then(|v| v.get("stop_reason"))
@@ -259,6 +304,7 @@ impl AnthropicToOpenAIStreamConverter {
             self.model_name(),
             json!({ "role": "assistant" }),
             Value::Null,
+            None,
         ));
     }
 
@@ -267,12 +313,24 @@ impl AnthropicToOpenAIStreamConverter {
             return;
         }
         self.emit_role_if_needed(output);
+        // Normalize: Anthropic's input_tokens excludes cache, OpenAI's prompt_tokens includes it
+        let prompt_tokens = self
+            .input_tokens
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0));
+        let usage = Some(openai_usage_json(
+            prompt_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+        ));
         output.push_str(&openai_sse_chunk(
             &self.id,
             self.created,
             self.model_name(),
             json!({}),
             json!(finish_reason),
+            usage,
         ));
         output.push_str("data: [DONE]\n\n");
         self.finished = true;
@@ -298,6 +356,9 @@ impl GeminiToOpenAIStreamConverter {
             finished: false,
             saw_tool_call: false,
             next_tool_index: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_input_tokens: None,
         }
     }
 
@@ -370,6 +431,23 @@ impl GeminiToOpenAIStreamConverter {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        if let Some(usage) = event.get("usageMetadata") {
+            if let Some(prompt_tokens) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+                self.prompt_tokens = prompt_tokens;
+            }
+            if let Some(completion_tokens) =
+                usage.get("candidatesTokenCount").and_then(|v| v.as_u64())
+            {
+                self.completion_tokens = completion_tokens;
+            }
+            if let Some(cache_read_input_tokens) = usage
+                .get("cachedContentTokenCount")
+                .and_then(|v| v.as_u64())
+            {
+                self.cache_read_input_tokens = Some(cache_read_input_tokens);
+            }
+        }
+
         if let Some(parts) = candidate
             .get("content")
             .and_then(|v| v.get("parts"))
@@ -386,6 +464,7 @@ impl GeminiToOpenAIStreamConverter {
                         &self.model,
                         json!({ "content": text }),
                         Value::Null,
+                        None,
                     ));
                 }
 
@@ -415,6 +494,7 @@ impl GeminiToOpenAIStreamConverter {
                             }]
                         }),
                         Value::Null,
+                        None,
                     ));
                 }
             }
@@ -440,6 +520,7 @@ impl GeminiToOpenAIStreamConverter {
             &self.model,
             json!({ "role": "assistant" }),
             Value::Null,
+            None,
         ));
     }
 
@@ -448,12 +529,19 @@ impl GeminiToOpenAIStreamConverter {
             return;
         }
         self.emit_role_if_needed(output);
+        let usage = Some(openai_usage_json(
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.cache_read_input_tokens,
+            None,
+        ));
         output.push_str(&openai_sse_chunk(
             &self.id,
             self.created,
             &self.model,
             json!({}),
             json!(finish_reason),
+            usage,
         ));
         output.push_str("data: [DONE]\n\n");
         self.finished = true;
@@ -466,21 +554,43 @@ fn openai_sse_chunk(
     model: &str,
     delta: Value,
     finish_reason: Value,
+    usage: Option<Value>,
 ) -> String {
-    format!(
-        "data: {}\n\n",
-        json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason
-            }]
-        })
-    )
+    let mut chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }]
+    });
+    if let Some(usage) = usage {
+        chunk["usage"] = usage;
+    }
+    format!("data: {}\n\n", chunk)
+}
+
+fn openai_usage_json(
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+) -> Value {
+    let mut usage = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens
+    });
+    if let Some(value) = cache_read_input_tokens {
+        usage["cache_read_input_tokens"] = json!(value);
+    }
+    if let Some(value) = cache_creation_input_tokens {
+        usage["cache_creation_input_tokens"] = json!(value);
+    }
+    usage
 }
 
 fn map_anthropic_stop_reason(stop_reason: &str) -> &'static str {
@@ -512,7 +622,7 @@ mod tests {
         let mut converter = AnthropicToOpenAIStreamConverter::new("claude-sonnet-4-5");
         let input = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":12}}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":30}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
             "event: content_block_start\n",
@@ -520,7 +630,7 @@ mod tests {
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}\n\n",
             "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7,\"cache_read_input_tokens\":90}}\n\n",
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
@@ -535,6 +645,8 @@ mod tests {
         assert!(output.contains("\"index\":1"));
         assert!(output.contains("\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\""));
         assert!(output.contains("\"finish_reason\":\"tool_calls\""));
+        assert!(output.contains("\"cache_read_input_tokens\":90"));
+        assert!(output.contains("\"cache_creation_input_tokens\":30"));
         assert!(output.contains("data: [DONE]"));
     }
 
@@ -544,7 +656,7 @@ mod tests {
         let input = concat!(
             "data: {\"responseId\":\"resp_1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}]}\n\n",
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]}}]}\n\n",
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"shell\",\"args\":{\"cmd\":\"ls\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"shell\",\"args\":{\"cmd\":\"ls\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":3,\"cachedContentTokenCount\":90}}\n\n",
         );
 
         let mut output = converter.push_bytes(input.as_bytes()).unwrap();
@@ -558,6 +670,7 @@ mod tests {
         assert!(output.contains("\"index\":0"));
         assert!(output.contains("\"name\":\"shell\""));
         assert!(output.contains("\"finish_reason\":\"tool_calls\""));
+        assert!(output.contains("\"cache_read_input_tokens\":90"));
         assert!(output.contains("data: [DONE]"));
     }
 }
