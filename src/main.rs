@@ -25,7 +25,7 @@ use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_over
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
 /// Known AI tool names that can be used as shortcut aliases for `run`.
-const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode"];
+const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
 /// Main entry point for the CLI
 #[tokio::main(flavor = "current_thread")]
@@ -358,7 +358,7 @@ fn print_help() {
     println!(
         "{} {}",
         style::bold("Shortcuts:"),
-        style::dim("aivo claude/codex/gemini/opencode")
+        style::dim("aivo claude/codex/gemini/opencode/pi")
     );
     println!();
     println!("{}", style::bold("Options:"));

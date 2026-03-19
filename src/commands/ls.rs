@@ -70,7 +70,7 @@ impl LsCommand {
         println!();
         println!("{}", style::bold("Tools:"));
         let path_dirs = collect_path_dirs();
-        for tool in ["claude", "codex", "gemini", "opencode"] {
+        for tool in ["claude", "codex", "gemini", "opencode", "pi"] {
             match find_in_dirs(tool, &path_dirs) {
                 Some(path) => println!(
                     "  {} {:8} {}",

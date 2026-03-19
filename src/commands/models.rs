@@ -511,6 +511,7 @@ mod tests {
             responses_api_supported: None,
             codex_mode: None,
             opencode_mode: None,
+            pi_mode: None,
             key: Zeroizing::new("sk-test".to_string()),
             created_at: "2026-01-01".to_string(),
         }

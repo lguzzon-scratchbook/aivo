@@ -14,7 +14,7 @@ fn non_empty() -> NonEmptyStringValueParser {
 #[derive(Parser, Debug)]
 #[command(
     name = "aivo",
-    about = "CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini, OpenCode)",
+    about = "CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi)",
     version = crate::version::VERSION,
     author = "yuanchuan",
     disable_help_flag = true,
@@ -36,7 +36,7 @@ pub struct Cli {
 /// Available commands for the CLI
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
-    /// Run AI tools (claude, codex, gemini, opencode) - all args passed through
+    /// Run AI tools (claude, codex, gemini, opencode, pi) - all args passed through
     Run(RunArgs),
 
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
@@ -88,10 +88,10 @@ pub struct KeysArgs {
 /// Arguments for the run command
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// The AI tool to run (claude, codex, gemini, opencode)
+    /// The AI tool to run (claude, codex, gemini, opencode, pi)
     #[arg(
         value_name = "TOOL",
-        help = "AI tool to run: claude, codex, gemini, or opencode"
+        help = "AI tool to run: claude, codex, gemini, opencode, or pi"
     )]
     pub tool: Option<String>,
 
@@ -458,7 +458,7 @@ mod tests {
 
     /// Helper to simulate the alias rewriting done in main.rs
     fn rewrite_alias(args: &[&str]) -> Vec<String> {
-        let aliases = ["claude", "codex", "gemini", "opencode"];
+        let aliases = ["claude", "codex", "gemini", "opencode", "pi"];
         let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
             let mut rewritten = vec![raw[0].clone(), "run".to_string()];

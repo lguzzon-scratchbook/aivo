@@ -13,6 +13,7 @@ pub(crate) struct LaunchRuntimeState {
     pub(crate) env: HashMap<String, String>,
     pub(crate) router_protocol: Option<Arc<AtomicU8>>,
     pub(crate) responses_api_support: Option<Arc<AtomicU8>>,
+    pub(crate) pi_agent_dir: Option<String>,
 }
 
 pub(crate) async fn prepare_runtime_env(
@@ -70,10 +71,23 @@ pub(crate) async fn prepare_runtime_env(
         patch_opencode_config_content(&mut env, port);
     }
 
+    if tool == AIToolType::Pi && env.contains_key("AIVO_SETUP_PI_AGENT_DIR") {
+        // Direct connection — no router needed, just write the temp agent dir.
+        write_pi_agent_dir(&mut env, None).await?;
+    }
+
+    if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_COPILOT_ROUTER") {
+        let port = start_responses_to_chat_copilot_router(&env).await?;
+        write_pi_agent_dir(&mut env, Some(port)).await?;
+    }
+
+    let pi_agent_dir = env.get("PI_CODING_AGENT_DIR").cloned();
+
     Ok(LaunchRuntimeState {
         env,
         router_protocol,
         responses_api_support,
+        pi_agent_dir,
     })
 }
 
@@ -170,10 +184,61 @@ pub(crate) async fn persist_runtime_discoveries(
     }
 }
 
-pub(crate) async fn cleanup_runtime_artifacts(codex_model_catalog_path: Option<&str>) {
+pub(crate) async fn cleanup_runtime_artifacts(
+    codex_model_catalog_path: Option<&str>,
+    pi_agent_dir: Option<&str>,
+) {
     if let Some(path) = codex_model_catalog_path {
         let _ = tokio::fs::remove_file(path).await;
     }
+    if let Some(dir) = pi_agent_dir {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+}
+
+/// Writes a temporary `PI_CODING_AGENT_DIR` with `models.json`, `auth.json`,
+/// and `settings.json` so Pi discovers the aivo custom provider.
+///
+/// When `port` is `Some`, the placeholder `http://127.0.0.1:0` in
+/// `AIVO_PI_MODELS_JSON` is patched with the real router port.
+/// When `port` is `None`, the JSON already contains the real upstream URL.
+async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>) -> Result<()> {
+    let raw = env
+        .get("AIVO_PI_MODELS_JSON")
+        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_PI_MODELS_JSON"))?
+        .clone();
+
+    let models_json = match port {
+        Some(p) => raw.replace("http://127.0.0.1:0", &format!("http://127.0.0.1:{p}")),
+        None => raw,
+    };
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir_name = format!("aivo-pi-{}-{}", std::process::id(), nonce);
+    let dir = std::env::temp_dir().join(dir_name);
+    tokio::fs::create_dir_all(&dir).await?;
+
+    tokio::try_join!(
+        tokio::fs::write(dir.join("models.json"), &models_json),
+        tokio::fs::write(dir.join("auth.json"), "{}"),
+        tokio::fs::write(dir.join("settings.json"), "{}"),
+    )?;
+
+    // Symlink the real pi agent's bin/ directory (contains managed fd, rg binaries)
+    // so pi doesn't re-download them into the temp dir.
+    if let Some(home) = crate::services::system_env::home_dir() {
+        let real_bin = home.join(".pi").join("agent").join("bin");
+        let _ = tokio::fs::symlink(&real_bin, dir.join("bin")).await;
+    }
+
+    env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        dir.to_string_lossy().to_string(),
+    );
+    Ok(())
 }
 
 fn set_local_base_url(env: &mut HashMap<String, String>, key: &str, port: u16) {

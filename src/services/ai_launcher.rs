@@ -34,6 +34,7 @@ pub enum AIToolType {
     Codex,
     Gemini,
     Opencode,
+    Pi,
 }
 
 impl AIToolType {
@@ -44,6 +45,7 @@ impl AIToolType {
             "codex" => Some(Self::Codex),
             "gemini" => Some(Self::Gemini),
             "opencode" => Some(Self::Opencode),
+            "pi" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -54,11 +56,18 @@ impl AIToolType {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::Opencode => "opencode",
+            Self::Pi => "pi",
         }
     }
 
     pub fn all() -> &'static [Self] {
-        &[Self::Claude, Self::Codex, Self::Gemini, Self::Opencode]
+        &[
+            Self::Claude,
+            Self::Codex,
+            Self::Gemini,
+            Self::Opencode,
+            Self::Pi,
+        ]
     }
 }
 
@@ -160,7 +169,11 @@ impl AILauncher {
         )
         .await;
 
-        cleanup_runtime_artifacts(runtime_args.codex_model_catalog_path.as_deref()).await;
+        cleanup_runtime_artifacts(
+            runtime_args.codex_model_catalog_path.as_deref(),
+            runtime.pi_agent_dir.as_deref(),
+        )
+        .await;
 
         result
     }
@@ -413,6 +426,7 @@ impl AILauncher {
             AIToolType::Codex => self.env_injector.for_codex(key, model),
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
             AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
+            AIToolType::Pi => self.env_injector.for_pi(key, model),
         };
 
         ToolConfig {
@@ -536,6 +550,7 @@ mod tests {
         assert_eq!(AIToolType::parse("codex"), Some(AIToolType::Codex));
         assert_eq!(AIToolType::parse("gemini"), Some(AIToolType::Gemini));
         assert_eq!(AIToolType::parse("opencode"), Some(AIToolType::Opencode));
+        assert_eq!(AIToolType::parse("pi"), Some(AIToolType::Pi));
         assert_eq!(AIToolType::parse("unknown"), None);
     }
 

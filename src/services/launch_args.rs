@@ -30,6 +30,9 @@ pub(crate) fn preview_args(
     env: &HashMap<String, String>,
 ) -> Vec<String> {
     let args = inject_claude_teammate_mode(tool, raw_args);
+    if tool == AIToolType::Pi {
+        return inject_pi_model(model, &args);
+    }
     if tool != AIToolType::Codex {
         return args;
     }
@@ -117,6 +120,18 @@ pub(crate) fn build_preview_notes(
         &["AIVO_USE_OPENCODE_COPILOT_ROUTER"],
         "starts a Copilot-backed OpenCode router on a random local port",
     );
+    maybe_push_router_note(
+        &mut notes,
+        env,
+        &["AIVO_SETUP_PI_AGENT_DIR"],
+        "writes a temporary Pi agent dir with custom provider config",
+    );
+    maybe_push_router_note(
+        &mut notes,
+        env,
+        &["AIVO_USE_PI_COPILOT_ROUTER"],
+        "starts a Copilot-backed Pi router on a random local port",
+    );
 
     let use_responses_router = uses_responses_to_chat_router(env);
     if tool == AIToolType::Codex
@@ -132,6 +147,15 @@ pub(crate) fn build_preview_notes(
         notes.push("writes a temporary Codex model catalog file at launch time".to_string());
     }
 
+    if tool == AIToolType::Pi
+        && model.is_some()
+        && !raw_args
+            .iter()
+            .any(|arg| arg == "--model" || arg.starts_with("--model="))
+    {
+        notes.push("injects `--model <model>` for Pi".to_string());
+    }
+
     notes
 }
 
@@ -142,6 +166,12 @@ pub(crate) async fn build_runtime_args(
     env: &HashMap<String, String>,
 ) -> Result<RuntimeArgs> {
     let args = inject_claude_teammate_mode(tool, raw_args);
+    if tool == AIToolType::Pi {
+        return Ok(RuntimeArgs {
+            args: inject_pi_model(model, &args),
+            codex_model_catalog_path: None,
+        });
+    }
     if tool != AIToolType::Codex {
         return Ok(RuntimeArgs {
             args,
@@ -208,6 +238,28 @@ fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String>
     }
 
     let mut new_args = vec!["--teammate-mode".to_string(), "in-process".to_string()];
+    new_args.extend_from_slice(args);
+    new_args
+}
+
+fn inject_pi_model(model: Option<&str>, args: &[String]) -> Vec<String> {
+    let model = match model {
+        Some(m) if !m.is_empty() => m,
+        _ => return args.to_vec(),
+    };
+
+    let has_model_flag = args
+        .iter()
+        .any(|a| a == "--model" || a.starts_with("--model="));
+    if has_model_flag {
+        return args.to_vec();
+    }
+
+    // Always prefix model with "aivo/" so pi selects
+    // the custom provider from models.json.
+    let pi_model = format!("aivo/{model}");
+
+    let mut new_args = vec!["--model".to_string(), pi_model];
     new_args.extend_from_slice(args);
     new_args
 }

@@ -1,12 +1,12 @@
 # aivo
 
-A lightweight CLI for managing API keys and running Claude Code, Codex, and Gemini CLI across providers.
+A lightweight CLI for managing API keys and running Claude Code, Codex, Gemini, OpenCode, and Pi CLI across providers.
 
 
 ## What it does
 
 - Securely manages multiple API keys for different providers.
-- Runs `claude`, `codex`, and `gemini` CLI tools seamlessly.
+- Runs `claude`, `codex`, `gemini`, `opencode`, and `pi` CLI tools seamlessly.
 - Provides a simple chat TUI and a one-shot `-x` mode.
 - Can expose the active provider as a local OpenAI-compatible server.
 

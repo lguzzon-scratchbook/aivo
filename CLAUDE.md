@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`aivo` is a Rust CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, and native APIs.
+`aivo` is a Rust CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, and native APIs.
 
 > [!IMPORTANT]
 > **Rebuild before testing**: After code changes, always run `cargo build --release && cargo install --path .` before testing the binary. Never test a stale build.
@@ -57,7 +57,7 @@ SessionStore → EnvironmentInjector → AILauncher
 
 | File        | Purpose                                                    |
 | ----------- | ---------------------------------------------------------- |
-| `run.rs`    | Launch AI tools; falls back to `start` flow when no tool given |
+| `run.rs`    | Launch AI tools (claude, codex, gemini, opencode, pi); falls back to `start` flow when no tool given |
 | `start.rs`  | Interactive remembered-start flow (key + tool + model picker) |
 | `chat.rs`   | Interactive chat command; routes to TUI or one-shot mode   |
 | `chat_tui.rs` | Full-screen interactive chat TUI (ratatui + crossterm)   |
@@ -77,7 +77,7 @@ SessionStore → EnvironmentInjector → AILauncher
 | `model_names.rs`              | Model name transformations (e.g. `claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`) |
 | `anthropic_router.rs`         | Proxy for Claude + OpenRouter                                           |
 | `anthropic_to_openai_router.rs` | Proxy for Anthropic-format clients + OpenAI-compatible providers     |
-| `copilot_router.rs`           | Proxy for Claude/Codex/Gemini + GitHub Copilot                          |
+| `copilot_router.rs`           | Proxy for Claude/Codex/Gemini/Pi + GitHub Copilot                       |
 | `copilot_auth.rs`             | GitHub Copilot OAuth device flow and token refresh                      |
 | `responses_to_chat_router.rs` | Proxy for Responses API clients + non-OpenAI providers (Responses API → Chat Completions) |
 | `gemini_router.rs`            | Proxy for Gemini + non-Google providers (Gemini format → Chat Completions) |
@@ -90,6 +90,8 @@ SessionStore → EnvironmentInjector → AILauncher
 | `anthropic_chat_response.rs`  | Anthropic chat response types                                           |
 | `models_cache.rs`             | 1-hour file-backed cache for model lists                                |
 | `system_env.rs`               | System environment helpers (CWD, home dir, etc.)                        |
+| `launch_runtime.rs`           | Router startup, temp dir writing (Pi agent dir), runtime env patching   |
+| `launch_args.rs`              | CLI arg injection (model flags, teammate mode, codex/pi model prefixing)|
 
 ### Data Model
 

@@ -96,6 +96,8 @@ pub struct ApiKey {
         skip_serializing_if = "Option::is_none"
     )]
     pub opencode_mode: Option<OpenAICompatibilityMode>,
+    #[serde(rename = "piMode", default, skip_serializing_if = "Option::is_none")]
+    pub pi_mode: Option<OpenAICompatibilityMode>,
     #[serde(with = "zeroizing_string")]
     pub key: Zeroizing<String>,
     #[serde(rename = "createdAt")]
@@ -119,6 +121,7 @@ impl ApiKey {
             responses_api_supported: None,
             codex_mode: None,
             opencode_mode: None,
+            pi_mode: None,
             key: Zeroizing::new(key),
             created_at: Utc::now().to_rfc3339(),
         }

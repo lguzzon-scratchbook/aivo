@@ -444,6 +444,43 @@ impl EnvironmentInjector {
         env
     }
 
+    /// Prepares environment variables for Pi CLI.
+    ///
+    /// Pi natively supports OpenAI, Anthropic, and Google protocols, so we point it
+    /// directly at the upstream via a custom `aivo` provider in `models.json` with
+    /// the appropriate `api` type. No conversion router is needed.
+    ///
+    /// - **Non-Copilot**: Write `models.json` with direct upstream URL + correct API type.
+    /// - **Copilot**: Needs CopilotTokenManager for auth, so start a ResponsesToChatRouter
+    ///   and point pi at it with `openai-completions`.
+    pub fn for_pi(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        let profile = provider_profile_for_key(key);
+
+        if profile.serve_flags.is_copilot {
+            // Copilot needs CopilotTokenManager — route through ResponsesToChatRouter
+            let models_json =
+                build_pi_models_json("http://127.0.0.1:0", "copilot", "openai-completions", model);
+            env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
+            env.insert("AIVO_USE_PI_COPILOT_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+        } else {
+            // Direct connection — pi talks to the upstream natively.
+            // Map aivo's ProviderProtocol to pi's API type string.
+            let pi_api = match profile.default_protocol {
+                ProviderProtocol::Anthropic => "anthropic-messages",
+                ProviderProtocol::Google => "google-generative-ai",
+                ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => "openai-completions",
+            };
+            let models_json =
+                build_pi_models_json(&key.base_url, &key.key, pi_api, model);
+            env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
+            env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
+        }
+
+        env
+    }
+
     /// Merges tool-specific environment variables with the current process environment
     ///
     /// Tool environment variables take precedence over existing process.env values.
@@ -502,8 +539,34 @@ fn strip_aivo_prefix(model: &str) -> &str {
     model.strip_prefix("aivo/").unwrap_or(model)
 }
 
+/// Builds a `models.json` string for Pi's custom "aivo" provider.
+///
+/// Pi reads `models.json` from `PI_CODING_AGENT_DIR` to discover custom providers.
+/// The placeholder URL `http://127.0.0.1:0` is patched at runtime with the actual router port.
+fn build_pi_models_json(
+    base_url: &str,
+    api_key: &str,
+    api_type: &str,
+    model: Option<&str>,
+) -> String {
+    let model_id = model.unwrap_or("default");
+    let models_json = json!({
+        "providers": {
+            "aivo": {
+                "baseUrl": base_url,
+                "apiKey": api_key,
+                "api": api_type,
+                "models": [
+                    { "id": model_id, "name": model_id }
+                ]
+            }
+        }
+    });
+    models_json.to_string()
+}
+
 pub(crate) fn redact_env_value(key: &str, value: &str) -> String {
-    if key == "OPENCODE_CONFIG_CONTENT" {
+    if key == "OPENCODE_CONFIG_CONTENT" || key == "AIVO_PI_MODELS_JSON" {
         return "<redacted>".to_string();
     }
 
