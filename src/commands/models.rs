@@ -492,7 +492,10 @@ pub(crate) async fn fetch_models_cached(
 ) -> Result<Vec<String>> {
     // Ollama lists local models instantly — skip cache entirely.
     let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
-    if !bypass_cache && !is_ollama && let Some(cached) = cache.get(&key.base_url).await {
+    if !bypass_cache
+        && !is_ollama
+        && let Some(cached) = cache.get(&key.base_url).await
+    {
         return Ok(cached);
     }
     let models = fetch_models(client, key).await?;

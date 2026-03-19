@@ -229,6 +229,7 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
 
     // Symlink the real pi agent's bin/ directory (contains managed fd, rg binaries)
     // so pi doesn't re-download them into the temp dir.
+    #[cfg(unix)]
     if let Some(home) = crate::services::system_env::home_dir() {
         let real_bin = home.join(".pi").join("agent").join("bin");
         let _ = tokio::fs::symlink(&real_bin, dir.join("bin")).await;

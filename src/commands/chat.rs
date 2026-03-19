@@ -242,11 +242,9 @@ impl ChatCommand {
                 ensure_picker_terminal("model", "--model <name>")?;
                 // No model set for this key — prompt user to select one
                 let models_list = if refresh {
-                    crate::commands::models::fetch_models_cached(
-                        &client, &key, &self.cache, true,
-                    )
-                    .await
-                    .unwrap_or_default()
+                    crate::commands::models::fetch_models_cached(&client, &key, &self.cache, true)
+                        .await
+                        .unwrap_or_default()
                 } else {
                     self.fetch_models_for_select(&client, &key).await
                 };
