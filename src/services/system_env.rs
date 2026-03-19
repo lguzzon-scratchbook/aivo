@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Best-effort user home directory lookup using standard environment variables.
 pub fn home_dir() -> Option<PathBuf> {
@@ -66,15 +66,7 @@ pub fn username() -> Option<String> {
 /// Expands a leading `~` to the user's home directory.
 /// Returns the path unchanged (as a `PathBuf`) if expansion is not needed or not possible.
 pub fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        return home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    }
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(path)
+    expand_tilde_with_home(path, home_dir().as_deref())
 }
 
 /// Best-effort current working directory lookup with canonicalization when possible.
@@ -98,20 +90,7 @@ pub fn machine_id() -> Option<String> {
             .args(["-rd1", "-c", "IOPlatformExpertDevice"])
             .output()
             .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if let Some(pos) = line.find("IOPlatformUUID")
-                && let Some(start) = line[pos..].find('"').map(|i| pos + i + 1)
-                && let Some(end) = line[start..].find('"').map(|i| start + i)
-            {
-                // Format: "IOPlatformUUID" = "XXXXXXXX-..."
-                let uuid = line[start..end].trim().to_string();
-                if !uuid.is_empty() {
-                    return Some(uuid);
-                }
-            }
-        }
-        None
+        parse_macos_platform_uuid(&String::from_utf8_lossy(&output.stdout))
     }
 
     #[cfg(target_os = "linux")]
@@ -151,5 +130,83 @@ pub fn machine_id() -> Option<String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_platform_uuid(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        if !line.contains("IOPlatformUUID") {
+            return None;
+        }
+
+        let (_, value) = line.split_once('=')?;
+        let uuid = value.trim().trim_matches('"').trim();
+        (!uuid.is_empty()).then(|| uuid.to_string())
+    })
+}
+
+fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
+    if path == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_tilde_replaces_home_prefix() {
+        let home = Path::new("/tmp/example-home");
+        assert_eq!(
+            expand_tilde_with_home("~/config/aivo", Some(home)),
+            home.join("config/aivo")
+        );
+        assert_eq!(expand_tilde_with_home("~", Some(home)), home);
+    }
+
+    #[test]
+    fn expand_tilde_leaves_non_home_paths_unchanged() {
+        assert_eq!(
+            expand_tilde_with_home("/var/tmp/aivo", Some(Path::new("/tmp/home"))),
+            PathBuf::from("/var/tmp/aivo")
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/docs", None),
+            PathBuf::from("~/docs")
+        );
+    }
+
+    #[test]
+    fn current_dir_string_returns_non_empty_path() {
+        let cwd = current_dir_string().expect("cwd should be available");
+        assert!(!cwd.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_macos_platform_uuid_extracts_uuid_value() {
+        let output = r#"    "IOPlatformUUID" = "12345678-1234-1234-1234-123456789ABC""#;
+
+        assert_eq!(
+            parse_macos_platform_uuid(output).as_deref(),
+            Some("12345678-1234-1234-1234-123456789ABC")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_macos_platform_uuid_rejects_blank_values() {
+        let output = r#"    "IOPlatformUUID" = "" "#;
+        assert_eq!(parse_macos_platform_uuid(output), None);
     }
 }

@@ -15,7 +15,7 @@ pub fn convert_openai_chat_to_anthropic_request(
     body: &Value,
     config: &OpenAIToAnthropicChatConfig,
 ) -> Value {
-    let mut system_parts: Vec<String> = Vec::new();
+    let mut system_blocks: Vec<Value> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -23,10 +23,7 @@ pub fn convert_openai_chat_to_anthropic_request(
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match role {
                 "system" => {
-                    let text = extract_openai_text(msg.get("content"));
-                    if !text.is_empty() {
-                        system_parts.push(text);
-                    }
+                    system_blocks.extend(extract_openai_anthropic_text_blocks(msg.get("content")));
                 }
                 "assistant" => messages.push(openai_assistant_to_anthropic(msg)),
                 "tool" => messages.push(openai_tool_to_anthropic(msg)),
@@ -45,8 +42,8 @@ pub fn convert_openai_chat_to_anthropic_request(
         "max_tokens": body.get("max_tokens").cloned().unwrap_or(json!(4096)),
     });
 
-    if !system_parts.is_empty() {
-        req["system"] = Value::String(system_parts.join("\n\n"));
+    if !system_blocks.is_empty() {
+        req["system"] = anthropic_text_blocks_to_content(system_blocks);
     }
     if let Some(v) = body.get("temperature") {
         req["temperature"] = v.clone();
@@ -310,10 +307,9 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> String {
 }
 
 fn openai_user_to_anthropic(msg: &Value, role: &str) -> Value {
-    let text = extract_openai_text(msg.get("content"));
     json!({
         "role": role,
-        "content": if text.is_empty() { Value::String(String::new()) } else { Value::String(text) }
+        "content": openai_content_to_anthropic_content(msg.get("content"))
     })
 }
 
@@ -368,6 +364,72 @@ fn extract_openai_text(content: Option<&Value>) -> String {
         Some(Value::Null) | None => String::new(),
         Some(other) => other.to_string(),
     }
+}
+
+fn openai_content_to_anthropic_content(content: Option<&Value>) -> Value {
+    anthropic_text_blocks_to_content(extract_openai_anthropic_text_blocks(content))
+}
+
+fn extract_openai_anthropic_text_blocks(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"type": "text", "text": s})]
+            }
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(openai_content_part_to_anthropic_block)
+            .collect(),
+        Some(Value::Null) | None => Vec::new(),
+        Some(other) => vec![json!({"type": "text", "text": other.to_string()})],
+    }
+}
+
+fn openai_content_part_to_anthropic_block(part: &Value) -> Option<Value> {
+    let part_type = part.get("type").and_then(|v| v.as_str());
+    if !matches!(part_type, None | Some("text")) {
+        return None;
+    }
+
+    let text = part.get("text").and_then(|v| v.as_str())?;
+    let mut block = part.clone();
+    if !block.is_object() {
+        block = json!({});
+    }
+    block["type"] = Value::String("text".to_string());
+    block["text"] = Value::String(text.to_string());
+    Some(block)
+}
+
+fn anthropic_text_blocks_to_content(blocks: Vec<Value>) -> Value {
+    if blocks.is_empty() {
+        return Value::String(String::new());
+    }
+
+    if blocks.iter().all(is_plain_anthropic_text_block) {
+        return Value::String(
+            blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+    }
+
+    Value::Array(blocks)
+}
+
+fn is_plain_anthropic_text_block(block: &Value) -> bool {
+    let Some(obj) = block.as_object() else {
+        return false;
+    };
+
+    obj.len() == 2
+        && obj.get("type").and_then(|v| v.as_str()) == Some("text")
+        && obj.get("text").and_then(|v| v.as_str()).is_some()
 }
 
 #[cfg(test)]
@@ -426,6 +488,44 @@ mod tests {
         assert_eq!(
             converted["choices"][0]["message"]["tool_calls"][0]["id"],
             "call_1"
+        );
+    }
+
+    #[test]
+    fn test_convert_openai_chat_to_anthropic_request_preserves_cache_control_blocks() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": "Be precise.",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hi",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ]
+        });
+
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-sonnet-4-5",
+            },
+        );
+
+        assert_eq!(converted["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            converted["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
         );
     }
 }

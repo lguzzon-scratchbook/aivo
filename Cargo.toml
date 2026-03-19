@@ -53,6 +53,7 @@ default = []
 test-fast-crypto = []
 
 [dev-dependencies]
+http = "1"
 tempfile = "3.0"
 
 [profile.dev]

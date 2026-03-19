@@ -194,61 +194,7 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
     let mut chat_body = convert_responses_to_chat_request(&body, &config);
     chat_body["stream"] = json!(client_wants_stream);
     let chat_response = handle_chat_body(chat_body, state).await?;
-
-    match chat_response {
-        RouterResponse::Buffered {
-            status,
-            content_type,
-            body,
-        } => {
-            if status >= 400 {
-                return Ok(RouterResponse::buffered(status, &content_type, body));
-            }
-
-            if client_wants_stream {
-                let sse = if content_type.contains("text/event-stream") {
-                    convert_chat_sse_to_responses_sse(std::str::from_utf8(&body)?, &original_model)?
-                } else {
-                    let chat_json: Value = serde_json::from_slice(&body)?;
-                    convert_chat_response_to_responses_sse(&chat_json, false, &original_model)
-                };
-                Ok(RouterResponse::buffered(
-                    200,
-                    "text/event-stream",
-                    sse.into_bytes(),
-                ))
-            } else {
-                let chat_json: Value = serde_json::from_slice(&body)?;
-                let response_json =
-                    convert_chat_response_to_responses_json(&chat_json, &original_model)?;
-                Ok(RouterResponse::buffered(
-                    200,
-                    "application/json",
-                    serde_json::to_vec(&response_json)?,
-                ))
-            }
-        }
-        RouterResponse::Streaming {
-            status,
-            content_type: _,
-            body,
-        } => {
-            if !client_wants_stream {
-                anyhow::bail!(
-                    "internal error: responses route received streaming body for non-streaming request"
-                );
-            }
-
-            Ok(RouterResponse::Streaming {
-                status,
-                content_type: "text/event-stream".to_string(),
-                body: Box::new(StreamingBody::Responses {
-                    source: body,
-                    converter: OpenAIToResponsesStreamConverter::new(&original_model),
-                }),
-            })
-        }
-    }
+    convert_chat_response_for_responses_route(chat_response, client_wants_stream, &original_model)
 }
 
 async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
@@ -508,13 +454,252 @@ async fn write_router_response(
 async fn write_chunk(socket: &mut tokio::net::TcpStream, chunk: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    if chunk.is_empty() {
+    let formatted = format_http_chunk(chunk);
+    if formatted.is_empty() {
         return Ok(());
     }
-
-    let chunk_len = format!("{:X}\r\n", chunk.len());
-    socket.write_all(chunk_len.as_bytes()).await?;
-    socket.write_all(chunk).await?;
-    socket.write_all(b"\r\n").await?;
+    socket.write_all(&formatted).await?;
     Ok(())
+}
+
+fn convert_chat_response_for_responses_route(
+    chat_response: RouterResponse,
+    client_wants_stream: bool,
+    original_model: &str,
+) -> Result<RouterResponse> {
+    match chat_response {
+        RouterResponse::Buffered {
+            status,
+            content_type,
+            body,
+        } => {
+            if status >= 400 {
+                return Ok(RouterResponse::buffered(status, &content_type, body));
+            }
+
+            if client_wants_stream {
+                let sse = if content_type.contains("text/event-stream") {
+                    convert_chat_sse_to_responses_sse(std::str::from_utf8(&body)?, original_model)?
+                } else {
+                    let chat_json: Value = serde_json::from_slice(&body)?;
+                    convert_chat_response_to_responses_sse(&chat_json, false, original_model)
+                };
+                Ok(RouterResponse::buffered(
+                    200,
+                    "text/event-stream",
+                    sse.into_bytes(),
+                ))
+            } else {
+                let chat_json: Value = serde_json::from_slice(&body)?;
+                let response_json =
+                    convert_chat_response_to_responses_json(&chat_json, original_model)?;
+                Ok(RouterResponse::buffered(
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&response_json)?,
+                ))
+            }
+        }
+        RouterResponse::Streaming {
+            status,
+            content_type: _,
+            body,
+        } => {
+            if !client_wants_stream {
+                anyhow::bail!(
+                    "internal error: responses route received streaming body for non-streaming request"
+                );
+            }
+
+            Ok(RouterResponse::Streaming {
+                status,
+                content_type: "text/event-stream".to_string(),
+                body: Box::new(StreamingBody::Responses {
+                    source: body,
+                    converter: OpenAIToResponsesStreamConverter::new(original_model),
+                }),
+            })
+        }
+    }
+}
+
+fn format_http_chunk(chunk: &[u8]) -> Vec<u8> {
+    if chunk.is_empty() {
+        return Vec::new();
+    }
+
+    let mut formatted = format!("{:X}\r\n", chunk.len()).into_bytes();
+    formatted.extend_from_slice(chunk);
+    formatted.extend_from_slice(b"\r\n");
+    formatted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::session_store::ApiKey;
+    use http::Response as HttpResponse;
+    use serde_json::json;
+
+    fn test_key() -> ApiKey {
+        ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "https://example.com/v1".to_string(),
+            None,
+            "secret".to_string(),
+        )
+    }
+
+    fn test_state(protocol: ProviderProtocol) -> ServeState {
+        ServeState {
+            config: Arc::new(ServeRouterConfig {
+                upstream_base_url: "https://example.com/v1".to_string(),
+                upstream_api_key: "secret".to_string(),
+                upstream_protocol: protocol,
+                is_copilot: false,
+                is_openrouter: false,
+            }),
+            client: router_http_client(),
+            key: test_key(),
+            copilot_tokens: None,
+            active_protocol: Arc::new(AtomicU8::new(protocol.to_u8())),
+        }
+    }
+
+    fn mock_reqwest_response(
+        status: u16,
+        content_type: &str,
+        body: impl Into<String>,
+    ) -> reqwest::Response {
+        HttpResponse::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .body(body.into())
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_maps_buffered_json() {
+        let chat = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "Hello from router"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(200, "application/json", serde_json::to_vec(&chat).unwrap()),
+            false,
+            "gpt-4o",
+        )
+        .unwrap();
+
+        match response {
+            RouterResponse::Buffered {
+                status,
+                content_type,
+                body,
+            } => {
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(content_type, "application/json");
+                assert_eq!(json["object"], "response");
+                assert_eq!(json["output"][0]["content"][0]["text"], "Hello from router");
+            }
+            RouterResponse::Streaming { .. } => panic!("expected buffered response"),
+        }
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_maps_streaming_sse() {
+        let chat_sse = concat!(
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(200, "text/event-stream", chat_sse.as_bytes().to_vec()),
+            true,
+            "gpt-4o",
+        )
+        .unwrap();
+
+        match response {
+            RouterResponse::Buffered {
+                status,
+                content_type,
+                body,
+            } => {
+                let sse = String::from_utf8(body).unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(content_type, "text/event-stream");
+                assert!(sse.contains("event: response.created"));
+                assert!(sse.contains("\"delta\":\"Hel\""));
+                assert!(sse.contains("event: response.completed"));
+            }
+            RouterResponse::Streaming { .. } => panic!("expected buffered SSE"),
+        }
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_rejects_streaming_non_stream_requests() {
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::Streaming {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                body: Box::new(StreamingBody::Upstream(mock_reqwest_response(
+                    200,
+                    "text/event-stream",
+                    "data: [DONE]\n\n",
+                ))),
+            },
+            false,
+            "gpt-4o",
+        );
+
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn responses_router_config_uses_active_protocol() {
+        let state = test_state(ProviderProtocol::Google);
+        let config = responses_router_config(&state);
+
+        assert_eq!(config.target_protocol, ProviderProtocol::Google);
+        assert_eq!(config.target_base_url, "https://example.com/v1");
+        assert_eq!(config.api_key, "secret");
+    }
+
+    #[test]
+    fn upstream_context_copies_router_flags() {
+        let state = ServeState {
+            config: Arc::new(ServeRouterConfig {
+                upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
+                upstream_api_key: "secret".to_string(),
+                upstream_protocol: ProviderProtocol::Openai,
+                is_copilot: false,
+                is_openrouter: true,
+            }),
+            client: router_http_client(),
+            key: test_key(),
+            copilot_tokens: None,
+            active_protocol: Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8())),
+        };
+
+        let context = upstream_context(&state);
+        assert!(context.is_openrouter);
+        assert!(!context.is_copilot);
+        assert_eq!(context.upstream_base_url, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn format_http_chunk_adds_hex_prefix_and_trailer() {
+        assert_eq!(format_http_chunk(b"hello"), b"5\r\nhello\r\n");
+        assert!(format_http_chunk(b"").is_empty());
+    }
 }
