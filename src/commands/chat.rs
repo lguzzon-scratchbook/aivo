@@ -197,10 +197,11 @@ impl ChatCommand {
         model: Option<String>,
         one_shot: Option<String>,
         attachments: Vec<String>,
+        refresh: bool,
         key_override: Option<ApiKey>,
     ) -> ExitCode {
         match self
-            .execute_internal(model, one_shot, attachments, key_override)
+            .execute_internal(model, one_shot, attachments, refresh, key_override)
             .await
         {
             Ok(code) => code,
@@ -216,6 +217,7 @@ impl ChatCommand {
         model_flag: Option<String>,
         one_shot: Option<String>,
         attachments: Vec<String>,
+        refresh: bool,
         key_override: Option<ApiKey>,
     ) -> Result<ExitCode> {
         let mut key = match key_override {
@@ -239,7 +241,15 @@ impl ChatCommand {
             None => {
                 ensure_picker_terminal("model", "--model <name>")?;
                 // No model set for this key — prompt user to select one
-                let models_list = self.fetch_models_for_select(&client, &key).await;
+                let models_list = if refresh {
+                    crate::commands::models::fetch_models_cached(
+                        &client, &key, &self.cache, true,
+                    )
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    self.fetch_models_for_select(&client, &key).await
+                };
 
                 if models_list.is_empty() {
                     anyhow::bail!(

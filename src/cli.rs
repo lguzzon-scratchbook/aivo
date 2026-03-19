@@ -196,6 +196,10 @@ pub struct ChatArgs {
     )]
     pub key: Option<String>,
 
+    /// Bypass cache and fetch fresh model list for the model picker
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
+
     /// Send one message, print response, then exit (non-interactive)
     #[arg(
         short = 'x',

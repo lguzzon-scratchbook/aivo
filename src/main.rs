@@ -106,6 +106,7 @@ async fn main() {
                     chat_args.model,
                     chat_args.execute,
                     chat_args.attachments,
+                    chat_args.refresh,
                     key_override,
                 )
                 .await
