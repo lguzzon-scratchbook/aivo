@@ -40,19 +40,20 @@ aivo claude
 aivo claude --model moonshotai/kimi-k2.5
 ```
 
-Use your GitHub Copilot subscription
+Use your GitHub Copilot subscription.
 
 ```bash
 aivo keys add copilot
 aivo claude
 ```
 
-Use local models via Ollama
+Use local models via Ollama.
 
 ```bash
 aivo keys add ollama
-aivo run opencode --model llama3.2
-aivo chat -m deepseek-r1
+
+# auto pull the model if not present
+aivo claude --model llama3.2
 ```
 
 ## Everyday usage
