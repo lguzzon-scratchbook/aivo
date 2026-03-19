@@ -8,7 +8,10 @@ use serde_json::{Map, Value, json};
 
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::model_names::{anthropic_native_model_name, google_native_model_name};
-use crate::services::provider_profile::{is_direct_openai_base, provider_profile_for_key};
+use crate::services::ollama::ollama_openai_base_url;
+use crate::services::provider_profile::{
+    ProviderKind, is_direct_openai_base, provider_profile_for_key,
+};
 use crate::services::provider_protocol::{ProviderProtocol, is_anthropic_endpoint};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
@@ -85,8 +88,31 @@ impl EnvironmentInjector {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
 
+        // Ollama: route through Anthropic-to-OpenAI router (Claude speaks Anthropic, Ollama speaks OpenAI)
+        if profile.kind == ProviderKind::Ollama {
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "ollama".to_string());
+            env.insert(
+                "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER".to_string(),
+                "1".to_string(),
+            );
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY".to_string(),
+                "ollama".to_string(),
+            );
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL".to_string(),
+                ollama_openai_base_url(),
+            );
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                "openai".to_string(),
+            );
         // For GitHub Copilot, use the built-in CopilotRouter (Anthropic → OpenAI conversion + token management)
-        if profile.serve_flags.is_copilot {
+        } else if profile.serve_flags.is_copilot {
             // Placeholder URL - AI launcher overwrites with the actual random port after binding
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -189,7 +215,30 @@ impl EnvironmentInjector {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
 
-        if profile.serve_flags.is_copilot {
+        if profile.kind == ProviderKind::Ollama {
+            // Ollama: route through responses-to-chat router (Codex uses Responses API, Ollama speaks Chat Completions)
+            env.insert(
+                "OPENAI_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("OPENAI_API_KEY".to_string(), "ollama".to_string());
+            env.insert(
+                "AIVO_USE_RESPONSES_TO_CHAT_ROUTER".to_string(),
+                "1".to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
+                "ollama".to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
+                ollama_openai_base_url(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                "openai".to_string(),
+            );
+        } else if profile.serve_flags.is_copilot {
             // GitHub Copilot: use the responses-to-chat router with CopilotTokenManager for auth
             // Placeholder URL — AI launcher overwrites with actual random port after binding
             env.insert(
@@ -276,7 +325,27 @@ impl EnvironmentInjector {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
 
-        if profile.serve_flags.is_copilot {
+        if profile.kind == ProviderKind::Ollama {
+            // Ollama: route through GeminiRouter (Gemini speaks Google format, Ollama speaks OpenAI)
+            env.insert(
+                "GOOGLE_GEMINI_BASE_URL".to_string(),
+                "http://127.0.0.1:0".to_string(),
+            );
+            env.insert("GEMINI_API_KEY".to_string(), "ollama".to_string());
+            env.insert("AIVO_USE_GEMINI_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_GEMINI_ROUTER_API_KEY".to_string(),
+                "ollama".to_string(),
+            );
+            env.insert(
+                "AIVO_GEMINI_ROUTER_BASE_URL".to_string(),
+                ollama_openai_base_url(),
+            );
+            env.insert(
+                "AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                "openai".to_string(),
+            );
+        } else if profile.serve_flags.is_copilot {
             env.insert(
                 "GOOGLE_GEMINI_BASE_URL".to_string(),
                 "http://127.0.0.1:0".to_string(),
@@ -346,9 +415,12 @@ impl EnvironmentInjector {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
 
+        // For Ollama, connect directly — OpenCode speaks OpenAI-compatible natively.
         // For GitHub Copilot, the base_url is the magic string "copilot" — not a real URL.
         // Use a placeholder that ai_launcher will overwrite with the actual CopilotRouter port.
-        let (base_url, api_key) = if profile.serve_flags.is_copilot {
+        let (base_url, api_key) = if profile.kind == ProviderKind::Ollama {
+            (ollama_openai_base_url(), "ollama".to_string())
+        } else if profile.serve_flags.is_copilot {
             env.insert(
                 "AIVO_USE_OPENCODE_COPILOT_ROUTER".to_string(),
                 "1".to_string(),
@@ -457,7 +529,17 @@ impl EnvironmentInjector {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
 
-        if profile.serve_flags.is_copilot {
+        if profile.kind == ProviderKind::Ollama {
+            // Ollama: direct connection via Pi's custom provider
+            let models_json = build_pi_models_json(
+                &ollama_openai_base_url(),
+                "ollama",
+                "openai-completions",
+                model,
+            );
+            env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
+            env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
+        } else if profile.serve_flags.is_copilot {
             // Copilot needs CopilotTokenManager — route through ResponsesToChatRouter
             let models_json =
                 build_pi_models_json("http://127.0.0.1:0", "copilot", "openai-completions", model);
@@ -472,8 +554,7 @@ impl EnvironmentInjector {
                 ProviderProtocol::Google => "google-generative-ai",
                 ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => "openai-completions",
             };
-            let models_json =
-                build_pi_models_json(&key.base_url, &key.key, pi_api, model);
+            let models_json = build_pi_models_json(&key.base_url, &key.key, pi_api, model);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         }
@@ -1439,5 +1520,133 @@ mod tests {
         assert_eq!(env.get("CODEX_MODEL"), Some(&"gpt-4o".to_string()));
         assert_eq!(env.get("OPENAI_DEFAULT_MODEL"), Some(&"gpt-4o".to_string()));
         assert_eq!(env.get("CODEX_MODEL_DEFAULT"), Some(&"gpt-4o".to_string()));
+    }
+
+    // --- Ollama tests ---
+
+    fn ollama_key() -> ApiKey {
+        ApiKey::new_with_protocol(
+            "oll1".to_string(),
+            "ollama".to_string(),
+            "ollama".to_string(),
+            None,
+            "ollama-local".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_for_claude_ollama_uses_anthropic_to_openai_router() {
+        let injector = EnvironmentInjector::new();
+        let key = ollama_key();
+        let env = injector.for_claude(&key, Some("llama3.2"));
+
+        assert_eq!(
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&"ollama".to_string()));
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY"),
+            Some(&"ollama".to_string())
+        );
+        assert!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL")
+                .unwrap()
+                .contains("11434")
+        );
+        assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&"llama3.2".to_string()));
+        // Should NOT use Copilot or OpenRouter routers
+        assert!(!env.contains_key("AIVO_USE_COPILOT_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_codex_ollama_uses_responses_to_chat_router() {
+        let injector = EnvironmentInjector::new();
+        let key = ollama_key();
+        let env = injector.for_codex(&key, Some("llama3.2"));
+
+        assert_eq!(
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("OPENAI_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(env.get("OPENAI_API_KEY"), Some(&"ollama".to_string()));
+        assert!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
+                .unwrap()
+                .contains("11434")
+        );
+        assert_eq!(env.get("CODEX_MODEL"), Some(&"llama3.2".to_string()));
+        assert!(!env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_gemini_ollama_uses_gemini_router() {
+        let injector = EnvironmentInjector::new();
+        let key = ollama_key();
+        let env = injector.for_gemini(&key, Some("llama3.2"));
+
+        assert_eq!(env.get("AIVO_USE_GEMINI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&"http://127.0.0.1:0".to_string())
+        );
+        assert_eq!(env.get("GEMINI_API_KEY"), Some(&"ollama".to_string()));
+        assert!(
+            env.get("AIVO_GEMINI_ROUTER_BASE_URL")
+                .unwrap()
+                .contains("11434")
+        );
+        assert_eq!(env.get("GEMINI_MODEL"), Some(&"llama3.2".to_string()));
+        assert!(!env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_opencode_ollama_uses_direct_connection() {
+        let injector = EnvironmentInjector::new();
+        let key = ollama_key();
+        let env = injector.for_opencode(&key, Some("llama3.2"), None);
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert!(
+            config["provider"]["aivo"]["options"]["baseURL"]
+                .as_str()
+                .unwrap()
+                .contains("11434")
+        );
+        assert_eq!(config["provider"]["aivo"]["options"]["apiKey"], "ollama");
+        assert_eq!(config["model"], "aivo/llama3.2");
+        // No router needed for OpenCode
+        assert!(!env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_OPENCODE_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_pi_ollama_uses_direct_connection() {
+        let injector = EnvironmentInjector::new();
+        let key = ollama_key();
+        let env = injector.for_pi(&key, Some("llama3.2"));
+
+        let models_json = env.get("AIVO_PI_MODELS_JSON").unwrap();
+        let parsed: Value = serde_json::from_str(models_json).unwrap();
+        assert!(
+            parsed["providers"]["aivo"]["baseUrl"]
+                .as_str()
+                .unwrap()
+                .contains("11434")
+        );
+        assert_eq!(parsed["providers"]["aivo"]["apiKey"], "ollama");
+        assert_eq!(parsed["providers"]["aivo"]["api"], "openai-completions");
+        assert_eq!(env.get("AIVO_SETUP_PI_AGENT_DIR"), Some(&"1".to_string()));
+        assert!(!env.contains_key("AIVO_USE_PI_COPILOT_ROUTER"));
     }
 }

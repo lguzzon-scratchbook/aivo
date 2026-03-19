@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`aivo` is a Rust CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, and native APIs.
+`aivo` is a Rust CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, Ollama (local models), and native APIs.
 
 > [!IMPORTANT]
 > **Rebuild before testing**: After code changes, always run `cargo build --release && cargo install --path .` before testing the binary. Never test a stale build.
@@ -89,13 +89,14 @@ SessionStore → EnvironmentInjector → AILauncher
 | `anthropic_chat_request.rs`   | Anthropic chat request types                                            |
 | `anthropic_chat_response.rs`  | Anthropic chat response types                                           |
 | `models_cache.rs`             | 1-hour file-backed cache for model lists                                |
+| `ollama.rs`                   | Ollama lifecycle management (detect, auto-start, model pull)            |
 | `system_env.rs`               | System environment helpers (CWD, home dir, etc.)                        |
 | `launch_runtime.rs`           | Router startup, temp dir writing (Pi agent dir), runtime env patching   |
 | `launch_args.rs`              | CLI arg injection (model flags, teammate mode, codex/pi model prefixing)|
 
 ### Data Model
 
-`ApiKey`: `id`, `name`, `base_url`, `key`, `created_at`. Stored AES-256-GCM encrypted in `~/.config/aivo/config.json`. The sentinel `base_url` value `"copilot"` identifies GitHub Copilot keys.
+`ApiKey`: `id`, `name`, `base_url`, `key`, `created_at`. Stored AES-256-GCM encrypted in `~/.config/aivo/config.json`. The sentinel `base_url` values `"copilot"` and `"ollama"` identify GitHub Copilot and local Ollama keys respectively.
 
 ### Exit Codes
 

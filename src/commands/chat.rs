@@ -218,7 +218,7 @@ impl ChatCommand {
         attachments: Vec<String>,
         key_override: Option<ApiKey>,
     ) -> Result<ExitCode> {
-        let key = match key_override {
+        let mut key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
                 Some(k) => k,
@@ -270,6 +270,13 @@ impl ChatCommand {
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
         let pending_attachments = build_pending_attachments(&attachments)?;
+
+        // Resolve the "ollama" sentinel to the actual local URL before any HTTP calls.
+        if key.base_url == "ollama" {
+            crate::services::ollama::ensure_ready().await?;
+            crate::services::ollama::ensure_model(&raw_model).await?;
+            key.base_url = crate::services::ollama::ollama_openai_base_url();
+        }
 
         // Create once so its token cache is reused across messages in the session.
         let copilot_tm = if key.base_url == "copilot" {
@@ -1193,7 +1200,15 @@ where
     let mut done = false;
 
     while !done {
-        let Some(chunk) = response.chunk().await? else {
+        let chunk_result = response.chunk().await;
+        let Some(chunk) = (match chunk_result {
+            Ok(c) => c,
+            Err(_) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                // Stream error after content was received — use what we have.
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }) else {
             break;
         };
         let text = String::from_utf8_lossy(&chunk);
@@ -1382,7 +1397,15 @@ where
     let mut done = false;
 
     while !done {
-        let Some(chunk) = response.chunk().await? else {
+        let chunk_result = response.chunk().await;
+        let Some(chunk) = (match chunk_result {
+            Ok(c) => c,
+            Err(_) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                // Stream error after content was received — use what we have.
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }) else {
             break;
         };
         let text = String::from_utf8_lossy(&chunk);

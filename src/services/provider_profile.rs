@@ -6,6 +6,7 @@ use crate::services::session_store::ApiKey;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Copilot,
+    Ollama,
     OpenRouter,
     CloudflareAi,
     AnthropicCompatible,
@@ -16,6 +17,7 @@ pub enum ProviderKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelListingStrategy {
     Copilot,
+    Ollama,
     Google,
     Anthropic,
     CloudflareSearch,
@@ -83,6 +85,10 @@ pub fn is_copilot_base(base_url: &str) -> bool {
     base_url == "copilot"
 }
 
+pub fn is_ollama_base(base_url: &str) -> bool {
+    base_url == "ollama"
+}
+
 pub fn is_openrouter_base(base_url: &str) -> bool {
     base_url.contains("openrouter")
 }
@@ -131,6 +137,19 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             model_listing_strategy: ModelListingStrategy::Copilot,
             serve_flags: ServeFlags {
                 is_copilot: true,
+                is_openrouter: false,
+            },
+        };
+    }
+
+    if is_ollama_base(base_url) {
+        return ProviderProfile {
+            kind: ProviderKind::Ollama,
+            default_protocol: ProviderProtocol::Openai,
+            quirks,
+            model_listing_strategy: ModelListingStrategy::Ollama,
+            serve_flags: ServeFlags {
+                is_copilot: false,
                 is_openrouter: false,
             },
         };
@@ -217,6 +236,16 @@ mod tests {
             ModelListingStrategy::Copilot
         );
         assert!(profile.serve_flags.is_copilot);
+        assert!(!profile.serve_flags.is_openrouter);
+    }
+
+    #[test]
+    fn classifies_ollama() {
+        let profile = provider_profile_for_base_url("ollama");
+        assert_eq!(profile.kind, ProviderKind::Ollama);
+        assert_eq!(profile.default_protocol, ProviderProtocol::Openai);
+        assert_eq!(profile.model_listing_strategy, ModelListingStrategy::Ollama);
+        assert!(!profile.serve_flags.is_copilot);
         assert!(!profile.serve_flags.is_openrouter);
     }
 

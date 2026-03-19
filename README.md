@@ -47,6 +47,14 @@ aivo keys add copilot
 aivo claude
 ```
 
+Use local models via Ollama
+
+```bash
+aivo keys add ollama
+aivo run opencode --model llama3.2
+aivo chat -m deepseek-r1
+```
+
 ## Everyday usage
 
 Run a tool with its normal flags:
@@ -122,6 +130,7 @@ aivo keys add openrouter --base-url https://openrouter.ai/api/v1 --key xxx
 aivo keys add groq --base-url https://api.groq.com/openai/v1 --key xxx
 aivo keys add deepseek --base-url https://api.deepseek.com/v1 --key xxx
 aivo keys add copilot
+aivo keys add ollama
 ```
 
 You are not limited to the providers above.

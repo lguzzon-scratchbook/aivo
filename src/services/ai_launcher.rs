@@ -19,8 +19,9 @@ use crate::services::launch_runtime::{
     record_launch_state,
 };
 use crate::services::models_cache::ModelsCache;
+use crate::services::ollama;
 use crate::services::provider_profile::{
-    is_copilot_base, is_direct_openai_base, provider_profile_for_base_url,
+    is_copilot_base, is_direct_openai_base, is_ollama_base, provider_profile_for_base_url,
 };
 use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::session_store::{
@@ -126,6 +127,15 @@ impl AILauncher {
     /// Spawns an AI tool with configured environment and stdio passthrough
     pub async fn launch(&self, options: &LaunchOptions) -> Result<i32> {
         let resolved = self.resolve_launch_context(options, true).await?;
+
+        // Ollama lifecycle: ensure server is running and model is pulled
+        if is_ollama_base(&resolved.key.base_url) {
+            ollama::ensure_ready().await?;
+            if let Some(ref model) = resolved.model {
+                ollama::ensure_model(model).await?;
+            }
+        }
+
         self.output_key_info(&resolved.key);
 
         let env = self.env_injector.merge(
@@ -226,7 +236,9 @@ impl AILauncher {
             },
         };
 
-        if options.tool == AIToolType::Claude {
+        if is_ollama_base(&key.base_url) {
+            // Ollama is always OpenAI-compatible; no protocol probing needed.
+        } else if options.tool == AIToolType::Claude {
             key = self
                 .resolve_claude_protocol(
                     key,

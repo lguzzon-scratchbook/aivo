@@ -280,11 +280,15 @@ impl KeysCommand {
             } else {
                 input
             };
-            if value == "copilot" || value.starts_with("http://") || value.starts_with("https://") {
+            if value == "copilot"
+                || value == "ollama"
+                || value.starts_with("http://")
+                || value.starts_with("https://")
+            {
                 break value;
             }
             eprintln!(
-                "{} URL must start with http:// or https:// (or enter 'copilot' for GitHub Copilot)",
+                "{} URL must start with http:// or https:// (or enter 'copilot' / 'ollama' for special providers)",
                 style::red("Error:")
             );
         };
@@ -399,6 +403,17 @@ impl KeysCommand {
                     return Ok(ExitCode::UserError);
                 }
             }
+        } else if name == "ollama" {
+            match add_options.base_url {
+                Some("ollama") | None => "ollama".to_string(),
+                Some(_) => {
+                    eprintln!(
+                        "{} Name 'ollama' is reserved for local Ollama. Use a different name or omit --base-url.",
+                        style::red("Error:")
+                    );
+                    return Ok(ExitCode::UserError);
+                }
+            }
         } else {
             let detected_url = detect_base_url(&name);
             let mut provided_base_url = add_options.base_url.map(str::to_string);
@@ -427,11 +442,21 @@ impl KeysCommand {
                     }
                     continue;
                 }
+                if value == "ollama" {
+                    eprintln!(
+                        "{} Ollama setup requires the explicit shortcut 'aivo keys add ollama'.",
+                        style::red("Error:")
+                    );
+                    if add_options.base_url.is_some() {
+                        return Ok(ExitCode::UserError);
+                    }
+                    continue;
+                }
                 if value.starts_with("http://") || value.starts_with("https://") {
                     break value;
                 }
                 eprintln!(
-                    "{} URL must start with http:// or https:// (or enter 'copilot' for GitHub Copilot)",
+                    "{} URL must start with http:// or https:// (or enter 'copilot' / 'ollama' for special providers)",
                     style::red("Error:")
                 );
                 if add_options.base_url.is_some() {
@@ -498,6 +523,68 @@ impl KeysCommand {
                 style::yellow("Next:"),
                 style::bold("aivo run claude"),
                 style::dim("(uses Copilot subscription)")
+            );
+
+            return Ok(ExitCode::Success);
+        }
+
+        // Ollama: verify installation, no API key needed
+        if base_url == "ollama" {
+            if add_options.key.is_some() {
+                eprintln!(
+                    "{} Ollama runs locally without authentication. Do not pass --key.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+
+            crate::services::ollama::ensure_ready().await?;
+
+            // Check for an existing Ollama key and prompt to replace
+            let existing_keys = self.session_store.get_keys().await?;
+            let existing_ollama_id =
+                if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "ollama") {
+                    eprint!(
+                        "{} Ollama key '{}' (ID: {}) already exists. Replace it? [y/N] ",
+                        style::yellow("Warning:"),
+                        existing.name,
+                        existing.id
+                    );
+                    use std::io::Write as _;
+                    std::io::stderr().flush()?;
+                    let answer = read_line("")?;
+                    if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
+                        println!("Aborted.");
+                        return Ok(ExitCode::Success);
+                    }
+                    Some(existing.id.clone())
+                } else {
+                    None
+                };
+
+            if let Some(old_id) = existing_ollama_id {
+                self.session_store.delete_key(&old_id).await?;
+            }
+
+            let id = self
+                .session_store
+                .add_key_with_protocol(&name, "ollama", None, "ollama-local")
+                .await?;
+            self.session_store.set_active_key(&id).await?;
+
+            println!(
+                "{} Added and activated key: {}",
+                style::success_symbol(),
+                style::cyan(&name)
+            );
+            println!("  {}", style::dim(format!("ID: {}", id)));
+            println!("  {}", style::dim("Provider: Ollama (local)"));
+            println!();
+            println!(
+                "{} {} {}",
+                style::yellow("Next:"),
+                style::bold("aivo models"),
+                style::dim("(list local models)")
             );
 
             return Ok(ExitCode::Success);
@@ -908,6 +995,26 @@ mod tests {
 
         let active = store.get_active_key().await.unwrap().unwrap();
         assert_eq!(active.id, keys[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_add_key_rejects_ollama_base_url_without_ollama_name() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+
+        let code = cmd
+            .execute(KeysArgs {
+                action: Some("add".to_string()),
+                args: Vec::new(),
+                name: None,
+                base_url: Some("ollama".to_string()),
+                key: None,
+            })
+            .await;
+
+        assert_eq!(code, crate::errors::ExitCode::UserError);
     }
 
     #[tokio::test]

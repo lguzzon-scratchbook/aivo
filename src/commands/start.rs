@@ -338,6 +338,9 @@ fn normalize_provider_label(base_url: &str) -> String {
     if base_url == "copilot" {
         return "github.com/copilot".to_string();
     }
+    if base_url == "ollama" {
+        return "localhost/ollama".to_string();
+    }
 
     reqwest::Url::parse(base_url)
         .ok()

@@ -248,6 +248,10 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
     let profile = provider_profile_for_key(key);
 
     match profile.model_listing_strategy {
+        ModelListingStrategy::Ollama => {
+            crate::services::ollama::ensure_ready().await?;
+            crate::services::ollama::list_models().await
+        }
         ModelListingStrategy::Copilot => {
             let tm = CopilotTokenManager::new(key.key.as_str().to_string());
             let (copilot_token, api_endpoint) = tm.get_token().await?;

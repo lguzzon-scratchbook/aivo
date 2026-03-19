@@ -17,6 +17,7 @@ pub mod launch_args;
 pub mod launch_runtime;
 pub mod model_names;
 pub mod models_cache;
+pub mod ollama;
 pub mod openai_anthropic_bridge;
 pub mod openai_gemini_bridge;
 pub mod openai_models;
