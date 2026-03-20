@@ -83,18 +83,37 @@ impl ServeRouter {
 }
 
 async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeState>) -> Result<()> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+
     loop {
         let (mut socket, _) = listener.accept().await?;
         let state = state.clone();
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
 
-            let request_bytes = match http_utils::read_full_request(&mut socket).await {
-                Ok(b) => b,
-                Err(err) => {
+            let _permit = permit;
+            let read_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                http_utils::read_full_request(&mut socket),
+            )
+            .await;
+
+            let request_bytes = match read_result {
+                Ok(Ok(b)) => b,
+                Ok(Err(err)) => {
                     let response = http_utils::http_request_read_error_response(&err);
                     let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = socket
+                        .write_all(
+                            http_utils::http_error_response(408, "Request read timed out")
+                                .as_bytes(),
+                        )
+                        .await;
                     return;
                 }
             };
@@ -221,7 +240,7 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
 
     let current = ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed));
     let candidates: Vec<ProviderProtocol> = std::iter::once(current)
-        .chain(fallback_protocols(current, &state.config.upstream_base_url))
+        .chain(fallback_protocols(current))
         .collect();
 
     let mut last_response: Option<RouterResponse> = None;

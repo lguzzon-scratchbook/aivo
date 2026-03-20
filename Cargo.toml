@@ -40,6 +40,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1.0"
 unicode-width = "0.2"
 uuid = { version = "1.22.0", features = ["v4"] }
+tempfile = "3.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

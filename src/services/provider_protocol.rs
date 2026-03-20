@@ -68,12 +68,20 @@ pub fn normalize_protocol_base(base_url: &str) -> &str {
 
 pub fn is_anthropic_endpoint(base_url: &str) -> bool {
     let normalized = normalize_protocol_base(base_url).to_ascii_lowercase();
-    normalized.contains("api.anthropic.com") || normalized.ends_with("/anthropic")
+    let host = extract_url_host(&normalized);
+    host == "api.anthropic.com" || normalized.ends_with("/anthropic")
 }
 
 pub fn is_google_endpoint(base_url: &str) -> bool {
     let normalized = normalize_protocol_base(base_url).to_ascii_lowercase();
-    normalized.contains("generativelanguage.googleapis.com")
+    let host = extract_url_host(&normalized);
+    host == "generativelanguage.googleapis.com"
+}
+
+fn extract_url_host(url: &str) -> &str {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    host_port.split(':').next().unwrap_or(host_port)
 }
 
 pub fn detect_provider_protocol(base_url: &str) -> ProviderProtocol {
@@ -95,8 +103,7 @@ pub fn is_protocol_mismatch(status: u16) -> bool {
 /// Returns fallback protocol candidates to try after `current` fails.
 /// Google is always included as the last fallback so generic gateways can still
 /// auto-switch to Google-native routing if they expose it.
-pub fn fallback_protocols(current: ProviderProtocol, base_url: &str) -> Vec<ProviderProtocol> {
-    let _ = base_url;
+pub fn fallback_protocols(current: ProviderProtocol) -> Vec<ProviderProtocol> {
     [
         ProviderProtocol::Openai,
         ProviderProtocol::ResponsesApi,
@@ -164,7 +171,7 @@ mod tests {
 
     #[test]
     fn fallback_protocols_includes_google_for_generic_url() {
-        let result = fallback_protocols(ProviderProtocol::Openai, "https://api.example.com");
+        let result = fallback_protocols(ProviderProtocol::Openai);
         assert_eq!(
             result,
             vec![
@@ -177,10 +184,7 @@ mod tests {
 
     #[test]
     fn fallback_protocols_includes_google_for_google_url() {
-        let result = fallback_protocols(
-            ProviderProtocol::Openai,
-            "https://generativelanguage.googleapis.com/v1beta",
-        );
+        let result = fallback_protocols(ProviderProtocol::Openai);
         assert!(result.contains(&ProviderProtocol::Google));
         assert!(result.contains(&ProviderProtocol::Anthropic));
     }

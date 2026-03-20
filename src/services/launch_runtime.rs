@@ -213,13 +213,10 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
         None => raw,
     };
 
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir_name = format!("aivo-pi-{}-{}", std::process::id(), nonce);
-    let dir = std::env::temp_dir().join(dir_name);
-    tokio::fs::create_dir_all(&dir).await?;
+    let dir = tempfile::Builder::new()
+        .prefix("aivo-pi-")
+        .tempdir()?
+        .keep();
 
     tokio::try_join!(
         tokio::fs::write(dir.join("models.json"), &models_json),

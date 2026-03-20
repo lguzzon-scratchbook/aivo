@@ -210,7 +210,7 @@ async fn handle_anthropic_to_upstream(
 
     let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
     let mut candidates = std::iter::once(current)
-        .chain(fallback_protocols(current, &config.target_base_url))
+        .chain(fallback_protocols(current))
         .collect::<Vec<_>>();
 
     let mut last_response: Option<RouterResponse> = None;

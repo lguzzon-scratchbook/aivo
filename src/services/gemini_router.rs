@@ -138,7 +138,7 @@ async fn forward_to_provider(
 ) -> Result<ForwardResult> {
     let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
     let candidates: Vec<ProviderProtocol> = std::iter::once(current)
-        .chain(fallback_protocols(current, &config.target_base_url))
+        .chain(fallback_protocols(current))
         .collect();
 
     let mut last_status = 0u16;

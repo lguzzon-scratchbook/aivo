@@ -137,19 +137,35 @@ where
     Handler: Fn(String, Arc<State>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = String> + Send + 'static,
 {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+
     loop {
         let (mut socket, _) = listener.accept().await?;
         let state = state.clone();
         let handler = handler.clone();
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
 
-            let request_bytes = match read_full_request(&mut socket).await {
-                Ok(b) => b,
-                Err(err) => {
+            let _permit = permit;
+            let read_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_full_request(&mut socket),
+            )
+            .await;
+
+            let request_bytes = match read_result {
+                Ok(Ok(b)) => b,
+                Ok(Err(err)) => {
                     let response = http_request_read_error_response(&err);
                     let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = socket
+                        .write_all(http_error_response(408, "Request read timed out").as_bytes())
+                        .await;
                     return;
                 }
             };
