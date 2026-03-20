@@ -80,9 +80,7 @@ pub struct PingArgs {
 impl PingArgs {
     /// Returns the key from either `-k <name>` or positional `<name>`.
     pub fn key(&self) -> Option<&str> {
-        self.named_key
-            .as_deref()
-            .or(self.positional_key.as_deref())
+        self.named_key.as_deref().or(self.positional_key.as_deref())
     }
 }
 

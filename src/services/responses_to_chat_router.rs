@@ -1,3 +1,4 @@
+use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::copilot_auth::CopilotTokenManager;
@@ -12,9 +13,10 @@ use crate::services::openai_gemini_bridge::{
     convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
     openai_chat_model,
 };
-use crate::services::provider_protocol::{
-    ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+use crate::services::protocol_fallback::{
+    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
+use crate::services::provider_protocol::{ProviderProtocol, is_protocol_mismatch};
 /**
  * Responses-to-Chat router service
  *
@@ -65,12 +67,6 @@ pub struct ResponsesToChatRouter {
 enum ForwardedChatResponse {
     Success(Value),
     HttpError { status: u16, body: String },
-}
-
-struct ProtocolAttemptResult {
-    status_code: u16,
-    response_text: String,
-    success: Option<ForwardedChatResponse>,
 }
 
 struct ResponsesToChatRouterState {
@@ -231,7 +227,7 @@ async fn try_responses_api_passthrough(
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
+        .unwrap_or(CONTENT_TYPE_JSON)
         .to_string();
     let response_body = response.text().await.ok()?;
 
@@ -399,46 +395,32 @@ async fn forward_openai_chat_request(
     force_non_streaming: bool,
     active_protocol: &Arc<AtomicU8>,
 ) -> Result<ForwardedChatResponse> {
-    let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
-    let candidates: Vec<ProviderProtocol> = std::iter::once(current)
-        .chain(fallback_protocols(current))
-        .collect();
-
+    let candidates = protocol_candidates(active_protocol);
     let mut last_status = 0u16;
     let mut last_body = String::new();
 
-    for (attempt, protocol) in candidates.iter().enumerate() {
-        let ProtocolAttemptResult {
-            status_code,
-            response_text,
-            success,
-        } = forward_chat_for_protocol(
-            *protocol,
+    for (attempt, protocol) in candidates.into_iter().enumerate() {
+        match forward_chat_for_protocol(
+            protocol,
             body,
             config.as_ref(),
             client,
             force_non_streaming,
         )
-        .await?;
-
-        if let Some(success) = success {
-            if attempt > 0 {
-                active_protocol.store(protocol.to_u8(), Ordering::Relaxed);
-                eprintln!("  • Protocol auto-switched to {}", protocol.as_str());
+        .await?
+        {
+            AttemptOutcome::Success(value) => {
+                commit_protocol_switch(active_protocol, protocol, attempt);
+                return Ok(ForwardedChatResponse::Success(value));
             }
-            return Ok(success);
+            AttemptOutcome::ProviderError { status, body } => {
+                return Ok(ForwardedChatResponse::HttpError { status, body });
+            }
+            AttemptOutcome::Mismatch { status, body } => {
+                last_status = status;
+                last_body = body;
+            }
         }
-
-        if is_protocol_mismatch(status_code) {
-            last_status = status_code;
-            last_body = response_text;
-            continue;
-        }
-
-        return Ok(ForwardedChatResponse::HttpError {
-            status: status_code,
-            body: response_text,
-        });
     }
 
     Ok(ForwardedChatResponse::HttpError {
@@ -453,7 +435,7 @@ async fn forward_chat_for_protocol(
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
     force_non_streaming: bool,
-) -> Result<ProtocolAttemptResult> {
+) -> Result<AttemptOutcome<Value>> {
     match protocol {
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
             forward_openai_protocol(body, config, client).await
@@ -469,7 +451,7 @@ async fn forward_openai_protocol(
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
-) -> Result<ProtocolAttemptResult> {
+) -> Result<AttemptOutcome<Value>> {
     let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
     let response = http_utils::authorized_openai_post(
         client,
@@ -482,7 +464,14 @@ async fn forward_openai_protocol(
     .send()
     .await?;
 
-    build_openai_protocol_result(response).await
+    let status = response.status().as_u16();
+    let body_text = response.text().await?;
+    let parsed = if status == 200 {
+        Some(parse_provider_response(&body_text)?)
+    } else {
+        None
+    };
+    Ok(classify_attempt(status, body_text, parsed))
 }
 
 async fn forward_anthropic_protocol(
@@ -490,7 +479,7 @@ async fn forward_anthropic_protocol(
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
     force_non_streaming: bool,
-) -> Result<ProtocolAttemptResult> {
+) -> Result<AttemptOutcome<Value>> {
     let mut body_with_cache = body.clone();
     if body_with_cache
         .get("model")
@@ -516,39 +505,32 @@ async fn forward_anthropic_protocol(
         .header("Authorization", format!("Bearer {}", config.api_key))
         .header("x-api-key", config.api_key.as_str())
         .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .json(&anthropic_body)
         .send()
         .await?;
 
     let status_code = response.status().as_u16();
     let response_text = response.text().await?;
-    let success = if status_code == 200 {
+    let parsed = if status_code == 200 {
         let anthropic_response: Value = serde_json::from_str(&response_text)?;
-        Some(ForwardedChatResponse::Success(
-            convert_anthropic_to_openai_chat_response(
-                &anthropic_response,
-                body.get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("gpt-4o"),
-            ),
+        Some(convert_anthropic_to_openai_chat_response(
+            &anthropic_response,
+            body.get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gpt-4o"),
         ))
     } else {
         None
     };
-
-    Ok(ProtocolAttemptResult {
-        status_code,
-        response_text,
-        success,
-    })
+    Ok(classify_attempt(status_code, response_text, parsed))
 }
 
 async fn forward_google_protocol(
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
-) -> Result<ProtocolAttemptResult> {
+) -> Result<AttemptOutcome<Value>> {
     let google_body = convert_openai_chat_to_gemini_request(
         body,
         &OpenAIToGeminiConfig {
@@ -560,47 +542,23 @@ async fn forward_google_protocol(
     let response = client
         .post(&target_url)
         .header("x-goog-api-key", config.api_key.as_str())
-        .header("Content-Type", "application/json")
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .json(&google_body)
         .send()
         .await?;
 
     let status_code = response.status().as_u16();
     let response_text = response.text().await?;
-    let success = if status_code == 200 {
+    let parsed = if status_code == 200 {
         let google_response: Value = serde_json::from_str(&response_text)?;
-        Some(ForwardedChatResponse::Success(
-            convert_gemini_to_openai_chat_response(&google_response, &model),
+        Some(convert_gemini_to_openai_chat_response(
+            &google_response,
+            &model,
         ))
     } else {
         None
     };
-
-    Ok(ProtocolAttemptResult {
-        status_code,
-        response_text,
-        success,
-    })
-}
-
-async fn build_openai_protocol_result(
-    response: reqwest::Response,
-) -> Result<ProtocolAttemptResult> {
-    let status_code = response.status().as_u16();
-    let response_text = response.text().await?;
-    let success = if status_code == 200 {
-        Some(ForwardedChatResponse::Success(parse_provider_response(
-            &response_text,
-        )?))
-    } else {
-        None
-    };
-
-    Ok(ProtocolAttemptResult {
-        status_code,
-        response_text,
-        success,
-    })
+    Ok(classify_attempt(status_code, response_text, parsed))
 }
 
 // =============================================================================
@@ -2109,5 +2067,152 @@ mod tests {
         // Non-copilot with non-openrouter URL: no transform
         let chat = convert_responses_to_chat_request(&body, &config);
         assert_eq!(chat["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn test_convert_response_sse_empty_choices_no_panic() {
+        let chat = json!({"choices": []});
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        // Should produce valid SSE with empty text
+        assert!(sse.contains("event: response.created"));
+        assert!(sse.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_convert_response_sse_missing_choices_no_panic() {
+        let chat = json!({});
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        assert!(sse.contains("event: response.created"));
+        assert!(sse.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_convert_request_missing_model_uses_default() {
+        let body = json!({"input": [{"type": "message", "role": "user", "content": "hi"}]});
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &ResponsesToChatRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
+                copilot_token_manager: None,
+                model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
+                max_tokens_cap: None,
+                responses_api_supported: None,
+            },
+        );
+        // Should have a model field (falls back to default)
+        assert!(chat.get("model").is_some());
+    }
+
+    #[test]
+    fn test_convert_request_empty_input() {
+        let body = json!({"model": "gpt-4o", "input": []});
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &ResponsesToChatRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
+                copilot_token_manager: None,
+                model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
+                max_tokens_cap: None,
+                responses_api_supported: None,
+            },
+        );
+        let msgs = chat["messages"].as_array().unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_chat_response_payload_null_message() {
+        let chat = json!({"choices": [{"message": null}]});
+        let (text, tool_calls, reasoning) = extract_chat_response_payload(&chat);
+        assert!(text.is_empty());
+        assert!(tool_calls.is_empty());
+        assert!(reasoning.is_empty());
+    }
+
+    #[test]
+    fn test_extract_chat_response_payload_output_text_item() {
+        let chat = json!({
+            "output": [{"type": "output_text", "text": "hello from output_text"}]
+        });
+        let (text, tool_calls, _) = extract_chat_response_payload(&chat);
+        assert_eq!(text, "hello from output_text");
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_accumulate_chat_sse_empty_input() {
+        let result = accumulate_chat_sse("");
+        // Empty SSE → empty accumulated response
+        assert!(
+            result["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_accumulate_chat_sse_only_done() {
+        let result = accumulate_chat_sse("data: [DONE]\n");
+        assert!(
+            result["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_parse_provider_response_empty_string() {
+        let result = parse_provider_response("");
+        // Empty string → SSE fallback produces minimal accumulation, not an error
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_provider_response_malformed_json() {
+        let result = parse_provider_response("{not valid json}");
+        // Should attempt SSE fallback and eventually fail or return minimal
+        assert!(result.is_err() || result.unwrap().is_object());
+    }
+
+    #[test]
+    fn test_chat_usage_to_responses_usage_missing() {
+        let chat = json!({"choices": []});
+        assert!(chat_usage_to_responses_usage(&chat).is_none());
+    }
+
+    #[test]
+    fn test_chat_usage_to_responses_usage_present() {
+        let chat = json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "cache_read_input_tokens": 8
+            }
+        });
+        let usage = chat_usage_to_responses_usage(&chat).unwrap();
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 5);
+        assert_eq!(usage["cache_read_input_tokens"], 8);
+    }
+
+    #[test]
+    fn test_extract_content_text_empty_array() {
+        assert_eq!(extract_content_text(Some(&json!([]))), "");
+    }
+
+    #[test]
+    fn test_extract_content_text_null() {
+        assert_eq!(extract_content_text(Some(&json!(null))), "");
     }
 }

@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
@@ -82,7 +83,7 @@ pub(crate) async fn send_anthropic_chat(
         .post(&url)
         .header("x-api-key", context.upstream_api_key.as_str())
         .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .header("User-Agent", "aivo-serve/1.0")
         .json(&anthropic_req)
         .send()
@@ -118,7 +119,7 @@ pub(crate) async fn send_gemini_chat(
         .client
         .post(&url)
         .header("x-goog-api-key", context.upstream_api_key.as_str())
-        .header("Content-Type", "application/json")
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .header("User-Agent", "aivo-serve/1.0")
         .json(&gemini_req)
         .send()
@@ -234,7 +235,7 @@ async fn finalize_anthropic_response(
     } else {
         Ok(RouterResponse::buffered(
             200,
-            "application/json",
+            CONTENT_TYPE_JSON,
             openai_resp.to_string().into_bytes(),
         ))
     }
@@ -280,7 +281,7 @@ async fn finalize_gemini_response(
     } else {
         Ok(RouterResponse::buffered(
             200,
-            "application/json",
+            CONTENT_TYPE_JSON,
             openai_resp.to_string().into_bytes(),
         ))
     }
@@ -438,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_openai_response_converts_json_to_sse_when_streaming_requested() {
-        let response = mock_response(200, "application/json", sample_openai_chat_response());
+        let response = mock_response(200, CONTENT_TYPE_JSON, sample_openai_chat_response());
 
         let result = finalize_openai_response(response, true).await.unwrap();
 
@@ -460,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_openai_response_buffers_errors() {
-        let response = mock_response(404, "application/json", r#"{"error":"missing"}"#);
+        let response = mock_response(404, CONTENT_TYPE_JSON, r#"{"error":"missing"}"#);
 
         let result = finalize_openai_response(response, false).await.unwrap();
 
@@ -471,7 +472,7 @@ mod tests {
                 body,
             } => {
                 assert_eq!(status, 404);
-                assert_eq!(content_type, "application/json");
+                assert_eq!(content_type, CONTENT_TYPE_JSON);
                 assert_eq!(String::from_utf8(body).unwrap(), r#"{"error":"missing"}"#);
             }
             RouterResponse::Streaming { .. } => panic!("expected buffered error"),
@@ -480,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_anthropic_response_converts_json_to_openai_chat() {
-        let response = mock_response(200, "application/json", sample_anthropic_response());
+        let response = mock_response(200, CONTENT_TYPE_JSON, sample_anthropic_response());
 
         let result = finalize_anthropic_response(response, false, "claude-sonnet-4-5")
             .await
@@ -494,7 +495,7 @@ mod tests {
             } => {
                 let json: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(status, 200);
-                assert_eq!(content_type, "application/json");
+                assert_eq!(content_type, CONTENT_TYPE_JSON);
                 assert_eq!(
                     json["choices"][0]["message"]["content"],
                     "Hello from anthropic"
@@ -506,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_gemini_response_converts_json_to_sse_when_streaming_requested() {
-        let response = mock_response(200, "application/json", sample_gemini_response());
+        let response = mock_response(200, CONTENT_TYPE_JSON, sample_gemini_response());
 
         let result = finalize_gemini_response(response, true, "gemini-2.5-pro")
             .await

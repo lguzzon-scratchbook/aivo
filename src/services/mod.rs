@@ -7,9 +7,12 @@ pub mod anthropic_chat_response;
 pub mod anthropic_route_pipeline;
 pub mod anthropic_router;
 pub mod anthropic_to_openai_router;
+pub mod api_key_store;
+pub mod chat_session_store;
 pub mod codex_model_map;
 pub mod copilot_auth;
 pub mod copilot_router;
+pub mod directory_starts;
 pub mod environment_injector;
 pub mod gemini_router;
 pub mod http_utils;
@@ -22,6 +25,7 @@ pub mod ollama;
 pub mod openai_anthropic_bridge;
 pub mod openai_gemini_bridge;
 pub mod openai_models;
+pub mod protocol_fallback;
 pub mod provider_profile;
 pub mod provider_protocol;
 pub mod responses_to_chat_router;
@@ -32,6 +36,7 @@ pub mod serve_upstream;
 pub mod session_crypto;
 pub mod session_store;
 pub mod system_env;
+pub mod usage_stats_store;
 
 #[allow(unused_imports)]
 pub use ai_launcher::{AILauncher, LaunchOptions, ToolConfig};

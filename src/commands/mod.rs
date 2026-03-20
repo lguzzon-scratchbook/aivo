@@ -26,6 +26,8 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
 }
 
 pub mod chat;
+pub(crate) mod chat_request_builder;
+pub(crate) mod chat_response_parser;
 pub mod keys;
 pub mod ls;
 pub mod models;

@@ -181,12 +181,10 @@ async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
         .build()?;
 
     match profile.model_listing_strategy {
-        ModelListingStrategy::Ollama => {
-            match client.get("http://localhost:11434/").send().await {
-                Ok(_) => Ok(PingStatus::Ok),
-                Err(_) => Ok(PingStatus::Unreachable),
-            }
-        }
+        ModelListingStrategy::Ollama => match client.get("http://localhost:11434/").send().await {
+            Ok(_) => Ok(PingStatus::Ok),
+            Err(_) => Ok(PingStatus::Unreachable),
+        },
         ModelListingStrategy::Copilot => {
             use crate::services::copilot_auth::CopilotTokenManager;
             let tm = CopilotTokenManager::new(key.key.as_str().to_string());
@@ -305,18 +303,11 @@ impl KeysCommand {
     }
 
     /// Health-checks API keys.
-    async fn ping_keys(
-        &self,
-        key_id_or_name: Option<&str>,
-        ping_all: bool,
-    ) -> Result<ExitCode> {
+    async fn ping_keys(&self, key_id_or_name: Option<&str>, ping_all: bool) -> Result<ExitCode> {
         let keys: Vec<ApiKey> = if ping_all {
             let all_keys = self.session_store.get_keys().await?;
             if all_keys.len() > 1 {
-                let confirmed = confirm(&format!(
-                    "Ping all {} keys?",
-                    all_keys.len()
-                ))?;
+                let confirmed = confirm(&format!("Ping all {} keys?", all_keys.len()))?;
                 if !confirmed {
                     println!("{}", style::dim("Cancelled."));
                     return Ok(ExitCode::Success);
@@ -328,17 +319,11 @@ impl KeysCommand {
             let matched: Vec<ApiKey> = all_keys
                 .into_iter()
                 .filter(|k| {
-                    k.id == filter
-                        || k.short_id() == filter
-                        || k.name.eq_ignore_ascii_case(filter)
+                    k.id == filter || k.short_id() == filter || k.name.eq_ignore_ascii_case(filter)
                 })
                 .collect();
             if matched.is_empty() {
-                eprintln!(
-                    "{} API key \"{}\" not found",
-                    style::red("Error:"),
-                    filter
-                );
+                eprintln!("{} API key \"{}\" not found", style::red("Error:"), filter);
                 return Ok(ExitCode::UserError);
             }
             matched

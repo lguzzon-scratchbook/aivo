@@ -2,8 +2,9 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicU8;
 
+use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils;
@@ -17,9 +18,10 @@ use crate::services::openai_gemini_bridge::{
     convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
     openai_chat_model,
 };
-use crate::services::provider_protocol::{
-    ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+use crate::services::protocol_fallback::{
+    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
+use crate::services::provider_protocol::ProviderProtocol;
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
@@ -122,7 +124,7 @@ async fn handle_request(
                     }
                 }
                 ForwardResult::ProviderError { status, body } => {
-                    Ok(http_utils::http_response(status, "application/json", &body))
+                    Ok(http_utils::http_response(status, CONTENT_TYPE_JSON, &body))
                 }
             }
         }
@@ -136,10 +138,7 @@ async fn forward_to_provider(
     client: &Arc<reqwest::Client>,
     active_protocol: &Arc<AtomicU8>,
 ) -> Result<ForwardResult> {
-    let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
-    let candidates: Vec<ProviderProtocol> = std::iter::once(current)
-        .chain(fallback_protocols(current))
-        .collect();
+    let candidates = protocol_candidates(active_protocol);
 
     let mut last_status = 0u16;
     let mut last_body = String::new();
@@ -178,7 +177,7 @@ async fn forward_to_provider(
                     .header("Authorization", format!("Bearer {}", config.api_key))
                     .header("x-api-key", config.api_key.as_str())
                     .header("anthropic-version", "2023-06-01")
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", CONTENT_TYPE_JSON)
                     .json(&anthropic_req)
                     .send()
                     .await?;
@@ -210,7 +209,7 @@ async fn forward_to_provider(
                 let response = client
                     .post(&target_url)
                     .header("x-goog-api-key", config.api_key.as_str())
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", CONTENT_TYPE_JSON)
                     .json(&google_body)
                     .send()
                     .await?;
@@ -250,24 +249,19 @@ async fn forward_to_provider(
             }
         };
 
-        if let Some(openai_response) = parsed {
-            if attempt > 0 {
-                active_protocol.store(protocol.to_u8(), Ordering::Relaxed);
-                eprintln!("  • Protocol auto-switched to {}", protocol.as_str());
+        match classify_attempt(status, body_text, parsed) {
+            AttemptOutcome::Success(result) => {
+                commit_protocol_switch(active_protocol, protocol, attempt);
+                return Ok(ForwardResult::Success(result));
             }
-            return Ok(ForwardResult::Success(openai_response));
+            AttemptOutcome::ProviderError { status, body } => {
+                return Ok(ForwardResult::ProviderError { status, body });
+            }
+            AttemptOutcome::Mismatch { status, body } => {
+                last_status = status;
+                last_body = body;
+            }
         }
-
-        if is_protocol_mismatch(status) {
-            last_status = status;
-            last_body = body_text;
-            continue;
-        }
-
-        return Ok(ForwardResult::ProviderError {
-            status,
-            body: body_text,
-        });
     }
 
     Ok(ForwardResult::ProviderError {
@@ -1376,5 +1370,80 @@ mod tests {
             .unwrap_or("{}");
         let args: Value = serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({}));
         assert_eq!(args["dir_path"], ".");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_empty_contents() {
+        let body = serde_json::json!({"contents": []});
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_missing_contents() {
+        let body = serde_json::json!({});
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_empty_choices() {
+        let response = serde_json::json!({"choices": []});
+        let result = convert_openai_to_gemini(&response);
+        assert_eq!(result["candidates"][0]["content"]["role"], "model");
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_missing_choices() {
+        let response = serde_json::json!({});
+        let result = convert_openai_to_gemini(&response);
+        // Should not panic; produces a candidate with empty text
+        assert!(result["candidates"].is_array());
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_no_usage() {
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        });
+        let result = convert_openai_to_gemini(&response);
+        // No usageMetadata key when usage is absent
+        assert!(result.get("usageMetadata").is_none());
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_content_filter_finish_reason() {
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "content_filter"}]
+        });
+        let result = convert_openai_to_gemini(&response);
+        assert_eq!(result["candidates"][0]["finishReason"], "SAFETY");
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_unknown_finish_reason() {
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "weird"}]
+        });
+        let result = convert_openai_to_gemini(&response);
+        assert_eq!(result["candidates"][0]["finishReason"], "OTHER");
+    }
+
+    #[test]
+    fn test_parse_gemini_path_missing_model() {
+        // Empty model name still parses (model is "")
+        let result = parse_gemini_path("/v1beta/models/:generateContent");
+        assert_eq!(result.unwrap().0, "");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_null_parts_no_panic() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": null}]
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        assert!(result["messages"].is_array());
     }
 }

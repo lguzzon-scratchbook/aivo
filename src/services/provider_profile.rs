@@ -328,4 +328,48 @@ mod tests {
         );
         assert_eq!(cloudflare_ai_base("https://api.openai.com/v1"), None);
     }
+
+    #[test]
+    fn is_direct_openai_base_matches_api_openai_com() {
+        use super::is_direct_openai_base;
+        assert!(is_direct_openai_base("https://api.openai.com/v1"));
+        assert!(is_direct_openai_base("https://api.openai.com/v1/"));
+        assert!(is_direct_openai_base("https://API.OPENAI.COM/v1"));
+        assert!(!is_direct_openai_base("https://api.example.com/v1"));
+        assert!(!is_direct_openai_base("copilot"));
+    }
+
+    #[test]
+    fn provider_quirks_inject_populates_env() {
+        use super::ProviderQuirks;
+        use std::collections::HashMap;
+
+        let quirks = ProviderQuirks {
+            model_prefix: Some("@cf/"),
+            requires_reasoning_content: true,
+            max_tokens_cap: Some(8192),
+        };
+        let mut env = HashMap::new();
+        quirks.inject(&mut env, "TEST");
+
+        assert_eq!(env.get("TEST_MODEL_PREFIX").unwrap(), "@cf/");
+        assert_eq!(env.get("TEST_REQUIRE_REASONING").unwrap(), "1");
+        assert_eq!(env.get("TEST_MAX_TOKENS_CAP").unwrap(), "8192");
+    }
+
+    #[test]
+    fn provider_quirks_inject_skips_none_fields() {
+        use super::ProviderQuirks;
+        use std::collections::HashMap;
+
+        let quirks = ProviderQuirks {
+            model_prefix: None,
+            requires_reasoning_content: false,
+            max_tokens_cap: None,
+        };
+        let mut env = HashMap::new();
+        quirks.inject(&mut env, "TEST");
+
+        assert!(env.is_empty());
+    }
 }

@@ -199,10 +199,7 @@ mod tests {
         // Changing this would alter the encryption key derived from machine_id.
         let output = r#"    "IOPlatformUUID" = "12345678-1234-1234-1234-123456789ABC""#;
 
-        assert_eq!(
-            parse_macos_platform_uuid(output).as_deref(),
-            Some("=")
-        );
+        assert_eq!(parse_macos_platform_uuid(output).as_deref(), Some("="));
     }
 
     #[cfg(target_os = "macos")]

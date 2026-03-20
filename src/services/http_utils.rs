@@ -8,6 +8,8 @@
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
+
+use crate::constants::CONTENT_TYPE_JSON;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -114,7 +116,7 @@ pub async fn authorized_openai_post(
         Ok(client
             .post(&copilot_url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONTENT_TYPE_JSON)
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT))
@@ -122,7 +124,7 @@ pub async fn authorized_openai_post(
         Ok(client
             .post(target_url)
             .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json"))
+            .header("Content-Type", CONTENT_TYPE_JSON))
     }
 }
 
@@ -338,7 +340,7 @@ pub fn response_content_type(response: &reqwest::Response) -> String {
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
+        .unwrap_or(CONTENT_TYPE_JSON)
         .to_string()
 }
 
@@ -418,13 +420,13 @@ pub async fn buffered_reqwest_to_http_response(response: reqwest::Response) -> R
 
 /// Formats a JSON error response with the correct HTTP status line.
 pub fn http_json_response(status: u16, body: &str) -> String {
-    http_response(status, "application/json", body)
+    http_response(status, CONTENT_TYPE_JSON, body)
 }
 
 /// Formats a JSON error response body with an error message.
 pub fn http_error_response(status: u16, message: &str) -> String {
     let body = serde_json::json!({"error": {"message": message}}).to_string();
-    http_response(status, "application/json", &body)
+    http_response(status, CONTENT_TYPE_JSON, &body)
 }
 
 pub fn http_request_read_error_response(error: &RequestReadError) -> String {
@@ -496,6 +498,7 @@ pub fn router_http_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_find_header_end() {
@@ -670,7 +673,7 @@ mod tests {
 
     #[test]
     fn test_http_response_format() {
-        let resp = http_response(200, "application/json", "{\"ok\":true}");
+        let resp = http_response(200, CONTENT_TYPE_JSON, "{\"ok\":true}");
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.contains("Content-Type: application/json"));
         assert!(resp.ends_with("{\"ok\":true}"));
@@ -678,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_http_response_head_format() {
-        let head = http_response_head(200, "application/json", 11);
+        let head = http_response_head(200, CONTENT_TYPE_JSON, 11);
         assert_eq!(
             head,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n"
@@ -696,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_http_response_error_status() {
-        let resp = http_response(500, "application/json", "{\"error\":true}");
+        let resp = http_response(500, CONTENT_TYPE_JSON, "{\"error\":true}");
         assert!(resp.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
     }
 
@@ -739,5 +742,138 @@ mod tests {
             build_chat_completions_url("https://example.com"),
             "https://example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn test_build_target_url_trailing_slash() {
+        assert_eq!(
+            build_target_url("https://example.com/v1/", "/chat/completions"),
+            "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_build_chat_completions_url_trailing_slash() {
+        assert_eq!(
+            build_chat_completions_url("https://example.com/v1/"),
+            "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_reason_phrase_uncommon_status_codes() {
+        assert_eq!(reason_phrase(201), "Created");
+        assert_eq!(reason_phrase(204), "No Content");
+        assert_eq!(reason_phrase(301), "Moved Permanently");
+        assert_eq!(reason_phrase(302), "Found");
+        assert_eq!(reason_phrase(304), "Not Modified");
+        assert_eq!(reason_phrase(405), "Method Not Allowed");
+        assert_eq!(reason_phrase(408), "Request Timeout");
+        assert_eq!(reason_phrase(413), "Payload Too Large");
+        assert_eq!(reason_phrase(429), "Too Many Requests");
+        assert_eq!(reason_phrase(502), "Bad Gateway");
+        assert_eq!(reason_phrase(503), "Service Unavailable");
+        assert_eq!(reason_phrase(504), "Gateway Timeout");
+    }
+
+    #[test]
+    fn test_reason_phrase_unknown_ranges() {
+        assert_eq!(reason_phrase(299), "OK");
+        assert_eq!(reason_phrase(399), "Redirect");
+        assert_eq!(reason_phrase(499), "Client Error");
+        assert_eq!(reason_phrase(599), "Server Error");
+    }
+
+    #[test]
+    fn test_http_error_response_json_structure() {
+        let resp = http_error_response(422, "Validation failed");
+        assert!(resp.contains("422"));
+        assert!(resp.contains("Validation failed"));
+        assert!(resp.contains("application/json"));
+    }
+
+    #[test]
+    fn test_http_request_read_error_response_header_too_large() {
+        let resp = http_request_read_error_response(&RequestReadError::HeaderTooLarge);
+        assert!(resp.starts_with("HTTP/1.1 413"));
+    }
+
+    #[test]
+    fn test_http_request_read_error_response_unsupported_encoding() {
+        let resp = http_request_read_error_response(&RequestReadError::UnsupportedTransferEncoding);
+        assert!(resp.starts_with("HTTP/1.1 400"));
+        assert!(resp.contains("chunked"));
+    }
+
+    #[test]
+    fn test_http_request_read_error_response_incomplete_headers() {
+        let resp = http_request_read_error_response(&RequestReadError::IncompleteHeaders);
+        assert!(resp.starts_with("HTTP/1.1 400"));
+    }
+
+    #[test]
+    fn test_parse_content_length_invalid_value() {
+        let headers = "POST /v1 HTTP/1.1\r\nContent-Length: not_a_number\r\n";
+        assert_eq!(parse_content_length(headers), None);
+    }
+
+    #[test]
+    fn test_sse_data_payload_with_space() {
+        assert_eq!(
+            sse_data_payload("data: {\"ok\":true}"),
+            Some("{\"ok\":true}")
+        );
+    }
+
+    #[test]
+    fn test_sse_data_payload_without_space() {
+        assert_eq!(
+            sse_data_payload("data:{\"ok\":true}"),
+            Some("{\"ok\":true}")
+        );
+    }
+
+    #[test]
+    fn test_sse_data_payload_non_data_line() {
+        assert_eq!(sse_data_payload("event: message"), None);
+        assert_eq!(sse_data_payload(""), None);
+    }
+
+    #[test]
+    fn test_parse_token_u64_number() {
+        assert_eq!(parse_token_u64(&json!(42)), Some(42));
+    }
+
+    #[test]
+    fn test_parse_token_u64_string() {
+        assert_eq!(parse_token_u64(&json!("100")), Some(100));
+    }
+
+    #[test]
+    fn test_parse_token_u64_invalid_string() {
+        assert_eq!(parse_token_u64(&json!("not_a_number")), None);
+    }
+
+    #[test]
+    fn test_parse_token_u64_null() {
+        assert_eq!(parse_token_u64(&json!(null)), None);
+    }
+
+    #[test]
+    fn test_extract_request_path_single_word() {
+        assert_eq!(extract_request_path("GET"), "/");
+    }
+
+    #[test]
+    fn test_is_post_path_empty_paths() {
+        let req = "POST /v1/messages HTTP/1.1\r\n";
+        assert!(!is_post_path(req, &[]));
+    }
+
+    #[test]
+    fn test_extract_passthrough_headers_no_custom_headers() {
+        let req = "POST /v1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer token\r\n\r\n{}";
+        let headers = extract_passthrough_headers(req).unwrap();
+        assert!(headers.is_empty());
     }
 }

@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::{
     AnthropicToOpenAIConfig, convert_anthropic_to_openai_request,
 };
@@ -93,7 +94,7 @@ async fn handle_messages(
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", copilot_token))
-        .header("Content-Type", "application/json")
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .header("Editor-Version", COPILOT_EDITOR_VERSION)
         .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
         .header("Openai-Intent", COPILOT_OPENAI_INTENT)
@@ -641,5 +642,91 @@ mod tests {
         });
         let req = anthropic_to_openai(&body);
         assert!(req.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_empty_messages() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": []
+        });
+        let result = anthropic_to_openai(&body);
+        let messages = result["messages"].as_array().unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_missing_messages_field() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024
+        });
+        let result = anthropic_to_openai(&body);
+        // Should not panic; messages should be empty or absent
+        assert!(
+            result.get("messages").is_none() || result["messages"].as_array().unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_empty_choices() {
+        let resp = json!({
+            "id": "chatcmpl-xxx",
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+        });
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        // Converter still produces a response with model set correctly
+        assert_eq!(result["model"], "claude-sonnet-4");
+        assert_eq!(result["id"], "chatcmpl-xxx");
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_missing_choices() {
+        let resp = json!({"id": "chatcmpl-xxx"});
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        assert_eq!(result["model"], "claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_sse_empty_choices() {
+        let resp = json!({
+            "id": "chatcmpl-xxx",
+            "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        });
+        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4");
+        assert!(sse.contains("event: message_start"));
+        assert!(sse.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn test_explain_copilot_error_plain_text_body() {
+        assert_eq!(
+            explain_copilot_error("Something went wrong"),
+            "Something went wrong"
+        );
+    }
+
+    #[test]
+    fn test_explain_copilot_error_empty_body() {
+        assert_eq!(explain_copilot_error(""), "");
+    }
+
+    #[test]
+    fn test_explain_copilot_error_malformed_json() {
+        assert_eq!(
+            explain_copilot_error("{not valid json}"),
+            "{not valid json}"
+        );
+    }
+
+    #[test]
+    fn test_explain_copilot_error_empty_message() {
+        let body = json!({"error": {"message": ""}}).to_string();
+        // Empty message falls through to raw body
+        let result = explain_copilot_error(&body);
+        assert!(!result.is_empty());
     }
 }

@@ -423,4 +423,101 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
     }
+
+    #[test]
+    fn test_convert_openai_chat_empty_messages() {
+        let body = json!({"model": "gemini-2.5-pro", "messages": []});
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        // Empty messages → fallback empty content injected
+        let contents = converted["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_missing_messages_field() {
+        let body = json!({"model": "gemini-2.5-pro"});
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        // No messages at all → fallback empty content
+        let contents = converted["contents"].as_array().unwrap();
+        assert!(!contents.is_empty());
+    }
+
+    #[test]
+    fn test_convert_openai_chat_null_content_no_panic() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": null}]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        assert!(converted["contents"].is_array());
+    }
+
+    #[test]
+    fn test_convert_gemini_response_empty_candidates() {
+        let resp = json!({"candidates": []});
+        let converted = convert_gemini_to_openai_chat_response(&resp, "gemini-2.5-pro");
+        assert_eq!(converted["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_no_candidates_field() {
+        let resp = json!({});
+        let converted = convert_gemini_to_openai_chat_response(&resp, "fallback-model");
+        assert_eq!(converted["model"], "fallback-model");
+        assert_eq!(converted["choices"][0]["finish_reason"], "stop");
+        assert_eq!(converted["usage"]["prompt_tokens"], 0);
+    }
+
+    #[test]
+    fn test_convert_gemini_response_safety_finish_reason() {
+        let resp = json!({
+            "candidates": [{"content": {"parts": []}, "finishReason": "SAFETY"}]
+        });
+        let converted = convert_gemini_to_openai_chat_response(&resp, "gemini");
+        assert_eq!(converted["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn test_openai_chat_model_missing_uses_default() {
+        let body = json!({});
+        assert_eq!(openai_chat_model(&body, "default-model"), "default-model");
+    }
+
+    #[test]
+    fn test_build_google_url_trailing_slash() {
+        let url =
+            build_google_generate_content_url("https://example.com/v1beta/", "gemini-2.5-pro");
+        assert!(url.contains("models/gemini-2.5-pro:generateContent"));
+        assert!(!url.contains("//models"));
+    }
+
+    #[test]
+    fn test_parse_tool_content_none() {
+        assert_eq!(parse_tool_content(None), json!({}));
+    }
+
+    #[test]
+    fn test_parse_tool_content_non_json_string() {
+        let content = json!("not valid json");
+        assert_eq!(
+            parse_tool_content(Some(&content)),
+            json!({"content": "not valid json"})
+        );
+    }
 }

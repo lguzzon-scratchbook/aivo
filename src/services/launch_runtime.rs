@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::session_store::{
@@ -199,7 +200,7 @@ pub(crate) async fn cleanup_runtime_artifacts(
 /// Writes a temporary `PI_CODING_AGENT_DIR` with `models.json`, `auth.json`,
 /// and `settings.json` so Pi discovers the aivo custom provider.
 ///
-/// When `port` is `Some`, the placeholder `http://127.0.0.1:0` in
+/// When `port` is `Some`, the placeholder `PLACEHOLDER_LOOPBACK_URL` in
 /// `AIVO_PI_MODELS_JSON` is patched with the real router port.
 /// When `port` is `None`, the JSON already contains the real upstream URL.
 async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>) -> Result<()> {
@@ -209,7 +210,7 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
         .clone();
 
     let models_json = match port {
-        Some(p) => raw.replace("http://127.0.0.1:0", &format!("http://127.0.0.1:{p}")),
+        Some(p) => raw.replace(PLACEHOLDER_LOOPBACK_URL, &format!("http://127.0.0.1:{p}")),
         None => raw,
     };
 
@@ -246,7 +247,7 @@ fn set_local_base_url(env: &mut HashMap<String, String>, key: &str, port: u16) {
 fn patch_opencode_config_content(env: &mut HashMap<String, String>, port: u16) {
     let real_url = format!("http://127.0.0.1:{port}");
     if let Some(content) = env.get("OPENCODE_CONFIG_CONTENT").cloned() {
-        let patched = content.replace("http://127.0.0.1:0", &real_url);
+        let patched = content.replace(PLACEHOLDER_LOOPBACK_URL, &real_url);
         env.insert("OPENCODE_CONFIG_CONTENT".to_string(), patched);
     }
 }
@@ -543,5 +544,16 @@ mod tests {
         let mut env = HashMap::new();
         patch_opencode_config_content(&mut env, 24860);
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn set_local_base_url_inserts_loopback_address() {
+        use super::set_local_base_url;
+        let mut env = HashMap::new();
+        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", 9999);
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://127.0.0.1:9999"
+        );
     }
 }

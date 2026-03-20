@@ -13,7 +13,9 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::constants::CONTENT_TYPE_JSON;
+use std::sync::atomic::AtomicU8;
 
 use crate::services::anthropic_chat_request::{
     AnthropicToOpenAIConfig, convert_anthropic_to_openai_request,
@@ -38,9 +40,10 @@ use crate::services::openai_models::{
     convert_responses_to_chat_response as convert_typed_responses_to_chat_response,
     stringify_message_content as stringify_typed_message_content,
 };
-use crate::services::provider_protocol::{
-    ProviderProtocol, fallback_protocols, is_protocol_mismatch,
+use crate::services::protocol_fallback::{
+    AttemptOutcome, commit_protocol_switch, protocol_candidates,
 };
+use crate::services::provider_protocol::{ProviderProtocol, is_protocol_mismatch};
 
 #[derive(Clone)]
 pub struct AnthropicToOpenAIRouterConfig {
@@ -124,7 +127,7 @@ async fn run_router(
 
             if !http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
                 let not_found =
-                    http_utils::http_response(404, "application/json", "{\"error\":\"Not found\"}");
+                    http_utils::http_response(404, CONTENT_TYPE_JSON, "{\"error\":\"Not found\"}");
                 let _ = socket.write_all(not_found.as_bytes()).await;
                 return;
             }
@@ -208,14 +211,10 @@ async fn handle_anthropic_to_upstream(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
-    let mut candidates = std::iter::once(current)
-        .chain(fallback_protocols(current))
-        .collect::<Vec<_>>();
-
+    let candidates = protocol_candidates(active_protocol);
     let mut last_response: Option<RouterResponse> = None;
 
-    for (attempt, protocol) in candidates.drain(..).enumerate() {
+    for (attempt, protocol) in candidates.into_iter().enumerate() {
         let mut req_body = simplified.clone();
         let mut attempt_headers = passthrough_headers.clone();
         prepare_gateway_model_metadata(&mut req_body, &mut attempt_headers, config, protocol);
@@ -231,7 +230,7 @@ async fn handle_anthropic_to_upstream(
             ));
         }
 
-        let (status_code, response_opt) = match protocol {
+        let outcome: AttemptOutcome<RouterResponse> = match protocol {
             ProviderProtocol::Google => {
                 req_body["stream"] = json!(false);
                 let model = openai_chat_model(&req_body, "gemini-2.5-pro");
@@ -246,7 +245,7 @@ async fn handle_anthropic_to_upstream(
                     .post(&url)
                     .headers(attempt_headers)
                     .header("x-goog-api-key", config.target_api_key.as_str())
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", CONTENT_TYPE_JSON)
                     .header("User-Agent", "aivo-router/1.0")
                     .json(&google_body)
                     .send()
@@ -255,14 +254,16 @@ async fn handle_anthropic_to_upstream(
                 let status_code = response.status().as_u16();
                 let response_body = response.text().await?;
                 if is_protocol_mismatch(status_code) {
-                    (status_code, None)
-                } else if status_code >= 400 {
-                    let r = RouterResponse::Buffered {
+                    AttemptOutcome::Mismatch {
                         status: status_code,
-                        content_type: "application/json".to_string(),
+                        body: response_body,
+                    }
+                } else if status_code >= 400 {
+                    AttemptOutcome::Success(RouterResponse::Buffered {
+                        status: status_code,
+                        content_type: CONTENT_TYPE_JSON.to_string(),
                         body: response_body.into_bytes(),
-                    };
-                    (status_code, Some(r))
+                    })
                 } else {
                     let google_response: Value = serde_json::from_str(&response_body)?;
                     let openai_response =
@@ -278,12 +279,12 @@ async fn handle_anthropic_to_upstream(
                     } else {
                         RouterResponse::Buffered {
                             status: 200,
-                            content_type: "application/json".to_string(),
+                            content_type: CONTENT_TYPE_JSON.to_string(),
                             body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?
                                 .into_bytes(),
                         }
                     };
-                    (status_code, Some(r))
+                    AttemptOutcome::Success(r)
                 }
             }
             ProviderProtocol::ResponsesApi => {
@@ -294,7 +295,7 @@ async fn handle_anthropic_to_upstream(
                     .post(&url)
                     .headers(attempt_headers)
                     .header("Authorization", format!("Bearer {}", config.target_api_key))
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", CONTENT_TYPE_JSON)
                     .header("User-Agent", "aivo-router/1.0")
                     .json(&responses_body)
                     .send()
@@ -303,14 +304,16 @@ async fn handle_anthropic_to_upstream(
                 let status_code = response.status().as_u16();
                 let response_body = response.text().await?;
                 if is_protocol_mismatch(status_code) || status_code == 400 {
-                    (status_code, None)
-                } else if status_code >= 400 {
-                    let r = RouterResponse::Buffered {
+                    AttemptOutcome::Mismatch {
                         status: status_code,
-                        content_type: "application/json".to_string(),
+                        body: response_body,
+                    }
+                } else if status_code >= 400 {
+                    AttemptOutcome::Success(RouterResponse::Buffered {
+                        status: status_code,
+                        content_type: CONTENT_TYPE_JSON.to_string(),
                         body: response_body.into_bytes(),
-                    };
-                    (status_code, Some(r))
+                    })
                 } else {
                     let resp: Value = serde_json::from_str(&response_body)?;
                     let openai_response = convert_responses_to_chat_response(&resp);
@@ -325,12 +328,12 @@ async fn handle_anthropic_to_upstream(
                     } else {
                         RouterResponse::Buffered {
                             status: 200,
-                            content_type: "application/json".to_string(),
+                            content_type: CONTENT_TYPE_JSON.to_string(),
                             body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?
                                 .into_bytes(),
                         }
                     };
-                    (status_code, Some(r))
+                    AttemptOutcome::Success(r)
                 }
             }
             _ => {
@@ -340,7 +343,7 @@ async fn handle_anthropic_to_upstream(
                     .post(&url)
                     .headers(attempt_headers)
                     .header("Authorization", format!("Bearer {}", config.target_api_key))
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", CONTENT_TYPE_JSON)
                     .header("User-Agent", "aivo-router/1.0")
                     .json(&req_body)
                     .send()
@@ -348,7 +351,10 @@ async fn handle_anthropic_to_upstream(
 
                 let status_code = response.status().as_u16();
                 if is_protocol_mismatch(status_code) {
-                    (status_code, None)
+                    AttemptOutcome::Mismatch {
+                        status: status_code,
+                        body: String::new(),
+                    }
                 } else {
                     let is_streaming = response
                         .headers()
@@ -361,7 +367,10 @@ async fn handle_anthropic_to_upstream(
                     // Chat Completions — treat as protocol mismatch so the
                     // ResponsesApi candidate gets a chance.
                     if status_code == 400 && is_responses_api_error(&response_body) {
-                        (status_code, None)
+                        AttemptOutcome::Mismatch {
+                            status: status_code,
+                            body: response_body,
+                        }
                     } else {
                         let r = if status_code == 200
                             && (is_streaming || response_body.starts_with("data:"))
@@ -378,36 +387,36 @@ async fn handle_anthropic_to_upstream(
                                 convert_openai_to_anthropic(&response_body, status_code)?;
                             RouterResponse::Buffered {
                                 status: status_code,
-                                content_type: "application/json".to_string(),
+                                content_type: CONTENT_TYPE_JSON.to_string(),
                                 body: anthropic_response.into_bytes(),
                             }
                         };
-                        (status_code, Some(r))
+                        AttemptOutcome::Success(r)
                     }
                 }
             }
         };
 
-        if let Some(r) = response_opt {
-            // Success (not a protocol mismatch)
-            if attempt > 0 {
-                active_protocol.store(protocol.to_u8(), Ordering::Relaxed);
-                eprintln!("  • Protocol auto-switched to {}", protocol.as_str());
+        match outcome {
+            AttemptOutcome::Success(r) => {
+                commit_protocol_switch(active_protocol, protocol, attempt);
+                return Ok(r);
             }
-            return Ok(r);
+            AttemptOutcome::ProviderError { status, .. }
+            | AttemptOutcome::Mismatch { status, .. } => {
+                last_response = Some(RouterResponse::Buffered {
+                    status,
+                    content_type: CONTENT_TYPE_JSON.to_string(),
+                    body: format!("{{\"error\":\"Protocol mismatch ({})\"}}", status).into_bytes(),
+                });
+            }
         }
-        // Protocol mismatch — try next candidate
-        last_response = Some(RouterResponse::Buffered {
-            status: status_code,
-            content_type: "application/json".to_string(),
-            body: format!("{{\"error\":\"Protocol mismatch ({})\"}}", status_code).into_bytes(),
-        });
     }
 
     // All candidates exhausted — return last error
     Ok(last_response.unwrap_or(RouterResponse::Buffered {
         status: 503,
-        content_type: "application/json".to_string(),
+        content_type: CONTENT_TYPE_JSON.to_string(),
         body: b"{\"error\":\"No compatible protocol found\"}".to_vec(),
     }))
 }
@@ -1373,5 +1382,89 @@ data: [DONE]\n";
         assert_eq!(messages[2]["content"], "plain\nstrings");
         // Array with no extractable text → empty string (not null)
         assert_eq!(messages[3]["content"], "");
+    }
+
+    #[test]
+    fn test_convert_openai_to_anthropic_error_status_passthrough() {
+        let error_body = r#"{"error":{"message":"rate limited"}}"#;
+        let result = convert_openai_to_anthropic(error_body, 429).unwrap();
+        // Error responses should be passed through as-is
+        assert!(result.contains("rate limited"));
+    }
+
+    #[test]
+    fn test_convert_openai_sse_to_anthropic_error_status_passthrough() {
+        let error_body = r#"{"error":"upstream down"}"#;
+        let result = convert_openai_sse_to_anthropic(error_body, 502).unwrap();
+        assert!(result.contains("upstream down"));
+        assert!(result.contains("data: "));
+    }
+
+    #[test]
+    fn test_convert_openai_to_anthropic_empty_body() {
+        let result = convert_openai_to_anthropic("", 200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_openai_to_anthropic_malformed_json() {
+        let result = convert_openai_to_anthropic("{not valid}", 200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_empty_messages() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": []
+        });
+        let req = anthropic_to_openai(&body, false);
+        let messages = req["messages"].as_array().unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_cap_max_tokens_field_no_cap() {
+        let mut req = json!({"model": "gpt-4o", "max_tokens": 12000});
+        cap_max_tokens_field(&mut req, None);
+        assert_eq!(req["max_tokens"], 12000);
+    }
+
+    #[test]
+    fn test_cap_max_tokens_field_under_cap() {
+        let mut req = json!({"model": "gpt-4o", "max_tokens": 4096});
+        cap_max_tokens_field(&mut req, Some(8192));
+        assert_eq!(req["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn test_convert_openai_sse_to_anthropic_empty_sse() {
+        let result = convert_openai_sse_to_anthropic("", 200).unwrap();
+        // Empty input → no events emitted (converter never started)
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_openai_stream_converter_malformed_json_in_data_line() {
+        let mut converter = OpenAIStreamConverter::new();
+        // Malformed JSON should be silently skipped, not error
+        let output = converter
+            .push_bytes(b"data: {invalid json}\ndata: [DONE]\n")
+            .unwrap();
+        let tail = converter.finish().unwrap();
+        // Should not panic and should produce empty/minimal output
+        let _ = output;
+        let _ = tail;
+    }
+
+    #[test]
+    fn test_stringify_message_content_null_content() {
+        let mut req = json!({
+            "messages": [{"role": "assistant", "content": null}]
+        });
+        stringify_message_content(&mut req);
+        // null content should remain unchanged (not crash)
+        let messages = req["messages"].as_array().unwrap();
+        assert!(messages[0]["content"].is_null());
     }
 }

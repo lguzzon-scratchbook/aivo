@@ -347,3 +347,31 @@ fn normalize_provider_label(base_url: &str) -> String {
         .and_then(|url| url.host_str().map(ToString::to_string))
         .unwrap_or_else(|| base_url.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_provider_label;
+
+    #[test]
+    fn normalize_copilot_sentinel() {
+        assert_eq!(normalize_provider_label("copilot"), "github.com/copilot");
+    }
+
+    #[test]
+    fn normalize_ollama_sentinel() {
+        assert_eq!(normalize_provider_label("ollama"), "localhost/ollama");
+    }
+
+    #[test]
+    fn normalize_extracts_host_from_url() {
+        assert_eq!(
+            normalize_provider_label("https://api.openai.com/v1"),
+            "api.openai.com"
+        );
+    }
+
+    #[test]
+    fn normalize_returns_raw_string_for_unparseable_url() {
+        assert_eq!(normalize_provider_label("not-a-url"), "not-a-url");
+    }
+}

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::commands::models::fetch_models;
+use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::provider_protocol::{
@@ -128,7 +129,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                     if !request.starts_with("POST ") {
                         Ok(RouterResponse::buffered(
                             405,
-                            "application/json",
+                            CONTENT_TYPE_JSON,
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
@@ -139,7 +140,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                     if !request.starts_with("POST ") {
                         Ok(RouterResponse::buffered(
                             405,
-                            "application/json",
+                            CONTENT_TYPE_JSON,
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
@@ -148,7 +149,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                 }
                 _ => Ok(RouterResponse::buffered(
                     404,
-                    "application/json",
+                    CONTENT_TYPE_JSON,
                     br#"{"error":{"message":"Not found"}}"#.to_vec(),
                 )),
             };
@@ -176,7 +177,7 @@ async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
     let resp = json!({"object": "list", "data": data});
     Ok(RouterResponse::buffered(
         200,
-        "application/json",
+        CONTENT_TYPE_JSON,
         resp.to_string().into_bytes(),
     ))
 }
@@ -282,7 +283,7 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
 
     Ok(last_response.unwrap_or(RouterResponse::buffered(
         503,
-        "application/json",
+        CONTENT_TYPE_JSON,
         br#"{"error":{"message":"No compatible protocol found"}}"#.to_vec(),
     )))
 }
@@ -514,7 +515,7 @@ fn convert_chat_response_for_responses_route(
                     convert_chat_response_to_responses_json(&chat_json, original_model)?;
                 Ok(RouterResponse::buffered(
                     200,
-                    "application/json",
+                    CONTENT_TYPE_JSON,
                     serde_json::to_vec(&response_json)?,
                 ))
             }
@@ -610,7 +611,7 @@ mod tests {
         });
 
         let response = convert_chat_response_for_responses_route(
-            RouterResponse::buffered(200, "application/json", serde_json::to_vec(&chat).unwrap()),
+            RouterResponse::buffered(200, CONTENT_TYPE_JSON, serde_json::to_vec(&chat).unwrap()),
             false,
             "gpt-4o",
         )
@@ -624,7 +625,7 @@ mod tests {
             } => {
                 let json: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(status, 200);
-                assert_eq!(content_type, "application/json");
+                assert_eq!(content_type, CONTENT_TYPE_JSON);
                 assert_eq!(json["object"], "response");
                 assert_eq!(json["output"][0]["content"][0]["text"], "Hello from router");
             }
@@ -720,5 +721,96 @@ mod tests {
     fn format_http_chunk_adds_hex_prefix_and_trailer() {
         assert_eq!(format_http_chunk(b"hello"), b"5\r\nhello\r\n");
         assert!(format_http_chunk(b"").is_empty());
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_passes_error_status_through() {
+        let error_body = br#"{"error":{"message":"rate limited"}}"#;
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(429, CONTENT_TYPE_JSON, error_body.to_vec()),
+            false,
+            "gpt-4o",
+        )
+        .unwrap();
+
+        match response {
+            RouterResponse::Buffered { status, body, .. } => {
+                assert_eq!(status, 429);
+                assert_eq!(body, error_body);
+            }
+            _ => panic!("expected buffered error passthrough"),
+        }
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_passes_500_through() {
+        let error_body = br#"{"error":"internal"}"#;
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(500, CONTENT_TYPE_JSON, error_body.to_vec()),
+            true,
+            "gpt-4o",
+        )
+        .unwrap();
+
+        match response {
+            RouterResponse::Buffered { status, .. } => assert_eq!(status, 500),
+            _ => panic!("expected buffered error passthrough"),
+        }
+    }
+
+    #[test]
+    fn format_http_chunk_large_payload() {
+        let data = vec![b'x'; 256];
+        let chunk = format_http_chunk(&data);
+        // 256 = 0x100
+        assert!(chunk.starts_with(b"100\r\n"));
+        assert!(chunk.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn format_http_chunk_single_byte() {
+        let chunk = format_http_chunk(b"a");
+        assert_eq!(chunk, b"1\r\na\r\n");
+    }
+
+    #[test]
+    fn responses_router_config_anthropic_protocol() {
+        let state = test_state(ProviderProtocol::Anthropic);
+        let config = responses_router_config(&state);
+        assert_eq!(config.target_protocol, ProviderProtocol::Anthropic);
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_buffered_json_to_stream() {
+        let chat = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "streamed text"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+        });
+
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(200, CONTENT_TYPE_JSON, serde_json::to_vec(&chat).unwrap()),
+            true, // client wants stream
+            "gpt-4o",
+        )
+        .unwrap();
+
+        match response {
+            RouterResponse::Buffered {
+                status,
+                content_type,
+                body,
+            } => {
+                assert_eq!(status, 200);
+                assert_eq!(content_type, "text/event-stream");
+                let sse = String::from_utf8(body).unwrap();
+                assert!(sse.contains("event: response.created"));
+                assert!(sse.contains("streamed text"));
+                assert!(sse.contains("event: response.completed"));
+            }
+            RouterResponse::Streaming { .. } => panic!("expected buffered SSE"),
+        }
     }
 }

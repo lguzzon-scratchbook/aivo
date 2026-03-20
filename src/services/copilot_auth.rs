@@ -10,6 +10,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::constants::CONTENT_TYPE_JSON;
+
 /// VS Code Copilot OAuth client ID (same as OpenCode uses)
 const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
@@ -96,7 +98,7 @@ impl CopilotTokenManager {
         let resp = client
             .get(COPILOT_TOKEN_URL)
             .header("Authorization", format!("token {}", self.github_token))
-            .header("Accept", "application/json")
+            .header("Accept", CONTENT_TYPE_JSON)
             .header("User-Agent", "aivo")
             .send()
             .await
@@ -142,7 +144,7 @@ pub async fn device_flow_login() -> Result<String> {
     // Step 1: Request device code
     let resp = client
         .post(DEVICE_CODE_URL)
-        .header("Accept", "application/json")
+        .header("Accept", CONTENT_TYPE_JSON)
         .form(&[("client_id", COPILOT_CLIENT_ID), ("scope", "copilot")])
         .send()
         .await
@@ -193,7 +195,7 @@ async fn poll_for_token(
 
         let resp = client
             .post(ACCESS_TOKEN_URL)
-            .header("Accept", "application/json")
+            .header("Accept", CONTENT_TYPE_JSON)
             .form(&[
                 ("client_id", COPILOT_CLIENT_ID),
                 ("device_code", device_code),

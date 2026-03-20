@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use crate::constants::CONTENT_TYPE_JSON;
 use crate::tui::FuzzySelect;
 use anyhow::Result;
 use chrono::Utc;
@@ -20,17 +21,27 @@ use serde::{Deserialize, Serialize};
 use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
-use crate::services::anthropic_route_pipeline::inject_cache_control_on_last_block;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
-use crate::services::http_utils::{parse_token_u64, sse_data_payload};
+use crate::services::http_utils::sse_data_payload;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{
     ApiKey, AttachmentStorage, MessageAttachment, SessionStore, StoredChatMessage,
 };
 use crate::style;
+
+use super::chat_request_builder::{build_anthropic_request, build_openai_chat_request};
+use super::chat_response_parser::{
+    ChatResponseChunk, ChatTurnResult, extract_anthropic_usage, extract_openai_message,
+    extract_openai_usage, merge_token_usage, normalize_reasoning_content, parse_anthropic_chunk,
+    parse_anthropic_usage_chunk, parse_openai_usage_chunk, parse_sse_chunk,
+};
+
+// Re-export for submodules (chat_tui uses ThinkTagParser, chat_tui_format uses TokenUsage)
+pub(crate) use super::chat_response_parser::ThinkTagParser;
+pub(crate) use super::chat_response_parser::TokenUsage;
 
 #[path = "chat_tui.rs"]
 mod chat_tui;
@@ -53,74 +64,6 @@ pub struct ChatMessage {
     pub attachments: Vec<MessageAttachment>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatChunk {
-    choices: Vec<ChunkChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChunkChoice {
-    delta: ChunkDelta,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChunkDelta {
-    content: Option<String>,
-    reasoning_content: Option<String>,
-    reasoning: Option<String>,
-    thinking: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatResponseChunk {
-    Content(String),
-    Reasoning(String),
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct AssistantResponse {
-    content: String,
-    reasoning_content: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct TokenUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct TokenUsageUpdate {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    cache_read_input_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-}
-
-impl TokenUsageUpdate {
-    fn is_empty(self) -> bool {
-        self.prompt_tokens.is_none()
-            && self.completion_tokens.is_none()
-            && self.cache_read_input_tokens.is_none()
-            && self.cache_creation_input_tokens.is_none()
-    }
-}
-
-impl TokenUsage {
-    fn total_tokens(self) -> u64 {
-        self.prompt_tokens.saturating_add(self.completion_tokens)
-    }
-}
-
-#[derive(Debug, Default)]
-struct ChatTurnResult {
-    content: String,
-    reasoning_content: Option<String>,
-    usage: Option<TokenUsage>,
-}
-
 /// Which API format the provider speaks
 #[derive(Debug, Clone, PartialEq)]
 enum ChatFormat {
@@ -128,21 +71,6 @@ enum ChatFormat {
     OpenAI,
     /// Anthropic native: POST /v1/messages
     Anthropic,
-}
-
-// Anthropic response structs
-
-#[derive(Deserialize)]
-struct AnthropicStreamEvent {
-    #[serde(rename = "type")]
-    event_type: String,
-    delta: Option<AnthropicDelta>,
-}
-
-#[derive(Deserialize)]
-struct AnthropicDelta {
-    text: Option<String>,
-    thinking: Option<String>,
 }
 
 /// ChatCommand provides an interactive REPL for chatting with AI models
@@ -716,7 +644,7 @@ fn guess_attachment_mime_type(path: &Path) -> Result<String> {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "json" => "application/json",
+        "json" => CONTENT_TYPE_JSON,
         "md" => "text/markdown",
         "html" => "text/html",
         "css" => "text/css",
@@ -769,10 +697,6 @@ async fn materialize_attachment(attachment: &MessageAttachment) -> Result<Messag
     }
 }
 
-fn format_text_attachment_content(name: &str, content: &str) -> String {
-    format!("[Attached file: {name}]\n{content}")
-}
-
 fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
     history
         .iter()
@@ -789,317 +713,6 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
 
 fn new_chat_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-fn normalize_reasoning_content(reasoning: String) -> Option<String> {
-    if reasoning.trim().is_empty() {
-        None
-    } else {
-        Some(reasoning)
-    }
-}
-
-fn extract_reasoning_part(part: &serde_json::Value) -> Option<String> {
-    part.get("thinking")
-        .and_then(|v| v.as_str())
-        .or_else(|| part.get("reasoning_content").and_then(|v| v.as_str()))
-        .or_else(|| part.get("reasoning").and_then(|v| v.as_str()))
-        .or_else(|| part.get("text").and_then(|v| v.as_str()))
-        .or_else(|| part.get("content").and_then(|v| v.as_str()))
-        .map(ToString::to_string)
-}
-
-fn extract_openai_message(body: &serde_json::Value) -> AssistantResponse {
-    let message = &body["choices"][0]["message"];
-    let mut content_parts = Vec::new();
-    let mut reasoning_parts = Vec::new();
-
-    if let Some(reasoning) = message.get("reasoning_content").and_then(|v| v.as_str()) {
-        reasoning_parts.push(reasoning.to_string());
-    }
-
-    if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
-        content_parts.push(content.to_string());
-    } else if let Some(parts) = message.get("content").and_then(|v| v.as_array()) {
-        for part in parts {
-            let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if matches!(part_type, "reasoning" | "thinking") {
-                if let Some(reasoning) = extract_reasoning_part(part) {
-                    reasoning_parts.push(reasoning);
-                }
-                continue;
-            }
-
-            if let Some(text) = part
-                .get("text")
-                .and_then(|v| v.as_str())
-                .or_else(|| part.get("content").and_then(|v| v.as_str()))
-            {
-                content_parts.push(text.to_string());
-            }
-        }
-    }
-
-    AssistantResponse {
-        content: content_parts.concat(),
-        reasoning_content: normalize_reasoning_content(reasoning_parts.join("")),
-    }
-}
-
-fn extract_openai_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let update = extract_openai_usage_update(body)?;
-    Some(TokenUsage {
-        prompt_tokens: update.prompt_tokens.unwrap_or(0),
-        completion_tokens: update.completion_tokens.unwrap_or(0),
-        cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
-        cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
-    })
-}
-
-fn extract_anthropic_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let update = extract_anthropic_usage_update(body)?;
-    Some(TokenUsage {
-        prompt_tokens: update.prompt_tokens.unwrap_or(0),
-        completion_tokens: update.completion_tokens.unwrap_or(0),
-        cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
-        cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
-    })
-}
-
-fn extract_openai_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
-    let usage = body.get("usage")?;
-    let update = TokenUsageUpdate {
-        prompt_tokens: usage.get("prompt_tokens").and_then(parse_token_u64),
-        completion_tokens: usage.get("completion_tokens").and_then(parse_token_u64),
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(parse_token_u64)
-            .or_else(|| {
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(parse_token_u64)
-            }),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(parse_token_u64),
-    };
-    if update.is_empty() {
-        None
-    } else {
-        Some(update)
-    }
-}
-
-fn extract_anthropic_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
-    let usage = body.get("usage")?;
-    let raw_input = usage.get("input_tokens").and_then(parse_token_u64);
-    let cache_read = usage
-        .get("cache_read_input_tokens")
-        .and_then(parse_token_u64);
-    let cache_creation = usage
-        .get("cache_creation_input_tokens")
-        .and_then(parse_token_u64);
-    // Normalize: Anthropic's input_tokens excludes cache, so add cache to get total input
-    let prompt_tokens = raw_input.map(|it| {
-        it.saturating_add(cache_read.unwrap_or(0))
-            .saturating_add(cache_creation.unwrap_or(0))
-    });
-    let update = TokenUsageUpdate {
-        prompt_tokens,
-        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
-        cache_read_input_tokens: cache_read,
-        cache_creation_input_tokens: cache_creation,
-    };
-    if update.is_empty() {
-        None
-    } else {
-        Some(update)
-    }
-}
-
-fn parse_openai_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
-    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-    extract_openai_usage_update(&value)
-}
-
-fn parse_anthropic_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
-    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-    extract_anthropic_usage_update(&value)
-}
-
-fn merge_token_usage(usage: &mut Option<TokenUsage>, update: TokenUsageUpdate) {
-    let current = usage.get_or_insert_with(TokenUsage::default);
-    if let Some(tokens) = update.prompt_tokens {
-        current.prompt_tokens = tokens;
-    }
-    if let Some(tokens) = update.completion_tokens {
-        current.completion_tokens = tokens;
-    }
-    if let Some(tokens) = update.cache_read_input_tokens {
-        current.cache_read_input_tokens = tokens;
-    }
-    if let Some(tokens) = update.cache_creation_input_tokens {
-        current.cache_creation_input_tokens = tokens;
-    }
-}
-
-fn build_openai_chat_request(
-    model: &str,
-    messages: &[ChatMessage],
-    stream: bool,
-) -> Result<serde_json::Value> {
-    let mut encoded_messages = Vec::with_capacity(messages.len());
-    for message in messages {
-        encoded_messages.push(build_openai_message(message)?);
-    }
-
-    Ok(serde_json::json!({
-        "model": model,
-        "messages": encoded_messages,
-        "stream": stream,
-    }))
-}
-
-/// Returns the inline data for a materialized attachment, or fails if it is still a FileRef.
-fn require_inline(attachment: &MessageAttachment) -> Result<&str> {
-    match &attachment.storage {
-        AttachmentStorage::Inline { data } => Ok(data),
-        AttachmentStorage::FileRef { path } => anyhow::bail!(
-            "Attachment '{}' is unresolved. Expected inline data before sending.",
-            path
-        ),
-    }
-}
-
-fn build_openai_message(message: &ChatMessage) -> Result<serde_json::Value> {
-    if message.attachments.is_empty() {
-        return Ok(serde_json::json!({
-            "role": message.role,
-            "content": message.content,
-        }));
-    }
-
-    let mut parts = Vec::new();
-    if !message.content.is_empty() {
-        parts.push(serde_json::json!({
-            "type": "text",
-            "text": message.content,
-        }));
-    }
-
-    for attachment in &message.attachments {
-        let data = require_inline(attachment)?;
-        if attachment.mime_type.starts_with("image/") {
-            parts.push(serde_json::json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": format!("data:{};base64,{}", attachment.mime_type, data),
-                },
-            }));
-        } else {
-            parts.push(serde_json::json!({
-                "type": "text",
-                "text": format_text_attachment_content(&attachment.name, data),
-            }));
-        }
-    }
-
-    Ok(serde_json::json!({
-        "role": message.role,
-        "content": parts,
-    }))
-}
-
-fn build_anthropic_request(
-    model: &str,
-    messages: &[ChatMessage],
-    stream: bool,
-) -> Result<serde_json::Value> {
-    let mut system_parts = Vec::new();
-    let mut encoded_messages = Vec::new();
-
-    for message in messages {
-        if message.role == "system" {
-            if !message.content.is_empty() {
-                system_parts.push(message.content.clone());
-            }
-            continue;
-        }
-
-        let role = if message.role == "assistant" {
-            "assistant"
-        } else {
-            "user"
-        };
-        encoded_messages.push(serde_json::json!({
-            "role": role,
-            "content": build_anthropic_content(message)?,
-        }));
-    }
-
-    let mut request = serde_json::json!({
-        "model": model,
-        "messages": encoded_messages,
-        "max_tokens": 8096,
-        "stream": stream,
-    });
-    if !system_parts.is_empty() {
-        request["system"] = serde_json::json!([{
-            "type": "text",
-            "text": system_parts.join("\n\n"),
-            "cache_control": {"type": "ephemeral"}
-        }]);
-    }
-
-    // Add cache_control to the last user message for Anthropic prompt caching
-    for msg in encoded_messages.iter_mut().rev() {
-        if msg["role"] != "user" {
-            continue;
-        }
-        if let Some(content) = msg.get_mut("content") {
-            inject_cache_control_on_last_block(content);
-        }
-        break;
-    }
-
-    request["messages"] = serde_json::json!(encoded_messages);
-    Ok(request)
-}
-
-fn build_anthropic_content(message: &ChatMessage) -> Result<serde_json::Value> {
-    if message.attachments.is_empty() {
-        return Ok(serde_json::Value::String(message.content.clone()));
-    }
-
-    let mut blocks = Vec::new();
-    if !message.content.is_empty() {
-        blocks.push(serde_json::json!({
-            "type": "text",
-            "text": message.content,
-        }));
-    }
-
-    for attachment in &message.attachments {
-        let data = require_inline(attachment)?;
-        if attachment.mime_type.starts_with("image/") {
-            blocks.push(serde_json::json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": attachment.mime_type,
-                    "data": data,
-                },
-            }));
-        } else {
-            blocks.push(serde_json::json!({
-                "type": "text",
-                "text": format_text_attachment_content(&attachment.name, data),
-            }));
-        }
-    }
-
-    Ok(serde_json::Value::Array(blocks))
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
@@ -1181,7 +794,7 @@ where
         client
             .post(&url)
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONTENT_TYPE_JSON)
             .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
@@ -1312,7 +925,7 @@ where
         client
             .post(url)
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONTENT_TYPE_JSON)
             .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
@@ -1370,7 +983,7 @@ where
         client
             .post(&url)
             .header("Authorization", format!("Bearer {}", copilot_token))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONTENT_TYPE_JSON)
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
@@ -1517,7 +1130,7 @@ where
         client
             .post(url)
             .header("Authorization", format!("Bearer {}", copilot_token))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONTENT_TYPE_JSON)
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
@@ -1554,119 +1167,6 @@ where
         reasoning_content: response.reasoning_content,
         usage,
     })
-}
-
-/// Parses a single SSE data chunk and extracts either a content or reasoning delta.
-fn parse_sse_chunk(data: &str) -> Option<ChatResponseChunk> {
-    let chunk: ChatChunk = serde_json::from_str(data).ok()?;
-    let delta = &chunk.choices.first()?.delta;
-    delta
-        .reasoning_content
-        .clone()
-        .or_else(|| delta.reasoning.clone())
-        .or_else(|| delta.thinking.clone())
-        .filter(|text| !text.is_empty())
-        .map(ChatResponseChunk::Reasoning)
-        .or_else(|| {
-            delta
-                .content
-                .clone()
-                .filter(|text| !text.is_empty())
-                .map(ChatResponseChunk::Content)
-        })
-}
-
-/// Extracts `<think>...</think>` blocks that some LLMs embed inline in their content stream,
-/// re-routing them as `Reasoning` chunks. Handles partial tags split across streaming chunks.
-pub(super) struct ThinkTagParser {
-    inside_think: bool,
-    buf: String,
-}
-
-impl ThinkTagParser {
-    fn new() -> Self {
-        Self {
-            inside_think: false,
-            buf: String::new(),
-        }
-    }
-
-    /// Feed a content string; returns re-routed chunks to emit.
-    fn feed(&mut self, text: &str) -> Vec<ChatResponseChunk> {
-        self.buf.push_str(text);
-        let mut out = Vec::new();
-        loop {
-            if self.inside_think {
-                const CLOSE: &str = "</think>";
-                if let Some(pos) = self.buf.find(CLOSE) {
-                    let reasoning = self.buf[..pos].to_string();
-                    if !reasoning.trim().is_empty() {
-                        out.push(ChatResponseChunk::Reasoning(reasoning));
-                    }
-                    self.buf = self.buf[pos + CLOSE.len()..].to_string();
-                    if self.buf.starts_with('\n') {
-                        self.buf = self.buf[1..].to_string();
-                    }
-                    self.inside_think = false;
-                } else {
-                    let keep = longest_suffix_prefix_len(&self.buf, CLOSE);
-                    let emit_end = self.buf.len() - keep;
-                    if emit_end > 0 {
-                        out.push(ChatResponseChunk::Reasoning(
-                            self.buf[..emit_end].to_string(),
-                        ));
-                    }
-                    self.buf = self.buf[emit_end..].to_string();
-                    break;
-                }
-            } else {
-                const OPEN: &str = "<think>";
-                if let Some(pos) = self.buf.find(OPEN) {
-                    if pos > 0 {
-                        out.push(ChatResponseChunk::Content(self.buf[..pos].to_string()));
-                    }
-                    self.buf = self.buf[pos + OPEN.len()..].to_string();
-                    self.inside_think = true;
-                } else {
-                    let keep = longest_suffix_prefix_len(&self.buf, OPEN);
-                    let emit_end = self.buf.len() - keep;
-                    if emit_end > 0 {
-                        out.push(ChatResponseChunk::Content(self.buf[..emit_end].to_string()));
-                    }
-                    self.buf = self.buf[emit_end..].to_string();
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    /// Flush remaining buffered content after the stream ends.
-    fn flush(&mut self) -> Vec<ChatResponseChunk> {
-        if self.buf.is_empty() {
-            return Vec::new();
-        }
-        let text = std::mem::take(&mut self.buf);
-        if self.inside_think {
-            vec![ChatResponseChunk::Reasoning(text)]
-        } else {
-            vec![ChatResponseChunk::Content(text)]
-        }
-    }
-}
-
-/// Returns the length of the longest suffix of `text` that is also a prefix of `tag`.
-/// Used to avoid splitting a potential partial tag across chunk boundaries.
-fn longest_suffix_prefix_len(text: &str, tag: &str) -> usize {
-    let text_bytes = text.as_bytes();
-    let tag_bytes = tag.as_bytes();
-    let max_check = tag_bytes.len().min(text_bytes.len());
-    for len in (1..=max_check).rev() {
-        if text_bytes[text_bytes.len() - len..] == tag_bytes[..len] {
-            return len;
-        }
-    }
-    0
 }
 
 /// Trims chat history to keep at most `max_messages` messages.
@@ -1731,7 +1231,7 @@ where
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
             .header("x-api-key", key.key.as_str())
             .header("anthropic-version", "2023-06-01")
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONTENT_TYPE_JSON)
             .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
@@ -1836,7 +1336,7 @@ where
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
             .header("x-api-key", key.key.as_str())
             .header("anthropic-version", "2023-06-01")
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONTENT_TYPE_JSON)
             .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
@@ -1897,119 +1397,9 @@ where
     })
 }
 
-/// Parses an Anthropic SSE data line and returns either a text or thinking delta.
-fn parse_anthropic_chunk(data: &str) -> Option<ChatResponseChunk> {
-    let event: AnthropicStreamEvent = serde_json::from_str(data).ok()?;
-    if event.event_type == "content_block_delta" {
-        let delta = event.delta?;
-        delta
-            .thinking
-            .filter(|text| !text.is_empty())
-            .map(ChatResponseChunk::Reasoning)
-            .or_else(|| {
-                delta
-                    .text
-                    .filter(|text| !text.is_empty())
-                    .map(ChatResponseChunk::Content)
-            })
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_sse_chunk_with_content() {
-        let data = r#"{"id":"chatcmpl-1","choices":[{"delta":{"content":"Hello"}}]}"#;
-        assert_eq!(
-            parse_sse_chunk(data),
-            Some(ChatResponseChunk::Content("Hello".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_sse_chunk_empty_delta() {
-        let data = r#"{"id":"chatcmpl-1","choices":[{"delta":{}}]}"#;
-        assert_eq!(parse_sse_chunk(data), None);
-    }
-
-    #[test]
-    fn test_parse_sse_chunk_invalid_json() {
-        assert_eq!(parse_sse_chunk("not json"), None);
-    }
-
-    #[test]
-    fn test_parse_sse_chunk_no_choices() {
-        let data = r#"{"id":"chatcmpl-1","choices":[]}"#;
-        assert_eq!(parse_sse_chunk(data), None);
-    }
-
-    #[test]
-    fn test_sse_data_payload_with_optional_space() {
-        assert_eq!(
-            sse_data_payload(r#"data: {"choices":[]}"#),
-            Some(r#"{"choices":[]}"#)
-        );
-        assert_eq!(
-            sse_data_payload(r#"data:{"choices":[]}"#),
-            Some(r#"{"choices":[]}"#)
-        );
-    }
-
-    #[test]
-    fn test_extract_openai_message_string_and_parts() {
-        let text = serde_json::json!({
-            "choices": [{"message": {"content": "hello"}}]
-        });
-        assert_eq!(
-            extract_openai_message(&text),
-            AssistantResponse {
-                content: "hello".to_string(),
-                reasoning_content: None,
-            }
-        );
-
-        let parts = serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": [
-                        {"type":"text", "text":"hello "},
-                        {"type":"text", "text":"world"}
-                    ]
-                }
-            }]
-        });
-        assert_eq!(
-            extract_openai_message(&parts),
-            AssistantResponse {
-                content: "hello world".to_string(),
-                reasoning_content: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_extract_openai_message_reasoning_content() {
-        let body = serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "answer",
-                    "reasoning_content": "step by step"
-                }
-            }]
-        });
-
-        assert_eq!(
-            extract_openai_message(&body),
-            AssistantResponse {
-                content: "answer".to_string(),
-                reasoning_content: Some("step by step".to_string()),
-            }
-        );
-    }
 
     #[test]
     fn test_compose_one_shot_prompt_without_stdin() {
@@ -2062,216 +1452,6 @@ mod tests {
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"content\":\"hello\""));
         assert!(!json.contains("reasoning_content"));
-    }
-
-    #[test]
-    fn test_build_openai_chat_request_encodes_file_and_image_attachments() {
-        let request = build_openai_chat_request(
-            "gpt-4o",
-            &[ChatMessage {
-                role: "user".to_string(),
-                content: "Review these".to_string(),
-                reasoning_content: None,
-                attachments: vec![
-                    MessageAttachment {
-                        name: "notes.md".to_string(),
-                        mime_type: "text/markdown".to_string(),
-                        storage: AttachmentStorage::Inline {
-                            data: "# hello".to_string(),
-                        },
-                    },
-                    MessageAttachment {
-                        name: "diagram.png".to_string(),
-                        mime_type: "image/png".to_string(),
-                        storage: AttachmentStorage::Inline {
-                            data: "YWJj".to_string(),
-                        },
-                    },
-                ],
-            }],
-            true,
-        )
-        .unwrap();
-
-        let parts = request["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(parts[0]["type"], "text");
-        assert!(parts[1]["text"].as_str().unwrap().contains("notes.md"));
-        assert_eq!(parts[2]["type"], "image_url");
-        assert_eq!(parts[2]["image_url"]["url"], "data:image/png;base64,YWJj");
-    }
-
-    #[test]
-    fn test_build_anthropic_request_encodes_image_attachment() {
-        let request = build_anthropic_request(
-            "claude-sonnet-4-5",
-            &[ChatMessage {
-                role: "user".to_string(),
-                content: String::new(),
-                reasoning_content: None,
-                attachments: vec![MessageAttachment {
-                    name: "diagram.png".to_string(),
-                    mime_type: "image/png".to_string(),
-                    storage: AttachmentStorage::Inline {
-                        data: "YWJj".to_string(),
-                    },
-                }],
-            }],
-            false,
-        )
-        .unwrap();
-
-        let blocks = request["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(blocks[0]["type"], "image");
-        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
-        assert_eq!(blocks[0]["source"]["data"], "YWJj");
-    }
-
-    #[test]
-    fn test_parse_anthropic_chunk_with_text() {
-        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
-        assert_eq!(
-            parse_anthropic_chunk(data),
-            Some(ChatResponseChunk::Content("Hello".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_anthropic_chunk_with_thinking() {
-        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Need to inspect files."}}"#;
-        assert_eq!(
-            parse_anthropic_chunk(data),
-            Some(ChatResponseChunk::Reasoning(
-                "Need to inspect files.".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn test_parse_anthropic_chunk_non_delta_event() {
-        let data = r#"{"type":"message_start","message":{"id":"msg_1"}}"#;
-        assert_eq!(parse_anthropic_chunk(data), None);
-    }
-
-    #[test]
-    fn test_parse_anthropic_chunk_ping() {
-        let data = r#"{"type":"ping"}"#;
-        assert_eq!(parse_anthropic_chunk(data), None);
-    }
-
-    #[test]
-    fn test_parse_anthropic_chunk_invalid_json() {
-        assert_eq!(parse_anthropic_chunk("not json"), None);
-    }
-
-    #[test]
-    fn test_merge_openai_stream_usage_across_chunks() {
-        let mut usage = None;
-        merge_token_usage(
-            &mut usage,
-            parse_openai_usage_chunk(r#"{"usage":{"prompt_tokens":24}}"#).unwrap(),
-        );
-        merge_token_usage(
-            &mut usage,
-            parse_openai_usage_chunk(r#"{"usage":{"completion_tokens":11}}"#).unwrap(),
-        );
-
-        assert_eq!(
-            usage,
-            Some(TokenUsage {
-                prompt_tokens: 24,
-                completion_tokens: 11,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn test_merge_anthropic_stream_usage_across_events() {
-        let mut usage = None;
-        merge_token_usage(
-            &mut usage,
-            parse_anthropic_usage_chunk(r#"{"usage":{"input_tokens":12}}"#).unwrap(),
-        );
-        merge_token_usage(
-            &mut usage,
-            parse_anthropic_usage_chunk(r#"{"usage":{"output_tokens":7}}"#).unwrap(),
-        );
-
-        assert_eq!(
-            usage,
-            Some(TokenUsage {
-                prompt_tokens: 12,
-                completion_tokens: 7,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn test_extract_openai_usage_accepts_numeric_strings() {
-        let body = serde_json::json!({
-            "usage": {
-                "prompt_tokens": "10",
-                "completion_tokens": "5"
-            }
-        });
-
-        assert_eq!(
-            extract_openai_usage(&body),
-            Some(TokenUsage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn test_extract_anthropic_usage_accepts_numeric_strings() {
-        let body = serde_json::json!({
-            "usage": {
-                "input_tokens": "8",
-                "output_tokens": "3",
-                "cache_read_input_tokens": "90",
-                "cache_creation_input_tokens": "15"
-            }
-        });
-
-        assert_eq!(
-            extract_anthropic_usage(&body),
-            Some(TokenUsage {
-                prompt_tokens: 113,
-                completion_tokens: 3,
-                cache_read_input_tokens: 90,
-                cache_creation_input_tokens: 15,
-            })
-        );
-    }
-
-    #[test]
-    fn test_extract_openai_usage_reads_cached_tokens_details() {
-        let body = serde_json::json!({
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "prompt_tokens_details": {
-                    "cached_tokens": 90
-                }
-            }
-        });
-
-        assert_eq!(
-            extract_openai_usage(&body),
-            Some(TokenUsage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                cache_read_input_tokens: 90,
-                cache_creation_input_tokens: 0,
-            })
-        );
     }
 
     #[test]

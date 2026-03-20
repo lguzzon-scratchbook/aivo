@@ -1,0 +1,273 @@
+use aivo::cli::{Cli, Commands};
+use clap::Parser;
+
+/// Simulates the alias rewriting done in main.rs
+fn rewrite_alias(args: &[&str]) -> Vec<String> {
+    let aliases = ["claude", "codex", "gemini", "opencode", "pi"];
+    let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
+        let mut rewritten = vec![raw[0].clone(), "run".to_string()];
+        rewritten.extend_from_slice(&raw[1..]);
+        rewritten
+    } else if raw.len() > 1 && raw[1] == "use" {
+        let mut rewritten = vec![raw[0].clone(), "keys".to_string(), "use".to_string()];
+        rewritten.extend_from_slice(&raw[2..]);
+        rewritten
+    } else {
+        raw
+    }
+}
+
+#[test]
+fn no_command_yields_none() {
+    let cli = Cli::try_parse_from(["aivo"]).unwrap();
+    assert!(cli.command.is_none());
+}
+
+#[test]
+fn version_flag() {
+    let cli = Cli::try_parse_from(["aivo", "--version"]).unwrap();
+    assert!(cli.version);
+}
+
+#[test]
+fn help_flag() {
+    let cli = Cli::try_parse_from(["aivo", "--help"]).unwrap();
+    assert!(cli.help);
+}
+
+#[test]
+fn run_with_tool() {
+    let cli = Cli::try_parse_from(["aivo", "run", "claude"]).unwrap();
+    if let Some(Commands::Run(args)) = cli.command {
+        assert_eq!(args.tool, Some("claude".to_string()));
+        assert!(!args.debug);
+        assert!(!args.dry_run);
+    } else {
+        panic!("Expected Run command");
+    }
+}
+
+#[test]
+fn run_without_tool() {
+    let cli = Cli::try_parse_from(["aivo", "run"]).unwrap();
+    if let Some(Commands::Run(args)) = cli.command {
+        assert!(args.tool.is_none());
+    } else {
+        panic!("Expected Run command");
+    }
+}
+
+#[test]
+fn tool_alias_claude() {
+    let args = rewrite_alias(&["aivo", "claude"]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    assert!(
+        matches!(cli.command, Some(Commands::Run(ref a)) if a.tool == Some("claude".to_string()))
+    );
+}
+
+#[test]
+fn tool_alias_codex_with_model() {
+    let args = rewrite_alias(&["aivo", "codex", "--model", "o4-mini"]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    if let Some(Commands::Run(run_args)) = cli.command {
+        assert_eq!(run_args.tool, Some("codex".to_string()));
+        assert_eq!(run_args.model, Some("o4-mini".to_string()));
+    } else {
+        panic!("Expected Run command");
+    }
+}
+
+#[test]
+fn tool_alias_gemini() {
+    let args = rewrite_alias(&["aivo", "gemini", "--debug"]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    if let Some(Commands::Run(run_args)) = cli.command {
+        assert_eq!(run_args.tool, Some("gemini".to_string()));
+        assert!(run_args.debug);
+    } else {
+        panic!("Expected Run command");
+    }
+}
+
+#[test]
+fn tool_alias_pi() {
+    let args = rewrite_alias(&["aivo", "pi"]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    assert!(matches!(cli.command, Some(Commands::Run(ref a)) if a.tool == Some("pi".to_string())));
+}
+
+#[test]
+fn tool_alias_opencode() {
+    let args = rewrite_alias(&["aivo", "opencode"]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    assert!(
+        matches!(cli.command, Some(Commands::Run(ref a)) if a.tool == Some("opencode".to_string()))
+    );
+}
+
+#[test]
+fn use_alias_rewrites_to_keys_use() {
+    let args = rewrite_alias(&["aivo", "use", "my-key"]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    if let Some(Commands::Keys(keys_args)) = cli.command {
+        assert_eq!(keys_args.action.as_deref(), Some("use"));
+        assert_eq!(keys_args.args, vec!["my-key"]);
+    } else {
+        panic!("Expected Keys command");
+    }
+}
+
+#[test]
+fn keys_add_with_all_flags() {
+    let cli = Cli::try_parse_from([
+        "aivo",
+        "keys",
+        "add",
+        "--name",
+        "test-provider",
+        "--base-url",
+        "https://example.com/v1",
+        "--key",
+        "sk-test-123",
+    ])
+    .unwrap();
+    if let Some(Commands::Keys(args)) = cli.command {
+        assert_eq!(args.action.as_deref(), Some("add"));
+        assert_eq!(args.name.as_deref(), Some("test-provider"));
+        assert_eq!(args.base_url.as_deref(), Some("https://example.com/v1"));
+        assert_eq!(args.key.as_deref(), Some("sk-test-123"));
+    } else {
+        panic!("Expected Keys command");
+    }
+}
+
+#[test]
+fn chat_execute_short_flag() {
+    let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello world"]).unwrap();
+    if let Some(Commands::Chat(args)) = cli.command {
+        assert_eq!(args.execute, Some("hello world".to_string()));
+    } else {
+        panic!("Expected Chat command");
+    }
+}
+
+#[test]
+fn chat_model_key_and_execute() {
+    let cli =
+        Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-x", "hi"]).unwrap();
+    if let Some(Commands::Chat(args)) = cli.command {
+        assert_eq!(args.key, Some("my-key".to_string()));
+        assert_eq!(args.model, Some("gpt-4o".to_string()));
+        assert_eq!(args.execute, Some("hi".to_string()));
+    } else {
+        panic!("Expected Chat command");
+    }
+}
+
+#[test]
+fn chat_empty_model_triggers_picker() {
+    let cli = Cli::try_parse_from(["aivo", "chat", "--model"]).unwrap();
+    if let Some(Commands::Chat(args)) = cli.command {
+        assert_eq!(args.model, Some(String::new()));
+    } else {
+        panic!("Expected Chat command");
+    }
+}
+
+#[test]
+fn serve_default_port() {
+    let cli = Cli::try_parse_from(["aivo", "serve"]).unwrap();
+    if let Some(Commands::Serve(args)) = cli.command {
+        assert_eq!(args.port, 24860);
+    } else {
+        panic!("Expected Serve command");
+    }
+}
+
+#[test]
+fn serve_custom_port() {
+    let cli = Cli::try_parse_from(["aivo", "serve", "-p", "8080"]).unwrap();
+    if let Some(Commands::Serve(args)) = cli.command {
+        assert_eq!(args.port, 8080);
+    } else {
+        panic!("Expected Serve command");
+    }
+}
+
+#[test]
+fn models_search_flag() {
+    let cli = Cli::try_parse_from(["aivo", "models", "-s", "sonnet"]).unwrap();
+    if let Some(Commands::Models(args)) = cli.command {
+        assert_eq!(args.search.as_deref(), Some("sonnet"));
+        assert!(!args.refresh);
+    } else {
+        panic!("Expected Models command");
+    }
+}
+
+#[test]
+fn models_refresh_flag() {
+    let cli = Cli::try_parse_from(["aivo", "models", "-r"]).unwrap();
+    if let Some(Commands::Models(args)) = cli.command {
+        assert!(args.refresh);
+    } else {
+        panic!("Expected Models command");
+    }
+}
+
+#[test]
+fn ping_positional_key() {
+    let cli = Cli::try_parse_from(["aivo", "ping", "my-key"]).unwrap();
+    if let Some(Commands::Ping(args)) = cli.command {
+        assert_eq!(args.key(), Some("my-key"));
+        assert!(!args.all);
+    } else {
+        panic!("Expected Ping command");
+    }
+}
+
+#[test]
+fn ping_named_key_flag() {
+    let cli = Cli::try_parse_from(["aivo", "ping", "-k", "my-key"]).unwrap();
+    if let Some(Commands::Ping(args)) = cli.command {
+        assert_eq!(args.key(), Some("my-key"));
+    } else {
+        panic!("Expected Ping command");
+    }
+}
+
+#[test]
+fn ping_all_flag() {
+    let cli = Cli::try_parse_from(["aivo", "ping", "--all"]).unwrap();
+    if let Some(Commands::Ping(args)) = cli.command {
+        assert!(args.all);
+    } else {
+        panic!("Expected Ping command");
+    }
+}
+
+#[test]
+fn ls_command() {
+    let cli = Cli::try_parse_from(["aivo", "ls"]).unwrap();
+    assert!(matches!(cli.command, Some(Commands::Ls)));
+}
+
+#[test]
+fn run_passthrough_args_after_separator() {
+    let cli = Cli::try_parse_from(["aivo", "run", "claude", "--", "--some-flag", "value"]).unwrap();
+    if let Some(Commands::Run(args)) = cli.command {
+        assert!(args.args.contains(&"--some-flag".to_string()));
+        assert!(args.args.contains(&"value".to_string()));
+    } else {
+        panic!("Expected Run command");
+    }
+}
+
+#[test]
+fn non_alias_not_rewritten() {
+    let args = rewrite_alias(&["aivo", "keys"]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    assert!(matches!(cli.command, Some(Commands::Keys(_))));
+}

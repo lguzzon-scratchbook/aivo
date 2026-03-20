@@ -1,0 +1,322 @@
+use anyhow::{Context, Result};
+use rand::Rng;
+use std::collections::HashSet;
+use zeroize::Zeroizing;
+
+use crate::errors::{CLIError, ErrorCategory};
+use crate::services::session_crypto::{decrypt, encrypt, is_encrypted};
+use crate::services::session_store::{
+    ApiKey, ClaudeProviderProtocol, ConfigContext, GeminiProviderProtocol, OpenAICompatibilityMode,
+    StoredConfig,
+};
+
+pub(crate) const KEY_ID_LENGTH: usize = 3;
+pub(crate) const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
+
+#[derive(Debug, Clone)]
+pub(crate) struct ApiKeyStore {
+    pub(crate) ctx: ConfigContext,
+}
+
+fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
+    config.chat_models.remove(key_id);
+    config
+        .directory_starts
+        .retain(|_, record| record.key_id != key_id);
+    // chat_sessions are now stored in individual files; file cleanup is handled
+    // asynchronously by remove_sessions_for_key().
+    config
+        .chat_sessions
+        .retain(|_, session| session.key_id != key_id);
+}
+
+pub(crate) fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..1000 {
+        let id: String = (0..KEY_ID_LENGTH)
+            .map(|_| {
+                let idx = rng.gen_range(0..KEY_ID_ALPHABET.len());
+                KEY_ID_ALPHABET[idx] as char
+            })
+            .collect();
+
+        if !existing_ids.contains(&id) {
+            return Ok(id);
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to generate unique key ID after 1000 attempts. Consider removing unused keys."
+    );
+}
+
+impl ApiKeyStore {
+    pub(crate) async fn add_key_with_protocol(
+        &self,
+        name: &str,
+        base_url: &str,
+        claude_protocol: Option<ClaudeProviderProtocol>,
+        key: &str,
+    ) -> Result<String> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+
+        let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
+        let id = generate_key_id(&existing_ids)?;
+
+        let mut new_key = ApiKey::new_with_protocol(
+            id.clone(),
+            name.to_string(),
+            base_url.to_string(),
+            claude_protocol,
+            key.to_string(),
+        );
+        // Pre-encrypt the new key so save_raw can write it as-is
+        new_key.key = Zeroizing::new(encrypt(&new_key.key)?);
+        config.api_keys.push(new_key);
+
+        // Save directly — existing keys are already encrypted in the raw config
+        self.ctx.save_raw(&config).await?;
+        Ok(id)
+    }
+
+    /// Gets all API keys without decrypting secrets.
+    pub(crate) async fn get_keys(&self) -> Result<Vec<ApiKey>> {
+        Ok(self.ctx.load().await?.api_keys)
+    }
+
+    /// Decrypts a single key's secret in place.
+    pub(crate) fn decrypt_key_secret(key: &mut ApiKey) -> Result<()> {
+        if is_encrypted(&key.key) {
+            let plaintext = decrypt(&key.key)
+                .with_context(|| format!("failed to decrypt key '{}'", key.display_name()))?;
+            key.key = Zeroizing::new(plaintext);
+        }
+        Ok(())
+    }
+
+    /// Gets a specific API key by ID with its secret decrypted.
+    pub(crate) async fn get_key_by_id(&self, id: &str) -> Result<Option<ApiKey>> {
+        let keys = self.get_keys().await?;
+        if let Some(mut key) = keys.into_iter().find(|k| k.id == id) {
+            Self::decrypt_key_secret(&mut key)?;
+            Ok(Some(key))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Deletes a key from config.json. Returns true if found and deleted.
+    /// Caller is responsible for session file cleanup.
+    pub(crate) async fn delete_key(&self, id: &str) -> Result<bool> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        let initial_len = config.api_keys.len();
+        config.api_keys.retain(|k| k.id != id);
+
+        if config.api_keys.len() < initial_len {
+            if config.active_key_id.as_deref() == Some(id) {
+                config.active_key_id = None;
+            }
+            remove_runtime_state_for_key(&mut config, id);
+            self.ctx.save_raw(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Updates a key. Returns (found, base_url_changed).
+    /// Caller is responsible for session file cleanup when base_url changes.
+    pub(crate) async fn update_key(
+        &self,
+        id: &str,
+        name: &str,
+        base_url: &str,
+        claude_protocol: Option<ClaudeProviderProtocol>,
+        key: &str,
+    ) -> Result<(bool, bool)> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            let base_url_changed = entry.base_url != base_url;
+            entry.name = name.to_string();
+            entry.base_url = base_url.to_string();
+            entry.claude_protocol = claude_protocol;
+            entry.key = Zeroizing::new(encrypt(key)?);
+            if base_url_changed {
+                remove_runtime_state_for_key(&mut config, id);
+            }
+            self.ctx.save_raw(&config).await?;
+            Ok((true, base_url_changed))
+        } else {
+            Ok((false, false))
+        }
+    }
+
+    async fn update_key_field(&self, id: &str, f: impl FnOnce(&mut ApiKey)) -> Result<bool> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
+            f(entry);
+            self.ctx.save_raw(&config).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub(crate) async fn set_key_claude_protocol(
+        &self,
+        id: &str,
+        claude_protocol: Option<ClaudeProviderProtocol>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.claude_protocol = claude_protocol)
+            .await
+    }
+
+    pub(crate) async fn set_key_gemini_protocol(
+        &self,
+        id: &str,
+        gemini_protocol: Option<GeminiProviderProtocol>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.gemini_protocol = gemini_protocol)
+            .await
+    }
+
+    pub(crate) async fn set_key_responses_api_supported(
+        &self,
+        id: &str,
+        responses_api_supported: Option<bool>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| {
+            entry.responses_api_supported = responses_api_supported
+        })
+        .await
+    }
+
+    pub(crate) async fn set_key_codex_mode(
+        &self,
+        id: &str,
+        codex_mode: Option<OpenAICompatibilityMode>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.codex_mode = codex_mode)
+            .await
+    }
+
+    pub(crate) async fn set_key_opencode_mode(
+        &self,
+        id: &str,
+        opencode_mode: Option<OpenAICompatibilityMode>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.opencode_mode = opencode_mode)
+            .await
+    }
+
+    pub(crate) async fn set_active_key(&self, id: &str) -> Result<()> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+
+        if !config.api_keys.iter().any(|k| k.id == id) {
+            return Err(CLIError::new(
+                format!("Key {} not found", id),
+                ErrorCategory::User,
+                None::<String>,
+                Some("Run 'aivo keys' to see available keys"),
+            )
+            .into());
+        }
+
+        config.active_key_id = Some(id.to_string());
+        self.ctx.save_raw(&config).await
+    }
+
+    pub(crate) async fn resolve_key_by_id_or_name(&self, id_or_name: &str) -> Result<ApiKey> {
+        let keys = self.get_keys().await?;
+
+        // Try exact ID match first, then short (first-3) ID match
+        if let Some(mut key) = keys
+            .iter()
+            .find(|k| k.id == id_or_name || k.short_id() == id_or_name)
+            .cloned()
+        {
+            Self::decrypt_key_secret(&mut key)?;
+            return Ok(key);
+        }
+
+        // Try name match
+        let name_matches: Vec<_> = keys.iter().filter(|k| k.name == id_or_name).collect();
+
+        match name_matches.len() {
+            0 => Err(CLIError::new(
+                format!("API key \"{}\" not found", id_or_name),
+                ErrorCategory::User,
+                None::<String>,
+                Some("Run 'aivo keys' to see available keys"),
+            )
+            .into()),
+            1 => {
+                let mut key = name_matches[0].clone();
+                Self::decrypt_key_secret(&mut key)?;
+                Ok(key)
+            }
+            _ => Err(CLIError::new(
+                format!(
+                    "Multiple keys found with name \"{}\". Use the key ID instead.",
+                    id_or_name
+                ),
+                ErrorCategory::User,
+                None::<String>,
+                Some("Run 'aivo keys' to see key IDs"),
+            )
+            .into()),
+        }
+    }
+
+    pub(crate) async fn get_active_key(&self) -> Result<Option<ApiKey>> {
+        let config = self.ctx.load().await?;
+
+        match config.active_key_id {
+            Some(ref id) => {
+                if let Some(mut key) = config.api_keys.into_iter().find(|k| k.id == *id) {
+                    Self::decrypt_key_secret(&mut key)?;
+                    Ok(Some(key))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_keys_and_active_id_info(
+        &self,
+    ) -> Result<(Vec<ApiKey>, Option<String>)> {
+        let config = self.ctx.load().await?;
+        Ok((config.api_keys, config.active_key_id))
+    }
+
+    pub(crate) async fn get_active_key_info(&self) -> Result<Option<ApiKey>> {
+        let config = self.ctx.load().await?;
+
+        match config.active_key_id {
+            Some(ref id) => Ok(config.api_keys.into_iter().find(|k| k.id == *id)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_chat_model(&self, key_id: &str) -> Result<Option<String>> {
+        let config = self.ctx.load().await?;
+        Ok(config.chat_models.get(key_id).cloned())
+    }
+
+    pub(crate) async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        config
+            .chat_models
+            .insert(key_id.to_string(), model.to_string());
+        self.ctx.save_raw(&config).await
+    }
+}

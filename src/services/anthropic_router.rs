@@ -9,6 +9,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
 use crate::services::http_utils::{self, router_http_client};
 
@@ -94,7 +95,7 @@ async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterSta
                     None => {
                         let not_found = http_utils::http_response(
                             404,
-                            "application/json",
+                            CONTENT_TYPE_JSON,
                             "{\"error\":\"Not found\"}",
                         );
                         let _ = socket.write_all(not_found.as_bytes()).await;
@@ -103,7 +104,7 @@ async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterSta
                 }
             } else {
                 let not_found =
-                    http_utils::http_response(404, "application/json", "{\"error\":\"Not found\"}");
+                    http_utils::http_response(404, CONTENT_TYPE_JSON, "{\"error\":\"Not found\"}");
                 let _ = socket.write_all(not_found.as_bytes()).await;
                 return;
             };
@@ -233,7 +234,7 @@ async fn forward_request(
     let mut headers = passthrough_headers;
     let auth_value = format!("Bearer {}", config.upstream_api_key);
     headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
     pipeline.patch_headers(route.patch_route(), &mut headers, &ctx)?;
 
     let response = client

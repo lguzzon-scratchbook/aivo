@@ -8,6 +8,7 @@ use clap::Parser;
 
 mod cli;
 mod commands;
+mod constants;
 mod errors;
 mod key_resolution;
 mod services;

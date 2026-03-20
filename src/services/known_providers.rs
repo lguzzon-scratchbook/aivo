@@ -12,19 +12,58 @@ pub struct KnownProvider {
 /// All known providers, ordered so that more specific names come first
 /// (e.g. "openrouter" before "openai") to avoid substring false-positives.
 static KNOWN_PROVIDERS: &[KnownProvider] = &[
-    KnownProvider { name: "openrouter", base_url: "https://openrouter.ai/api/v1" },
-    KnownProvider { name: "vercel", base_url: "https://ai-gateway.vercel.sh/v1" },
-    KnownProvider { name: "fireworks", base_url: "https://api.fireworks.ai/inference/v1" },
-    KnownProvider { name: "minimax", base_url: "https://api.minimax.io/anthropic" },
-    KnownProvider { name: "deepseek", base_url: "https://api.deepseek.com/v1" },
-    KnownProvider { name: "moonshot", base_url: "https://api.moonshot.ai/v1" },
-    KnownProvider { name: "anthropic", base_url: "https://api.anthropic.com" },
-    KnownProvider { name: "openai", base_url: "https://api.openai.com" },
-    KnownProvider { name: "qwen", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
-    KnownProvider { name: "zai", base_url: "https://api.z.ai/v1" },
-    KnownProvider { name: "groq", base_url: "https://api.groq.com/openai/v1" },
-    KnownProvider { name: "xai", base_url: "https://api.x.ai/v1" },
-    KnownProvider { name: "mistral", base_url: "https://api.mistral.ai/v1" },
+    KnownProvider {
+        name: "openrouter",
+        base_url: "https://openrouter.ai/api/v1",
+    },
+    KnownProvider {
+        name: "vercel",
+        base_url: "https://ai-gateway.vercel.sh/v1",
+    },
+    KnownProvider {
+        name: "fireworks",
+        base_url: "https://api.fireworks.ai/inference/v1",
+    },
+    KnownProvider {
+        name: "minimax",
+        base_url: "https://api.minimax.io/anthropic",
+    },
+    KnownProvider {
+        name: "deepseek",
+        base_url: "https://api.deepseek.com/v1",
+    },
+    KnownProvider {
+        name: "moonshot",
+        base_url: "https://api.moonshot.ai/v1",
+    },
+    KnownProvider {
+        name: "anthropic",
+        base_url: "https://api.anthropic.com",
+    },
+    KnownProvider {
+        name: "openai",
+        base_url: "https://api.openai.com",
+    },
+    KnownProvider {
+        name: "qwen",
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    },
+    KnownProvider {
+        name: "zai",
+        base_url: "https://api.z.ai/v1",
+    },
+    KnownProvider {
+        name: "groq",
+        base_url: "https://api.groq.com/openai/v1",
+    },
+    KnownProvider {
+        name: "xai",
+        base_url: "https://api.x.ai/v1",
+    },
+    KnownProvider {
+        name: "mistral",
+        base_url: "https://api.mistral.ai/v1",
+    },
 ];
 
 /// Find a provider whose name appears as a substring in the input

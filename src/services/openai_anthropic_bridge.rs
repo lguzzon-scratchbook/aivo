@@ -528,4 +528,89 @@ mod tests {
             "ephemeral"
         );
     }
+
+    #[test]
+    fn test_convert_openai_chat_empty_messages_array() {
+        let body = json!({"model": "gpt-4o", "messages": []});
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        assert!(converted["messages"].as_array().unwrap().is_empty());
+        assert_eq!(converted["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_missing_model_uses_default() {
+        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "fallback-model",
+            },
+        );
+        assert_eq!(converted["model"], "fallback-model");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_null_content_no_panic() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": null},
+                {"role": "assistant", "content": null}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        assert_eq!(converted["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_convert_openai_chat_missing_messages_field() {
+        let body = json!({"model": "gpt-4o"});
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        assert!(converted["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_convert_anthropic_response_empty_content() {
+        let resp = json!({"id": "msg_1", "model": "test", "content": [], "usage": {}});
+        let converted = convert_anthropic_to_openai_chat_response(&resp, "fallback");
+        assert!(converted["choices"][0]["message"]["content"].is_null());
+        assert!(converted["choices"][0]["message"]["tool_calls"].is_null());
+    }
+
+    #[test]
+    fn test_convert_anthropic_response_missing_usage() {
+        let resp = json!({"content": [{"type": "text", "text": "hi"}]});
+        let converted = convert_anthropic_to_openai_chat_response(&resp, "fallback");
+        assert_eq!(converted["usage"]["prompt_tokens"], 0);
+        assert_eq!(converted["usage"]["completion_tokens"], 0);
+    }
+
+    #[test]
+    fn test_convert_anthropic_response_unknown_stop_reason() {
+        let resp =
+            json!({"content": [{"type": "text", "text": "hi"}], "stop_reason": "weird_reason"});
+        let converted = convert_anthropic_to_openai_chat_response(&resp, "fallback");
+        assert_eq!(converted["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn test_extract_openai_text_unexpected_type() {
+        assert_eq!(extract_openai_text(Some(&json!(42))), "42");
+        assert_eq!(extract_openai_text(Some(&json!(true))), "true");
+    }
 }

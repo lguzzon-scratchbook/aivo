@@ -6,16 +6,35 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
+use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::model_names::{anthropic_native_model_name, google_native_model_name};
 use crate::services::ollama::ollama_openai_base_url;
 use crate::services::provider_profile::{
-    ProviderKind, is_direct_openai_base, provider_profile_for_key,
+    ProviderKind, ProviderProfile, is_direct_openai_base, provider_profile_for_key,
 };
 use crate::services::provider_protocol::{ProviderProtocol, is_anthropic_endpoint};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
 };
+
+/// Describes which env vars a tool uses for base URL, auth, and router configuration.
+struct ToolEnvConfig {
+    base_url_env: &'static str,
+    auth_env: &'static str,
+    router_flag: &'static str,
+    router_prefix: &'static str,
+    copilot_flag: &'static str,
+}
+
+/// How the tool should connect to the upstream provider.
+enum ConnectionMode {
+    Ollama,
+    Copilot,
+    OpenRouter,
+    Direct { base_url: String },
+    Routed { protocol: ProviderProtocol },
+}
 
 /// EnvironmentInjector prepares tool-specific environment variables for AI tools
 #[derive(Debug, Clone, Default)]
@@ -78,98 +97,113 @@ impl EnvironmentInjector {
         Self
     }
 
-    /// Prepares environment variables for Claude CLI
-    ///
-    /// Sets ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY from the key.
-    /// Disables nonessential traffic.
-    /// When model is provided, sets ANTHROPIC_MODEL and related env vars for Claude Code routing.
-    /// For OpenRouter, uses AnthropicRouter if available, otherwise applies model name transformation.
-    pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+    /// Injects connection env vars following the common Ollama/Copilot/OpenRouter/Direct/Routed pattern.
+    fn inject_connection(
+        cfg: &ToolEnvConfig,
+        key: &ApiKey,
+        mode: &ConnectionMode,
+        profile: &ProviderProfile,
+    ) -> HashMap<String, String> {
         let mut env = HashMap::new();
-        let profile = provider_profile_for_key(key);
+        match mode {
+            ConnectionMode::Ollama => {
+                env.insert(
+                    cfg.base_url_env.to_string(),
+                    PLACEHOLDER_LOOPBACK_URL.to_string(),
+                );
+                env.insert(cfg.auth_env.to_string(), "ollama".to_string());
+                env.insert(cfg.router_flag.to_string(), "1".to_string());
+                env.insert(
+                    format!("{}_API_KEY", cfg.router_prefix),
+                    "ollama".to_string(),
+                );
+                env.insert(
+                    format!("{}_BASE_URL", cfg.router_prefix),
+                    ollama_openai_base_url(),
+                );
+                env.insert(
+                    format!("{}_UPSTREAM_PROTOCOL", cfg.router_prefix),
+                    "openai".to_string(),
+                );
+            }
+            ConnectionMode::Copilot => {
+                env.insert(
+                    cfg.base_url_env.to_string(),
+                    PLACEHOLDER_LOOPBACK_URL.to_string(),
+                );
+                env.insert(cfg.auth_env.to_string(), "copilot".to_string());
+                env.insert(cfg.copilot_flag.to_string(), "1".to_string());
+                env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+            }
+            ConnectionMode::OpenRouter => {
+                env.insert(
+                    cfg.base_url_env.to_string(),
+                    PLACEHOLDER_LOOPBACK_URL.to_string(),
+                );
+                env.insert(cfg.auth_env.to_string(), key.key.to_string());
+                env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
+                env.insert("AIVO_ROUTER_API_KEY".to_string(), key.key.to_string());
+                env.insert("AIVO_ROUTER_BASE_URL".to_string(), key.base_url.to_string());
+            }
+            ConnectionMode::Direct { base_url } => {
+                env.insert(cfg.base_url_env.to_string(), base_url.clone());
+                env.insert(cfg.auth_env.to_string(), key.key.to_string());
+            }
+            ConnectionMode::Routed { protocol } => {
+                env.insert(
+                    cfg.base_url_env.to_string(),
+                    PLACEHOLDER_LOOPBACK_URL.to_string(),
+                );
+                env.insert(cfg.auth_env.to_string(), key.key.to_string());
+                env.insert(cfg.router_flag.to_string(), "1".to_string());
+                env.insert(
+                    format!("{}_API_KEY", cfg.router_prefix),
+                    key.key.to_string(),
+                );
+                env.insert(
+                    format!("{}_BASE_URL", cfg.router_prefix),
+                    key.base_url.to_string(),
+                );
+                env.insert(
+                    format!("{}_UPSTREAM_PROTOCOL", cfg.router_prefix),
+                    protocol.as_str().to_string(),
+                );
+                profile.quirks.inject(&mut env, cfg.router_prefix);
+            }
+        }
+        env
+    }
 
-        // Ollama: route through Anthropic-to-OpenAI router (Claude speaks Anthropic, Ollama speaks OpenAI)
-        if profile.kind == ProviderKind::Ollama {
-            env.insert(
-                "ANTHROPIC_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "ollama".to_string());
-            env.insert(
-                "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER".to_string(),
-                "1".to_string(),
-            );
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY".to_string(),
-                "ollama".to_string(),
-            );
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL".to_string(),
-                ollama_openai_base_url(),
-            );
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                "openai".to_string(),
-            );
-        // For GitHub Copilot, use the built-in CopilotRouter (Anthropic → OpenAI conversion + token management)
+    /// Prepares environment variables for Claude CLI
+    pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        let profile = provider_profile_for_key(key);
+        let mode = if profile.kind == ProviderKind::Ollama {
+            ConnectionMode::Ollama
         } else if profile.serve_flags.is_copilot {
-            // Placeholder URL - AI launcher overwrites with the actual random port after binding
-            env.insert(
-                "ANTHROPIC_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "copilot".to_string());
-            env.insert("AIVO_USE_COPILOT_ROUTER".to_string(), "1".to_string());
-            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
-        // For OpenRouter, use the built-in router (needs model name transformation + API proxying)
+            ConnectionMode::Copilot
         } else if profile.serve_flags.is_openrouter {
-            // Placeholder URL - AI launcher overwrites with the actual random port after binding
-            env.insert(
-                "ANTHROPIC_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            // Router will handle the OpenRouter API key transformation
-            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
-            // Signal to start the router
-            env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
-            env.insert("AIVO_ROUTER_API_KEY".to_string(), key.key.to_string());
-            env.insert("AIVO_ROUTER_BASE_URL".to_string(), key.base_url.to_string());
+            ConnectionMode::OpenRouter
         } else if Self::use_direct_anthropic_for_claude(key) {
-            // Direct connection — native Anthropic API (api.anthropic.com).
-            // Claude Code appends /v1/messages itself, so strip any trailing /v1 to avoid doubling.
             let base_url = key.base_url.trim_end_matches('/');
             let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
-            env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.to_string());
-            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
+            ConnectionMode::Direct {
+                base_url: base_url.to_string(),
+            }
         } else {
-            // Route Anthropic-format clients through the compatibility router for
-            // OpenAI-compatible and Google-native upstreams.
-            // Placeholder URL - AI launcher overwrites with the actual random port after binding.
-            env.insert(
-                "ANTHROPIC_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.key.to_string());
-            env.insert(
-                "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER".to_string(),
-                "1".to_string(),
-            );
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY".to_string(),
-                key.key.to_string(),
-            );
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL".to_string(),
-                key.base_url.to_string(),
-            );
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                Self::routed_protocol_for_claude(key).as_str().to_string(),
-            );
-            profile
-                .quirks
-                .inject(&mut env, "AIVO_ANTHROPIC_TO_OPENAI_ROUTER");
-        }
+            ConnectionMode::Routed {
+                protocol: Self::routed_protocol_for_claude(key),
+            }
+        };
+
+        let cfg = ToolEnvConfig {
+            base_url_env: "ANTHROPIC_BASE_URL",
+            auth_env: "ANTHROPIC_AUTH_TOKEN",
+            router_flag: "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER",
+            router_prefix: "AIVO_ANTHROPIC_TO_OPENAI_ROUTER",
+            copilot_flag: "AIVO_USE_COPILOT_ROUTER",
+        };
+
+        let mut env = Self::inject_connection(&cfg, key, &mode, &profile);
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
         env.insert(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
@@ -177,10 +211,9 @@ impl EnvironmentInjector {
         );
 
         if let Some(model) = model {
-            let anthropic_model = if Self::use_direct_anthropic_for_claude(key) {
+            let anthropic_model = if matches!(mode, ConnectionMode::Direct { .. }) {
                 anthropic_native_model_name(model)
             } else {
-                // Routers handle provider-specific model-name transformation internally.
                 model.to_string()
             };
             env.insert("ANTHROPIC_MODEL".to_string(), anthropic_model.clone());
@@ -207,94 +240,43 @@ impl EnvironmentInjector {
     }
 
     /// Prepares environment variables for Codex CLI
-    ///
-    /// For non-OpenAI providers, activates the responses-to-chat router to strip unsupported
-    /// built-in tool types (computer_use, file_search, etc.) before forwarding.
-    /// For official OpenAI (api.openai.com), connects directly.
     pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
-        let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
-
-        if profile.kind == ProviderKind::Ollama {
-            // Ollama: route through responses-to-chat router (Codex uses Responses API, Ollama speaks Chat Completions)
-            env.insert(
-                "OPENAI_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("OPENAI_API_KEY".to_string(), "ollama".to_string());
-            env.insert(
-                "AIVO_USE_RESPONSES_TO_CHAT_ROUTER".to_string(),
-                "1".to_string(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
-                "ollama".to_string(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
-                ollama_openai_base_url(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                "openai".to_string(),
-            );
+        let mode = if profile.kind == ProviderKind::Ollama {
+            ConnectionMode::Ollama
         } else if profile.serve_flags.is_copilot {
-            // GitHub Copilot: use the responses-to-chat router with CopilotTokenManager for auth
-            // Placeholder URL — AI launcher overwrites with actual random port after binding
-            env.insert(
-                "OPENAI_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("OPENAI_API_KEY".to_string(), "copilot".to_string());
-            env.insert(
-                "AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER".to_string(),
-                "1".to_string(),
-            );
-            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+            ConnectionMode::Copilot
         } else if !Self::use_direct_openai_for_codex(key) {
-            // Non-OpenAI provider: use the responses-to-chat router to strip unsupported tool types
-            // Placeholder URL - AI launcher overwrites with the actual random port after binding
-            env.insert(
-                "OPENAI_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("OPENAI_API_KEY".to_string(), key.key.to_string());
-            env.insert(
-                "AIVO_USE_RESPONSES_TO_CHAT_ROUTER".to_string(),
-                "1".to_string(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
-                key.key.to_string(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
-                key.base_url.clone(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                profile.default_protocol.as_str().to_string(),
-            );
-            if let Some(supported) = key.responses_api_supported {
-                env.insert(
-                    "AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API".to_string(),
-                    if supported { "1" } else { "0" }.to_string(),
-                );
+            ConnectionMode::Routed {
+                protocol: profile.default_protocol,
             }
-            profile
-                .quirks
-                .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
         } else {
-            // Official OpenAI: direct connection, no proxy needed
-            env.insert("OPENAI_BASE_URL".to_string(), key.base_url.clone());
-            env.insert("OPENAI_API_KEY".to_string(), key.key.to_string());
+            ConnectionMode::Direct {
+                base_url: key.base_url.clone(),
+            }
+        };
+
+        let cfg = ToolEnvConfig {
+            base_url_env: "OPENAI_BASE_URL",
+            auth_env: "OPENAI_API_KEY",
+            router_flag: "AIVO_USE_RESPONSES_TO_CHAT_ROUTER",
+            router_prefix: "AIVO_RESPONSES_TO_CHAT_ROUTER",
+            copilot_flag: "AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER",
+        };
+
+        let mut env = Self::inject_connection(&cfg, key, &mode, &profile);
+
+        // Codex-specific: responses_api_supported flag (routed mode only)
+        if matches!(mode, ConnectionMode::Routed { .. })
+            && let Some(supported) = key.responses_api_supported
+        {
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API".to_string(),
+                if supported { "1" } else { "0" }.to_string(),
+            );
         }
 
         if let Some(model) = model {
-            // When using a router, pass the original model name so the catalog entry matches.
-            // The router translates it to the actual provider model via
-            // AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL.
-            // For direct OpenAI connections, map to a known OpenAI model so Codex CLI finds metadata.
             let using_router = env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER")
                 || env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER");
             let codex_model = if using_router {
@@ -305,7 +287,6 @@ impl EnvironmentInjector {
             env.insert("CODEX_MODEL".to_string(), codex_model.clone());
             env.insert("OPENAI_DEFAULT_MODEL".to_string(), codex_model.clone());
             env.insert("CODEX_MODEL_DEFAULT".to_string(), codex_model.clone());
-            // Store the original model for the router to use with the provider
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL".to_string(),
                 model.to_string(),
@@ -316,82 +297,44 @@ impl EnvironmentInjector {
     }
 
     /// Prepares environment variables for Gemini CLI
-    ///
-    /// Sets GOOGLE_GEMINI_BASE_URL and GEMINI_API_KEY from the key.
-    /// For non-Google endpoints, activates GeminiRouter to convert native Gemini
-    /// API format to OpenAI chat completions format.
-    /// When model is provided, sets GEMINI_MODEL.
     pub fn for_gemini(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
-        let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
-
-        if profile.kind == ProviderKind::Ollama {
-            // Ollama: route through GeminiRouter (Gemini speaks Google format, Ollama speaks OpenAI)
-            env.insert(
-                "GOOGLE_GEMINI_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("GEMINI_API_KEY".to_string(), "ollama".to_string());
-            env.insert("AIVO_USE_GEMINI_ROUTER".to_string(), "1".to_string());
-            env.insert(
-                "AIVO_GEMINI_ROUTER_API_KEY".to_string(),
-                "ollama".to_string(),
-            );
-            env.insert(
-                "AIVO_GEMINI_ROUTER_BASE_URL".to_string(),
-                ollama_openai_base_url(),
-            );
-            env.insert(
-                "AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                "openai".to_string(),
-            );
+        let mode = if profile.kind == ProviderKind::Ollama {
+            ConnectionMode::Ollama
         } else if profile.serve_flags.is_copilot {
-            env.insert(
-                "GOOGLE_GEMINI_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
-            );
-            env.insert("GEMINI_API_KEY".to_string(), "copilot".to_string());
-            env.insert(
-                "AIVO_USE_GEMINI_COPILOT_ROUTER".to_string(),
-                "1".to_string(),
-            );
-            env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
-            if let Some(m) = model {
-                env.insert(
-                    "AIVO_GEMINI_COPILOT_FORCED_MODEL".to_string(),
-                    m.to_string(),
-                );
-            }
+            ConnectionMode::Copilot
         } else if Self::use_google_native_for_gemini(key) {
-            // Native Google endpoint: connect directly
-            env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), key.base_url.clone());
-            env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());
+            ConnectionMode::Direct {
+                base_url: key.base_url.clone(),
+            }
         } else {
-            // Non-Google provider: use GeminiRouter to convert Gemini API → OpenAI format
-            // Placeholder URL — AI launcher overwrites with actual random port after binding
+            ConnectionMode::Routed {
+                protocol: Self::routed_protocol_for_gemini(key),
+            }
+        };
+
+        let cfg = ToolEnvConfig {
+            base_url_env: "GOOGLE_GEMINI_BASE_URL",
+            auth_env: "GEMINI_API_KEY",
+            router_flag: "AIVO_USE_GEMINI_ROUTER",
+            router_prefix: "AIVO_GEMINI_ROUTER",
+            copilot_flag: "AIVO_USE_GEMINI_COPILOT_ROUTER",
+        };
+
+        let mut env = Self::inject_connection(&cfg, key, &mode, &profile);
+
+        // Gemini-specific: copilot forced model
+        if matches!(mode, ConnectionMode::Copilot)
+            && let Some(m) = model
+        {
             env.insert(
-                "GOOGLE_GEMINI_BASE_URL".to_string(),
-                "http://127.0.0.1:0".to_string(),
+                "AIVO_GEMINI_COPILOT_FORCED_MODEL".to_string(),
+                m.to_string(),
             );
-            env.insert("GEMINI_API_KEY".to_string(), key.key.to_string());
-            env.insert("AIVO_USE_GEMINI_ROUTER".to_string(), "1".to_string());
-            env.insert(
-                "AIVO_GEMINI_ROUTER_API_KEY".to_string(),
-                key.key.to_string(),
-            );
-            env.insert(
-                "AIVO_GEMINI_ROUTER_BASE_URL".to_string(),
-                key.base_url.clone(),
-            );
-            env.insert(
-                "AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
-                Self::routed_protocol_for_gemini(key).as_str().to_string(),
-            );
-            profile.quirks.inject(&mut env, "AIVO_GEMINI_ROUTER");
         }
 
         if let Some(model) = model {
-            let gemini_model = if Self::use_google_native_for_gemini(key) {
+            let gemini_model = if matches!(mode, ConnectionMode::Direct { .. }) {
                 google_native_model_name(model).to_string()
             } else {
                 model.to_string()
@@ -426,7 +369,7 @@ impl EnvironmentInjector {
                 "1".to_string(),
             );
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
-            ("http://127.0.0.1:0".to_string(), "copilot".to_string())
+            (PLACEHOLDER_LOOPBACK_URL.to_string(), "copilot".to_string())
         } else if Self::use_router_for_opencode(key) {
             env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
             env.insert(
@@ -450,7 +393,7 @@ impl EnvironmentInjector {
             profile
                 .quirks
                 .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
-            ("http://127.0.0.1:0".to_string(), key.key.to_string())
+            (PLACEHOLDER_LOOPBACK_URL.to_string(), key.key.to_string())
         } else {
             (key.base_url.clone(), key.key.to_string())
         };
@@ -541,8 +484,12 @@ impl EnvironmentInjector {
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         } else if profile.serve_flags.is_copilot {
             // Copilot needs CopilotTokenManager — route through ResponsesToChatRouter
-            let models_json =
-                build_pi_models_json("http://127.0.0.1:0", "copilot", "openai-completions", model);
+            let models_json = build_pi_models_json(
+                PLACEHOLDER_LOOPBACK_URL,
+                "copilot",
+                "openai-completions",
+                model,
+            );
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_COPILOT_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
@@ -814,7 +761,7 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
         assert_eq!(
@@ -873,7 +820,7 @@ mod tests {
         // Base URL is a placeholder; AI launcher overwrites with actual port after binding
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
     }
 
@@ -943,7 +890,7 @@ mod tests {
         // Placeholder; AI launcher overwrites with the actual random port after binding
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         // Model name passes through unchanged - router transforms it
         assert_eq!(
@@ -989,7 +936,7 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(
             env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL"),
@@ -1029,7 +976,7 @@ mod tests {
         // Placeholder; AI launcher overwrites with actual port after binding
         assert_eq!(
             env.get("OPENAI_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(
             env.get("OPENAI_API_KEY"),
@@ -1145,7 +1092,7 @@ mod tests {
         // Non-Google URL: placeholder is used, router env vars are set
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(
             env.get("GEMINI_API_KEY"),
@@ -1238,7 +1185,7 @@ mod tests {
         // Placeholder — launcher overwrites with actual port
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
     }
 
@@ -1267,7 +1214,7 @@ mod tests {
         );
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(env.get("GEMINI_API_KEY"), Some(&"copilot".to_string()));
         assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
@@ -1412,7 +1359,7 @@ mod tests {
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
         assert_eq!(
             config["provider"]["aivo"]["options"]["baseURL"],
-            "http://127.0.0.1:0"
+            PLACEHOLDER_LOOPBACK_URL
         );
         assert_eq!(config["provider"]["aivo"]["options"]["apiKey"], "copilot");
     }
@@ -1434,7 +1381,7 @@ mod tests {
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
         assert_eq!(
             config["provider"]["aivo"]["options"]["baseURL"],
-            "http://127.0.0.1:0"
+            PLACEHOLDER_LOOPBACK_URL
         );
         assert_eq!(
             config["provider"]["aivo"]["options"]["apiKey"],
@@ -1468,7 +1415,7 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(
             env.get("ANTHROPIC_AUTH_TOKEN"),
@@ -1495,7 +1442,7 @@ mod tests {
         );
         assert_eq!(
             env.get("OPENAI_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(env.get("OPENAI_API_KEY"), Some(&"copilot".to_string()));
         assert_eq!(
@@ -1546,7 +1493,7 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&"ollama".to_string()));
         assert_eq!(
@@ -1576,7 +1523,7 @@ mod tests {
         );
         assert_eq!(
             env.get("OPENAI_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(env.get("OPENAI_API_KEY"), Some(&"ollama".to_string()));
         assert!(
@@ -1597,7 +1544,7 @@ mod tests {
         assert_eq!(env.get("AIVO_USE_GEMINI_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
-            Some(&"http://127.0.0.1:0".to_string())
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
         assert_eq!(env.get("GEMINI_API_KEY"), Some(&"ollama".to_string()));
         assert!(

@@ -1,19 +1,19 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
-/**
- * SessionStore service for managing credential persistence.
- * Stores credentials in ~/.config/aivo/config.json with AES-256-GCM encryption.
- */
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-use crate::errors::{CLIError, ErrorCategory};
+#[allow(unused_imports)]
 pub use crate::services::session_crypto::{decrypt, encrypt, is_encrypted};
 use crate::services::system_env;
+
+use crate::services::api_key_store::ApiKeyStore;
+use crate::services::chat_session_store::ChatSessionStore;
+use crate::services::directory_starts::DirectoryStartsStore;
+use crate::services::usage_stats_store::UsageStatsStore;
 
 /// Serde module for serializing/deserializing Zeroizing<String> as regular String
 mod zeroizing_string {
@@ -36,8 +36,7 @@ mod zeroizing_string {
     }
 }
 
-const KEY_ID_LENGTH: usize = 3;
-const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
+// ── Public types ──────────────────────────────────────────────────────────────
 
 /// API key stored on user's machine
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,7 +249,7 @@ impl UsageStats {
         self == &Self::default()
     }
 
-    fn record_selection(&mut self, key_id: &str, tool: &str, model: Option<&str>) {
+    pub(crate) fn record_selection(&mut self, key_id: &str, tool: &str, model: Option<&str>) {
         self.total_selections = self.total_selections.saturating_add(1);
         let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
         key_stats.selections = key_stats.selections.saturating_add(1);
@@ -263,7 +262,7 @@ impl UsageStats {
         }
     }
 
-    fn record_tokens(
+    pub(crate) fn record_tokens(
         &mut self,
         key_id: &str,
         model: Option<&str>,
@@ -427,18 +426,6 @@ fn default_chat_session_id() -> String {
     "legacy".to_string()
 }
 
-fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
-    config.chat_models.remove(key_id);
-    config
-        .directory_starts
-        .retain(|_, record| record.key_id != key_id);
-    // chat_sessions are now stored in individual files; file cleanup is handled
-    // asynchronously by remove_sessions_for_key().
-    config
-        .chat_sessions
-        .retain(|_, session| session.key_id != key_id);
-}
-
 /// Stored configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredConfig {
@@ -489,25 +476,15 @@ impl StoredConfig {
     }
 }
 
-/// SessionStore manages API key persistence in ~/.config/aivo/config.json
-#[derive(Debug, Clone)]
-pub struct SessionStore {
-    config_path: PathBuf,
-    config_dir: PathBuf,
-}
+// ── Shared infrastructure ─────────────────────────────────────────────────────
 
-#[cfg(unix)]
-struct ConfigLockGuard {
-    _file: std::fs::File,
-}
-
-#[cfg(windows)]
-struct ConfigLockGuard {
+#[cfg(any(unix, windows))]
+pub(crate) struct ConfigLockGuard {
     _file: std::fs::File,
 }
 
 #[cfg(not(any(unix, windows)))]
-struct ConfigLockGuard;
+pub(crate) struct ConfigLockGuard;
 
 #[cfg(unix)]
 impl Drop for ConfigLockGuard {
@@ -535,51 +512,15 @@ impl Drop for ConfigLockGuard {
     }
 }
 
-impl SessionStore {
-    pub fn new() -> Self {
-        let config_dir = system_env::home_dir()
-            .map(|p| p.join(".config").join("aivo"))
-            .unwrap_or_else(|| PathBuf::from(".config/aivo"));
-        let config_path = config_dir.join("config.json");
-
-        Self {
-            config_path,
-            config_dir,
-        }
-    }
-
-    /// Creates a new SessionStore with a custom config path (for testing)
-    #[allow(dead_code)]
-    pub fn with_path(config_path: PathBuf) -> Self {
-        let config_dir = config_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
-        Self {
-            config_path,
-            config_dir,
-        }
-    }
-
-    fn lock_path(&self) -> PathBuf {
-        self.config_dir.join("config.lock")
-    }
-
-    fn acquire_config_lock(&self) -> Result<ConfigLockGuard> {
-        if !self.config_dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(&self.config_dir).with_context(|| {
-                format!("Failed to create config directory: {:?}", self.config_dir)
-            })?;
-        }
-
-        let lock_path = self.lock_path();
+impl ConfigLockGuard {
+    pub(crate) fn acquire(lock_path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("Failed to open config lock file: {:?}", lock_path))?;
+            .open(lock_path)
+            .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
 
         #[cfg(unix)]
         {
@@ -594,9 +535,8 @@ impl SessionStore {
 
                 let err = std::io::Error::last_os_error();
                 if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(err).with_context(|| {
-                        format!("Failed to acquire config lock: {:?}", lock_path)
-                    });
+                    return Err(err)
+                        .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
                 }
             }
 
@@ -631,396 +571,34 @@ impl SessionStore {
             };
             if rc == 0 {
                 return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("Failed to acquire config lock: {:?}", lock_path));
+                    .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
             }
             Ok(ConfigLockGuard { _file: file })
         }
     }
+}
 
-    // ── Session file helpers ───────────────────────────────────────────────
+/// Shared configuration I/O context used by all sub-stores.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigContext {
+    pub(crate) config_path: PathBuf,
+    pub(crate) config_dir: PathBuf,
+}
 
-    fn sessions_dir(&self) -> PathBuf {
-        self.config_dir.join("sessions")
-    }
-
-    pub fn session_file_path(&self, session_id: &str) -> PathBuf {
-        self.sessions_dir().join(format!("{session_id}.json"))
-    }
-
-    fn index_path(&self) -> PathBuf {
-        self.sessions_dir().join("index.json")
-    }
-
-    fn session_lock_path(&self) -> PathBuf {
-        self.sessions_dir().join("sessions.lock")
-    }
-
-    fn acquire_session_lock(&self) -> Result<ConfigLockGuard> {
-        let sessions_dir = self.sessions_dir();
-        std::fs::create_dir_all(&sessions_dir)
-            .with_context(|| format!("Failed to create sessions directory: {:?}", sessions_dir))?;
-
-        let lock_path = self.session_lock_path();
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("Failed to open session lock file: {:?}", lock_path))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-
-            loop {
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-                if rc == 0 {
-                    break;
-                }
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(err).with_context(|| {
-                        format!("Failed to acquire session lock: {:?}", lock_path)
-                    });
-                }
-            }
-            Ok(ConfigLockGuard { _file: file })
+impl ConfigContext {
+    pub(crate) fn acquire_config_lock(&self) -> Result<ConfigLockGuard> {
+        if !self.config_dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(&self.config_dir).with_context(|| {
+                format!("Failed to create config directory: {:?}", self.config_dir)
+            })?;
         }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = file;
-            Ok(ConfigLockGuard)
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Foundation::BOOL;
-            use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
-            use windows_sys::Win32::System::IO::OVERLAPPED;
-
-            let handle = file.as_raw_handle();
-            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-            let rc: BOOL = unsafe {
-                LockFileEx(
-                    handle,
-                    LOCKFILE_EXCLUSIVE_LOCK,
-                    0,
-                    u32::MAX,
-                    u32::MAX,
-                    &mut overlapped,
-                )
-            };
-            if rc == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("Failed to acquire session lock: {:?}", lock_path));
-            }
-            Ok(ConfigLockGuard { _file: file })
-        }
+        ConfigLockGuard::acquire(&self.config_dir.join("config.lock"))
     }
-
-    async fn load_index(&self) -> Result<SessionIndex> {
-        let path = self.index_path();
-        match tokio::fs::read_to_string(&path).await {
-            Ok(data) => serde_json::from_str(&data).context("Failed to parse session index"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SessionIndex::default()),
-            Err(e) => Err(e).with_context(|| format!("Failed to read session index: {:?}", path)),
-        }
-    }
-
-    async fn save_index(&self, index: &SessionIndex) -> Result<()> {
-        let sessions_dir = self.sessions_dir();
-        tokio::fs::create_dir_all(&sessions_dir)
-            .await
-            .with_context(|| format!("Failed to create sessions directory: {:?}", sessions_dir))?;
-
-        let data =
-            serde_json::to_string_pretty(index).context("Failed to serialize session index")?;
-        let path = self.index_path();
-        let tmp_path = path.with_extension("json.tmp");
-
-        tokio::fs::write(&tmp_path, &data)
-            .await
-            .with_context(|| format!("Failed to write temp index file: {:?}", tmp_path))?;
-
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .with_context(|| format!("Failed to rename temp index to {:?}", path))?;
-
-        Ok(())
-    }
-
-    async fn load_session_file(&self, session_id: &str) -> Result<ChatSessionState> {
-        let path = self.session_file_path(session_id);
-        let data = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to read session file: {:?}", path))?;
-        serde_json::from_str(&data).context("Failed to parse session file")
-    }
-
-    async fn save_session_file(&self, state: &ChatSessionState) -> Result<()> {
-        let sessions_dir = self.sessions_dir();
-        tokio::fs::create_dir_all(&sessions_dir)
-            .await
-            .with_context(|| format!("Failed to create sessions directory: {:?}", sessions_dir))?;
-
-        let data = serde_json::to_string_pretty(state).context("Failed to serialize session")?;
-        let path = self.session_file_path(&state.session_id);
-        let tmp_path = path.with_extension("json.tmp");
-
-        tokio::fs::write(&tmp_path, &data)
-            .await
-            .with_context(|| format!("Failed to write temp session file: {:?}", tmp_path))?;
-
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .with_context(|| format!("Failed to rename temp session to {:?}", path))?;
-
-        Ok(())
-    }
-
-    // ── Session title/preview helpers ─────────────────────────────────────
-
-    fn compute_session_title(messages: &[StoredChatMessage], model: &str) -> String {
-        let last_user = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user" && !m.content.trim().is_empty())
-            .map(|m| Self::first_non_empty_line(&m.content));
-        let fallback = messages
-            .iter()
-            .rev()
-            .find(|m| !m.content.trim().is_empty())
-            .map(|m| Self::first_non_empty_line(&m.content));
-        last_user
-            .or(fallback)
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| model.to_string())
-    }
-
-    fn compute_session_preview(messages: &[StoredChatMessage], model: &str) -> String {
-        let snippets: Vec<String> = messages
-            .iter()
-            .rev()
-            .filter(|m| !m.content.trim().is_empty())
-            .take(2)
-            .map(|m| m.content.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
-        let joined = snippets
-            .into_iter()
-            .rev()
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
-        if !joined.is_empty() {
-            joined
-        } else {
-            model.to_string()
-        }
-    }
-
-    fn first_non_empty_line(text: &str) -> String {
-        text.lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("")
-            .to_string()
-    }
-
-    // ── Migration ─────────────────────────────────────────────────────────
-
-    /// Migrates legacy sessions from config.json to individual session files.
-    /// Idempotent — skips if sessions/.migrated marker exists.
-    async fn migrate_sessions_if_needed(&self) -> Result<()> {
-        let marker = self.sessions_dir().join(".migrated");
-        if marker.exists() {
-            return Ok(());
-        }
-
-        // Load config and check for legacy sessions
-        let config = self.load().await?;
-        if config.chat_sessions.is_empty() {
-            // Write marker even if nothing to migrate
-            let sessions_dir = self.sessions_dir();
-            tokio::fs::create_dir_all(&sessions_dir).await?;
-            tokio::fs::write(&marker, b"").await?;
-            return Ok(());
-        }
-
-        let sessions_dir = self.sessions_dir();
-        tokio::fs::create_dir_all(&sessions_dir).await?;
-
-        let mut index = self.load_index().await.unwrap_or_default();
-
-        for session in config.chat_sessions.values() {
-            let file_path = self.session_file_path(&session.session_id);
-            // Skip if already migrated
-            if file_path.exists() {
-                continue;
-            }
-
-            // Compute title/preview by decrypting
-            let (title, preview) = if let Ok(messages) = session.decrypt_messages() {
-                (
-                    Self::compute_session_title(&messages, &session.model),
-                    Self::compute_session_preview(&messages, &session.model),
-                )
-            } else {
-                (session.model.clone(), String::new())
-            };
-
-            self.save_session_file(session).await?;
-
-            // Update or insert index entry
-            let pos = index
-                .entries
-                .iter()
-                .position(|e| e.session_id == session.session_id);
-            let entry = SessionIndexEntry {
-                session_id: session.session_id.clone(),
-                key_id: session.key_id.clone(),
-                base_url: session.base_url.clone(),
-                cwd: session.cwd.clone(),
-                model: session.model.clone(),
-                updated_at: session.updated_at.clone(),
-                created_at: session.created_at.clone(),
-                title,
-                preview,
-            };
-            if let Some(i) = pos {
-                index.entries[i] = entry;
-            } else {
-                index.entries.push(entry);
-            }
-        }
-
-        self.save_index(&index).await?;
-        tokio::fs::write(&marker, b"").await?;
-        Ok(())
-    }
-
-    // ── Eviction ──────────────────────────────────────────────────────────
-
-    /// Evicts old sessions, keeping at most MAX_SESSIONS_PER_SCOPE per key+cwd
-    /// and at most MAX_TOTAL_SESSIONS globally.
-    async fn evict_old_sessions(&self, index: &mut SessionIndex) -> Result<()> {
-        const MAX_SESSIONS_PER_SCOPE: usize = 20;
-        const MAX_TOTAL_SESSIONS: usize = 100;
-
-        let mut to_delete: Vec<String> = Vec::new();
-
-        // Group by (key_id, cwd) and mark per-scope excess
-        let mut scope_map: std::collections::HashMap<(String, String), Vec<usize>> =
-            std::collections::HashMap::new();
-        for (i, entry) in index.entries.iter().enumerate() {
-            scope_map
-                .entry((entry.key_id.clone(), entry.cwd.clone()))
-                .or_default()
-                .push(i);
-        }
-        let mut keep = vec![true; index.entries.len()];
-        for indices in scope_map.values() {
-            // Sort by updated_at desc (most recent first) and mark excess
-            let mut sorted = indices.clone();
-            sorted.sort_by(|&a, &b| {
-                index.entries[b]
-                    .updated_at
-                    .cmp(&index.entries[a].updated_at)
-            });
-            for &idx in sorted.iter().skip(MAX_SESSIONS_PER_SCOPE) {
-                keep[idx] = false;
-                to_delete.push(index.entries[idx].session_id.clone());
-            }
-        }
-
-        // Global cap: if still over limit, drop oldest across all scopes
-        let remaining: Vec<usize> = keep
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &k)| if k { Some(i) } else { None })
-            .collect();
-        if remaining.len() > MAX_TOTAL_SESSIONS {
-            let mut sorted = remaining.clone();
-            sorted.sort_by(|&a, &b| {
-                index.entries[b]
-                    .updated_at
-                    .cmp(&index.entries[a].updated_at)
-            });
-            for &idx in sorted.iter().skip(MAX_TOTAL_SESSIONS) {
-                keep[idx] = false;
-                to_delete.push(index.entries[idx].session_id.clone());
-            }
-        }
-
-        // Delete session files
-        for session_id in &to_delete {
-            let path = self.session_file_path(session_id);
-            let _ = tokio::fs::remove_file(&path).await;
-        }
-
-        // Prune index
-        if !to_delete.is_empty() {
-            index.entries.retain(|e| !to_delete.contains(&e.session_id));
-        }
-
-        Ok(())
-    }
-
-    // ── Rebuild index safety net ──────────────────────────────────────────
-
-    /// Rebuilds the session index by scanning all session files.
-    /// Called as fallback when the index is corrupted or missing and sessions exist.
-    async fn rebuild_index(&self) -> Result<SessionIndex> {
-        let sessions_dir = self.sessions_dir();
-        let mut read_dir = match tokio::fs::read_dir(&sessions_dir).await {
-            Ok(rd) => rd,
-            Err(_) => return Ok(SessionIndex::default()),
-        };
-
-        let mut entries = Vec::new();
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            let path = entry.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.ends_with(".json") || name == "index.json" {
-                continue;
-            }
-            let session_id = name.trim_end_matches(".json");
-            if let Ok(state) = self.load_session_file(session_id).await {
-                let (title, preview) = if let Ok(messages) = state.decrypt_messages() {
-                    (
-                        Self::compute_session_title(&messages, &state.model),
-                        Self::compute_session_preview(&messages, &state.model),
-                    )
-                } else {
-                    (state.model.clone(), String::new())
-                };
-
-                entries.push(SessionIndexEntry {
-                    session_id: state.session_id.clone(),
-                    key_id: state.key_id.clone(),
-                    base_url: state.base_url.clone(),
-                    cwd: state.cwd.clone(),
-                    model: state.model.clone(),
-                    updated_at: state.updated_at.clone(),
-                    created_at: state.created_at.clone(),
-                    title,
-                    preview,
-                });
-            }
-        }
-
-        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(SessionIndex { entries })
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
 
     /// Saves config to the config file.
     /// Keys must already be encrypted before calling this.
     /// Uses atomic write (write to temp file then rename) to prevent corruption.
-    async fn save_raw(&self, config: &StoredConfig) -> Result<()> {
+    pub(crate) async fn save_raw(&self, config: &StoredConfig) -> Result<()> {
         tokio::fs::create_dir_all(&self.config_dir)
             .await
             .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
@@ -1056,7 +634,7 @@ impl SessionStore {
 
     /// Loads config from the config file. Keys remain encrypted;
     /// use `decrypt_key_secret` on individual keys that need plaintext access.
-    pub async fn load(&self) -> Result<StoredConfig> {
+    pub(crate) async fn load(&self) -> Result<StoredConfig> {
         let data = match tokio::fs::read_to_string(&self.config_path).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1072,6 +650,70 @@ impl SessionStore {
             )),
         }
     }
+}
+
+// ── SessionStore facade ───────────────────────────────────────────────────────
+
+/// SessionStore manages API key persistence in ~/.config/aivo/config.json
+#[derive(Debug, Clone)]
+pub struct SessionStore {
+    ctx: ConfigContext,
+    api_keys: ApiKeyStore,
+    sessions: ChatSessionStore,
+    stats: UsageStatsStore,
+    dirs: DirectoryStartsStore,
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        let config_dir = system_env::home_dir()
+            .map(|p| p.join(".config").join("aivo"))
+            .unwrap_or_else(|| PathBuf::from(".config/aivo"));
+        let config_path = config_dir.join("config.json");
+        Self::from_ctx(ConfigContext {
+            config_path,
+            config_dir,
+        })
+    }
+
+    /// Creates a new SessionStore with a custom config path (for testing)
+    #[allow(dead_code)]
+    pub fn with_path(config_path: PathBuf) -> Self {
+        let config_dir = config_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        Self::from_ctx(ConfigContext {
+            config_path,
+            config_dir,
+        })
+    }
+
+    fn from_ctx(ctx: ConfigContext) -> Self {
+        Self {
+            api_keys: ApiKeyStore { ctx: ctx.clone() },
+            sessions: ChatSessionStore { ctx: ctx.clone() },
+            stats: UsageStatsStore { ctx: ctx.clone() },
+            dirs: DirectoryStartsStore { ctx: ctx.clone() },
+            ctx,
+        }
+    }
+
+    // ── Config I/O ────────────────────────────────────────────────────────
+
+    /// Loads config from the config file. Keys remain encrypted.
+    #[allow(dead_code)]
+    pub async fn load(&self) -> Result<StoredConfig> {
+        self.ctx.load().await
+    }
+
+    /// Gets the config path
+    #[allow(dead_code)]
+    pub fn get_config_path(&self) -> &PathBuf {
+        &self.ctx.config_path
+    }
+
+    // ── API Key management (delegated to ApiKeyStore) ─────────────────────
 
     /// Adds a new API key with an optional explicit Claude protocol.
     pub async fn add_key_with_protocol(
@@ -1081,75 +723,33 @@ impl SessionStore {
         claude_protocol: Option<ClaudeProviderProtocol>,
         key: &str,
     ) -> Result<String> {
-        let _lock = self.acquire_config_lock()?;
-        // Load raw config without decrypting existing keys — we only need to
-        // append a new key so there is no reason to touch existing secrets.
-        let mut config = self.load().await?;
-
-        let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
-        let id = generate_key_id(&existing_ids)?;
-
-        let mut new_key = ApiKey::new_with_protocol(
-            id.clone(),
-            name.to_string(),
-            base_url.to_string(),
-            claude_protocol,
-            key.to_string(),
-        );
-        // Pre-encrypt the new key so save_unlocked can write it as-is
-        new_key.key = Zeroizing::new(encrypt(&new_key.key)?);
-        config.api_keys.push(new_key);
-
-        // Save directly — existing keys are already encrypted in the raw config
-        self.save_raw(&config).await?;
-        Ok(id)
+        self.api_keys
+            .add_key_with_protocol(name, base_url, claude_protocol, key)
+            .await
     }
 
     /// Gets all API keys without decrypting secrets.
-    /// Callers that need the plaintext secret should call `decrypt_key_secret` on individual keys.
     pub async fn get_keys(&self) -> Result<Vec<ApiKey>> {
-        Ok(self.load().await?.api_keys)
+        self.api_keys.get_keys().await
     }
 
     /// Decrypts a single key's secret in place.
     pub fn decrypt_key_secret(key: &mut ApiKey) -> Result<()> {
-        if is_encrypted(&key.key) {
-            let plaintext = decrypt(&key.key)
-                .with_context(|| format!("failed to decrypt key '{}'", key.display_name()))?;
-            key.key = Zeroizing::new(plaintext);
-        }
-        Ok(())
+        ApiKeyStore::decrypt_key_secret(key)
     }
 
     /// Gets a specific API key by ID with its secret decrypted.
     pub async fn get_key_by_id(&self, id: &str) -> Result<Option<ApiKey>> {
-        let keys = self.get_keys().await?;
-        if let Some(mut key) = keys.into_iter().find(|k| k.id == id) {
-            Self::decrypt_key_secret(&mut key)?;
-            Ok(Some(key))
-        } else {
-            Ok(None)
-        }
+        self.api_keys.get_key_by_id(id).await
     }
 
     /// Deletes an API key by ID
     pub async fn delete_key(&self, id: &str) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        let initial_len = config.api_keys.len();
-        config.api_keys.retain(|k| k.id != id);
-
-        if config.api_keys.len() < initial_len {
-            if config.active_key_id.as_deref() == Some(id) {
-                config.active_key_id = None;
-            }
-            remove_runtime_state_for_key(&mut config, id);
-            self.save_raw(&config).await?;
-            let _ = self.remove_sessions_for_key(id).await;
-            Ok(true)
-        } else {
-            Ok(false)
+        let deleted = self.api_keys.delete_key(id).await?;
+        if deleted {
+            let _ = self.sessions.remove_sessions_for_key(id).await;
         }
+        Ok(deleted)
     }
 
     /// Updates an existing API key's fields by ID. Returns false if not found.
@@ -1161,39 +761,14 @@ impl SessionStore {
         claude_protocol: Option<ClaudeProviderProtocol>,
         key: &str,
     ) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
-            let base_url_changed = entry.base_url != base_url;
-            entry.name = name.to_string();
-            entry.base_url = base_url.to_string();
-            entry.claude_protocol = claude_protocol;
-            entry.key = Zeroizing::new(encrypt(key)?);
-            if base_url_changed {
-                remove_runtime_state_for_key(&mut config, id);
-            }
-            self.save_raw(&config).await?;
-            if base_url_changed {
-                let _ = self.remove_sessions_for_key(id).await;
-            }
-            Ok(true)
-        } else {
-            Ok(false)
+        let (found, base_url_changed) = self
+            .api_keys
+            .update_key(id, name, base_url, claude_protocol, key)
+            .await?;
+        if found && base_url_changed {
+            let _ = self.sessions.remove_sessions_for_key(id).await;
         }
-    }
-
-    /// Internal helper: load config, apply `f` to the key with `id`, save, and return whether
-    /// the key was found. Does not decrypt/re-encrypt keys — only touches metadata fields.
-    async fn update_key_field(&self, id: &str, f: impl FnOnce(&mut ApiKey)) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
-            f(entry);
-            self.save_raw(&config).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(found)
     }
 
     pub async fn set_key_claude_protocol(
@@ -1201,7 +776,8 @@ impl SessionStore {
         id: &str,
         claude_protocol: Option<ClaudeProviderProtocol>,
     ) -> Result<bool> {
-        self.update_key_field(id, |entry| entry.claude_protocol = claude_protocol)
+        self.api_keys
+            .set_key_claude_protocol(id, claude_protocol)
             .await
     }
 
@@ -1210,7 +786,8 @@ impl SessionStore {
         id: &str,
         gemini_protocol: Option<GeminiProviderProtocol>,
     ) -> Result<bool> {
-        self.update_key_field(id, |entry| entry.gemini_protocol = gemini_protocol)
+        self.api_keys
+            .set_key_gemini_protocol(id, gemini_protocol)
             .await
     }
 
@@ -1219,10 +796,9 @@ impl SessionStore {
         id: &str,
         responses_api_supported: Option<bool>,
     ) -> Result<bool> {
-        self.update_key_field(id, |entry| {
-            entry.responses_api_supported = responses_api_supported
-        })
-        .await
+        self.api_keys
+            .set_key_responses_api_supported(id, responses_api_supported)
+            .await
     }
 
     pub async fn set_key_codex_mode(
@@ -1230,8 +806,7 @@ impl SessionStore {
         id: &str,
         codex_mode: Option<OpenAICompatibilityMode>,
     ) -> Result<bool> {
-        self.update_key_field(id, |entry| entry.codex_mode = codex_mode)
-            .await
+        self.api_keys.set_key_codex_mode(id, codex_mode).await
     }
 
     pub async fn set_key_opencode_mode(
@@ -1239,151 +814,48 @@ impl SessionStore {
         id: &str,
         opencode_mode: Option<OpenAICompatibilityMode>,
     ) -> Result<bool> {
-        self.update_key_field(id, |entry| entry.opencode_mode = opencode_mode)
-            .await
+        self.api_keys.set_key_opencode_mode(id, opencode_mode).await
     }
 
     /// Sets the currently active API key
     pub async fn set_active_key(&self, id: &str) -> Result<()> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-
-        if !config.api_keys.iter().any(|k| k.id == id) {
-            return Err(CLIError::new(
-                format!("Key {} not found", id),
-                ErrorCategory::User,
-                None::<String>,
-                Some("Run 'aivo keys' to see available keys"),
-            )
-            .into());
-        }
-
-        config.active_key_id = Some(id.to_string());
-        self.save_raw(&config).await
+        self.api_keys.set_active_key(id).await
     }
 
     /// Resolves an API key by ID or name, decrypting only the matched key's secret.
-    /// Tries exact ID match first, then name match.
-    /// Returns an error if no match found or multiple names match.
     pub async fn resolve_key_by_id_or_name(&self, id_or_name: &str) -> Result<ApiKey> {
-        let keys = self.get_keys().await?;
-
-        // Try exact ID match first, then short (first-3) ID match
-        if let Some(mut key) = keys
-            .iter()
-            .find(|k| k.id == id_or_name || k.short_id() == id_or_name)
-            .cloned()
-        {
-            Self::decrypt_key_secret(&mut key)?;
-            return Ok(key);
-        }
-
-        // Try name match
-        let name_matches: Vec<_> = keys.iter().filter(|k| k.name == id_or_name).collect();
-
-        match name_matches.len() {
-            0 => Err(CLIError::new(
-                format!("API key \"{}\" not found", id_or_name),
-                ErrorCategory::User,
-                None::<String>,
-                Some("Run 'aivo keys' to see available keys"),
-            )
-            .into()),
-            1 => {
-                let mut key = name_matches[0].clone();
-                Self::decrypt_key_secret(&mut key)?;
-                Ok(key)
-            }
-            _ => Err(CLIError::new(
-                format!(
-                    "Multiple keys found with name \"{}\". Use the key ID instead.",
-                    id_or_name
-                ),
-                ErrorCategory::User,
-                None::<String>,
-                Some("Run 'aivo keys' to see key IDs"),
-            )
-            .into()),
-        }
+        self.api_keys.resolve_key_by_id_or_name(id_or_name).await
     }
 
     /// Gets the currently active API key with its secret decrypted.
     pub async fn get_active_key(&self) -> Result<Option<ApiKey>> {
-        let config = self.load().await?;
-
-        match config.active_key_id {
-            Some(ref id) => {
-                if let Some(mut key) = config.api_keys.into_iter().find(|k| k.id == *id) {
-                    Self::decrypt_key_secret(&mut key)?;
-                    Ok(Some(key))
-                } else {
-                    Ok(None)
-                }
-            }
-            None => Ok(None),
-        }
+        self.api_keys.get_active_key().await
     }
 
     /// Gets all keys and the active key ID without decrypting secrets.
-    /// Use this for display-only paths (e.g., `aivo keys` list).
     pub async fn get_keys_and_active_id_info(&self) -> Result<(Vec<ApiKey>, Option<String>)> {
-        let config = self.load().await?;
-        Ok((config.api_keys, config.active_key_id))
+        self.api_keys.get_keys_and_active_id_info().await
     }
 
-    /// Gets the active key's display metadata (id, name, base_url) without decrypting secrets.
-    /// Use this when the key value is not needed (e.g., help output).
+    /// Gets the active key's display metadata without decrypting secrets.
     pub async fn get_active_key_info(&self) -> Result<Option<ApiKey>> {
-        let config = self.load().await?;
-
-        match config.active_key_id {
-            Some(ref id) => Ok(config.api_keys.into_iter().find(|k| k.id == *id)),
-            None => Ok(None),
-        }
-    }
-
-    /// Gets the config path
-    #[allow(dead_code)]
-    pub fn get_config_path(&self) -> &PathBuf {
-        &self.config_path
+        self.api_keys.get_active_key_info().await
     }
 
     /// Gets the persisted chat model for a specific API key
     pub async fn get_chat_model(&self, key_id: &str) -> Result<Option<String>> {
-        let config = self.load().await?;
-        Ok(config.chat_models.get(key_id).cloned())
+        self.api_keys.get_chat_model(key_id).await
     }
 
     /// Saves the chat model for a specific API key
     pub async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        config
-            .chat_models
-            .insert(key_id.to_string(), model.to_string());
-        self.save_raw(&config).await
+        self.api_keys.set_chat_model(key_id, model).await
     }
 
+    // ── Directory starts (delegated to DirectoryStartsStore) ──────────────
+
     pub async fn get_directory_start(&self, cwd: &str) -> Result<Option<DirectoryStartRecord>> {
-        let config = self.load().await?;
-        let Some(record) = config.directory_starts.get(cwd).cloned() else {
-            return Ok(None);
-        };
-
-        let key_is_valid = config
-            .api_keys
-            .iter()
-            .any(|key| key.id == record.key_id && key.base_url == record.base_url);
-        if key_is_valid {
-            return Ok(Some(record));
-        }
-
-        // Stale record — re-acquire exclusive lock, reload, remove, save.
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        config.directory_starts.remove(cwd);
-        self.save_raw(&config).await?;
-        Ok(None)
+        self.dirs.get_directory_start(cwd).await
     }
 
     pub async fn set_directory_start(
@@ -1394,34 +866,17 @@ impl SessionStore {
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        config.directory_starts.insert(
-            cwd.to_string(),
-            DirectoryStartRecord {
-                key_id: key_id.to_string(),
-                base_url: base_url.to_string(),
-                tool: tool.to_string(),
-                model: model
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string),
-                updated_at: Utc::now().to_rfc3339(),
-            },
-        );
-        self.save_raw(&config).await
+        self.dirs
+            .set_directory_start(cwd, key_id, base_url, tool, model)
+            .await
     }
 
     #[allow(dead_code)]
     pub async fn clear_directory_start(&self, cwd: &str) -> Result<bool> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        let removed = config.directory_starts.remove(cwd).is_some();
-        if removed {
-            self.save_raw(&config).await?;
-        }
-        Ok(removed)
+        self.dirs.clear_directory_start(cwd).await
     }
+
+    // ── Usage stats (delegated to UsageStatsStore) ────────────────────────
 
     pub async fn record_selection(
         &self,
@@ -1429,10 +884,7 @@ impl SessionStore {
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        config.stats.record_selection(key_id, tool, model);
-        self.save_raw(&config).await
+        self.stats.record_selection(key_id, tool, model).await
     }
 
     pub async fn record_tokens(
@@ -1444,26 +896,27 @@ impl SessionStore {
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
     ) -> Result<()> {
-        let _lock = self.acquire_config_lock()?;
-        let mut config = self.load().await?;
-        config.stats.record_tokens(
-            key_id,
-            model,
-            prompt_tokens,
-            completion_tokens,
-            cache_read_input_tokens,
-            cache_creation_input_tokens,
-        );
-        self.save_raw(&config).await
+        self.stats
+            .record_tokens(
+                key_id,
+                model,
+                prompt_tokens,
+                completion_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            )
+            .await
+    }
+
+    // ── Chat sessions (delegated to ChatSessionStore) ─────────────────────
+
+    #[allow(dead_code)]
+    pub fn session_file_path(&self, session_id: &str) -> PathBuf {
+        self.sessions.session_file_path(session_id)
     }
 
     pub async fn get_chat_session(&self, session_id: &str) -> Result<Option<ChatSessionState>> {
-        self.migrate_sessions_if_needed().await?;
-        let path = self.session_file_path(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(Some(self.load_session_file(session_id).await?))
+        self.sessions.get_chat_session(session_id).await
     }
 
     pub async fn list_chat_sessions(
@@ -1472,47 +925,9 @@ impl SessionStore {
         base_url: &str,
         cwd: &str,
     ) -> Result<Vec<SessionIndexEntry>> {
-        self.migrate_sessions_if_needed().await?;
-        let _lock = self.acquire_session_lock()?;
-
-        let mut index = match self.load_index().await {
-            Ok(idx) => idx,
-            Err(_) => self.rebuild_index().await?,
-        };
-
-        // Validate key still exists; prune stale entries
-        let key_is_valid = {
-            let config = self.load().await?;
-            config
-                .api_keys
-                .iter()
-                .any(|k| k.id == key_id && k.base_url == base_url)
-        };
-
-        let mut stale_ids: Vec<String> = Vec::new();
-        let mut entries: Vec<SessionIndexEntry> = Vec::new();
-
-        for entry in &index.entries {
-            if entry.key_id != key_id || entry.cwd != cwd {
-                continue;
-            }
-            if !key_is_valid || entry.base_url != base_url {
-                stale_ids.push(entry.session_id.clone());
-            } else {
-                entries.push(entry.clone());
-            }
-        }
-
-        if !stale_ids.is_empty() {
-            for session_id in &stale_ids {
-                let _ = tokio::fs::remove_file(self.session_file_path(session_id)).await;
-            }
-            index.entries.retain(|e| !stale_ids.contains(&e.session_id));
-            self.save_index(&index).await?;
-        }
-
-        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(entries)
+        self.sessions
+            .list_chat_sessions(key_id, base_url, cwd)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1527,130 +942,22 @@ impl SessionStore {
         title: &str,
         preview: &str,
     ) -> Result<()> {
-        self.migrate_sessions_if_needed().await?;
-        let _lock = self.acquire_session_lock()?;
-
-        let json = serde_json::to_string(messages).context("Failed to serialize messages")?;
-        let encrypted = encrypt(&json)?;
-        let now = Utc::now().to_rfc3339();
-        // Preserve created_at from existing session file; use now for new sessions.
-        let created_at = self
-            .load_session_file(session_id)
+        self.sessions
+            .save_chat_session_with_id(
+                key_id, base_url, cwd, session_id, model, messages, title, preview,
+            )
             .await
-            .ok()
-            .and_then(|s| {
-                if s.created_at.is_empty() {
-                    None
-                } else {
-                    Some(s.created_at)
-                }
-            })
-            .unwrap_or_else(|| now.clone());
-        let state = ChatSessionState {
-            session_id: session_id.to_string(),
-            key_id: key_id.to_string(),
-            base_url: base_url.to_string(),
-            cwd: cwd.to_string(),
-            model: model.to_string(),
-            messages: encrypted,
-            updated_at: now.clone(),
-            created_at: created_at.clone(),
-        };
-        self.save_session_file(&state).await?;
-
-        let mut index = match self.load_index().await {
-            Ok(idx) => idx,
-            Err(_) => self.rebuild_index().await?,
-        };
-
-        let new_entry = SessionIndexEntry {
-            session_id: session_id.to_string(),
-            key_id: key_id.to_string(),
-            base_url: base_url.to_string(),
-            cwd: cwd.to_string(),
-            model: model.to_string(),
-            updated_at: now,
-            created_at,
-            title: title.to_string(),
-            preview: preview.to_string(),
-        };
-
-        if let Some(pos) = index
-            .entries
-            .iter()
-            .position(|e| e.session_id == session_id)
-        {
-            index.entries[pos] = new_entry;
-        } else {
-            index.entries.push(new_entry);
-        }
-
-        self.evict_old_sessions(&mut index).await?;
-        self.save_index(&index).await
     }
 
     pub async fn delete_chat_session(&self, session_id: &str) -> Result<bool> {
-        self.migrate_sessions_if_needed().await?;
-        let _lock = self.acquire_session_lock()?;
-
-        let path = self.session_file_path(session_id);
-        let existed = path.exists();
-        if existed {
-            tokio::fs::remove_file(&path)
-                .await
-                .with_context(|| format!("Failed to delete session file: {:?}", path))?;
-        }
-
-        let mut index = self.load_index().await.unwrap_or_default();
-        let before = index.entries.len();
-        index.entries.retain(|e| e.session_id != session_id);
-        if index.entries.len() < before {
-            self.save_index(&index).await?;
-        }
-
-        Ok(existed || before > index.entries.len())
+        self.sessions.delete_chat_session(session_id).await
     }
 
     /// Removes session files for all sessions belonging to a key.
+    #[allow(dead_code)]
     pub async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {
-        let _lock = self.acquire_session_lock()?;
-        let mut index = self.load_index().await.unwrap_or_default();
-        let to_delete: Vec<String> = index
-            .entries
-            .iter()
-            .filter(|e| e.key_id == key_id)
-            .map(|e| e.session_id.clone())
-            .collect();
-        for session_id in &to_delete {
-            let _ = tokio::fs::remove_file(self.session_file_path(session_id)).await;
-        }
-        index.entries.retain(|e| e.key_id != key_id);
-        if !to_delete.is_empty() {
-            self.save_index(&index).await?;
-        }
-        Ok(())
+        self.sessions.remove_sessions_for_key(key_id).await
     }
-}
-
-fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
-    let mut rng = rand::thread_rng();
-
-    for _ in 0..1000 {
-        let id: String = (0..KEY_ID_LENGTH)
-            .map(|_| {
-                let idx = rng.gen_range(0..KEY_ID_ALPHABET.len());
-                KEY_ID_ALPHABET[idx] as char
-            })
-            .collect();
-
-        if !existing_ids.contains(&id) {
-            return Ok(id);
-        }
-    }
-
-    anyhow::bail!(
-        "Failed to generate unique key ID after 1000 attempts. Consider removing unused keys."
-    );
 }
 
 impl Default for SessionStore {
@@ -1662,6 +969,7 @@ impl Default for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::api_key_store::{KEY_ID_ALPHABET, KEY_ID_LENGTH};
     use tempfile::TempDir;
 
     #[tokio::test]
