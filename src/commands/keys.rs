@@ -21,16 +21,18 @@ enum KeySelection {
     NotFound,
 }
 
+// Reads a line from stdin with proper terminal handling (backspace, etc.).
+fn term_read_line(prompt: &str) -> std::io::Result<String> {
+    let term = console::Term::stdout();
+    term.write_str(prompt)?;
+    let input = term.read_line()?;
+    Ok(input.trim().to_string())
+}
+
 // Reads a confirmation from stdin (y/yes for true, anything else for false).
 fn confirm(prompt: &str) -> std::io::Result<bool> {
-    print!("{} [y/N]: ", prompt);
-    std::io::Write::flush(&mut std::io::stdout())?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    Ok(matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    let input = term_read_line(&format!("{} [y/N]: ", prompt))?;
+    Ok(matches!(input.to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 // Creates a safe preview of an API key, handling short keys without panicking.
@@ -556,7 +558,7 @@ impl KeysCommand {
 
     /// Interactively edits an API key
     async fn edit_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
-        use std::io::{self, Write};
+        use std::io;
 
         let key = match self
             .resolve_key_selection(key_id_or_name, "Select a key to edit", "No API keys found.")
@@ -580,11 +582,7 @@ impl KeysCommand {
         println!();
 
         fn read_line_with_default(prompt: &str) -> io::Result<String> {
-            print!("{}", prompt);
-            io::stdout().flush()?;
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            Ok(input.trim().to_string())
+            term_read_line(prompt)
         }
 
         // Name
@@ -695,14 +693,10 @@ impl KeysCommand {
         provided_name: Option<&str>,
         add_options: AddKeyOptions<'_>,
     ) -> Result<ExitCode> {
-        use std::io::{self, Write};
+        use std::io;
 
         fn read_line(prompt: &str) -> io::Result<String> {
-            print!("{}", style::dim(prompt));
-            io::stdout().flush()?;
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            Ok(input.trim().to_string())
+            term_read_line(&style::dim(prompt))
         }
 
         if provided_name.is_some() && add_options.name.is_some() {
@@ -809,15 +803,12 @@ impl KeysCommand {
             let existing_keys = self.session_store.get_keys().await?;
             let existing_copilot_id =
                 if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "copilot") {
-                    eprint!(
+                    let answer = read_line(&format!(
                         "{} Copilot key '{}' (ID: {}) already exists. Replace it? [y/N] ",
                         style::yellow("Warning:"),
                         existing.name,
                         existing.id
-                    );
-                    use std::io::Write as _;
-                    std::io::stderr().flush()?;
-                    let answer = read_line("")?;
+                    ))?;
                     if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
                         println!("Aborted.");
                         return Ok(ExitCode::Success);
@@ -874,15 +865,12 @@ impl KeysCommand {
             let existing_keys = self.session_store.get_keys().await?;
             let existing_ollama_id =
                 if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "ollama") {
-                    eprint!(
+                    let answer = read_line(&format!(
                         "{} Ollama key '{}' (ID: {}) already exists. Replace it? [y/N] ",
                         style::yellow("Warning:"),
                         existing.name,
                         existing.id
-                    );
-                    use std::io::Write as _;
-                    std::io::stderr().flush()?;
-                    let answer = read_line("")?;
+                    ))?;
                     if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
                         println!("Aborted.");
                         return Ok(ExitCode::Success);
