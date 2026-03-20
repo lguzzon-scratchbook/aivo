@@ -13,6 +13,7 @@ use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
+#[allow(clippy::large_enum_variant)]
 enum KeySelection {
     Key(ApiKey),
     Cancelled,
@@ -77,25 +78,7 @@ fn print_ping_result(result: &PingResult, max_name_len: usize) {
 }
 
 fn detect_base_url(name: &str) -> Option<&'static str> {
-    let lower = name.to_lowercase();
-    let providers: &[(&str, &str)] = &[
-        ("openrouter", "https://openrouter.ai/api/v1"),
-        ("vercel", "https://ai-gateway.vercel.sh/v1"),
-        ("fireworks", "https://api.fireworks.ai/inference/v1"),
-        ("minimax", "https://api.minimax.io/anthropic"),
-        ("deepseek", "https://api.deepseek.com/v1"),
-        ("moonshot", "https://api.moonshot.ai/v1"),
-        ("anthropic", "https://api.anthropic.com"),
-        ("openai", "https://api.openai.com"),
-        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        ("zai", "https://api.z.ai/v1"),
-        ("groq", "https://api.groq.com/openai/v1"),
-        ("xai", "https://api.x.ai/v1"),
-        ("mistral", "https://api.mistral.ai/v1"),
-    ];
-    providers
-        .iter()
-        .find_map(|(kw, url)| lower.contains(kw).then_some(*url))
+    crate::services::known_providers::find_by_name_substring(name).map(|p| p.base_url)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

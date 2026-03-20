@@ -223,12 +223,14 @@ impl PickerEntry {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ModelSelectionTarget {
     CurrentChat,
     KeySwitch(ApiKey),
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum PickerKind {
     Model {
         target: ModelSelectionTarget,

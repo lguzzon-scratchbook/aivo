@@ -6,6 +6,7 @@ use crate::errors::ExitCode;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum KeyResolution {
     Selected(ApiKey),
     Cancelled,

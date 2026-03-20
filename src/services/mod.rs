@@ -13,6 +13,7 @@ pub mod copilot_router;
 pub mod environment_injector;
 pub mod gemini_router;
 pub mod http_utils;
+pub mod known_providers;
 pub mod launch_args;
 pub mod launch_runtime;
 pub mod model_names;
