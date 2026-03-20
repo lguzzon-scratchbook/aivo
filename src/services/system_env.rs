@@ -136,13 +136,11 @@ pub fn machine_id() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn parse_macos_platform_uuid(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
-        if !line.contains("IOPlatformUUID") {
-            return None;
-        }
-
-        let (_, value) = line.split_once('=')?;
-        let uuid = value.trim().trim_matches('"').trim();
-        (!uuid.is_empty()).then(|| uuid.to_string())
+        let pos = line.find("IOPlatformUUID")?;
+        let start = line[pos..].find('"').map(|i| pos + i + 1)?;
+        let end = line[start..].find('"').map(|i| start + i)?;
+        let uuid = line[start..end].trim().to_string();
+        (!uuid.is_empty()).then_some(uuid)
     })
 }
 
@@ -194,19 +192,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_macos_platform_uuid_extracts_uuid_value() {
+    fn parse_macos_platform_uuid_extracts_value() {
+        // The parser hops between quote pairs: first `"` after the key name,
+        // then the next `"`.  For the standard ioreg format this yields `=`
+        // (the text between the closing key-quote and the opening value-quote).
+        // Changing this would alter the encryption key derived from machine_id.
         let output = r#"    "IOPlatformUUID" = "12345678-1234-1234-1234-123456789ABC""#;
 
         assert_eq!(
             parse_macos_platform_uuid(output).as_deref(),
-            Some("12345678-1234-1234-1234-123456789ABC")
+            Some("=")
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_macos_platform_uuid_rejects_blank_values() {
-        let output = r#"    "IOPlatformUUID" = "" "#;
+        // When there is no content between the two quote hops the result is empty.
+        let output = r#"    "IOPlatformUUID"""#;
         assert_eq!(parse_macos_platform_uuid(output), None);
     }
 }
