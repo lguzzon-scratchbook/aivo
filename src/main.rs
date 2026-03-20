@@ -97,7 +97,7 @@ async fn main() {
         Commands::Ping(ping_args) => {
             let keys_args = cli::KeysArgs {
                 action: Some("ping".to_string()),
-                args: ping_args.key.into_iter().collect(),
+                args: ping_args.key().map(String::from).into_iter().collect(),
                 name: None,
                 base_url: None,
                 key: None,

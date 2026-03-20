@@ -64,13 +64,26 @@ pub enum Commands {
 /// Arguments for the ping command
 #[derive(Args, Debug, Clone)]
 pub struct PingArgs {
-    /// Key ID or name to ping (default: active key)
+    /// Key ID or name to ping (positional)
     #[arg(value_name = "ID_OR_NAME")]
-    pub key: Option<String>,
+    positional_key: Option<String>,
+
+    /// Key ID or name to ping
+    #[arg(short = 'k', value_name = "ID_OR_NAME")]
+    named_key: Option<String>,
 
     /// Ping all keys
     #[arg(long)]
     pub all: bool,
+}
+
+impl PingArgs {
+    /// Returns the key from either `-k <name>` or positional `<name>`.
+    pub fn key(&self) -> Option<&str> {
+        self.named_key
+            .as_deref()
+            .or(self.positional_key.as_deref())
+    }
 }
 
 /// Arguments for the keys command

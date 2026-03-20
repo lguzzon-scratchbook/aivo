@@ -1096,7 +1096,7 @@ impl KeysCommand {
     }
 
     pub fn print_ping_help() {
-        println!("{} aivo ping [id|name]", style::bold("Usage:"));
+        println!("{} aivo ping [-k] [id|name]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
@@ -1111,7 +1111,7 @@ impl KeysCommand {
         );
         println!(
             "  {:<18} {}",
-            "<id|name>",
+            "-k <id|name>",
             style::dim("- Ping a specific key")
         );
         println!(
