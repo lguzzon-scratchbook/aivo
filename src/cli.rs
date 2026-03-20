@@ -51,11 +51,26 @@ pub enum Commands {
     /// Serve an OpenAI-compatible API that proxies to the active provider
     Serve(ServeArgs),
 
+    /// Health-check API keys (alias for `keys ping`)
+    Ping(PingArgs),
+
     /// Show a compact status view of keys, tools, and current directory state
     Ls,
 
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
+}
+
+/// Arguments for the ping command
+#[derive(Args, Debug, Clone)]
+pub struct PingArgs {
+    /// Key ID or name to ping (default: active key)
+    #[arg(value_name = "ID_OR_NAME")]
+    pub key: Option<String>,
+
+    /// Ping all keys
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// Arguments for the keys command
@@ -83,6 +98,14 @@ pub struct KeysArgs {
     /// Provider API key for `keys add`
     #[arg(long, value_name = "API_KEY", value_parser = non_empty())]
     pub key: Option<String>,
+
+    /// Ping all keys (for `keys ping`)
+    #[arg(long)]
+    pub all: bool,
+
+    /// List keys with ping status
+    #[arg(long)]
+    pub ping: bool,
 }
 
 /// Arguments for the run command

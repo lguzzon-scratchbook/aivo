@@ -3,6 +3,8 @@
  */
 use anyhow::Result;
 
+use std::time::{Duration, Instant};
+
 use crate::cli::KeysArgs;
 use crate::commands::truncate_url_for_display;
 use crate::tui::FuzzySelect;
@@ -50,6 +52,30 @@ struct AddKeyOptions<'a> {
     key: Option<&'a str>,
 }
 
+fn print_ping_result(result: &PingResult, max_name_len: usize) {
+    let icon = match &result.status {
+        PingStatus::Ok => style::green(result.status.icon()),
+        _ => style::red(result.status.icon()),
+    };
+    let latency = result
+        .latency
+        .map(|d| format!("{}ms", d.as_millis()))
+        .unwrap_or_default();
+    let name_padded = format!("{:<width$}", result.name, width = max_name_len);
+    let message = result.status.message();
+    println!(
+        " {} {}  {}  {:>6}  {}",
+        icon,
+        name_padded,
+        style::dim(truncate_url_for_display(&result.url, 40)),
+        style::dim(latency),
+        match &result.status {
+            PingStatus::Ok => style::green(&message),
+            _ => style::red(&message),
+        }
+    );
+}
+
 fn detect_base_url(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
     let providers: &[(&str, &str)] = &[
@@ -72,6 +98,166 @@ fn detect_base_url(name: &str) -> Option<&'static str> {
         .find_map(|(kw, url)| lower.contains(kw).then_some(*url))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PingStatus {
+    Ok,
+    AuthError,
+    Unreachable,
+    Timeout,
+    Error(String),
+}
+
+impl PingStatus {
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            PingStatus::Ok => "✓",
+            PingStatus::AuthError => "✗",
+            PingStatus::Unreachable => "✗",
+            PingStatus::Timeout => "✗",
+            PingStatus::Error(_) => "✗",
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            PingStatus::Ok => "ok".to_string(),
+            PingStatus::AuthError => "auth failed".to_string(),
+            PingStatus::Unreachable => "unreachable".to_string(),
+            PingStatus::Timeout => "timeout".to_string(),
+            PingStatus::Error(msg) => msg.clone(),
+        }
+    }
+
+    pub(crate) fn from_http_status(status: u16) -> Self {
+        match status {
+            200..=299 => PingStatus::Ok,
+            401 | 403 => PingStatus::AuthError,
+            // 404/405 on probe endpoints means reachable but wrong path — still ok for ping
+            404 | 405 => PingStatus::Ok,
+            _ => PingStatus::Error(format!("HTTP {}", status)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PingResult {
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) status: PingStatus,
+    pub(crate) latency: Option<Duration>,
+}
+
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+const PING_MAX_RETRIES: u32 = 3;
+
+async fn ping_key(key: ApiKey) -> PingResult {
+    let name = if key.name.is_empty() {
+        key.short_id().to_string()
+    } else {
+        key.name.clone()
+    };
+    let url = key.base_url.clone();
+
+    let start = Instant::now();
+    let status = ping_with_retries(&key).await;
+    let latency = Some(start.elapsed());
+
+    PingResult {
+        name,
+        url,
+        status,
+        latency,
+    }
+}
+
+async fn ping_with_retries(key: &ApiKey) -> PingStatus {
+    let mut last_status = PingStatus::Unreachable;
+    for _ in 0..PING_MAX_RETRIES {
+        last_status = match tokio::time::timeout(PING_TIMEOUT, probe_key(key)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => PingStatus::Unreachable,
+            Err(_) => PingStatus::Timeout,
+        };
+        if matches!(last_status, PingStatus::Ok) {
+            return last_status;
+        }
+    }
+    last_status
+}
+
+async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
+    use crate::services::provider_profile::{ModelListingStrategy, provider_profile_for_key};
+
+    let profile = provider_profile_for_key(key);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(PING_TIMEOUT)
+        .build()?;
+
+    match profile.model_listing_strategy {
+        ModelListingStrategy::Ollama => {
+            match client.get("http://localhost:11434/").send().await {
+                Ok(_) => Ok(PingStatus::Ok),
+                Err(_) => Ok(PingStatus::Unreachable),
+            }
+        }
+        ModelListingStrategy::Copilot => {
+            use crate::services::copilot_auth::CopilotTokenManager;
+            let tm = CopilotTokenManager::new(key.key.as_str().to_string());
+            match tm.get_token().await {
+                Ok(_) => Ok(PingStatus::Ok),
+                Err(_) => Ok(PingStatus::AuthError),
+            }
+        }
+        ModelListingStrategy::Google => {
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                key.key.as_str()
+            );
+            match client.get(&url).send().await {
+                Ok(r) => Ok(PingStatus::from_http_status(r.status().as_u16())),
+                Err(_) => Ok(PingStatus::Unreachable),
+            }
+        }
+        ModelListingStrategy::Anthropic => {
+            let base = key.base_url.trim_end_matches('/');
+            let url = if base.ends_with("/v1") {
+                format!("{}/models", base)
+            } else {
+                format!("{}/v1/models", base)
+            };
+            match client
+                .get(&url)
+                .header("x-api-key", key.key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await
+            {
+                Ok(r) => Ok(PingStatus::from_http_status(r.status().as_u16())),
+                Err(_) => Ok(PingStatus::Unreachable),
+            }
+        }
+        ModelListingStrategy::CloudflareSearch | ModelListingStrategy::OpenAiCompatible => {
+            let base = key.base_url.trim_end_matches('/');
+            let url = if base.ends_with("/v1") {
+                format!("{}/models", base)
+            } else {
+                format!("{}/v1/models", base)
+            };
+            match client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", key.key.as_str()))
+                .send()
+                .await
+            {
+                Ok(r) => Ok(PingStatus::from_http_status(r.status().as_u16())),
+                Err(_) => Ok(PingStatus::Unreachable),
+            }
+        }
+    }
+}
+
 impl KeysCommand {
     /// Creates a new KeysCommand instance
     pub fn new(session_store: SessionStore) -> Self {
@@ -87,9 +273,11 @@ impl KeysCommand {
             base_url: keys_args.base_url.as_deref(),
             key: keys_args.key.as_deref(),
         };
+        let ping_all = keys_args.all;
+        let list_ping = keys_args.ping;
 
         match self
-            .execute_internal(action, Some(&args), add_options)
+            .execute_internal(action, Some(&args), add_options, ping_all, list_ping)
             .await
         {
             Ok(code) => code,
@@ -105,8 +293,11 @@ impl KeysCommand {
         action: Option<&str>,
         args: Option<&[&str]>,
         add_options: AddKeyOptions<'_>,
+        ping_all: bool,
+        list_ping: bool,
     ) -> Result<ExitCode> {
         match action {
+            None if list_ping => self.list_keys_with_ping().await,
             None => self.list_keys().await,
             Some("add") => {
                 self.add_key(args.and_then(|a| a.first().copied()), add_options)
@@ -116,12 +307,114 @@ impl KeysCommand {
             Some("use") => self.use_key(args.and_then(|a| a.first().copied())).await,
             Some("cat") => self.cat_key(args.and_then(|a| a.first().copied())).await,
             Some("edit") => self.edit_key(args.and_then(|a| a.first().copied())).await,
+            Some("ping") => {
+                self.ping_keys(args.and_then(|a| a.first().copied()), ping_all)
+                    .await
+            }
             Some(action) => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
                 Self::print_help();
                 Ok(ExitCode::UserError)
             }
         }
+    }
+
+    /// Health-checks API keys.
+    async fn ping_keys(
+        &self,
+        key_id_or_name: Option<&str>,
+        ping_all: bool,
+    ) -> Result<ExitCode> {
+        let keys: Vec<ApiKey> = if ping_all {
+            let all_keys = self.session_store.get_keys().await?;
+            if all_keys.len() > 1 {
+                let confirmed = confirm(&format!(
+                    "Ping all {} keys?",
+                    all_keys.len()
+                ))?;
+                if !confirmed {
+                    println!("{}", style::dim("Cancelled."));
+                    return Ok(ExitCode::Success);
+                }
+            }
+            all_keys
+        } else if let Some(filter) = key_id_or_name {
+            let all_keys = self.session_store.get_keys().await?;
+            let matched: Vec<ApiKey> = all_keys
+                .into_iter()
+                .filter(|k| {
+                    k.id == filter
+                        || k.short_id() == filter
+                        || k.name.eq_ignore_ascii_case(filter)
+                })
+                .collect();
+            if matched.is_empty() {
+                eprintln!(
+                    "{} API key \"{}\" not found",
+                    style::red("Error:"),
+                    filter
+                );
+                return Ok(ExitCode::UserError);
+            }
+            matched
+        } else {
+            match self.session_store.get_active_key().await? {
+                Some(key) => vec![key],
+                None => {
+                    eprintln!(
+                        "{} No active API key. Run 'aivo keys use' first.",
+                        style::red("Error:")
+                    );
+                    return Ok(ExitCode::UserError);
+                }
+            }
+        };
+
+        if keys.is_empty() {
+            println!("{}", style::dim("No API keys found."));
+            return Ok(ExitCode::Success);
+        }
+
+        let max_name_len = keys
+            .iter()
+            .map(|k| {
+                if k.name.is_empty() {
+                    k.short_id().len()
+                } else {
+                    k.name.len()
+                }
+            })
+            .max()
+            .unwrap_or(0);
+
+        let mut handles = Vec::with_capacity(keys.len());
+        for mut key in keys {
+            if SessionStore::decrypt_key_secret(&mut key).is_err() {
+                print_ping_result(
+                    &PingResult {
+                        name: if key.name.is_empty() {
+                            key.short_id().to_string()
+                        } else {
+                            key.name.clone()
+                        },
+                        url: key.base_url.clone(),
+                        status: PingStatus::Error("decrypt failed".to_string()),
+                        latency: None,
+                    },
+                    max_name_len,
+                );
+                continue;
+            }
+            handles.push(tokio::spawn(ping_key(key)));
+        }
+
+        for handle in handles {
+            if let Ok(result) = handle.await {
+                print_ping_result(&result, max_name_len);
+            }
+        }
+
+        Ok(ExitCode::Success)
     }
 
     /// Lists all API keys
@@ -150,6 +443,60 @@ impl KeysCommand {
                 style::cyan(&id_padded),
                 name_padded,
                 style::dim(truncate_url_for_display(&key.base_url, 50))
+            );
+        }
+
+        Ok(ExitCode::Success)
+    }
+
+    /// Lists all API keys with live ping status, streaming results as they complete.
+    async fn list_keys_with_ping(&self) -> Result<ExitCode> {
+        let (keys, active_key_id) = self.session_store.get_keys_and_active_id_info().await?;
+
+        if keys.is_empty() {
+            println!("{}", style::dim("No API keys found."));
+            return Ok(ExitCode::Success);
+        }
+
+        let max_name_len = keys.iter().map(|k| k.name.len()).max().unwrap_or(0);
+        let url_display_width = 42;
+
+        for mut key in keys {
+            let is_active = active_key_id.as_deref() == Some(key.id.as_str());
+            let active_indicator = if is_active {
+                style::bullet_symbol()
+            } else {
+                style::empty_bullet_symbol()
+            };
+            let id_padded = format!("{:<3}", key.short_id());
+            let name_padded = format!("{:<width$}", key.name, width = max_name_len);
+
+            let ping_status = if SessionStore::decrypt_key_secret(&mut key).is_ok() {
+                let start = Instant::now();
+                let status = ping_with_retries(&key).await;
+                let ms = start.elapsed().as_millis();
+                let icon = match &status {
+                    PingStatus::Ok => style::green(status.icon()),
+                    _ => style::red(status.icon()),
+                };
+                let msg = match &status {
+                    PingStatus::Ok => style::green(status.message()),
+                    _ => style::red(status.message()),
+                };
+                format!("{} {:>5}ms {}", icon, ms, msg)
+            } else {
+                format!("{} {}", style::red("✗"), style::red("decrypt failed"))
+            };
+
+            let url_display = truncate_url_for_display(&key.base_url, url_display_width);
+            let url_padded = format!("{:<width$}", url_display, width = url_display_width);
+            println!(
+                "{} {}  {}  {}  {}",
+                active_indicator,
+                style::cyan(&id_padded),
+                name_padded,
+                style::dim(&url_padded),
+                ping_status
             );
         }
 
@@ -751,6 +1098,7 @@ impl KeysCommand {
         print_row("rm [id|name]", "- Remove an API key");
         print_row("add [name]", "- Add an API key");
         print_row("edit [id|name]", "- Edit an API key");
+        print_row("ping [id|name]", "- Health-check API keys (or: aivo ping)");
         println!();
         println!("{}", style::bold("Add Flags:"));
         print_row("--name <name>", "- Set key name");
@@ -761,6 +1109,32 @@ impl KeysCommand {
             style::dim(
                 "Example: aivo keys add --name abc --base-url https://example.io --key sk-..."
             )
+        );
+    }
+
+    pub fn print_ping_help() {
+        println!("{} aivo ping [id|name]", style::bold("Usage:"));
+        println!();
+        println!(
+            "{}",
+            style::dim("Health-check API keys (alias for 'aivo keys ping').")
+        );
+        println!();
+        println!("{}", style::bold("Options:"));
+        println!(
+            "  {:<18} {}",
+            "(no args)",
+            style::dim("- Ping the active key")
+        );
+        println!(
+            "  {:<18} {}",
+            "<id|name>",
+            style::dim("- Ping a specific key")
+        );
+        println!(
+            "  {:<18} {}",
+            "--all",
+            style::dim("- Ping all keys (confirms first)")
         );
     }
 }
@@ -840,6 +1214,8 @@ mod tests {
             name: None,
             base_url: None,
             key: None,
+            all: false,
+            ping: false,
         }
     }
 
@@ -933,6 +1309,8 @@ mod tests {
                 name: Some("minimax".to_string()),
                 base_url: Some("https://api.minimax.io/anthropic".to_string()),
                 key: Some("sk-minimax-test".to_string()),
+                all: false,
+                ping: false,
             })
             .await;
 
@@ -963,6 +1341,8 @@ mod tests {
                 name: Some("flag-name".to_string()),
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
                 key: Some("sk-or-v1-test".to_string()),
+                all: false,
+                ping: false,
             })
             .await;
 
@@ -983,6 +1363,8 @@ mod tests {
                 name: None,
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
                 key: Some("sk-or-v1-test".to_string()),
+                all: false,
+                ping: false,
             })
             .await;
 
@@ -1011,6 +1393,8 @@ mod tests {
                 name: None,
                 base_url: Some("ollama".to_string()),
                 key: None,
+                all: false,
+                ping: false,
             })
             .await;
 
@@ -1031,6 +1415,8 @@ mod tests {
                 name: None,
                 base_url: Some("copilot".to_string()),
                 key: None,
+                all: false,
+                ping: false,
             })
             .await;
 
@@ -1106,6 +1492,60 @@ mod tests {
     fn test_detect_base_url_no_match() {
         assert_eq!(detect_base_url("random"), None);
         assert_eq!(detect_base_url(""), None);
+    }
+
+    #[test]
+    fn test_ping_status_from_http_status_ok() {
+        assert_eq!(PingStatus::from_http_status(200), PingStatus::Ok);
+        assert_eq!(PingStatus::from_http_status(204), PingStatus::Ok);
+    }
+
+    #[test]
+    fn test_ping_status_from_http_status_auth_error() {
+        assert_eq!(PingStatus::from_http_status(401), PingStatus::AuthError);
+        assert_eq!(PingStatus::from_http_status(403), PingStatus::AuthError);
+    }
+
+    #[test]
+    fn test_ping_status_from_http_status_other() {
+        assert_eq!(
+            PingStatus::from_http_status(500),
+            PingStatus::Error("HTTP 500".to_string())
+        );
+        assert_eq!(
+            PingStatus::from_http_status(429),
+            PingStatus::Error("HTTP 429".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ping_status_from_http_status_reachable_wrong_path() {
+        assert_eq!(PingStatus::from_http_status(404), PingStatus::Ok);
+        assert_eq!(PingStatus::from_http_status(405), PingStatus::Ok);
+    }
+
+    #[test]
+    fn test_ping_status_icons_and_messages() {
+        assert_eq!(PingStatus::Ok.icon(), "✓");
+        assert_eq!(PingStatus::Ok.message(), "ok");
+        assert_eq!(PingStatus::AuthError.icon(), "✗");
+        assert_eq!(PingStatus::AuthError.message(), "auth failed");
+        assert_eq!(PingStatus::Unreachable.icon(), "✗");
+        assert_eq!(PingStatus::Unreachable.message(), "unreachable");
+        assert_eq!(PingStatus::Timeout.icon(), "✗");
+        assert_eq!(PingStatus::Timeout.message(), "timeout");
+    }
+
+    #[test]
+    fn test_ping_result_empty_name_uses_short_id() {
+        let result = PingResult {
+            name: "abc".to_string(),
+            url: "https://api.openai.com".to_string(),
+            status: PingStatus::Ok,
+            latency: Some(std::time::Duration::from_millis(42)),
+        };
+        assert_eq!(result.name, "abc");
+        assert_eq!(result.status, PingStatus::Ok);
     }
 
     #[test]

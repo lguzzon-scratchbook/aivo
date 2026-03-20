@@ -55,6 +55,9 @@ async fn main() {
             Some(Commands::Serve(_)) => {
                 ServeCommand::print_help();
             }
+            Some(Commands::Ping(_)) => {
+                KeysCommand::print_ping_help();
+            }
             Some(Commands::Ls) => {
                 LsCommand::print_help();
             }
@@ -87,6 +90,20 @@ async fn main() {
     // Route to command handler
     let exit_code = match command {
         Commands::Keys(keys_args) => {
+            let command = KeysCommand::new(session_store);
+            command.execute(keys_args).await
+        }
+
+        Commands::Ping(ping_args) => {
+            let keys_args = cli::KeysArgs {
+                action: Some("ping".to_string()),
+                args: ping_args.key.into_iter().collect(),
+                name: None,
+                base_url: None,
+                key: None,
+                all: ping_args.all,
+                ping: false,
+            };
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
         }
@@ -334,6 +351,11 @@ fn print_help() {
         "  {}      {}",
         style::cyan("use [name]"),
         style::dim("Switch active API key")
+    );
+    println!(
+        "  {}            {}",
+        style::cyan("ping"),
+        style::dim("Health-check API keys")
     );
     println!(
         "  {}          {}",
