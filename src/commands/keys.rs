@@ -1073,31 +1073,6 @@ impl KeysCommand {
         );
     }
 
-    pub fn print_ping_help() {
-        println!("{} aivo ping [-k] [id|name]", style::bold("Usage:"));
-        println!();
-        println!(
-            "{}",
-            style::dim("Health-check API keys (alias for 'aivo keys ping').")
-        );
-        println!();
-        println!("{}", style::bold("Options:"));
-        println!(
-            "  {:<18} {}",
-            "(no args)",
-            style::dim("- Ping the active key")
-        );
-        println!(
-            "  {:<18} {}",
-            "-k <id|name>",
-            style::dim("- Ping a specific key")
-        );
-        println!(
-            "  {:<18} {}",
-            "--all",
-            style::dim("- Ping all keys (confirms first)")
-        );
-    }
 }
 
 // Formats an API key as a choice string for interactive selectors.

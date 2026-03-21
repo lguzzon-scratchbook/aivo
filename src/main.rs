@@ -18,9 +18,8 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    AliasCommand, ChatCommand, DoctorCommand, KeysCommand, LsCommand, ModelsCommand, RunCommand,
-    ServeCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
-    truncate_url_for_display,
+    AliasCommand, ChatCommand, InfoCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand,
+    StartCommand, StartFlowArgs, StatsCommand, UpdateCommand, truncate_url_for_display,
 };
 use errors::ExitCode;
 use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
@@ -57,20 +56,14 @@ async fn main() {
             Some(Commands::Serve(_)) => {
                 ServeCommand::print_help();
             }
-            Some(Commands::Ping(_)) => {
-                KeysCommand::print_ping_help();
-            }
             Some(Commands::Alias(_)) => {
                 AliasCommand::print_help();
             }
-            Some(Commands::Doctor) => {
-                DoctorCommand::print_help();
+            Some(Commands::Ls(_)) => {
+                InfoCommand::print_help();
             }
             Some(Commands::Stats(_)) => {
                 StatsCommand::print_help();
-            }
-            Some(Commands::Ls) => {
-                LsCommand::print_help();
             }
             Some(Commands::Update(_)) => {
                 UpdateCommand::print_help();
@@ -106,20 +99,6 @@ async fn main() {
         }
 
         Commands::Keys(keys_args) => {
-            let command = KeysCommand::new(session_store);
-            command.execute(keys_args).await
-        }
-
-        Commands::Ping(ping_args) => {
-            let keys_args = cli::KeysArgs {
-                action: Some("ping".to_string()),
-                args: ping_args.key().map(String::from).into_iter().collect(),
-                name: None,
-                base_url: None,
-                key: None,
-                all: ping_args.all,
-                ping: false,
-            };
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
         }
@@ -288,19 +267,14 @@ async fn main() {
                 .await
         }
 
-        Commands::Doctor => {
-            let command = DoctorCommand::new(session_store);
-            command.execute().await
+        Commands::Ls(ls_args) => {
+            let command = InfoCommand::new(session_store, models_cache);
+            command.execute(ls_args.ping).await
         }
 
         Commands::Stats(stats_args) => {
             let command = StatsCommand::new(session_store);
             command.execute(stats_args).await
-        }
-
-        Commands::Ls => {
-            let command = LsCommand::new(session_store, models_cache);
-            command.execute().await
         }
 
         Commands::Update(update_args) => match UpdateCommand::new() {
@@ -385,11 +359,9 @@ fn print_help() {
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
     print_cmd("use", "Switch active API key");
     print_cmd("models", "List available models from the active provider");
-    print_cmd("ping", "Health-check API keys");
     print_cmd("alias", "Create, list, or remove model aliases");
-    print_cmd("doctor", "Run a comprehensive health check");
+    print_cmd("ls", "Show system info, keys, tools, and directory state");
     print_cmd("stats", "Show usage statistics");
-    print_cmd("ls", "Show saved keys, tools, and current directory state");
     print_cmd("update", "Update to the latest version");
     println!();
     println!(

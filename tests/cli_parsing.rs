@@ -218,40 +218,23 @@ fn models_refresh_flag() {
 }
 
 #[test]
-fn ping_positional_key() {
-    let cli = Cli::try_parse_from(["aivo", "ping", "my-key"]).unwrap();
-    if let Some(Commands::Ping(args)) = cli.command {
-        assert_eq!(args.key(), Some("my-key"));
-        assert!(!args.all);
-    } else {
-        panic!("Expected Ping command");
-    }
-}
-
-#[test]
-fn ping_named_key_flag() {
-    let cli = Cli::try_parse_from(["aivo", "ping", "-k", "my-key"]).unwrap();
-    if let Some(Commands::Ping(args)) = cli.command {
-        assert_eq!(args.key(), Some("my-key"));
-    } else {
-        panic!("Expected Ping command");
-    }
-}
-
-#[test]
-fn ping_all_flag() {
-    let cli = Cli::try_parse_from(["aivo", "ping", "--all"]).unwrap();
-    if let Some(Commands::Ping(args)) = cli.command {
-        assert!(args.all);
-    } else {
-        panic!("Expected Ping command");
-    }
-}
-
-#[test]
 fn ls_command() {
     let cli = Cli::try_parse_from(["aivo", "ls"]).unwrap();
-    assert!(matches!(cli.command, Some(Commands::Ls)));
+    if let Some(Commands::Ls(args)) = cli.command {
+        assert!(!args.ping);
+    } else {
+        panic!("Expected Ls command");
+    }
+}
+
+#[test]
+fn ls_command_with_ping() {
+    let cli = Cli::try_parse_from(["aivo", "ls", "--ping"]).unwrap();
+    if let Some(Commands::Ls(args)) = cli.command {
+        assert!(args.ping);
+    } else {
+        panic!("Expected Ls command");
+    }
 }
 
 #[test]

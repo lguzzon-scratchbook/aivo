@@ -1,5 +1,12 @@
+/**
+ * InfoCommand handler — unified system info and health check for aivo.
+ *
+ * `aivo info` shows config, keys, tools, directory state, and active defaults.
+ * `aivo info --check` additionally pings all keys and shows a pass/fail summary.
+ */
 use anyhow::Result;
 
+use crate::commands::keys::{PingResult, PingStatus, ping_keys_streaming};
 use crate::commands::truncate_url_for_display;
 use crate::errors::ExitCode;
 use crate::services::models_cache::ModelsCache;
@@ -7,13 +14,14 @@ use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::services::session_store::{DirectoryStartRecord, SessionStore};
 use crate::services::system_env;
 use crate::style;
+use crate::version;
 
-pub struct LsCommand {
+pub struct InfoCommand {
     session_store: SessionStore,
     cache: ModelsCache,
 }
 
-impl LsCommand {
+impl InfoCommand {
     pub fn new(session_store: SessionStore, cache: ModelsCache) -> Self {
         Self {
             session_store,
@@ -21,8 +29,8 @@ impl LsCommand {
         }
     }
 
-    pub async fn execute(&self) -> ExitCode {
-        match self.execute_internal().await {
+    pub async fn execute(&self, check: bool) -> ExitCode {
+        match self.execute_internal(check).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -31,7 +39,15 @@ impl LsCommand {
         }
     }
 
-    async fn execute_internal(&self) -> Result<ExitCode> {
+    async fn execute_internal(&self, check: bool) -> Result<ExitCode> {
+        // Header
+        println!(
+            "{} {}",
+            style::cyan("aivo info"),
+            style::dim(format!("v{}", version::VERSION)),
+        );
+        println!();
+
         let (keys, active_key_id) = self.session_store.get_keys_and_active_id_info().await?;
         let cwd = system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
         let remembered = self.session_store.get_directory_start(&cwd).await?;
@@ -39,16 +55,39 @@ impl LsCommand {
             .as_deref()
             .and_then(|active_id| keys.iter().find(|key| key.id == active_id));
 
+        let mut has_problems = false;
+
+        // 1. Config
+        if check {
+            has_problems |= self.check_config();
+        }
+
+        // 2. Keys
         println!("{}", style::bold("Keys:"));
         if keys.is_empty() {
-            println!("  {}", style::dim("(none)"));
+            if check {
+                println!(
+                    "  {}",
+                    style::dim("(none) — run `aivo keys add` to add a key")
+                );
+            } else {
+                println!("  {}", style::dim("(none)"));
+            }
         } else {
             let max_name_len = keys
                 .iter()
                 .map(|k| k.display_name().len())
                 .max()
                 .unwrap_or(0);
-            for key in &keys {
+
+            if check {
+                let active_id = active_key_id.as_deref();
+                ping_keys_streaming(keys.clone(), |id, result| {
+                    has_problems |= print_key_result(id, result, active_id, max_name_len);
+                })
+                .await;
+            } else {
+                for key in &keys {
                 let is_active = active_key_id.as_deref() == Some(key.id.as_str());
                 let marker = if is_active {
                     style::bullet_symbol()
@@ -63,9 +102,11 @@ impl LsCommand {
                     style::dim(truncate_url_for_display(&key.base_url, 50)),
                     width = max_name_len
                 );
+                }
             }
         }
 
+        // 3. Tools
         println!();
         println!("{}", style::bold("Tools:"));
         let path_dirs = collect_path_dirs();
@@ -86,6 +127,7 @@ impl LsCommand {
             }
         }
 
+        // 4. Current directory + remembered start
         println!();
         println!("{}", style::bold("Current directory:"));
         println!("  {}", style::dim(&cwd));
@@ -97,6 +139,7 @@ impl LsCommand {
             ),
         }
 
+        // 5. Active defaults
         println!();
         println!("{}", style::bold("Active defaults:"));
         if let Some(key) = active_key {
@@ -124,19 +167,69 @@ impl LsCommand {
             println!("  {}", style::dim("No active key."));
         }
 
+        // 6. Summary (check mode only)
+        if check {
+            println!();
+            if has_problems {
+                println!(
+                    "{}",
+                    style::yellow("Some checks failed. See details above.")
+                );
+                return Ok(ExitCode::UserError);
+            } else {
+                println!("{}", style::green("All checks passed."));
+            }
+        }
+
         Ok(ExitCode::Success)
     }
 
+    fn check_config(&self) -> bool {
+        println!("{}", style::bold("Config:"));
+
+        let config_path = self.session_store.get_config_path();
+        let exists = config_path.exists();
+        if exists {
+            println!(
+                "  {} config file  {}",
+                style::green("✓"),
+                style::dim(config_path.display().to_string())
+            );
+        } else {
+            println!(
+                "  {} config file  {}",
+                style::red("✗"),
+                style::dim("not found — run `aivo keys add` to create")
+            );
+            println!();
+            return true;
+        }
+
+        println!();
+        false
+    }
+
     pub fn print_help() {
-        println!("{} aivo ls", style::bold("Usage:"));
+        println!("{} aivo ls [--ping]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
-            style::dim("Show saved keys, installed tool binaries, and current directory state.")
+            style::dim("Show system info, keys, tools, and directory state.")
         );
+        println!(
+            "{}",
+            style::dim("With --ping, also pings all keys and shows a pass/fail summary.")
+        );
+        println!();
+        println!("{}", style::bold("Options:"));
+        let print_opt = |flag: &str, desc: &str| {
+            println!("  {:<18} {}", flag, style::dim(desc));
+        };
+        print_opt("--ping", "Ping all keys and show pass/fail summary");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo ls"));
+        println!("  {}", style::dim("aivo ls --ping"));
     }
 
     fn print_directory_start(
@@ -153,6 +246,39 @@ impl LsCommand {
             model
         );
     }
+}
+
+/// Prints a single key ping result. Returns true if the result indicates a problem.
+fn print_key_result(
+    id: &str,
+    result: &PingResult,
+    active_key_id: Option<&str>,
+    max_name_len: usize,
+) -> bool {
+    let is_active = active_key_id == Some(id);
+    let active_marker = if is_active { " (active)" } else { "" };
+    let message = result.status.message();
+    let has_problem = !matches!(result.status, PingStatus::Ok);
+    let (icon, status_styled) = if has_problem {
+        (style::red("✗"), style::red(&message))
+    } else {
+        (style::green("✓"), style::green(&message))
+    };
+    let latency = result
+        .latency
+        .map(|d: std::time::Duration| format!(" {}ms", d.as_millis()))
+        .unwrap_or_default();
+    let name_padded = format!("{:<width$}", result.name, width = max_name_len);
+    println!(
+        "  {} {}{}  {}  {}{}",
+        icon,
+        name_padded,
+        style::dim(active_marker),
+        style::dim(truncate_url_for_display(&result.url, 40)),
+        status_styled,
+        style::dim(&latency),
+    );
+    has_problem
 }
 
 fn format_directory_start_line(
@@ -172,8 +298,6 @@ fn format_directory_start_line(
 
     (record.tool.clone(), key_name, model)
 }
-
-// Tests for path search utilities are in services::path_search
 
 #[cfg(test)]
 mod tests {

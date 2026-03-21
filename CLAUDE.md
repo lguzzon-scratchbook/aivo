@@ -69,9 +69,8 @@ SessionStore → EnvironmentInjector → AILauncher
 | `chat_request_builder.rs`| HTTP request body construction for OpenAI/Anthropic chat APIs |
 | `chat_response_parser.rs`| SSE chunk parsing, usage extraction, response format handling |
 | `alias.rs`               | Model alias management (short names → full model names)    |
-| `doctor.rs`              | Health checks (config file, encryption, stored keys, tool binaries) |
+| `info.rs`                | System info and health check (keys, tools, directory state; `--ping` for key pinging) |
 | `keys.rs`                | API key management (add, rm, use, edit, cat, list)         |
-| `ls.rs`                  | List stored keys, directory starts, and models             |
 | `models.rs`              | List available models from active provider (1h cache)      |
 | `serve.rs`               | Local OpenAI-compatible API server                         |
 | `stats.rs`               | Usage statistics display (tokens, requests, costs)         |
