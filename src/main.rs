@@ -309,6 +309,12 @@ fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
         return rewritten;
     }
 
+    if raw_args[1] == "ping" {
+        let mut rewritten = vec![raw_args[0].clone(), "keys".to_string(), "ping".to_string()];
+        rewritten.extend_from_slice(&raw_args[2..]);
+        return rewritten;
+    }
+
     if raw_args[1] == "-x" || raw_args[1] == "--execute" {
         let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
@@ -357,18 +363,30 @@ fn print_help() {
     print_cmd("chat", "Start the interactive chat TUI");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
-    print_cmd("use", "Switch active API key");
     print_cmd("models", "List available models from the active provider");
     print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("ls", "Show system info, keys, tools, and directory state");
     print_cmd("stats", "Show usage statistics");
     print_cmd("update", "Update to the latest version");
     println!();
-    println!(
-        "{} {}",
-        style::bold("Shortcuts:"),
-        style::dim("aivo claude/codex/gemini/opencode/pi [\"prompt\"]")
-    );
+    println!("{}", style::bold("Shortcuts:"));
+    let print_shortcut = |alias: &str, expansion: &str| {
+        println!(
+            "  {} {} {}",
+            style::cyan(alias),
+            style::arrow_symbol(),
+            style::dim(expansion)
+        );
+    };
+    print_shortcut("use", "keys use");
+    print_shortcut("ping", "keys ping");
+    print_shortcut("claude|codex|gemini|opencode|pi", "run <tool>");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo claude -m kimi-k2.5"));
+    println!("  {}", style::dim("aivo chat -x \"hello\""));
+    println!("  {}", style::dim("aivo gemini -k mykey -m minimax-m2.7"));
+    println!("  {}", style::dim("aivo ls --ping"));
     println!();
     println!("{}", style::bold("Options:"));
     let print_opt = |flag: &str, desc: &str| {
