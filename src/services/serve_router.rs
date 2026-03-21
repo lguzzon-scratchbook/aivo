@@ -250,11 +250,8 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                 if provided != Some(&**expected) {
                     let _ = socket
                         .write_all(
-                            http_utils::http_error_response(
-                                401,
-                                "Invalid or missing bearer token",
-                            )
-                            .as_bytes(),
+                            http_utils::http_error_response(401, "Invalid or missing bearer token")
+                                .as_bytes(),
                         )
                         .await;
                     return;

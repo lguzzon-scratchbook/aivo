@@ -21,6 +21,7 @@ pub(super) fn read_system_clipboard() -> Result<ClipboardPayload> {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn read_command_stdout(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
