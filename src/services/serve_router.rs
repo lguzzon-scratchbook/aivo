@@ -47,6 +47,7 @@ pub struct ServeRouterConfig {
     pub is_openrouter: bool,
     pub cors: bool,
     pub timeout: u64,
+    pub auth_token: Option<String>,
 }
 
 pub struct ServeRouter {
@@ -141,6 +142,7 @@ impl ServeRouter {
                         is_openrouter: profile.serve_flags.is_openrouter,
                         cors: false,
                         timeout,
+                        auth_token: None,
                     }),
                     key: fk,
                     copilot_tokens: ct,
@@ -174,6 +176,11 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
     } else {
         ""
     };
+    let expected_auth: Option<Arc<str>> = state
+        .config
+        .auth_token
+        .as_ref()
+        .map(|t| Arc::from(format!("Bearer {}", t)));
 
     loop {
         let accept = tokio::select! {
@@ -191,6 +198,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
         let peer_ip = peer_addr.ip().to_string();
         let state = state.clone();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let expected_auth = expected_auth.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -232,6 +240,27 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
 
             let path = http_utils::extract_request_path(&request);
             let path_no_query = path.split('?').next().unwrap_or(&path);
+
+            // Bearer token auth check (skip /health)
+            if let Some(ref expected) = expected_auth
+                && path_no_query != "/health"
+            {
+                let headers_end = request.find("\r\n\r\n").unwrap_or(request.len());
+                let provided = http_utils::header_value(&request[..headers_end], "Authorization");
+                if provided != Some(&**expected) {
+                    let _ = socket
+                        .write_all(
+                            http_utils::http_error_response(
+                                401,
+                                "Invalid or missing bearer token",
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    return;
+                }
+            }
+
             let request_start = std::time::Instant::now();
 
             // Extract model from request body for logging (best-effort)
@@ -883,6 +912,7 @@ mod tests {
                 is_openrouter: false,
                 cors: false,
                 timeout: 300,
+                auth_token: None,
             }),
             client: http_utils::router_http_client(),
             key: test_key(),
@@ -1013,6 +1043,7 @@ mod tests {
                 is_openrouter: true,
                 cors: false,
                 timeout: 300,
+                auth_token: None,
             }),
             client: http_utils::router_http_client(),
             key: test_key(),
@@ -1176,6 +1207,7 @@ mod tests {
                 is_openrouter: false,
                 cors: false,
                 timeout: 300,
+                auth_token: None,
             }),
             key: test_key(),
             copilot_tokens: None,
@@ -1204,6 +1236,7 @@ mod tests {
             is_openrouter: false,
             cors: false,
             timeout: 300,
+            auth_token: None,
         });
 
         let entry = FailoverEntry {
@@ -1231,6 +1264,7 @@ mod tests {
                 is_openrouter: false,
                 cors: false,
                 timeout: 300,
+                auth_token: None,
             }),
             key: test_key(),
             copilot_tokens: None,

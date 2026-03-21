@@ -18,6 +18,7 @@ pub struct ServeParams {
     pub failover_keys: Vec<ApiKey>,
     pub cors: bool,
     pub timeout: u64,
+    pub auth_token: Option<String>,
 }
 
 pub struct ServeCommand;
@@ -52,7 +53,22 @@ impl ServeCommand {
             failover_keys,
             cors,
             timeout,
+            auth_token,
         } = params;
+
+        // Resolve auth token: None → no auth, Some("") → generate, Some(t) → use as-is
+        let auth_token = match auth_token {
+            Some(ref t) if t.is_empty() => {
+                use rand::Rng;
+                let token: String = rand::thread_rng()
+                    .sample_iter(&rand::distributions::Alphanumeric)
+                    .take(32)
+                    .map(char::from)
+                    .collect();
+                Some(token)
+            }
+            other => other,
+        };
         let key = match key_override {
             Some(k) => k,
             None => {
@@ -83,7 +99,12 @@ impl ServeCommand {
         let display_host = if is_copilot {
             "github.com/copilot".to_string()
         } else {
-            key.base_url.clone()
+            let stripped = key
+                .base_url
+                .strip_prefix("https://")
+                .or_else(|| key.base_url.strip_prefix("http://"))
+                .unwrap_or(&key.base_url);
+            super::truncate_url_for_display(stripped, 40)
         };
 
         let config = ServeRouterConfig {
@@ -94,6 +115,7 @@ impl ServeCommand {
             is_openrouter,
             cors,
             timeout,
+            auth_token,
         };
 
         let logger = match log {
@@ -106,6 +128,7 @@ impl ServeCommand {
 
         let failover_count = failover_keys.len();
         let log_display = logger.as_ref().map(|l| l.path_display().to_string());
+        let auth_display = config.auth_token.clone();
         let router = ServeRouter::new(config, key)
             .with_logger(logger)
             .with_failover_keys(failover_keys);
@@ -125,12 +148,20 @@ impl ServeCommand {
             display_addr,
             port
         );
-        eprintln!("  {} · {}", display_name, style::dim(&display_host));
-        eprintln!("  protocol: {}", style::dim(upstream_protocol.as_str()));
+
+        // Info line: key · host · log
+        let mut info_parts = vec![display_name.clone()];
+        // Only show base URL if it differs from the key name (avoid "ollama · ollama")
+        if display_host != display_name {
+            info_parts.push(style::dim(&display_host));
+        }
         if let Some(ref path) = log_display {
-            eprintln!("  logging: {}", style::dim(path));
-        } else {
-            eprintln!("  logging: {}", style::dim("off"));
+            info_parts.push(format!("log: {}", style::dim(path)));
+        }
+        eprintln!("  {}", info_parts.join(" · "));
+
+        if let Some(ref token) = auth_display {
+            eprintln!("  auth: {}", style::dim(token));
         }
         if cors {
             eprintln!("  cors: {}", style::dim("enabled"));
@@ -143,7 +174,6 @@ impl ServeCommand {
                 if failover_count == 1 { "" } else { "s" }
             );
         }
-        print_supported_paths();
         eprintln!("  {}", style::dim("Press Ctrl+C to stop"));
 
         tokio::select! {
@@ -217,6 +247,10 @@ impl ServeCommand {
             "--timeout <SECS>",
             "Upstream timeout in seconds (default: 300)",
         );
+        print_opt(
+            "--auth-token [TOKEN]",
+            "Require bearer token (auto-generated if no value given)",
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo serve"));
@@ -226,17 +260,6 @@ impl ServeCommand {
         println!("  {}", style::dim("aivo serve --log /tmp/requests.jsonl"));
         println!("  {}", style::dim("aivo serve --cors --timeout 60"));
     }
-}
-
-fn print_supported_paths() {
-    eprintln!();
-    eprintln!("{}", style::bold("Supported paths"));
-    eprintln!("  {}", style::blue("/health"));
-    eprintln!("  {}", style::blue("/v1/models"));
-    eprintln!("  {}", style::blue("/v1/chat/completions"));
-    eprintln!("  {}", style::blue("/v1/responses"));
-    eprintln!("  {}", style::blue("/v1/embeddings"));
-    eprintln!();
 }
 
 fn is_self_proxy_target(base_url: &str, port: u16, bind_host: &str) -> bool {

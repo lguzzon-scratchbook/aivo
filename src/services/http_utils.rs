@@ -183,7 +183,7 @@ pub fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+pub fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     headers.lines().find_map(|line| {
         let (header_name, value) = line.split_once(':')?;
         if header_name.trim().eq_ignore_ascii_case(name) {

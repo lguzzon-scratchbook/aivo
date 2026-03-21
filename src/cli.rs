@@ -219,6 +219,10 @@ pub struct ServeArgs {
     /// Upstream request timeout in seconds (0 = no timeout)
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
+
+    /// Require bearer token (auto-generated if no value given)
+    #[arg(long, value_name = "TOKEN", num_args = 0..=1, default_missing_value = "")]
+    pub auth_token: Option<String>,
 }
 
 /// Arguments for the stats command

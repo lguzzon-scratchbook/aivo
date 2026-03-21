@@ -272,6 +272,7 @@ async fn main() {
                     failover_keys,
                     cors: serve_args.cors,
                     timeout: serve_args.timeout,
+                    auth_token: serve_args.auth_token,
                 })
                 .await
         }

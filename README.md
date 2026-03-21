@@ -161,6 +161,19 @@ http://127.0.0.1:24860
 
 This is handy for scripts and tools that already speak the OpenAI API.
 
+Options:
+
+```bash
+aivo serve --host 0.0.0.0 -p 8080       # bind to all interfaces
+aivo serve --cors                        # enable CORS for browser clients
+aivo serve --timeout 60                  # upstream timeout in seconds (default: 300)
+aivo serve --auth-token                  # require bearer token (auto-generated)
+aivo serve --auth-token my-secret        # require a specific bearer token
+aivo serve --failover                    # multi-key failover on 429/5xx errors
+aivo serve --log /tmp/requests.jsonl     # log requests to a file
+aivo serve --log | jq .                  # log requests to stdout as JSONL
+```
+
 ## keys
 
 List, inspect, switch, edit, or remove saved keys:
