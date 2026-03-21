@@ -62,14 +62,21 @@ aivo keys add ollama
 aivo claude --model llama3.2
 ```
 
-## Everyday usage
+## run
 
-Run a tool with its normal flags:
+Launch an AI tool, or use the saved start flow.
+
+### Supported tools:
+
+- `claude` [Claude Code](https://github.com/anthropics/claude-code)
+- `codex` [Codex](https://github.com/openai/codex)
+- `gemini` [Gemini CLI](https://github.com/google-gemini/gemini-cli)
+- `opencode` [OpenCode](https://github.com/anomalyco/opencode)
+- `pi` [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
 
 ```bash
 aivo claude --dangerously-skip-permissions
 aivo claude --resume 16354407-050e-4447-a068-4db222ff841
-aivo claude --model moonshotai/kimi-k2.5
 ```
 
 Pick a model for one run:
@@ -83,7 +90,7 @@ Or let `--model` open the model picker if the provider supports the model list A
 
 ```bash
 aivo claude --model
-aivo chat --model
+aivo chat -m  # or just use -m
 ```
 
 Use a different saved key without changing the active one:
@@ -91,7 +98,7 @@ Use a different saved key without changing the active one:
 ```bash
 aivo claude --key openrouter
 aivo codex --key copilot
-aivo claude --key              # open key picker for this run only
+aivo claude --key  # open key picker for this run only
 ```
 
 Preview what `aivo` would launch without starting the tool:
@@ -115,7 +122,46 @@ aivo run
 
 `aivo run` without a tool will reuse the saved selection for that directory when it has one.
 
-## Keys and providers
+## chat
+
+`aivo chat` starts the full-screen chat UI. `-x` sends a single prompt and exits.
+
+```bash
+aivo chat
+aivo chat -x "Summarize this repository"
+aivo chat --attach README.md --attach screenshot.png
+git diff --cached | aivo chat -x "Write a one-line commit message"
+```
+
+Omit the message to read from stdin instead (Ctrl-D to send):
+
+```bash
+aivo chat -x
+aivo -x "hello"
+```
+
+The selected chat model is remembered per saved key.
+
+## serve
+
+`aivo serve` exposes the active provider as a local OpenAI-compatible endpoint:
+
+```bash
+aivo serve
+aivo serve --port 8080
+aivo serve --key openrouter
+aivo serve --log
+```
+
+Default address:
+
+```text
+http://127.0.0.1:24860
+```
+
+This is handy for scripts and tools that already speak the OpenAI API.
+
+## keys
 
 List, inspect, switch, edit, or remove saved keys:
 
@@ -126,9 +172,12 @@ aivo keys use
 aivo keys cat
 aivo keys edit
 aivo keys rm
+aivo keys ping
+aivo keys ping --all # ping all keys and show status
 ```
 
 `aivo use <name>` is a shortcut for `aivo keys use <name>`.
+`aivo ping` is a shortcut for `aivo keys ping`.
 
 Examples:
 
@@ -144,7 +193,7 @@ You are not limited to the providers above.
 Any endpoint that matches the supported protocols can be saved with `aivo keys add`.
 Keys are stored locally and encrypted in the user config directory.
 
-## Models
+## models
 
 List models for the active provider:
 
@@ -157,51 +206,52 @@ aivo models -s sonnet
 
 Model lists are cached for one hour. `--refresh` bypasses the cache.
 
-## Status
+## alias
 
-`aivo ls` shows a compact status view of:
+Create short names for models:
+
+```bash
+aivo alias                          # list all aliases
+aivo alias fast=claude-haiku-4-5    # create an alias
+aivo alias best claude-sonnet-4-6   # alternative syntax
+aivo alias rm fast                  # remove an alias
+
+# then you can use the alias in place of the model name:
+aivo claude -m fast
+```
+
+## ls
+
+`aivo ls` shows a compact overview of:
 
 - saved keys and the active key
 - installed tool binaries on `PATH`
 - the remembered tool/model for the current directory
 - the saved chat model and cached model count for the active key
 
-## Chat
-
-`aivo chat` starts the full-screen chat UI. `-x` sends a single prompt and exits.
+Use `--ping` to also health-check all keys:
 
 ```bash
-aivo chat
-aivo chat -x "Summarize this repository"
-git diff --cached | aivo chat -x "Write a one-line commit message"
+aivo ls --ping
 ```
 
-Omit the message to read from stdin instead (Ctrl-D to send):
+## stats
+
+Show usage statistics: token counts, request counts, and cost breakdowns.
 
 ```bash
-aivo chat -x
-aivo -x "hello"
+aivo stats                  # human-readable summary
+aivo stats -n               # exact numbers
+aivo stats -s openrouter    # filter by key, model, or tool
 ```
 
-The selected chat model is remembered per saved key.
+## update
 
-## Local API server
-
-`aivo serve` exposes the active provider as a local OpenAI-compatible endpoint:
+Update to the latest version:
 
 ```bash
-aivo serve
-aivo serve --port 8080
-aivo serve --key openrouter
+aivo update
 ```
-
-Default address:
-
-```text
-http://127.0.0.1:24860
-```
-
-This is handy for scripts, MCP servers, and tools that already speak the OpenAI API.
 
 ## Development
 
