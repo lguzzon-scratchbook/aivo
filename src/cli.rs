@@ -190,6 +190,10 @@ pub struct ServeArgs {
     #[arg(short = 'p', long, default_value_t = 24860)]
     pub port: u16,
 
+    /// Host address to bind to
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
     /// Select API key by ID or name
     #[arg(
         short = 'k',
@@ -200,13 +204,21 @@ pub struct ServeArgs {
     )]
     pub key: Option<String>,
 
-    /// Enable request logging to ~/.config/aivo/logs/
-    #[arg(long)]
-    pub log: bool,
+    /// Enable request logging (stdout, or to a file if path given)
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    pub log: Option<String>,
 
     /// Enable multi-key failover on 429/5xx errors
     #[arg(long)]
     pub failover: bool,
+
+    /// Enable CORS headers for browser-based clients
+    #[arg(long)]
+    pub cors: bool,
+
+    /// Upstream request timeout in seconds (0 = no timeout)
+    #[arg(long, default_value_t = 300)]
+    pub timeout: u64,
 }
 
 /// Arguments for the stats command

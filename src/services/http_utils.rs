@@ -362,6 +362,7 @@ fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
@@ -379,24 +380,59 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
+/// Returns the pre-formatted CORS header lines (without trailing \r\n\r\n).
+pub fn cors_header_block() -> &'static str {
+    "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Max-Age: 86400"
+}
+
 /// Formats the HTTP response head (status line + headers) without the body.
 pub fn http_response_head(status: u16, content_type: &str, content_length: usize) -> String {
+    http_response_head_with_extra(status, content_type, content_length, "")
+}
+
+/// Formats extra headers as a block to append before the final \r\n\r\n.
+fn format_extra_headers(extra: &str) -> String {
+    if extra.is_empty() {
+        String::new()
+    } else {
+        format!("\r\n{}", extra)
+    }
+}
+
+/// Formats the HTTP response head with extra headers injected before the final \r\n\r\n.
+pub fn http_response_head_with_extra(
+    status: u16,
+    content_type: &str,
+    content_length: usize,
+    extra: &str,
+) -> String {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close{}\r\n\r\n",
         status,
         reason_phrase(status),
         content_type,
-        content_length
+        content_length,
+        format_extra_headers(extra)
     )
 }
 
 /// Formats the HTTP response head for chunked transfer encoding.
 pub fn http_chunked_response_head(status: u16, content_type: &str) -> String {
+    http_chunked_response_head_with_extra(status, content_type, "")
+}
+
+/// Formats the chunked HTTP response head with extra headers injected.
+pub fn http_chunked_response_head_with_extra(
+    status: u16,
+    content_type: &str,
+    extra: &str,
+) -> String {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close{}\r\n\r\n",
         status,
         reason_phrase(status),
-        content_type
+        content_type,
+        format_extra_headers(extra)
     )
 }
 
@@ -483,16 +519,23 @@ pub fn sse_data_payload(line: &str) -> Option<&str> {
     line.strip_prefix("data:").map(str::trim_start)
 }
 
+/// Creates a `reqwest::Client` with a configurable overall timeout.
+/// If `secs` is 0, no overall timeout is applied.
+pub fn router_http_client_with_timeout(secs: u64) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(std::time::Duration::from_secs(60));
+    if secs > 0 {
+        builder = builder.timeout(std::time::Duration::from_secs(secs));
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Creates a `reqwest::Client` with connection pooling for router use.
 /// Enables keep-alive for connection reuse across requests.
 pub fn router_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300)) // 5 minute overall timeout
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .pool_max_idle_per_host(10) // Reuse up to 10 connections per host
-        .tcp_keepalive(std::time::Duration::from_secs(60)) // TCP keep-alive every 60s
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    router_http_client_with_timeout(300)
 }
 
 #[cfg(test)]

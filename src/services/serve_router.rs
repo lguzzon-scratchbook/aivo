@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use crate::commands::models::fetch_models;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::http_utils::{self, router_http_client};
+use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch,
 };
@@ -27,7 +27,7 @@ use crate::services::serve_responses::{
 };
 use crate::services::serve_upstream::{
     RouterResponse, StreamingBody, UpstreamRequestContext, send_anthropic_chat, send_gemini_chat,
-    send_openai_chat,
+    send_openai_chat, send_openai_embeddings,
 };
 use crate::services::session_store::ApiKey;
 
@@ -45,6 +45,8 @@ pub struct ServeRouterConfig {
     pub upstream_protocol: ProviderProtocol,
     pub is_copilot: bool,
     pub is_openrouter: bool,
+    pub cors: bool,
+    pub timeout: u64,
 }
 
 pub struct ServeRouter {
@@ -62,6 +64,7 @@ struct ServeState {
     active_protocol: Arc<AtomicU8>,
     logger: Option<RequestLogger>,
     failover_keys: Arc<Vec<FailoverEntry>>,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 struct FailoverEntry {
@@ -92,9 +95,17 @@ impl ServeRouter {
     }
 
     /// Binds to the port eagerly (propagates "address already in use" immediately),
-    /// then spawns the accept loop in the background and returns the join handle.
-    pub async fn start_background(self, port: u16) -> Result<tokio::task::JoinHandle<Result<()>>> {
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    /// then spawns the accept loop in the background and returns the join handle
+    /// and a shutdown notifier.
+    pub async fn start_background(
+        self,
+        host: &str,
+        port: u16,
+    ) -> Result<(
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<tokio::sync::Notify>,
+    )> {
+        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
 
         let copilot_tokens = if self.config.is_copilot {
             Some(Arc::new(CopilotTokenManager::new(
@@ -105,6 +116,7 @@ impl ServeRouter {
         };
 
         let initial_protocol = self.config.upstream_protocol;
+        let timeout = self.config.timeout;
 
         let failover_entries: Vec<FailoverEntry> = self
             .failover_keys
@@ -127,6 +139,8 @@ impl ServeRouter {
                         upstream_protocol: protocol,
                         is_copilot,
                         is_openrouter: profile.serve_flags.is_openrouter,
+                        cors: false,
+                        timeout,
                     }),
                     key: fk,
                     copilot_tokens: ct,
@@ -135,25 +149,46 @@ impl ServeRouter {
             })
             .collect();
 
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+
         let state = Arc::new(ServeState {
             config: Arc::new(self.config),
-            client: router_http_client(),
+            client: router_http_client_with_timeout(timeout),
             key: self.key,
             copilot_tokens,
             active_protocol: Arc::new(AtomicU8::new(initial_protocol.to_u8())),
             logger: self.logger,
             failover_keys: Arc::new(failover_entries),
+            shutdown: shutdown.clone(),
         });
 
-        Ok(tokio::spawn(run_accept_loop(listener, state)))
+        Ok((tokio::spawn(run_accept_loop(listener, state)), shutdown))
     }
 }
 
 async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeState>) -> Result<()> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+    let cors = state.config.cors;
+    let cors_extra = if cors {
+        http_utils::cors_header_block()
+    } else {
+        ""
+    };
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let accept = tokio::select! {
+            result = listener.accept() => result,
+            _ = state.shutdown.notified() => {
+                // Wait for in-flight requests to finish (max 5s)
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    semaphore.acquire_many(100),
+                ).await;
+                return Ok(());
+            }
+        };
+        let (mut socket, peer_addr) = accept?;
+        let peer_ip = peer_addr.ip().to_string();
         let state = state.clone();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
@@ -186,11 +221,20 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             };
 
             let request = String::from_utf8_lossy(&request_bytes).into_owned();
+
+            // Handle OPTIONS preflight for CORS
+            if cors && request.starts_with("OPTIONS ") {
+                let head =
+                    http_utils::http_response_head_with_extra(204, "text/plain", 0, cors_extra);
+                let _ = socket.write_all(head.as_bytes()).await;
+                return;
+            }
+
             let path = http_utils::extract_request_path(&request);
             let path_no_query = path.split('?').next().unwrap_or(&path);
             let request_start = std::time::Instant::now();
 
-            // Extract model from request body for logging (best-effort, only when logging enabled)
+            // Extract model from request body for logging (best-effort)
             let log_model = if state.logger.is_some() {
                 http_utils::extract_request_body(&request)
                     .ok()
@@ -229,6 +273,17 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                         handle_responses_with_failover(&request, &state).await
                     }
                 }
+                "/v1/embeddings" => {
+                    if !request.starts_with("POST ") {
+                        Ok(RouterResponse::buffered(
+                            405,
+                            CONTENT_TYPE_JSON,
+                            br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
+                        ))
+                    } else {
+                        handle_embeddings_with_failover(&request, &state).await
+                    }
+                }
                 _ => Ok(RouterResponse::buffered(
                     404,
                     CONTENT_TYPE_JSON,
@@ -244,7 +299,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
 
             match result {
                 Ok(response) => {
-                    let _ = write_router_response(&mut socket, response).await;
+                    let _ = write_router_response(&mut socket, response, cors_extra).await;
                 }
                 Err(e) => {
                     let _ = socket
@@ -256,13 +311,20 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             // Log request (non-blocking, non-fatal)
             if let Some(ref logger) = state.logger {
                 let latency_ms = request_start.elapsed().as_millis() as u64;
+                let method = request
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("GET")
+                    .to_string();
                 logger
                     .log(crate::services::request_log::RequestLogEntry {
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        method,
                         path: path_no_query.to_string(),
                         model: log_model,
                         status: response_status,
                         latency_ms,
+                        ip: peer_ip,
                     })
                     .await;
             }
@@ -284,16 +346,50 @@ async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
     ))
 }
 
+fn parse_json_body(body_str: &str) -> std::result::Result<Value, RouterResponse> {
+    serde_json::from_str(body_str).map_err(|e| {
+        RouterResponse::buffered(
+            400,
+            CONTENT_TYPE_JSON,
+            json!({"error":{"message": format!("Invalid JSON: {}", e)}})
+                .to_string()
+                .into_bytes(),
+        )
+    })
+}
+
 async fn handle_chat(request: &str, state: &ServeState) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
-    let body: Value = serde_json::from_str(body_str)?;
+    let body = match parse_json_body(body_str) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+
+    if !body.get("messages").is_some_and(|v| v.is_array()) {
+        return Ok(RouterResponse::buffered(
+            400,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"Missing required field: messages"}}"#.to_vec(),
+        ));
+    }
 
     handle_chat_body(body, state).await
 }
 
 async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
-    let body: Value = serde_json::from_str(body_str)?;
+    let body = match parse_json_body(body_str) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+
+    if body.get("input").is_none() {
+        return Ok(RouterResponse::buffered(
+            400,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"Missing required field: input"}}"#.to_vec(),
+        ));
+    }
     let original_model = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -338,6 +434,7 @@ fn failover_state(entry: &FailoverEntry, client: &reqwest::Client) -> ServeState
         active_protocol: Arc::new(AtomicU8::new(entry.active_protocol.load(Ordering::Relaxed))),
         logger: None,
         failover_keys: Arc::new(Vec::new()),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -388,6 +485,29 @@ macro_rules! impl_with_failover {
 
 impl_with_failover!(handle_chat_with_failover, handle_chat);
 impl_with_failover!(handle_responses_with_failover, handle_responses);
+impl_with_failover!(handle_embeddings_with_failover, handle_embeddings);
+
+async fn handle_embeddings(request: &str, state: &ServeState) -> Result<RouterResponse> {
+    let protocol = ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed));
+    if !matches!(
+        protocol,
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi
+    ) {
+        return Ok(RouterResponse::buffered(
+            501,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"Embeddings not supported with this provider"}}"#.to_vec(),
+        ));
+    }
+
+    let body_str = http_utils::extract_request_body(request)?;
+    let body = match parse_json_body(body_str) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+
+    send_openai_embeddings(&body, &upstream_context(state)).await
+}
 
 async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
     let client_wants_stream = body
@@ -512,6 +632,7 @@ async fn handle_chat_openai(
 async fn write_router_response(
     socket: &mut tokio::net::TcpStream,
     response: RouterResponse,
+    extra_headers: &str,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -521,7 +642,12 @@ async fn write_router_response(
             content_type,
             body,
         } => {
-            let headers = http_utils::http_response_head(status, &content_type, body.len());
+            let headers = http_utils::http_response_head_with_extra(
+                status,
+                &content_type,
+                body.len(),
+                extra_headers,
+            );
             socket.write_all(headers.as_bytes()).await?;
             socket.write_all(&body).await?;
         }
@@ -530,7 +656,11 @@ async fn write_router_response(
             content_type,
             body,
         } => {
-            let headers = http_utils::http_chunked_response_head(status, &content_type);
+            let headers = http_utils::http_chunked_response_head_with_extra(
+                status,
+                &content_type,
+                extra_headers,
+            );
             socket.write_all(headers.as_bytes()).await?;
 
             match *body {
@@ -751,13 +881,16 @@ mod tests {
                 upstream_protocol: protocol,
                 is_copilot: false,
                 is_openrouter: false,
+                cors: false,
+                timeout: 300,
             }),
-            client: router_http_client(),
+            client: http_utils::router_http_client(),
             key: test_key(),
             copilot_tokens: None,
             active_protocol: Arc::new(AtomicU8::new(protocol.to_u8())),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -878,13 +1011,16 @@ mod tests {
                 upstream_protocol: ProviderProtocol::Openai,
                 is_copilot: false,
                 is_openrouter: true,
+                cors: false,
+                timeout: 300,
             }),
-            client: router_http_client(),
+            client: http_utils::router_http_client(),
             key: test_key(),
             copilot_tokens: None,
             active_protocol: Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8())),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         };
 
         let context = upstream_context(&state);
@@ -1038,13 +1174,15 @@ mod tests {
                 upstream_protocol: ProviderProtocol::Openai,
                 is_copilot: false,
                 is_openrouter: false,
+                cors: false,
+                timeout: 300,
             }),
             key: test_key(),
             copilot_tokens: None,
             active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
         };
 
-        let client = router_http_client();
+        let client = http_utils::router_http_client();
         let state = failover_state(&entry, &client);
 
         assert_eq!(
@@ -1064,6 +1202,8 @@ mod tests {
             upstream_protocol: ProviderProtocol::Openai,
             is_copilot: false,
             is_openrouter: false,
+            cors: false,
+            timeout: 300,
         });
 
         let entry = FailoverEntry {
@@ -1073,7 +1213,7 @@ mod tests {
             active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
         };
 
-        let client = router_http_client();
+        let client = http_utils::router_http_client();
         let state = failover_state(&entry, &client);
 
         // Arc should be a clone of the same allocation, not a new copy
@@ -1089,13 +1229,15 @@ mod tests {
                 upstream_protocol: ProviderProtocol::Openai,
                 is_copilot: false,
                 is_openrouter: false,
+                cors: false,
+                timeout: 300,
             }),
             key: test_key(),
             copilot_tokens: None,
             active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
         };
 
-        let client = router_http_client();
+        let client = http_utils::router_http_client();
         let state = failover_state(&entry, &client);
 
         // Failover state should have no failover keys (no cascading)

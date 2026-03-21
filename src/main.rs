@@ -19,7 +19,8 @@ mod version;
 use cli::{Cli, Commands};
 use commands::{
     AliasCommand, ChatCommand, InfoCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand,
-    StartCommand, StartFlowArgs, StatsCommand, UpdateCommand, truncate_url_for_display,
+    ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    truncate_url_for_display,
 };
 use errors::ExitCode;
 use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
@@ -263,7 +264,15 @@ async fn main() {
             };
             let command = ServeCommand::new();
             command
-                .execute(serve_args.port, key_override, serve_args.log, failover_keys)
+                .execute(ServeParams {
+                    port: serve_args.port,
+                    host: serve_args.host,
+                    key_override,
+                    log: serve_args.log,
+                    failover_keys,
+                    cors: serve_args.cors,
+                    timeout: serve_args.timeout,
+                })
                 .await
         }
 

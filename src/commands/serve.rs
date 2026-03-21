@@ -10,6 +10,16 @@ use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
 use crate::services::session_store::ApiKey;
 use crate::style;
 
+pub struct ServeParams {
+    pub port: u16,
+    pub host: String,
+    pub key_override: Option<ApiKey>,
+    pub log: Option<String>,
+    pub failover_keys: Vec<ApiKey>,
+    pub cors: bool,
+    pub timeout: u64,
+}
+
 pub struct ServeCommand;
 
 impl Default for ServeCommand {
@@ -23,17 +33,8 @@ impl ServeCommand {
         Self
     }
 
-    pub async fn execute(
-        &self,
-        port: u16,
-        key_override: Option<ApiKey>,
-        log: bool,
-        failover_keys: Vec<ApiKey>,
-    ) -> ExitCode {
-        match self
-            .execute_internal(port, key_override, log, failover_keys)
-            .await
-        {
+    pub async fn execute(&self, params: ServeParams) -> ExitCode {
+        match self.execute_internal(params).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -42,13 +43,16 @@ impl ServeCommand {
         }
     }
 
-    async fn execute_internal(
-        &self,
-        port: u16,
-        key_override: Option<ApiKey>,
-        log: bool,
-        failover_keys: Vec<ApiKey>,
-    ) -> Result<ExitCode> {
+    async fn execute_internal(&self, params: ServeParams) -> Result<ExitCode> {
+        let ServeParams {
+            port,
+            host,
+            key_override,
+            log,
+            failover_keys,
+            cors,
+            timeout,
+        } = params;
         let key = match key_override {
             Some(k) => k,
             None => {
@@ -65,10 +69,11 @@ impl ServeCommand {
         let is_openrouter = profile.serve_flags.is_openrouter;
         let upstream_protocol = profile.default_protocol;
 
-        if is_self_proxy_target(&key.base_url, port) {
+        if is_self_proxy_target(&key.base_url, port, &host) {
             anyhow::bail!(
-                "Refusing to start `aivo serve`: active upstream {} points back to http://127.0.0.1:{} and would proxy into itself. Switch to a real provider key with `aivo use <name>` or pass `--key <name>`.",
+                "Refusing to start `aivo serve`: active upstream {} points back to http://{}:{} and would proxy into itself. Switch to a real provider key with `aivo use <name>` or pass `--key <name>`.",
                 key.base_url,
+                host,
                 port
             );
         }
@@ -87,31 +92,49 @@ impl ServeCommand {
             upstream_protocol,
             is_copilot,
             is_openrouter,
+            cors,
+            timeout,
         };
 
-        let logger = if log {
-            let config_dir = crate::services::system_env::home_dir()
-                .map(|p| p.join(".config").join("aivo"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".config/aivo"));
-            RequestLogger::new(&config_dir).await
-        } else {
-            None
+        let logger = match log {
+            Some(ref path) if !path.is_empty() => {
+                RequestLogger::new_with_path(std::path::Path::new(path)).await
+            }
+            Some(_) => Some(RequestLogger::new_stdout()),
+            None => None,
         };
 
         let failover_count = failover_keys.len();
+        let log_display = logger.as_ref().map(|l| l.path_display().to_string());
         let router = ServeRouter::new(config, key)
             .with_logger(logger)
             .with_failover_keys(failover_keys);
 
         // Bind eagerly — errors here (e.g. "address already in use") before printing startup
-        let mut handle = router.start_background(port).await?;
+        let (mut handle, shutdown) = router.start_background(&host, port).await?;
 
+        // Format display URL — bracket IPv6 addresses
+        let display_addr = if host.contains(':') {
+            format!("[{}]", host)
+        } else {
+            host.clone()
+        };
         eprintln!(
-            "{} Listening on http://127.0.0.1:{}",
+            "{} Listening on http://{}:{}",
             style::success_symbol(),
+            display_addr,
             port
         );
         eprintln!("  {} · {}", display_name, style::dim(&display_host));
+        eprintln!("  protocol: {}", style::dim(upstream_protocol.as_str()));
+        if let Some(ref path) = log_display {
+            eprintln!("  logging: {}", style::dim(path));
+        } else {
+            eprintln!("  logging: {}", style::dim("off"));
+        }
+        if cors {
+            eprintln!("  cors: {}", style::dim("enabled"));
+        }
         if failover_count > 0 {
             eprintln!(
                 "  {} failover: {} additional key{}",
@@ -126,8 +149,19 @@ impl ServeCommand {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal?;
-                handle.abort();
-                let _ = handle.await;
+                eprintln!("\n  Shutting down...");
+                shutdown.notify_one();
+                match tokio::time::timeout(std::time::Duration::from_secs(6), &mut handle).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(err))) => return Err(err),
+                    Ok(Err(err)) if err.is_cancelled() => {}
+                    Ok(Err(err)) => anyhow::bail!("serve router task failed: {}", err),
+                    Err(_) => {
+                        eprintln!("  Grace period expired, aborting");
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                }
             }
             result = &mut handle => match result {
                 Ok(Ok(())) => {
@@ -166,16 +200,31 @@ impl ServeCommand {
         };
         print_opt("-p, --port <PORT>", "Port to listen on (default: 24860)");
         print_opt(
+            "--host <ADDR>",
+            "Host address to bind to (default: 127.0.0.1)",
+        );
+        print_opt(
             "-k, --key <id|name>",
             "Select API key by ID or name (-k opens key picker)",
         );
-        print_opt("--log", "Enable request logging to ~/.config/aivo/logs/");
+        print_opt(
+            "--log [PATH]",
+            "Log requests as JSONL (stdout, or to file if PATH given)",
+        );
+        print_opt("--failover", "Enable multi-key failover on 429/5xx errors");
+        print_opt("--cors", "Enable CORS headers for browser-based clients");
+        print_opt(
+            "--timeout <SECS>",
+            "Upstream timeout in seconds (default: 300)",
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo serve"));
-        println!("  {}", style::dim("aivo serve -p 8080"));
+        println!("  {}", style::dim("aivo serve --host 0.0.0.0 -p 8080"));
         println!("  {}", style::dim("aivo serve -k openrouter"));
-        println!("  {}", style::dim("aivo serve --log"));
+        println!("  {}", style::dim("aivo serve --log | jq ."));
+        println!("  {}", style::dim("aivo serve --log /tmp/requests.jsonl"));
+        println!("  {}", style::dim("aivo serve --cors --timeout 60"));
     }
 }
 
@@ -186,10 +235,11 @@ fn print_supported_paths() {
     eprintln!("  {}", style::blue("/v1/models"));
     eprintln!("  {}", style::blue("/v1/chat/completions"));
     eprintln!("  {}", style::blue("/v1/responses"));
+    eprintln!("  {}", style::blue("/v1/embeddings"));
     eprintln!();
 }
 
-fn is_self_proxy_target(base_url: &str, port: u16) -> bool {
+fn is_self_proxy_target(base_url: &str, port: u16, bind_host: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
     };
@@ -205,13 +255,23 @@ fn is_self_proxy_target(base_url: &str, port: u16) -> bool {
         return false;
     }
 
+    // When binding to 0.0.0.0, all loopback addresses are self-proxy targets
+    let binds_all = bind_host == "0.0.0.0" || bind_host == "::";
+
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
 
     host.trim_matches(['[', ']'])
         .parse::<IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+        .is_ok_and(|ip| {
+            if binds_all {
+                // When bound to all interfaces, any local address is a self-proxy target
+                ip.is_loopback() || ip.is_unspecified()
+            } else {
+                ip.is_loopback()
+            }
+        })
 }
 
 #[cfg(test)]
@@ -220,16 +280,54 @@ mod tests {
 
     #[test]
     fn detects_localhost_self_proxy() {
-        assert!(is_self_proxy_target("http://127.0.0.1:24860", 24860));
-        assert!(is_self_proxy_target("http://127.0.0.1:24860/v1", 24860));
-        assert!(is_self_proxy_target("http://localhost:24860", 24860));
-        assert!(is_self_proxy_target("http://[::1]:24860/v1", 24860));
+        assert!(is_self_proxy_target(
+            "http://127.0.0.1:24860",
+            24860,
+            "127.0.0.1"
+        ));
+        assert!(is_self_proxy_target(
+            "http://127.0.0.1:24860/v1",
+            24860,
+            "127.0.0.1"
+        ));
+        assert!(is_self_proxy_target(
+            "http://localhost:24860",
+            24860,
+            "127.0.0.1"
+        ));
+        assert!(is_self_proxy_target(
+            "http://[::1]:24860/v1",
+            24860,
+            "127.0.0.1"
+        ));
     }
 
     #[test]
     fn ignores_other_ports_and_hosts() {
-        assert!(!is_self_proxy_target("http://127.0.0.1:8080", 24860));
-        assert!(!is_self_proxy_target("https://api.openai.com/v1", 24860));
-        assert!(!is_self_proxy_target("not-a-url", 24860));
+        assert!(!is_self_proxy_target(
+            "http://127.0.0.1:8080",
+            24860,
+            "127.0.0.1"
+        ));
+        assert!(!is_self_proxy_target(
+            "https://api.openai.com/v1",
+            24860,
+            "127.0.0.1"
+        ));
+        assert!(!is_self_proxy_target("not-a-url", 24860, "127.0.0.1"));
+    }
+
+    #[test]
+    fn detects_self_proxy_when_bound_to_all() {
+        assert!(is_self_proxy_target(
+            "http://127.0.0.1:24860",
+            24860,
+            "0.0.0.0"
+        ));
+        assert!(is_self_proxy_target(
+            "http://localhost:24860",
+            24860,
+            "0.0.0.0"
+        ));
     }
 }

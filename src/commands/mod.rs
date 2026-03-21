@@ -44,7 +44,7 @@ pub use info::InfoCommand;
 pub use keys::KeysCommand;
 pub use models::ModelsCommand;
 pub use run::RunCommand;
-pub use serve::ServeCommand;
+pub use serve::{ServeCommand, ServeParams};
 pub use start::{StartCommand, StartFlowArgs};
 pub use stats::StatsCommand;
 pub use update::UpdateCommand;

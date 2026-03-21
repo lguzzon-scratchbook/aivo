@@ -148,6 +148,26 @@ pub(crate) async fn send_openai_chat(
     finalize_openai_response(response, client_wants_stream).await
 }
 
+pub(crate) async fn send_openai_embeddings(
+    body: &Value,
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
+    let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/embeddings");
+    let req = http_utils::authorized_openai_post(
+        &context.client,
+        &url,
+        context.upstream_api_key.as_str(),
+        context.copilot_tokens.as_deref(),
+    )
+    .await?;
+
+    let response = req.json(body).send().await?;
+    let status = response.status().as_u16();
+    let content_type = http_utils::response_content_type(&response);
+    let body_bytes = response.bytes().await?.to_vec();
+    Ok(RouterResponse::buffered(status, &content_type, body_bytes))
+}
+
 fn build_anthropic_request(body: &Value, client_wants_stream: bool) -> (String, Value) {
     let fallback_model = body
         .get("model")
