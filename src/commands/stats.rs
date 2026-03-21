@@ -34,10 +34,10 @@ impl StatsCommand {
         }
 
         let keys = self.store.get_keys().await.unwrap_or_default();
-        let fmt = if args.human {
-            format_human
-        } else {
+        let fmt = if args.numbers {
             format_number
+        } else {
+            format_human
         };
 
         let all_key_ids: HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
@@ -229,12 +229,12 @@ impl StatsCommand {
                 style::dim(desc)
             );
         };
-        print_opt("-H, --human", "Human-readable numbers (K/M/B)");
+        print_opt("-n, --numbers", "Exact numbers instead of human-readable");
         print_opt("-s, --search <QUERY>", "Search by key, model, or tool name");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo stats"));
-        println!("  {}", style::dim("aivo stats -H"));
+        println!("  {}", style::dim("aivo stats -n"));
         println!("  {}", style::dim("aivo stats -s openrouter"));
     }
 }

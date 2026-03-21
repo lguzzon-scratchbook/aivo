@@ -212,9 +212,9 @@ pub struct ServeArgs {
 /// Arguments for the stats command
 #[derive(Args, Debug, Clone)]
 pub struct StatsArgs {
-    /// Human-readable numbers (K/M/B suffixes)
-    #[arg(short = 'H', long)]
-    pub human: bool,
+    /// Exact numbers instead of human-readable
+    #[arg(short = 'n', long)]
+    pub numbers: bool,
 
     /// Search by key, model, or tool name (substring match)
     #[arg(short = 's', long, value_name = "QUERY")]
