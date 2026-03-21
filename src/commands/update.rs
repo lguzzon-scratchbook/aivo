@@ -109,7 +109,7 @@ impl UpdateCommand {
                     PackageManager::Homebrew => {
                         return Ok(self.update_via_homebrew());
                     }
-                    PackageManager::Cargo => {
+                    PackageManager::Npm | PackageManager::Cargo => {
                         eprintln!(
                             "{} aivo was installed via {}.",
                             style::yellow("Warning:"),
@@ -633,6 +633,7 @@ fn get_install_path() -> Result<PathBuf> {
 enum PackageManager {
     Homebrew,
     Cargo,
+    Npm,
 }
 
 /// Information about a detected package manager
@@ -651,6 +652,15 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
     }
 
     let path_str = install_path.to_string_lossy();
+
+    // npm: .../node_modules/@yuanchuan/aivo/...
+    if path_str.contains("/node_modules/") {
+        return Some(ManagedInstall {
+            kind: PackageManager::Npm,
+            name: "npm",
+            upgrade_command: "npm install -g @yuanchuan/aivo",
+        });
+    }
 
     // Homebrew: /opt/homebrew/Cellar/..., /usr/local/Cellar/..., /home/linuxbrew/.linuxbrew/Cellar/...
     if path_str.contains("/Cellar/") || path_str.contains("/homebrew/") {
@@ -782,6 +792,28 @@ mod tests {
         assert!(assets.contains(&"aivo-linux-arm64"));
         assert!(assets.contains(&"aivo-linux-x64"));
         assert!(assets.contains(&"aivo-windows-x64.exe"));
+    }
+
+    #[test]
+    fn test_detect_npm_global() {
+        let path = Path::new(
+            "/opt/homebrew/lib/node_modules/@yuanchuan/aivo/native/aivo",
+        );
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.name, "npm");
+        assert_eq!(m.upgrade_command, "npm install -g @yuanchuan/aivo");
+    }
+
+    #[test]
+    fn test_detect_npm_nvm() {
+        let path = Path::new(
+            "/Users/user/.nvm/versions/node/v22.0.0/lib/node_modules/@yuanchuan/aivo/native/aivo",
+        );
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "npm");
     }
 
     #[test]
