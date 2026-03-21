@@ -266,46 +266,44 @@ impl UsageStats {
         self == &Self::default()
     }
 
-    /// Removes all stats linked to a key and recomputes global totals.
+    /// Removes stats linked to a key by subtracting its known contributions from globals.
+    /// Uses subtraction instead of recomputing to preserve legacy global data that
+    /// predates per-key model/tool tracking.
     pub(crate) fn remove_key(&mut self, key_id: &str) {
-        if self.key_usage.remove(key_id).is_none() {
+        let Some(removed) = self.key_usage.remove(key_id) else {
             return;
+        };
+        self.total_selections = self.total_selections.saturating_sub(removed.selections);
+        self.total_prompt_tokens = self.total_prompt_tokens.saturating_sub(removed.prompt_tokens);
+        self.total_completion_tokens = self
+            .total_completion_tokens
+            .saturating_sub(removed.completion_tokens);
+        self.total_cache_read_input_tokens = self
+            .total_cache_read_input_tokens
+            .saturating_sub(removed.cache_read_input_tokens);
+        self.total_cache_creation_input_tokens = self
+            .total_cache_creation_input_tokens
+            .saturating_sub(removed.cache_creation_input_tokens);
+        self.total_tokens = self.total_tokens.saturating_sub(removed.total_tokens);
+        for (tool, count) in &removed.per_tool {
+            if let Some(tc) = self.tool_counts.get_mut(tool) {
+                *tc = tc.saturating_sub(*count);
+                if *tc == 0 {
+                    self.tool_counts.remove(tool);
+                }
+            }
         }
-        self.recompute_globals();
-    }
-
-    /// Recomputes all global totals from per-key data.
-    fn recompute_globals(&mut self) {
-        self.total_selections = 0;
-        self.total_prompt_tokens = 0;
-        self.total_completion_tokens = 0;
-        self.total_cache_read_input_tokens = 0;
-        self.total_cache_creation_input_tokens = 0;
-        self.total_tokens = 0;
-        self.tool_counts.clear();
-        self.model_usage.clear();
-
-        for entry in self.key_usage.values() {
-            self.total_selections += entry.selections;
-            self.total_prompt_tokens += entry.prompt_tokens;
-            self.total_completion_tokens += entry.completion_tokens;
-            self.total_cache_read_input_tokens += entry.cache_read_input_tokens;
-            self.total_cache_creation_input_tokens += entry.cache_creation_input_tokens;
-            self.total_tokens += entry.total_tokens;
-            for (tool, count) in &entry.per_tool {
-                *self.tool_counts.entry(tool.clone()).or_default() += count;
+        for (model, sel) in &removed.per_model_selections {
+            if let Some(mu) = self.model_usage.get_mut(model) {
+                mu.selections = mu.selections.saturating_sub(*sel);
             }
-            for (model, sel) in &entry.per_model_selections {
-                self.model_usage
-                    .entry(model.clone())
-                    .or_default()
-                    .selections += sel;
-            }
-            for (model, tok) in &entry.per_model_tokens {
-                self.model_usage
-                    .entry(model.clone())
-                    .or_default()
-                    .total_tokens += tok;
+        }
+        for (model, tok) in &removed.per_model_tokens {
+            if let Some(mu) = self.model_usage.get_mut(model) {
+                mu.total_tokens = mu.total_tokens.saturating_sub(*tok);
+                if mu.selections == 0 && mu.total_tokens == 0 {
+                    self.model_usage.remove(model);
+                }
             }
         }
     }
@@ -1728,5 +1726,82 @@ mod tests {
         let session: ChatSessionState = serde_json::from_str(&session_json).unwrap();
         let decoded = session.decrypt_messages().unwrap();
         assert_eq!(decoded, msgs);
+    }
+
+    #[test]
+    fn remove_key_subtracts_from_globals() {
+        let mut stats = UsageStats::default();
+        // Set up global totals (simulating legacy data that's larger than per-key)
+        stats.total_selections = 100;
+        stats.total_prompt_tokens = 5000;
+        stats.total_completion_tokens = 3000;
+        stats.total_tokens = 8000;
+        stats.tool_counts.insert("claude".to_string(), 50);
+        stats.tool_counts.insert("codex".to_string(), 30);
+        stats
+            .model_usage
+            .insert("gpt-4o".to_string(), UsageCounter {
+                selections: 40,
+                total_tokens: 6000,
+                ..Default::default()
+            });
+
+        // Key to remove has partial contributions
+        let mut entry = UsageCounter::default();
+        entry.selections = 10;
+        entry.prompt_tokens = 500;
+        entry.completion_tokens = 300;
+        entry.total_tokens = 800;
+        entry.per_tool.insert("claude".to_string(), 5);
+        entry.per_model_selections.insert("gpt-4o".to_string(), 3);
+        entry.per_model_tokens.insert("gpt-4o".to_string(), 1000);
+        stats.key_usage.insert("key1".to_string(), entry);
+
+        stats.remove_key("key1");
+
+        // Globals should be reduced, not zeroed
+        assert_eq!(stats.total_selections, 90);
+        assert_eq!(stats.total_prompt_tokens, 4500);
+        assert_eq!(stats.total_completion_tokens, 2700);
+        assert_eq!(stats.total_tokens, 7200);
+        assert_eq!(stats.tool_counts.get("claude"), Some(&45));
+        assert_eq!(stats.tool_counts.get("codex"), Some(&30));
+        assert_eq!(stats.model_usage.get("gpt-4o").unwrap().selections, 37);
+        assert_eq!(stats.model_usage.get("gpt-4o").unwrap().total_tokens, 5000);
+        assert!(stats.key_usage.get("key1").is_none());
+    }
+
+    #[test]
+    fn remove_key_noop_for_missing_key() {
+        let mut stats = UsageStats::default();
+        stats.total_selections = 10;
+        stats.remove_key("nonexistent");
+        assert_eq!(stats.total_selections, 10);
+    }
+
+    #[test]
+    fn remove_key_cleans_up_zeroed_entries() {
+        let mut stats = UsageStats::default();
+        stats.tool_counts.insert("claude".to_string(), 5);
+        stats
+            .model_usage
+            .insert("gpt-4o".to_string(), UsageCounter {
+                selections: 3,
+                total_tokens: 1000,
+                ..Default::default()
+            });
+
+        let mut entry = UsageCounter::default();
+        entry.per_tool.insert("claude".to_string(), 5);
+        entry.per_model_selections.insert("gpt-4o".to_string(), 3);
+        entry.per_model_tokens.insert("gpt-4o".to_string(), 1000);
+        stats.key_usage.insert("key1".to_string(), entry);
+
+        stats.remove_key("key1");
+
+        // Zeroed tool count should be removed
+        assert!(stats.tool_counts.get("claude").is_none());
+        // Zeroed model usage should be removed
+        assert!(stats.model_usage.get("gpt-4o").is_none());
     }
 }

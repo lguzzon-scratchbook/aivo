@@ -278,48 +278,53 @@ fn print_usage_section(
 }
 
 /// Aggregates tool counts from per-key data of existing keys.
-/// Falls back to global tool_counts for legacy data without per-key breakdowns.
+/// Falls back to global tool_counts when any existing key lacks per-key breakdowns
+/// (mixed legacy + new data).
 fn aggregate_tool_counts(
     stats: &UsageStats,
     existing_keys: &HashSet<&str>,
 ) -> HashMap<String, u64> {
     let mut result: HashMap<String, u64> = HashMap::new();
-    let mut has_per_key = false;
+    let mut all_have_per_key = true;
     for (key_id, entry) in &stats.key_usage {
         if existing_keys.contains(key_id.as_str()) {
+            if entry.per_tool.is_empty() {
+                all_have_per_key = false;
+            }
             for (tool, count) in &entry.per_tool {
-                has_per_key = true;
                 *result.entry(tool.clone()).or_default() += count;
             }
         }
     }
-    if !has_per_key {
+    if !all_have_per_key {
         return stats.tool_counts.clone();
     }
     result
 }
 
 /// Aggregates model usage from per-key data of existing keys.
-/// Falls back to global model_usage for legacy data without per-key breakdowns.
+/// Falls back to global model_usage when any existing key lacks per-key breakdowns
+/// (mixed legacy + new data).
 fn aggregate_model_usage(
     stats: &UsageStats,
     existing_keys: &HashSet<&str>,
 ) -> HashMap<String, UsageCounter> {
     let mut result: HashMap<String, UsageCounter> = HashMap::new();
-    let mut has_per_key = false;
+    let mut all_have_per_key = true;
     for (key_id, entry) in &stats.key_usage {
         if existing_keys.contains(key_id.as_str()) {
+            if entry.per_model_selections.is_empty() && entry.per_model_tokens.is_empty() {
+                all_have_per_key = false;
+            }
             for (model, sel) in &entry.per_model_selections {
-                has_per_key = true;
                 result.entry(model.clone()).or_default().selections += sel;
             }
             for (model, tok) in &entry.per_model_tokens {
-                has_per_key = true;
                 result.entry(model.clone()).or_default().total_tokens += tok;
             }
         }
     }
-    if !has_per_key {
+    if !all_have_per_key {
         return stats.model_usage.clone();
     }
     result
@@ -517,6 +522,10 @@ mod tests {
     fn aggregate_tool_counts_falls_back_to_global() {
         let mut stats = UsageStats::default();
         stats.tool_counts.insert("claude".to_string(), 10);
+        // Legacy key exists but has no per_tool data
+        stats
+            .key_usage
+            .insert("key1".to_string(), UsageCounter::default());
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
         let result = aggregate_tool_counts(&stats, &keys);
@@ -535,6 +544,49 @@ mod tests {
         let result = aggregate_model_usage(&stats, &keys);
         assert_eq!(result.get("gpt-4o").unwrap().selections, 3);
         assert_eq!(result.get("gpt-4o").unwrap().total_tokens, 1000);
+    }
+
+    #[test]
+    fn aggregate_model_usage_falls_back_when_mixed_legacy_and_new() {
+        let mut stats = UsageStats::default();
+        // Key with per-model data (new)
+        let mut c1 = UsageCounter::default();
+        c1.per_model_selections.insert("gpt-4o".to_string(), 5);
+        c1.per_model_tokens.insert("gpt-4o".to_string(), 1000);
+        stats.key_usage.insert("new_key".to_string(), c1);
+        // Key without per-model data (legacy)
+        let c2 = UsageCounter::default();
+        stats.key_usage.insert("legacy_key".to_string(), c2);
+        // Global model_usage has the full picture
+        let mut global = UsageCounter::default();
+        global.selections = 698;
+        global.total_tokens = 500_000;
+        stats.model_usage.insert("gpt-4o".to_string(), global);
+
+        let keys: HashSet<&str> = ["new_key", "legacy_key"].into_iter().collect();
+        let result = aggregate_model_usage(&stats, &keys);
+        // Should fall back to global since legacy_key lacks per-model data
+        assert_eq!(result.get("gpt-4o").unwrap().selections, 698);
+        assert_eq!(result.get("gpt-4o").unwrap().total_tokens, 500_000);
+    }
+
+    #[test]
+    fn aggregate_tool_counts_falls_back_when_mixed_legacy_and_new() {
+        let mut stats = UsageStats::default();
+        // Key with per-tool data (new)
+        let mut c1 = UsageCounter::default();
+        c1.per_tool.insert("claude".to_string(), 5);
+        stats.key_usage.insert("new_key".to_string(), c1);
+        // Key without per-tool data (legacy)
+        let c2 = UsageCounter::default();
+        stats.key_usage.insert("legacy_key".to_string(), c2);
+        // Global tool_counts has the full picture
+        stats.tool_counts.insert("claude".to_string(), 100);
+
+        let keys: HashSet<&str> = ["new_key", "legacy_key"].into_iter().collect();
+        let result = aggregate_tool_counts(&stats, &keys);
+        // Should fall back to global since legacy_key lacks per-tool data
+        assert_eq!(result.get("claude"), Some(&100));
     }
 
     #[test]
