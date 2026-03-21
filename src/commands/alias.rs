@@ -64,7 +64,7 @@ impl AliasCommand {
         let max_name = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
         for (name, model) in &entries {
             println!(
-                "  {:width$} {} {}",
+                "{:width$} {} {}",
                 style::cyan(name),
                 style::dim("->"),
                 model,

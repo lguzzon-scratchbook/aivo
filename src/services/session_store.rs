@@ -274,7 +274,9 @@ impl UsageStats {
             return;
         };
         self.total_selections = self.total_selections.saturating_sub(removed.selections);
-        self.total_prompt_tokens = self.total_prompt_tokens.saturating_sub(removed.prompt_tokens);
+        self.total_prompt_tokens = self
+            .total_prompt_tokens
+            .saturating_sub(removed.prompt_tokens);
         self.total_completion_tokens = self
             .total_completion_tokens
             .saturating_sub(removed.completion_tokens);
@@ -1738,13 +1740,14 @@ mod tests {
         stats.total_tokens = 8000;
         stats.tool_counts.insert("claude".to_string(), 50);
         stats.tool_counts.insert("codex".to_string(), 30);
-        stats
-            .model_usage
-            .insert("gpt-4o".to_string(), UsageCounter {
+        stats.model_usage.insert(
+            "gpt-4o".to_string(),
+            UsageCounter {
                 selections: 40,
                 total_tokens: 6000,
                 ..Default::default()
-            });
+            },
+        );
 
         // Key to remove has partial contributions
         let mut entry = UsageCounter::default();
@@ -1783,13 +1786,14 @@ mod tests {
     fn remove_key_cleans_up_zeroed_entries() {
         let mut stats = UsageStats::default();
         stats.tool_counts.insert("claude".to_string(), 5);
-        stats
-            .model_usage
-            .insert("gpt-4o".to_string(), UsageCounter {
+        stats.model_usage.insert(
+            "gpt-4o".to_string(),
+            UsageCounter {
                 selections: 3,
                 total_tokens: 1000,
                 ..Default::default()
-            });
+            },
+        );
 
         let mut entry = UsageCounter::default();
         entry.per_tool.insert("claude".to_string(), 5);
