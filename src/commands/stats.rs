@@ -157,18 +157,19 @@ impl StatsCommand {
             let count_w = rows.iter().map(|(_, c)| fmt(*c).len()).max().unwrap_or(0);
             let max_val = rows.iter().map(|(_, c)| *c).max().unwrap_or(0);
 
+            let show_tool_bar = !searching && rows.len() > 1;
             for (name, count) in &rows {
                 let pn = format!("{:<width$}", name, width = name_w);
                 let pc = format!("{:>width$}", fmt(*count), width = count_w);
-                if searching {
-                    println!("  {} {}", style::cyan(&pn), pc);
-                } else {
+                if show_tool_bar {
                     println!(
                         "  {} {} {}",
                         style::cyan(&pn),
                         pc,
                         style::cyan(bar(*count, max_val)),
                     );
+                } else {
+                    println!("  {} {}", style::cyan(&pn), pc);
                 }
             }
         }
@@ -264,6 +265,7 @@ fn print_usage_section(
         .unwrap_or(0);
     let max_tok = rows.iter().map(|r| r.2).max().unwrap_or(0);
 
+    let show_bar = show_bar && rows.len() > 1;
     for (name, sel, tok) in &rows {
         let pn = format!("{:<width$}", name, width = name_w);
         let ps = format!("{:>width$}", fmt(*sel), width = sel_w);
