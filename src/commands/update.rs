@@ -796,9 +796,7 @@ mod tests {
 
     #[test]
     fn test_detect_npm_global() {
-        let path = Path::new(
-            "/opt/homebrew/lib/node_modules/@yuanchuan/aivo/native/aivo",
-        );
+        let path = Path::new("/opt/homebrew/lib/node_modules/@yuanchuan/aivo/native/aivo");
         let result = detect_managed_install(path);
         assert!(result.is_some());
         let m = result.unwrap();

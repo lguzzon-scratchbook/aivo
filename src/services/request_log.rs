@@ -102,7 +102,10 @@ impl RequestLogger {
         let result = match &mut writer.target {
             LogTarget::File(f) => {
                 use tokio::io::AsyncWriteExt;
-                f.write_all(line.as_bytes()).await
+                match f.write_all(line.as_bytes()).await {
+                    Ok(()) => f.flush().await,
+                    Err(e) => Err(e),
+                }
             }
             LogTarget::Stdout => {
                 use std::io::Write;
