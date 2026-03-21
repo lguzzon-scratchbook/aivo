@@ -10,6 +10,8 @@ const { resolvePlatformAsset } = require("../lib/platform");
 
 const pkg = require(path.join(getPackageRoot(), "package.json"));
 
+const MAX_REDIRECTS = 5;
+
 async function main() {
   if (process.env.AIVO_SKIP_POSTINSTALL === "1") {
     return;
@@ -23,14 +25,16 @@ async function main() {
   const checksumUrl = `${baseUrl}/${assetName}.sha256`;
   const binaryUrl = `${baseUrl}/${assetName}`;
 
-  const checksumText = await downloadText(checksumUrl);
-  const expectedSha = parseChecksumText(checksumText, assetName);
+  const [checksumText, binary] = await Promise.all([
+    downloadText(checksumUrl),
+    downloadBuffer(binaryUrl)
+  ]);
 
+  const expectedSha = parseChecksumText(checksumText, assetName);
   if (!expectedSha) {
     throw new Error(`Checksum asset for ${assetName} could not be parsed.`);
   }
 
-  const binary = await downloadBuffer(binaryUrl);
   const actualSha = sha256(binary);
   if (actualSha !== expectedSha) {
     throw new Error(`Checksum verification failed for ${assetName}.`);
@@ -54,12 +58,14 @@ function downloadText(url) {
 
 function downloadBuffer(url, redirectCount = 0) {
   return new Promise((resolve, reject) => {
-    const request = https.get(
+    const proto = url.startsWith("https://") ? https : require("node:http");
+    const request = proto.get(
       url,
       {
         headers: {
           "User-Agent": "@yuanchuan/aivo-installer"
-        }
+        },
+        timeout: 30_000
       },
       (response) => {
         const status = response.statusCode || 0;
@@ -68,10 +74,15 @@ function downloadBuffer(url, redirectCount = 0) {
           status >= 300 &&
           status < 400 &&
           response.headers.location &&
-          redirectCount < 5
+          redirectCount < MAX_REDIRECTS
         ) {
           response.resume();
-          resolve(downloadBuffer(response.headers.location, redirectCount + 1));
+          const location = response.headers.location;
+          if (!location.startsWith("https://") && !location.startsWith("http://")) {
+            reject(new Error(`Invalid redirect URL: ${location}`));
+            return;
+          }
+          resolve(downloadBuffer(location, redirectCount + 1));
           return;
         }
 
@@ -87,6 +98,10 @@ function downloadBuffer(url, redirectCount = 0) {
       }
     );
 
+    request.on("timeout", () => {
+      request.destroy();
+      reject(new Error(`Download timed out: ${url}`));
+    });
     request.on("error", reject);
   });
 }
