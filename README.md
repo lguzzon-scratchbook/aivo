@@ -18,6 +18,12 @@ Homebrew:
 brew install yuanchuan/tap/aivo
 ```
 
+npm:
+
+```bash
+npm install -g @yuanchuan/aivo
+```
+
 Install script:
 
 ```bash

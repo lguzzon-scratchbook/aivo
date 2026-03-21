@@ -25,3 +25,7 @@ Thumbs.db
 
 # Git worktrees
 .worktrees/
+
+# npm package
+npm/native/
+npm/*.tgz

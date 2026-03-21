@@ -150,6 +150,32 @@ jobs:
           name: release-artifacts
           path: artifacts/*
 
+  update-npm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Set npm package version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cd npm
+          npm pkg set version="$VERSION"
+
+      - name: Run tests
+        run: cd npm && npm test
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd npm && npm publish --access public
+
   update-homebrew:
     needs: release
     runs-on: ubuntu-latest
