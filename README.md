@@ -64,9 +64,7 @@ aivo claude --model llama3.2
 
 ## run
 
-Launch an AI tool, or use the saved start flow.
-
-### Supported tools:
+Launch an AI tool with the active provider key. Supported tools:
 
 - `claude` [Claude Code](https://github.com/anthropics/claude-code)
 - `codex` [Codex](https://github.com/openai/codex)
@@ -75,22 +73,24 @@ Launch an AI tool, or use the saved start flow.
 - `pi` [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
 
 ```bash
+aivo claude                              # launch claude
+aivo codex                               # launch codex
+aivo gemini                              # launch gemini
+```
+
+All extra arguments are passed through to the underlying tool:
+
+```bash
 aivo claude --dangerously-skip-permissions
 aivo claude --resume 16354407-050e-4447-a068-4db222ff841
 ```
 
-Pick a model for one run:
+Pick a model for one run, or omit the value to open the model picker:
 
 ```bash
 aivo claude --model moonshotai/kimi-k2.5
-aivo chat --model openai/gpt-4o
-```
-
-Or let `--model` open the model picker if the provider supports the model list API:
-
-```bash
-aivo claude --model
-aivo chat -m  # or just use -m
+aivo claude --model                      # opens model picker
+aivo claude -m                           # short form
 ```
 
 Use a different saved key without changing the active one:
@@ -98,29 +98,26 @@ Use a different saved key without changing the active one:
 ```bash
 aivo claude --key openrouter
 aivo codex --key copilot
-aivo claude --key  # open key picker for this run only
+aivo claude --key                        # opens key picker
 ```
 
-Preview what `aivo` would launch without starting the tool:
+Preview the resolved command and environment:
 
 ```bash
 aivo claude --dry-run
-aivo run codex --model gpt-5 --dry-run
 ```
 
-Inject extra env vars into the child process:
+Inject extra environment variables into the child process:
 
 ```bash
-aivo claude --env=BASH_DEFAULT_TIMEOUT_MS=60000
+aivo claude --env BASH_DEFAULT_TIMEOUT_MS=60000
 ```
 
-Use the interactive start flow for the current directory:
+`aivo run` without a tool name uses the interactive start flow, which remembers your key + tool selection per directory:
 
 ```bash
 aivo run
 ```
-
-`aivo run` without a tool will reuse the saved selection for that directory when it has one.
 
 ## chat
 
