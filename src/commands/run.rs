@@ -244,6 +244,9 @@ impl RunCommand {
             "  {}",
             style::dim("aivo run claude --model claude-sonnet-4.5")
         );
+        println!("  {}", style::dim("aivo claude \"fix the login bug\""));
+        println!("  {}", style::dim("aivo codex \"refactor this function\""));
+        println!("  {}", style::dim("aivo gemini \"explain this code\""));
     }
 }
 

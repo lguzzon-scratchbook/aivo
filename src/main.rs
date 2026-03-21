@@ -395,7 +395,7 @@ fn print_help() {
     println!(
         "{} {}",
         style::bold("Shortcuts:"),
-        style::dim("aivo claude/codex/gemini/opencode/pi")
+        style::dim("aivo claude/codex/gemini/opencode/pi [\"prompt\"]")
     );
     println!();
     println!("{}", style::bold("Options:"));
@@ -802,5 +802,46 @@ mod tests {
             rewrite_cli_args(args(&["aivo", "claude", "--model", "gpt-5"])),
             args(&["aivo", "run", "claude", "--model", "gpt-5"])
         );
+    }
+
+    #[test]
+    fn prompt_passes_through_extraction() {
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            false,
+            vec![],
+            &args(&["fix the login bug"]),
+        );
+        assert_eq!(r.remaining_args, args(&["fix the login bug"]));
+        assert_eq!(r.model, None);
+    }
+
+    #[test]
+    fn prompt_preserved_with_model_flag() {
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            false,
+            vec![],
+            &args(&["--model", "gpt-4o", "fix the login bug"]),
+        );
+        assert_eq!(r.model, Some("gpt-4o".to_string()));
+        assert_eq!(r.remaining_args, args(&["fix the login bug"]));
+    }
+
+    #[test]
+    fn multi_word_unquoted_args_pass_through() {
+        let r = extract_aivo_flags(
+            None,
+            None,
+            false,
+            false,
+            vec![],
+            &args(&["fix", "the", "bug"]),
+        );
+        assert_eq!(r.remaining_args, args(&["fix", "the", "bug"]));
     }
 }

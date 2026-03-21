@@ -539,4 +539,45 @@ mod tests {
         assert_eq!(parsed["models"][0]["slug"], model);
         assert_eq!(parsed["models"][0]["display_name"], model);
     }
+
+    #[test]
+    fn claude_prompt_after_teammate_mode() {
+        let args = vec!["fix the login bug".to_string()];
+        let result = inject_claude_teammate_mode(AIToolType::Claude, &args);
+        assert_eq!(
+            result,
+            vec!["--teammate-mode", "in-process", "fix the login bug"]
+        );
+    }
+
+    #[test]
+    fn codex_prompt_after_model_flag() {
+        let args = vec!["refactor this function".to_string()];
+        let result = inject_codex_model(Some("gpt-4o"), &args, false);
+        assert_eq!(result, vec!["-m", "gpt-4o", "refactor this function"]);
+    }
+
+    #[test]
+    fn pi_prompt_after_model_flag() {
+        let args = vec!["explain this code".to_string()];
+        let result = inject_pi_model(Some("gpt-4o"), &args);
+        assert_eq!(result, vec!["--model", "aivo/gpt-4o", "explain this code"]);
+    }
+
+    #[test]
+    fn gemini_prompt_passes_through() {
+        let args = vec!["explain this code".to_string()];
+        let result = inject_claude_teammate_mode(AIToolType::Gemini, &args);
+        assert_eq!(result, vec!["explain this code"]);
+    }
+
+    #[tokio::test]
+    async fn opencode_prompt_passes_through_build_runtime_args() {
+        let args = vec!["explain this code".to_string()];
+        let env = HashMap::new();
+        let result = build_runtime_args(AIToolType::Opencode, &args, None, &env)
+            .await
+            .unwrap();
+        assert_eq!(result.args, vec!["explain this code"]);
+    }
 }
