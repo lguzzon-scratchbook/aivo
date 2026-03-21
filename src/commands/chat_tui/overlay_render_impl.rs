@@ -376,6 +376,10 @@ impl ChatTuiApp {
                 Span::styled("      toggle thinking blocks", Style::default().fg(TEXT)),
             ]),
             Line::from(vec![
+                Span::styled("Shift+mouse", key_style),
+                Span::styled(" select and copy text", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
                 Span::styled("Tab", key_style),
                 Span::styled(
                     "         complete command or attach path",

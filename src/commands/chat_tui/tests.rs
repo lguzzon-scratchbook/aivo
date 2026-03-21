@@ -459,6 +459,54 @@ fn make_test_app(
 }
 
 #[test]
+fn test_composer_empty_lines_align_with_cursor_position() {
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
+
+    // Empty lines must use Line::from("") (no whitespace prefix) to avoid
+    // ratatui WordWrapper producing extra visual rows for whitespace-only Lines.
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(USER)),
+            Span::styled("hello", Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("hel", Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("sadf", Style::default().fg(TEXT)),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("dsf", Style::default().fg(TEXT)),
+        ]),
+    ];
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let area = Rect::new(0, 0, 20, 10);
+    let mut buf = Buffer::empty(area);
+    paragraph.render(area, &mut buf);
+
+    let cell_row = |r: u16| -> String {
+        (0..20)
+            .map(|x| buf.cell((x, r)).unwrap().symbol().chars().next().unwrap_or(' '))
+            .collect()
+    };
+
+    assert!(cell_row(0).starts_with("> hello"), "row 0");
+    assert!(cell_row(1).starts_with("  hel"), "row 1");
+    assert!(cell_row(2).starts_with("  sadf"), "row 2");
+    assert!(cell_row(5).starts_with("  dsf"), "row 5: dsf must align with cursor_position y=5");
+
+    // cursor_position must agree
+    let (cx, cy) = cursor_position("hello\nhel\nsadf\n\n\ndsf", 17, 20, 2);
+    assert_eq!((cx, cy), (2, 5));
+}
+
+#[test]
 fn test_markdown_renderer_formats_code_and_lists() {
     let lines = render_markdown_lines("## Title\n\n- one\n- two\n\n```rust\nlet x = 1;\n```");
     let plain = lines

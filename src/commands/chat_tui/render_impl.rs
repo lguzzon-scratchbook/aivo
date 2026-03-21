@@ -389,15 +389,19 @@ impl ChatTuiApp {
         }
 
         for (index, line) in self.draft.split('\n').enumerate() {
-            let prefix = if index == 0 {
-                prompt.clone()
+            if line.is_empty() && index > 0 {
+                lines.push(Line::from(""));
             } else {
-                Span::raw("  ")
-            };
-            lines.push(Line::from(vec![
-                prefix,
-                Span::styled(line.to_string(), Style::default().fg(TEXT)),
-            ]));
+                let prefix = if index == 0 {
+                    prompt.clone()
+                } else {
+                    Span::raw("  ")
+                };
+                lines.push(Line::from(vec![
+                    prefix,
+                    Span::styled(line.to_string(), Style::default().fg(TEXT)),
+                ]));
+            }
         }
 
         Text::from(lines)
@@ -441,7 +445,7 @@ impl ChatTuiApp {
     }
 
     pub(super) fn composer_height(&self) -> u16 {
-        let lines = (self.draft.lines().count().max(1) + self.draft_attachments.len()) as u16;
+        let lines = (self.draft.split('\n').count().max(1) + self.draft_attachments.len()) as u16;
         (lines + 2).clamp(3, 9)
     }
 }
