@@ -74,6 +74,23 @@ pub(crate) struct ChatTurnResult {
     pub usage: Option<TokenUsage>,
 }
 
+impl ChatTurnResult {
+    /// Returns the reported usage, or estimates from text lengths (~4 chars/token).
+    pub(crate) fn usage_or_estimate(&self, prompt_text: &str) -> TokenUsage {
+        if let Some(usage) = self.usage {
+            return usage;
+        }
+        let prompt_tokens = (prompt_text.len() / 4) as u64;
+        let completion_tokens = (self.content.len() / 4) as u64;
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+}
+
 // Anthropic response structs
 
 #[derive(Deserialize)]

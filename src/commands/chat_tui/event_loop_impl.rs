@@ -70,23 +70,27 @@ impl ChatTuiApp {
             attachments: vec![],
         });
 
-        if let Some(usage) = turn.usage {
-            self.session_store
-                .record_tokens(
-                    &self.key.id,
-                    Some(&self.raw_model),
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.cache_read_input_tokens,
-                    usage.cache_creation_input_tokens,
-                )
-                .await?;
-            self.context_tokens = usage.total_tokens();
-            self.last_usage = Some(usage);
+        let prompt_text: String = self.history.iter()
+            .rev().skip(1) // skip the assistant message we just pushed
+            .map(|m| m.content.as_str())
+            .collect();
+        let usage = turn.usage_or_estimate(&prompt_text);
+        self.session_store
+            .record_tokens(
+                &self.key.id,
+                Some(&self.raw_model),
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+            )
+            .await?;
+        self.context_tokens = if turn.usage.is_some() {
+            usage.total_tokens()
         } else {
-            self.context_tokens = estimate_context_tokens(&self.history);
-            self.last_usage = None;
-        }
+            estimate_context_tokens(&self.history)
+        };
+        self.last_usage = turn.usage;
 
         self.persist_history().await?;
         self.notice = None;

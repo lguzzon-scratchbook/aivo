@@ -23,11 +23,15 @@ pub(crate) fn build_openai_chat_request(
         encoded_messages.push(build_openai_message(message)?);
     }
 
-    Ok(serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": encoded_messages,
         "stream": stream,
-    }))
+    });
+    if stream {
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
+    Ok(body)
 }
 
 /// Returns the inline data for a materialized attachment, or fails if it is still a FileRef.

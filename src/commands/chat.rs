@@ -283,18 +283,19 @@ impl ChatCommand {
 
             match result {
                 Ok(turn) => {
-                    if let Some(usage) = turn.usage {
-                        self.session_store
-                            .record_tokens(
-                                &key.id,
-                                Some(&raw_model),
-                                usage.prompt_tokens,
-                                usage.completion_tokens,
-                                usage.cache_read_input_tokens,
-                                usage.cache_creation_input_tokens,
-                            )
-                            .await?;
-                    }
+                    let prompt_text: String =
+                        history.iter().map(|m| m.content.as_str()).collect();
+                    let usage = turn.usage_or_estimate(&prompt_text);
+                    self.session_store
+                        .record_tokens(
+                            &key.id,
+                            Some(&raw_model),
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.cache_read_input_tokens,
+                            usage.cache_creation_input_tokens,
+                        )
+                        .await?;
                     println!();
                     return Ok(ExitCode::Success);
                 }

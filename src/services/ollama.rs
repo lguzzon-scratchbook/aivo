@@ -30,11 +30,17 @@ pub fn detect_binary() -> bool {
         .is_ok()
 }
 
-fn health_client() -> reqwest::Client {
+/// Builds a client that bypasses proxies (Ollama is always local).
+fn local_client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
+        .no_proxy()
+        .timeout(timeout)
         .build()
         .unwrap_or_default()
+}
+
+fn health_client() -> reqwest::Client {
+    local_client(Duration::from_secs(1))
 }
 
 async fn check_health(client: &reqwest::Client) -> bool {
@@ -97,13 +103,22 @@ struct TagModel {
 /// Lists locally available Ollama models via `GET /api/tags`.
 pub async fn list_models() -> Result<Vec<String>> {
     let url = format!("{}/api/tags", ollama_host());
-    let resp: TagsResponse = reqwest::get(&url)
+    let response = local_client(Duration::from_secs(10))
+        .get(&url)
+        .send()
         .await
-        .context("Failed to connect to Ollama")?
-        .json()
+        .context("Failed to connect to Ollama")?;
+    let text = response
+        .text()
         .await
-        .context("Invalid response from Ollama /api/tags")?;
+        .context("Failed to read Ollama /api/tags response")?;
+    let resp: TagsResponse = serde_json::from_str(&text)
+        .with_context(|| format!("Failed to parse Ollama /api/tags: {}", truncate(&text, 200)))?;
     Ok(resp.models.into_iter().map(|m| m.name).collect())
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max { s } else { &s[..max] }
 }
 
 /// Returns `true` if the given model name is already pulled locally.
@@ -119,7 +134,7 @@ pub async fn is_model_available(name: &str) -> Result<bool> {
 /// Pulls a model from the Ollama registry with streaming progress output.
 pub async fn pull_model(name: &str) -> Result<()> {
     let url = format!("{}/api/pull", ollama_host());
-    let client = reqwest::Client::new();
+    let client = local_client(Duration::from_secs(600));
     let mut resp = client
         .post(&url)
         .json(&serde_json::json!({ "name": name, "stream": true }))

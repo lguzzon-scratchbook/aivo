@@ -21,11 +21,13 @@ enum KeySelection {
     NotFound,
 }
 
-// Reads a line from stdin with proper terminal handling (backspace, etc.).
+// Reads a line from stdin, flushing the prompt first so it appears before blocking.
 fn term_read_line(prompt: &str) -> std::io::Result<String> {
-    let term = console::Term::stdout();
-    term.write_str(prompt)?;
-    let input = term.read_line()?;
+    use std::io::{BufRead, Write};
+    print!("{}", prompt);
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().lock().read_line(&mut input)?;
     Ok(input.trim().to_string())
 }
 
@@ -84,7 +86,7 @@ fn detect_base_url(name: &str) -> Option<&'static str> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PingStatus {
+pub enum PingStatus {
     Ok,
     AuthError,
     Unreachable,
@@ -93,7 +95,7 @@ pub(crate) enum PingStatus {
 }
 
 impl PingStatus {
-    pub(crate) fn icon(&self) -> &'static str {
+    pub fn icon(&self) -> &'static str {
         match self {
             PingStatus::Ok => "✓",
             PingStatus::AuthError => "✗",
@@ -103,7 +105,7 @@ impl PingStatus {
         }
     }
 
-    pub(crate) fn message(&self) -> String {
+    pub fn message(&self) -> String {
         match self {
             PingStatus::Ok => "ok".to_string(),
             PingStatus::AuthError => "auth failed".to_string(),
@@ -113,7 +115,7 @@ impl PingStatus {
         }
     }
 
-    pub(crate) fn from_http_status(status: u16) -> Self {
+    pub fn from_http_status(status: u16) -> Self {
         match status {
             200..=299 => PingStatus::Ok,
             401 | 403 => PingStatus::AuthError,
@@ -125,18 +127,18 @@ impl PingStatus {
 }
 
 #[derive(Debug)]
-pub(crate) struct PingResult {
-    pub(crate) name: String,
-    pub(crate) url: String,
-    pub(crate) status: PingStatus,
-    pub(crate) latency: Option<Duration>,
+pub struct PingResult {
+    pub name: String,
+    pub url: String,
+    pub status: PingStatus,
+    pub latency: Option<Duration>,
 }
 
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PING_MAX_RETRIES: u32 = 3;
 
-async fn ping_key(key: ApiKey) -> PingResult {
+pub async fn ping_key(key: ApiKey) -> PingResult {
     let name = if key.name.is_empty() {
         key.short_id().to_string()
     } else {
@@ -153,6 +155,39 @@ async fn ping_key(key: ApiKey) -> PingResult {
         url,
         status,
         latency,
+    }
+}
+
+/// Pings keys concurrently and calls `on_result(key_id, result)` for each as it resolves.
+/// Decrypt failures are reported immediately; successful decrypts are spawned and awaited in order.
+pub async fn ping_keys_streaming(
+    keys: Vec<ApiKey>,
+    mut on_result: impl FnMut(&str, &PingResult),
+) {
+    let mut handles = Vec::new();
+    for mut key in keys {
+        let id = key.id.clone();
+        if SessionStore::decrypt_key_secret(&mut key).is_err() {
+            on_result(
+                &id,
+                &PingResult {
+                    name: key.display_name().to_string(),
+                    url: key.base_url.clone(),
+                    status: PingStatus::Error("decrypt failed".to_string()),
+                    latency: None,
+                },
+            );
+            continue;
+        }
+        handles.push(tokio::spawn(async move {
+            let result = ping_key(key).await;
+            (id, result)
+        }));
+    }
+    for handle in handles {
+        if let Ok((id, result)) = handle.await {
+            on_result(&id, &result);
+        }
     }
 }
 
@@ -347,42 +382,14 @@ impl KeysCommand {
 
         let max_name_len = keys
             .iter()
-            .map(|k| {
-                if k.name.is_empty() {
-                    k.short_id().len()
-                } else {
-                    k.name.len()
-                }
-            })
+            .map(|k| k.display_name().len())
             .max()
             .unwrap_or(0);
 
-        let mut handles = Vec::with_capacity(keys.len());
-        for mut key in keys {
-            if SessionStore::decrypt_key_secret(&mut key).is_err() {
-                print_ping_result(
-                    &PingResult {
-                        name: if key.name.is_empty() {
-                            key.short_id().to_string()
-                        } else {
-                            key.name.clone()
-                        },
-                        url: key.base_url.clone(),
-                        status: PingStatus::Error("decrypt failed".to_string()),
-                        latency: None,
-                    },
-                    max_name_len,
-                );
-                continue;
-            }
-            handles.push(tokio::spawn(ping_key(key)));
-        }
-
-        for handle in handles {
-            if let Ok(result) = handle.await {
-                print_ping_result(&result, max_name_len);
-            }
-        }
+        ping_keys_streaming(keys, |_id, result| {
+            print_ping_result(result, max_name_len);
+        })
+        .await;
 
         Ok(ExitCode::Success)
     }
@@ -965,6 +972,10 @@ impl KeysCommand {
         }
 
         if self.session_store.delete_key(&key_to_remove.id).await? {
+            let _ = self
+                .session_store
+                .remove_key_stats(&key_to_remove.id)
+                .await;
             println!(
                 "{} Removed key: {}",
                 style::success_symbol(),

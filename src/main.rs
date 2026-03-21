@@ -18,8 +18,9 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    ChatCommand, KeysCommand, LsCommand, ModelsCommand, RunCommand, ServeCommand, StartCommand,
-    StartFlowArgs, UpdateCommand, truncate_url_for_display,
+    AliasCommand, ChatCommand, DoctorCommand, KeysCommand, LsCommand, ModelsCommand, RunCommand,
+    ServeCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    truncate_url_for_display,
 };
 use errors::ExitCode;
 use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
@@ -59,6 +60,15 @@ async fn main() {
             Some(Commands::Ping(_)) => {
                 KeysCommand::print_ping_help();
             }
+            Some(Commands::Alias(_)) => {
+                AliasCommand::print_help();
+            }
+            Some(Commands::Doctor) => {
+                DoctorCommand::print_help();
+            }
+            Some(Commands::Stats(_)) => {
+                StatsCommand::print_help();
+            }
             Some(Commands::Ls) => {
                 LsCommand::print_help();
             }
@@ -90,6 +100,11 @@ async fn main() {
 
     // Route to command handler
     let exit_code = match command {
+        Commands::Alias(alias_args) => {
+            let command = AliasCommand::new(session_store);
+            command.execute(alias_args).await
+        }
+
         Commands::Keys(keys_args) => {
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
@@ -118,10 +133,11 @@ async fn main() {
                 )
                 .await,
             );
+            let model = resolve_model_alias(&session_store, chat_args.model).await;
             let command = ChatCommand::new(session_store, models_cache.clone());
             command
                 .execute(
-                    chat_args.model,
+                    model,
                     chat_args.execute,
                     chat_args.attachments,
                     chat_args.refresh,
@@ -146,7 +162,7 @@ async fn main() {
                 run_args.envs,
                 &run_args.args,
             );
-            let model = extracted.model;
+            let model = resolve_model_alias(&session_store, extracted.model).await;
             let key_flag = extracted.key_flag;
             let debug = extracted.debug;
             let dry_run = extracted.dry_run;
@@ -253,8 +269,33 @@ async fn main() {
                     process::exit(ExitCode::UserError.code());
                 }
             };
+            // Build failover key list when --failover is enabled
+            let failover_keys = if serve_args.failover {
+                let mut all_keys = session_store.get_keys().await.unwrap_or_default();
+                // Decrypt and exclude the primary key
+                let primary_id = key_override.as_ref().map(|k| k.id.clone());
+                all_keys.retain(|k| primary_id.as_deref() != Some(&k.id));
+                all_keys.iter_mut().for_each(|k| {
+                    let _ = SessionStore::decrypt_key_secret(k);
+                });
+                all_keys
+            } else {
+                Vec::new()
+            };
             let command = ServeCommand::new();
-            command.execute(serve_args.port, key_override).await
+            command
+                .execute(serve_args.port, key_override, serve_args.log, failover_keys)
+                .await
+        }
+
+        Commands::Doctor => {
+            let command = DoctorCommand::new(session_store);
+            command.execute().await
+        }
+
+        Commands::Stats(stats_args) => {
+            let command = StatsCommand::new(session_store);
+            command.execute(stats_args).await
         }
 
         Commands::Ls => {
@@ -310,6 +351,7 @@ async fn print_active_key(session_store: &SessionStore) {
         None => return,
     };
 
+    println!();
     println!("{}", style::bold("Active key:"));
     let id_padded = format!("{:<3}", active_key.short_id());
     println!(
@@ -333,51 +375,22 @@ fn print_help() {
     println!("{} aivo <command> [options]", style::bold("Usage:"));
     println!();
     println!("{}", style::bold("Commands:"));
-    println!(
-        "  {}      {}",
-        style::cyan("run [tool]"),
-        style::dim("Launch AI tool, or use the saved start flow")
-    );
-    println!(
-        "  {}  {}",
-        style::cyan("chat [--model]"),
-        style::dim("Start the interactive chat TUI")
-    );
-    println!(
-        "  {}   {}",
-        style::cyan("keys [action]"),
-        style::dim("Manage API keys (use, rm, add, cat, edit)")
-    );
-    println!(
-        "  {}      {}",
-        style::cyan("use [name]"),
-        style::dim("Switch active API key")
-    );
-    println!(
-        "  {}            {}",
-        style::cyan("ping"),
-        style::dim("Health-check API keys")
-    );
-    println!(
-        "  {}          {}",
-        style::cyan("models"),
-        style::dim("List available models from the active provider")
-    );
-    println!(
-        "  {}           {}",
-        style::cyan("serve"),
-        style::dim("Start a local OpenAI-compatible API server")
-    );
-    println!(
-        "  {}              {}",
-        style::cyan("ls"),
-        style::dim("Show saved keys, tools, and current directory state")
-    );
-    println!(
-        "  {}          {}",
-        style::cyan("update"),
-        style::dim("Update to the latest version")
-    );
+    let print_cmd = |name: &str, desc: &str| {
+        let padded = format!("{:<10}", name);
+        println!("  {}{}", style::cyan(&padded), style::dim(desc));
+    };
+    print_cmd("run",    "Launch AI tool, or use the saved start flow");
+    print_cmd("chat",   "Start the interactive chat TUI");
+    print_cmd("serve",  "Start a local OpenAI-compatible API server");
+    print_cmd("keys",   "Manage API keys (use, rm, add, cat, edit)");
+    print_cmd("use",    "Switch active API key");
+    print_cmd("models", "List available models from the active provider");
+    print_cmd("ping",   "Health-check API keys");
+    print_cmd("alias",  "Create, list, or remove model aliases");
+    print_cmd("doctor", "Run a comprehensive health check");
+    print_cmd("stats",  "Show usage statistics");
+    print_cmd("ls",     "Show saved keys, tools, and current directory state");
+    print_cmd("update", "Update to the latest version");
     println!();
     println!(
         "{} {}",
@@ -386,14 +399,12 @@ fn print_help() {
     );
     println!();
     println!("{}", style::bold("Options:"));
-    println!(
-        "  {}   Display help information",
-        style::dim("-h, --help   ")
-    );
-    println!(
-        "  {}   Display the current version",
-        style::dim("-v, --version")
-    );
+    let print_opt = |flag: &str, desc: &str| {
+        let padded = format!("{:<14}", flag);
+        println!("  {}{}", style::dim(&padded), desc);
+    };
+    print_opt("-h, --help", "Display help information");
+    print_opt("-v, --version", "Display the current version");
 }
 
 /// Prints version information
@@ -403,6 +414,21 @@ fn print_version() {
         style::cyan("aivo"),
         style::dim(format!("v{}", version::VERSION))
     );
+}
+
+/// Resolves a model alias if the model is a non-empty Some value.
+/// Returns the original value unchanged if resolution fails or if it's None/empty (picker).
+async fn resolve_model_alias(
+    session_store: &SessionStore,
+    model: Option<String>,
+) -> Option<String> {
+    match model {
+        Some(ref m) if !m.is_empty() => match session_store.resolve_alias(m).await {
+            Ok(resolved) => Some(resolved),
+            Err(_) => model,
+        },
+        other => other,
+    }
 }
 
 /// Result of extracting aivo-specific flags from clap's trailing passthrough args.

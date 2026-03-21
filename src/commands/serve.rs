@@ -5,6 +5,7 @@ use std::net::IpAddr;
 
 use crate::errors::ExitCode;
 use crate::services::provider_profile::provider_profile_for_key;
+use crate::services::request_log::RequestLogger;
 use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
 use crate::services::session_store::ApiKey;
 use crate::style;
@@ -22,8 +23,17 @@ impl ServeCommand {
         Self
     }
 
-    pub async fn execute(&self, port: u16, key_override: Option<ApiKey>) -> ExitCode {
-        match self.execute_internal(port, key_override).await {
+    pub async fn execute(
+        &self,
+        port: u16,
+        key_override: Option<ApiKey>,
+        log: bool,
+        failover_keys: Vec<ApiKey>,
+    ) -> ExitCode {
+        match self
+            .execute_internal(port, key_override, log, failover_keys)
+            .await
+        {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -32,7 +42,13 @@ impl ServeCommand {
         }
     }
 
-    async fn execute_internal(&self, port: u16, key_override: Option<ApiKey>) -> Result<ExitCode> {
+    async fn execute_internal(
+        &self,
+        port: u16,
+        key_override: Option<ApiKey>,
+        log: bool,
+        failover_keys: Vec<ApiKey>,
+    ) -> Result<ExitCode> {
         let key = match key_override {
             Some(k) => k,
             None => {
@@ -73,7 +89,19 @@ impl ServeCommand {
             is_openrouter,
         };
 
-        let router = ServeRouter::new(config, key);
+        let logger = if log {
+            let config_dir = crate::services::system_env::home_dir()
+                .map(|p| p.join(".config").join("aivo"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".config/aivo"));
+            RequestLogger::new(&config_dir).await
+        } else {
+            None
+        };
+
+        let failover_count = failover_keys.len();
+        let router = ServeRouter::new(config, key)
+            .with_logger(logger)
+            .with_failover_keys(failover_keys);
 
         // Bind eagerly — errors here (e.g. "address already in use") before printing startup
         let mut handle = router.start_background(port).await?;
@@ -84,6 +112,14 @@ impl ServeCommand {
             port
         );
         eprintln!("  {} · {}", display_name, style::dim(&display_host));
+        if failover_count > 0 {
+            eprintln!(
+                "  {} failover: {} additional key{}",
+                style::dim("↳"),
+                failover_count,
+                if failover_count == 1 { "" } else { "s" }
+            );
+        }
         print_supported_paths();
         eprintln!("  {}", style::dim("Press Ctrl+C to stop"));
 
@@ -131,17 +167,24 @@ impl ServeCommand {
             style::cyan("-k, --key <id|name>"),
             style::dim("Select API key by ID or name (-k opens key picker)")
         );
+        println!(
+            "  {}           {}",
+            style::cyan("--log"),
+            style::dim("Enable request logging to ~/.config/aivo/logs/")
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo serve"));
         println!("  {}", style::dim("aivo serve -p 8080"));
         println!("  {}", style::dim("aivo serve -k openrouter"));
+        println!("  {}", style::dim("aivo serve --log"));
     }
 }
 
 fn print_supported_paths() {
     eprintln!();
     eprintln!("{}", style::bold("Supported paths"));
+    eprintln!("  {}", style::blue("/health"));
     eprintln!("  {}", style::blue("/v1/models"));
     eprintln!("  {}", style::blue("/v1/chat/completions"));
     eprintln!("  {}", style::blue("/v1/responses"));

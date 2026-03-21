@@ -25,24 +25,30 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     )
 }
 
+pub mod alias;
 pub mod chat;
 pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
+pub mod doctor;
 pub mod keys;
 pub mod ls;
 pub mod models;
 pub mod run;
 pub mod serve;
 pub mod start;
+pub mod stats;
 pub mod update;
 
+pub use alias::AliasCommand;
 pub use chat::ChatCommand;
+pub use doctor::DoctorCommand;
 pub use keys::KeysCommand;
 pub use ls::LsCommand;
 pub use models::ModelsCommand;
 pub use run::RunCommand;
 pub use serve::ServeCommand;
 pub use start::{StartCommand, StartFlowArgs};
+pub use stats::StatsCommand;
 pub use update::UpdateCommand;
 
 pub(crate) fn print_launch_preview(plan: &PreparedLaunch) {

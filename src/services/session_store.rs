@@ -174,6 +174,27 @@ pub struct UsageCounter {
     pub cache_creation_input_tokens: u64,
     #[serde(rename = "totalTokens", default, skip_serializing_if = "is_zero")]
     pub total_tokens: u64,
+    /// Per-tool selection counts (only populated in key_usage entries).
+    #[serde(
+        rename = "perTool",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_tool: HashMap<String, u64>,
+    /// Per-model selection counts (only populated in key_usage entries).
+    #[serde(
+        rename = "perModelSelections",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_model_selections: HashMap<String, u64>,
+    /// Per-model total token counts (only populated in key_usage entries).
+    #[serde(
+        rename = "perModelTokens",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_model_tokens: HashMap<String, u64>,
 }
 
 impl UsageCounter {
@@ -249,17 +270,60 @@ impl UsageStats {
         self == &Self::default()
     }
 
-    pub(crate) fn record_selection(&mut self, key_id: &str, tool: &str, model: Option<&str>) {
+    /// Removes all stats linked to a key and recomputes global totals.
+    pub(crate) fn remove_key(&mut self, key_id: &str) {
+        if self.key_usage.remove(key_id).is_none() {
+            return;
+        }
+        self.recompute_globals();
+    }
+
+    /// Recomputes all global totals from per-key data.
+    fn recompute_globals(&mut self) {
+        self.total_selections = 0;
+        self.total_prompt_tokens = 0;
+        self.total_completion_tokens = 0;
+        self.total_cache_read_input_tokens = 0;
+        self.total_cache_creation_input_tokens = 0;
+        self.total_tokens = 0;
+        self.tool_counts.clear();
+        self.model_usage.clear();
+
+        for entry in self.key_usage.values() {
+            self.total_selections += entry.selections;
+            self.total_prompt_tokens += entry.prompt_tokens;
+            self.total_completion_tokens += entry.completion_tokens;
+            self.total_cache_read_input_tokens += entry.cache_read_input_tokens;
+            self.total_cache_creation_input_tokens += entry.cache_creation_input_tokens;
+            self.total_tokens += entry.total_tokens;
+            for (tool, count) in &entry.per_tool {
+                *self.tool_counts.entry(tool.clone()).or_default() += count;
+            }
+            for (model, sel) in &entry.per_model_selections {
+                self.model_usage
+                    .entry(model.clone())
+                    .or_default()
+                    .selections += sel;
+            }
+            for (model, tok) in &entry.per_model_tokens {
+                self.model_usage
+                    .entry(model.clone())
+                    .or_default()
+                    .total_tokens += tok;
+            }
+        }
+    }
+
+    pub(crate) fn record_selection(&mut self, key_id: &str, tool: &str, _model: Option<&str>) {
         self.total_selections = self.total_selections.saturating_add(1);
         let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
         key_stats.selections = key_stats.selections.saturating_add(1);
+        *key_stats.per_tool.entry(tool.to_string()).or_default() += 1;
+
         let tool_count = self.tool_counts.entry(tool.to_string()).or_default();
         *tool_count = tool_count.saturating_add(1);
-
-        if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
-            let model_stats = self.model_usage.entry(model.to_string()).or_default();
-            model_stats.selections = model_stats.selections.saturating_add(1);
-        }
+        // Model is recorded in record_tokens only when tokens are produced,
+        // to avoid counting invalid/alias model names.
     }
 
     pub(crate) fn record_tokens(
@@ -285,26 +349,32 @@ impl UsageStats {
             .total_tokens
             .saturating_add(prompt_tokens.saturating_add(completion_tokens));
 
-        self.key_usage
-            .entry(key_id.to_string())
-            .or_default()
-            .add_tokens(
+        let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
+        key_stats.add_tokens(
+            prompt_tokens,
+            completion_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        );
+
+        let total = prompt_tokens.saturating_add(completion_tokens);
+        if let Some(model) = model.filter(|value| !value.trim().is_empty() && total > 0) {
+            *key_stats
+                .per_model_selections
+                .entry(model.to_string())
+                .or_default() += 1;
+            *key_stats
+                .per_model_tokens
+                .entry(model.to_string())
+                .or_default() += total;
+            let model_stats = self.model_usage.entry(model.to_string()).or_default();
+            model_stats.selections = model_stats.selections.saturating_add(1);
+            model_stats.add_tokens(
                 prompt_tokens,
                 completion_tokens,
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
             );
-
-        if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
-            self.model_usage
-                .entry(model.to_string())
-                .or_default()
-                .add_tokens(
-                    prompt_tokens,
-                    completion_tokens,
-                    cache_read_input_tokens,
-                    cache_creation_input_tokens,
-                );
         }
     }
 }
@@ -451,6 +521,9 @@ pub struct StoredConfig {
         skip_serializing_if = "UsageStats::is_empty"
     )]
     pub stats: UsageStats,
+    /// Model aliases (e.g. "fast" -> "claude-haiku-4-5")
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub aliases: HashMap<String, String>,
     /// Legacy field — read from old configs but never written back.
     /// Sessions are now stored in individual files under sessions/.
     #[serde(rename = "chat_sessions", default, skip_serializing)]
@@ -471,6 +544,7 @@ impl StoredConfig {
             chat_models: HashMap::new(),
             directory_starts: HashMap::new(),
             stats: UsageStats::default(),
+            aliases: HashMap::new(),
             chat_sessions: HashMap::new(),
         }
     }
@@ -693,7 +767,7 @@ impl SessionStore {
         Self {
             api_keys: ApiKeyStore { ctx: ctx.clone() },
             sessions: ChatSessionStore { ctx: ctx.clone() },
-            stats: UsageStatsStore { ctx: ctx.clone() },
+            stats: UsageStatsStore::new(ctx.clone()),
             dirs: DirectoryStartsStore { ctx: ctx.clone() },
             ctx,
         }
@@ -878,6 +952,18 @@ impl SessionStore {
 
     // ── Usage stats (delegated to UsageStatsStore) ────────────────────────
 
+    pub async fn load_stats(&self) -> Result<UsageStats> {
+        self.stats.load().await
+    }
+
+    pub async fn clear_stats(&self) -> Result<()> {
+        self.stats.clear().await
+    }
+
+    pub async fn remove_key_stats(&self, key_id: &str) -> Result<()> {
+        self.stats.remove_key(key_id).await
+    }
+
     pub async fn record_selection(
         &self,
         key_id: &str,
@@ -957,6 +1043,49 @@ impl SessionStore {
     #[allow(dead_code)]
     pub async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {
         self.sessions.remove_sessions_for_key(key_id).await
+    }
+
+    // ── Model aliases ─────────────────────────────────────────────────────
+
+    /// Returns all model aliases.
+    pub async fn get_aliases(&self) -> Result<HashMap<String, String>> {
+        let config = self.ctx.load().await?;
+        Ok(config.aliases)
+    }
+
+    /// Sets a model alias. Returns the previous value if it existed.
+    pub async fn set_alias(&self, name: String, model: String) -> Result<Option<String>> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        let prev = config.aliases.insert(name, model);
+        self.ctx.save_raw(&config).await?;
+        Ok(prev)
+    }
+
+    /// Removes a model alias. Returns the removed value if it existed.
+    pub async fn remove_alias(&self, name: &str) -> Result<Option<String>> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        let removed = config.aliases.remove(name);
+        if removed.is_some() {
+            self.ctx.save_raw(&config).await?;
+        }
+        Ok(removed)
+    }
+
+    /// Resolves a model name through aliases, with cycle detection.
+    /// Returns the final resolved model name.
+    pub async fn resolve_alias(&self, model: &str) -> Result<String> {
+        let aliases = self.get_aliases().await?;
+        let mut current = model.to_string();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(target) = aliases.get(&current) {
+            if !seen.insert(current.clone()) {
+                anyhow::bail!("circular alias detected: {}", model);
+            }
+            current = target.clone();
+        }
+        Ok(current)
     }
 }
 
@@ -1310,7 +1439,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = store.load().await.unwrap().stats;
+        let stats = store.load_stats().await.unwrap();
         assert_eq!(stats.total_selections, 1);
         assert_eq!(stats.total_tokens, 15);
         assert_eq!(stats.total_cache_read_input_tokens, 90);

@@ -54,6 +54,15 @@ pub enum Commands {
     /// Health-check API keys (alias for `keys ping`)
     Ping(PingArgs),
 
+    /// Create, list, or remove model aliases
+    Alias(AliasArgs),
+
+    /// Run a comprehensive health check (config, keys, tools)
+    Doctor,
+
+    /// Show usage statistics (tokens, requests, breakdowns)
+    Stats(StatsArgs),
+
     /// Show a compact status view of keys, tools, and current directory state
     Ls,
 
@@ -82,6 +91,22 @@ impl PingArgs {
     pub fn key(&self) -> Option<&str> {
         self.named_key.as_deref().or(self.positional_key.as_deref())
     }
+}
+
+/// Arguments for the alias command
+#[derive(Args, Debug, Clone)]
+pub struct AliasArgs {
+    /// Alias assignment (name=model) or name for rm
+    #[arg(value_name = "NAME[=MODEL]")]
+    pub assignment: Option<String>,
+
+    /// Model target when using `aivo alias name model` form
+    #[arg(value_name = "MODEL")]
+    pub value: Option<String>,
+
+    /// Remove an alias
+    #[arg(long, short)]
+    pub rm: bool,
 }
 
 /// Arguments for the keys command
@@ -203,6 +228,26 @@ pub struct ServeArgs {
         default_missing_value = ""
     )]
     pub key: Option<String>,
+
+    /// Enable request logging to ~/.config/aivo/logs/
+    #[arg(long)]
+    pub log: bool,
+
+    /// Enable multi-key failover on 429/5xx errors
+    #[arg(long)]
+    pub failover: bool,
+}
+
+/// Arguments for the stats command
+#[derive(Args, Debug, Clone)]
+pub struct StatsArgs {
+    /// Human-readable numbers (K/M/B suffixes)
+    #[arg(short = 'H', long)]
+    pub human: bool,
+
+    /// Search by key, model, or tool name (substring match)
+    #[arg(short = 's', long, value_name = "QUERY")]
+    pub search: Option<String>,
 }
 
 /// Arguments for the update command

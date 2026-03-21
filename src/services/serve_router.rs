@@ -16,6 +16,7 @@ use crate::services::http_utils::{self, router_http_client};
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch,
 };
+use crate::services::request_log::RequestLogger;
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, convert_chat_response_to_responses_sse,
     convert_responses_to_chat_request,
@@ -30,6 +31,14 @@ use crate::services::serve_upstream::{
 };
 use crate::services::session_store::ApiKey;
 
+use std::sync::LazyLock;
+
+static HEALTH_RESPONSE: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    json!({"status": "ok", "version": crate::version::VERSION})
+        .to_string()
+        .into_bytes()
+});
+
 pub struct ServeRouterConfig {
     pub upstream_base_url: String,
     pub upstream_api_key: String,
@@ -41,6 +50,8 @@ pub struct ServeRouterConfig {
 pub struct ServeRouter {
     config: ServeRouterConfig,
     key: ApiKey,
+    logger: Option<RequestLogger>,
+    failover_keys: Vec<ApiKey>,
 }
 
 struct ServeState {
@@ -49,11 +60,35 @@ struct ServeState {
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
     active_protocol: Arc<AtomicU8>,
+    logger: Option<RequestLogger>,
+    failover_keys: Arc<Vec<FailoverEntry>>,
+}
+
+struct FailoverEntry {
+    config: Arc<ServeRouterConfig>,
+    key: ApiKey,
+    copilot_tokens: Option<Arc<CopilotTokenManager>>,
+    active_protocol: AtomicU8,
 }
 
 impl ServeRouter {
     pub fn new(config: ServeRouterConfig, key: ApiKey) -> Self {
-        Self { config, key }
+        Self {
+            config,
+            key,
+            logger: None,
+            failover_keys: Vec::new(),
+        }
+    }
+
+    pub fn with_logger(mut self, logger: Option<RequestLogger>) -> Self {
+        self.logger = logger;
+        self
+    }
+
+    pub fn with_failover_keys(mut self, keys: Vec<ApiKey>) -> Self {
+        self.failover_keys = keys;
+        self
     }
 
     /// Binds to the port eagerly (propagates "address already in use" immediately),
@@ -71,12 +106,43 @@ impl ServeRouter {
 
         let initial_protocol = self.config.upstream_protocol;
 
+        let failover_entries: Vec<FailoverEntry> = self
+            .failover_keys
+            .into_iter()
+            .map(|fk| {
+                let profile = crate::services::provider_profile::provider_profile_for_key(&fk);
+                let is_copilot = profile.serve_flags.is_copilot;
+                let protocol = profile.default_protocol;
+                let ct = if is_copilot {
+                    Some(Arc::new(CopilotTokenManager::new(
+                        fk.key.as_str().to_string(),
+                    )))
+                } else {
+                    None
+                };
+                FailoverEntry {
+                    config: Arc::new(ServeRouterConfig {
+                        upstream_base_url: fk.base_url.clone(),
+                        upstream_api_key: fk.key.as_str().to_string(),
+                        upstream_protocol: protocol,
+                        is_copilot,
+                        is_openrouter: profile.serve_flags.is_openrouter,
+                    }),
+                    key: fk,
+                    copilot_tokens: ct,
+                    active_protocol: AtomicU8::new(protocol.to_u8()),
+                }
+            })
+            .collect();
+
         let state = Arc::new(ServeState {
             config: Arc::new(self.config),
             client: router_http_client(),
             key: self.key,
             copilot_tokens,
             active_protocol: Arc::new(AtomicU8::new(initial_protocol.to_u8())),
+            logger: self.logger,
+            failover_keys: Arc::new(failover_entries),
         });
 
         Ok(tokio::spawn(run_accept_loop(listener, state)))
@@ -122,8 +188,24 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             let request = String::from_utf8_lossy(&request_bytes).into_owned();
             let path = http_utils::extract_request_path(&request);
             let path_no_query = path.split('?').next().unwrap_or(&path);
+            let request_start = std::time::Instant::now();
+
+            // Extract model from request body for logging (best-effort, only when logging enabled)
+            let log_model = if state.logger.is_some() {
+                http_utils::extract_request_body(&request)
+                    .ok()
+                    .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+            } else {
+                None
+            };
 
             let result = match path_no_query {
+                "/health" => Ok(RouterResponse::buffered(
+                    200,
+                    CONTENT_TYPE_JSON,
+                    HEALTH_RESPONSE.clone(),
+                )),
                 "/v1/models" | "/models" => handle_models(&state).await,
                 "/v1/chat/completions" => {
                     if !request.starts_with("POST ") {
@@ -133,7 +215,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
-                        handle_chat(&request, &state).await
+                        handle_chat_with_failover(&request, &state).await
                     }
                 }
                 "/v1/responses" | "/responses" => {
@@ -144,7 +226,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
-                        handle_responses(&request, &state).await
+                        handle_responses_with_failover(&request, &state).await
                     }
                 }
                 _ => Ok(RouterResponse::buffered(
@@ -152,6 +234,12 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                     CONTENT_TYPE_JSON,
                     br#"{"error":{"message":"Not found"}}"#.to_vec(),
                 )),
+            };
+
+            let response_status = match &result {
+                Ok(RouterResponse::Buffered { status, .. }) => *status,
+                Ok(RouterResponse::Streaming { status, .. }) => *status,
+                Err(_) => 500,
             };
 
             match result {
@@ -163,6 +251,20 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                         .write_all(http_utils::http_error_response(500, &e.to_string()).as_bytes())
                         .await;
                 }
+            }
+
+            // Log request (non-blocking, non-fatal)
+            if let Some(ref logger) = state.logger {
+                let latency_ms = request_start.elapsed().as_millis() as u64;
+                logger
+                    .log(crate::services::request_log::RequestLogEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        path: path_no_query.to_string(),
+                        model: log_model,
+                        status: response_status,
+                        latency_ms,
+                    })
+                    .await;
             }
         });
     }
@@ -216,6 +318,76 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
     let chat_response = handle_chat_body(chat_body, state).await?;
     convert_chat_response_for_responses_route(chat_response, client_wants_stream, &original_model)
 }
+
+/// Returns true if the status code should trigger failover.
+/// - 401/403: auth failure (key revoked, expired, or lacks model access)
+/// - 429: rate limited
+/// - 5xx: server errors
+fn is_failover_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429) || (500..600).contains(&status)
+}
+
+/// Builds a temporary ServeState from a FailoverEntry, sharing the client.
+/// Logger is intentionally omitted — failover attempts are not individually logged.
+fn failover_state(entry: &FailoverEntry, client: &reqwest::Client) -> ServeState {
+    ServeState {
+        config: entry.config.clone(), // Arc clone — O(1) atomic increment
+        client: client.clone(),
+        key: entry.key.clone(),
+        copilot_tokens: entry.copilot_tokens.clone(),
+        active_protocol: Arc::new(AtomicU8::new(entry.active_protocol.load(Ordering::Relaxed))),
+        logger: None,
+        failover_keys: Arc::new(Vec::new()),
+    }
+}
+
+/// Generates a failover wrapper around a handler function.
+/// Tries the primary handler, then falls through to failover keys on 429/5xx
+/// buffered responses. Streaming responses are never retried.
+macro_rules! impl_with_failover {
+    ($name:ident, $handler:ident) => {
+        async fn $name(request: &str, state: &ServeState) -> Result<RouterResponse> {
+            let response = $handler(request, state).await?;
+            if state.failover_keys.is_empty() {
+                return Ok(response);
+            }
+
+            let status = match &response {
+                RouterResponse::Buffered { status, .. } => *status,
+                RouterResponse::Streaming { .. } => return Ok(response),
+            };
+
+            if !is_failover_status(status) {
+                return Ok(response);
+            }
+
+            eprintln!(
+                "  \u{21bb} Primary key returned {}; trying failover keys...",
+                status
+            );
+            for entry in state.failover_keys.iter() {
+                let fstate = failover_state(entry, &state.client);
+                if let Ok(resp) = $handler(request, &fstate).await {
+                    let s = match &resp {
+                        RouterResponse::Buffered { status, .. } => *status,
+                        RouterResponse::Streaming { .. } => 200,
+                    };
+                    if !is_failover_status(s) {
+                        eprintln!(
+                            "  \u{2713} Failover to {} succeeded",
+                            entry.key.display_name()
+                        );
+                        return Ok(resp);
+                    }
+                }
+            }
+            Ok(response)
+        }
+    };
+}
+
+impl_with_failover!(handle_chat_with_failover, handle_chat);
+impl_with_failover!(handle_responses_with_failover, handle_responses);
 
 async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
     let client_wants_stream = body
@@ -584,6 +756,8 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             active_protocol: Arc::new(AtomicU8::new(protocol.to_u8())),
+            logger: None,
+            failover_keys: Arc::new(Vec::new()),
         }
     }
 
@@ -709,6 +883,8 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             active_protocol: Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8())),
+            logger: None,
+            failover_keys: Arc::new(Vec::new()),
         };
 
         let context = upstream_context(&state);
@@ -812,5 +988,134 @@ mod tests {
             }
             RouterResponse::Streaming { .. } => panic!("expected buffered SSE"),
         }
+    }
+
+    // ── Failover tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn is_failover_status_triggers_on_auth_errors() {
+        assert!(is_failover_status(401));
+        assert!(is_failover_status(403));
+    }
+
+    #[test]
+    fn is_failover_status_triggers_on_rate_limit() {
+        assert!(is_failover_status(429));
+    }
+
+    #[test]
+    fn is_failover_status_triggers_on_server_errors() {
+        assert!(is_failover_status(500));
+        assert!(is_failover_status(502));
+        assert!(is_failover_status(503));
+        assert!(is_failover_status(504));
+        assert!(is_failover_status(599));
+    }
+
+    #[test]
+    fn is_failover_status_does_not_trigger_on_success() {
+        assert!(!is_failover_status(200));
+        assert!(!is_failover_status(201));
+        assert!(!is_failover_status(204));
+    }
+
+    #[test]
+    fn is_failover_status_does_not_trigger_on_client_errors() {
+        // Client errors that indicate a bad request — retrying with a different
+        // key won't help.
+        assert!(!is_failover_status(400));
+        assert!(!is_failover_status(404));
+        assert!(!is_failover_status(405));
+        assert!(!is_failover_status(422));
+    }
+
+    #[test]
+    fn failover_state_builds_from_entry() {
+        let entry = FailoverEntry {
+            config: Arc::new(ServeRouterConfig {
+                upstream_base_url: "https://backup.example.com/v1".to_string(),
+                upstream_api_key: "backup-key".to_string(),
+                upstream_protocol: ProviderProtocol::Openai,
+                is_copilot: false,
+                is_openrouter: false,
+            }),
+            key: test_key(),
+            copilot_tokens: None,
+            active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
+        };
+
+        let client = router_http_client();
+        let state = failover_state(&entry, &client);
+
+        assert_eq!(
+            state.config.upstream_base_url,
+            "https://backup.example.com/v1"
+        );
+        assert_eq!(state.config.upstream_api_key, "backup-key");
+        assert!(state.logger.is_none());
+        assert!(state.failover_keys.is_empty());
+    }
+
+    #[test]
+    fn failover_state_shares_arc_config() {
+        let config = Arc::new(ServeRouterConfig {
+            upstream_base_url: "https://backup.example.com/v1".to_string(),
+            upstream_api_key: "key".to_string(),
+            upstream_protocol: ProviderProtocol::Openai,
+            is_copilot: false,
+            is_openrouter: false,
+        });
+
+        let entry = FailoverEntry {
+            config: config.clone(),
+            key: test_key(),
+            copilot_tokens: None,
+            active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
+        };
+
+        let client = router_http_client();
+        let state = failover_state(&entry, &client);
+
+        // Arc should be a clone of the same allocation, not a new copy
+        assert!(Arc::ptr_eq(&entry.config, &state.config));
+    }
+
+    #[test]
+    fn failover_state_does_not_cascade() {
+        let entry = FailoverEntry {
+            config: Arc::new(ServeRouterConfig {
+                upstream_base_url: "https://backup.example.com/v1".to_string(),
+                upstream_api_key: "key".to_string(),
+                upstream_protocol: ProviderProtocol::Openai,
+                is_copilot: false,
+                is_openrouter: false,
+            }),
+            key: test_key(),
+            copilot_tokens: None,
+            active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
+        };
+
+        let client = router_http_client();
+        let state = failover_state(&entry, &client);
+
+        // Failover state should have no failover keys (no cascading)
+        assert!(state.failover_keys.is_empty());
+        // Logger should be disabled on failover attempts
+        assert!(state.logger.is_none());
+    }
+
+    #[test]
+    fn health_response_is_valid_json() {
+        let json: Value = serde_json::from_slice(&HEALTH_RESPONSE).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].is_string());
+    }
+
+    #[test]
+    fn health_response_is_stable() {
+        // LazyLock should return the same bytes every time
+        let a = HEALTH_RESPONSE.clone();
+        let b = HEALTH_RESPONSE.clone();
+        assert_eq!(a, b);
     }
 }

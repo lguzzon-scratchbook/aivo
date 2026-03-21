@@ -1,23 +1,130 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::path::PathBuf;
 
-use crate::services::session_store::ConfigContext;
+use crate::services::session_store::{ConfigContext, ConfigLockGuard, UsageStats};
+
+#[derive(Debug, Clone)]
+struct StatsFileContext {
+    stats_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl StatsFileContext {
+    fn acquire_lock(&self) -> Result<ConfigLockGuard> {
+        if let Some(parent) = self.stats_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
+        }
+        ConfigLockGuard::acquire(&self.lock_path)
+    }
+
+    async fn load(&self) -> Result<UsageStats> {
+        let data = match tokio::fs::read_to_string(&self.stats_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(UsageStats::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        serde_json::from_str(&data).context("Failed to parse stats.json")
+    }
+
+    async fn save(&self, stats: &UsageStats) -> Result<()> {
+        if let Some(parent) = self.stats_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
+        }
+
+        let data = serde_json::to_string_pretty(stats).context("Failed to serialize stats")?;
+        let tmp_path = self.stats_path.with_extension("json.tmp");
+
+        tokio::fs::write(&tmp_path, &data)
+            .await
+            .with_context(|| format!("Failed to write temp stats file: {:?}", tmp_path))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = tokio::fs::metadata(&tmp_path).await?;
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            tokio::fs::set_permissions(&tmp_path, permissions).await?;
+        }
+
+        tokio::fs::rename(&tmp_path, &self.stats_path)
+            .await
+            .with_context(|| {
+                format!("Failed to rename temp stats file to {:?}", self.stats_path)
+            })?;
+
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct UsageStatsStore {
-    pub(crate) ctx: ConfigContext,
+    stats_ctx: StatsFileContext,
+    config_ctx: ConfigContext,
 }
 
 impl UsageStatsStore {
+    pub(crate) fn new(config_ctx: ConfigContext) -> Self {
+        let stats_path = config_ctx.config_dir.join("stats.json");
+        let lock_path = config_ctx.config_dir.join("stats.lock");
+        Self {
+            stats_ctx: StatsFileContext {
+                stats_path,
+                lock_path,
+            },
+            config_ctx,
+        }
+    }
+
+    /// Loads stats, migrating from config.json on first access if needed.
+    async fn load_with_migration(&self) -> Result<UsageStats> {
+        if tokio::fs::try_exists(&self.stats_ctx.stats_path).await? {
+            return self.stats_ctx.load().await;
+        }
+
+        // Check config.json for inline stats to migrate
+        let _config_lock = self.config_ctx.acquire_config_lock()?;
+
+        // Double-check after acquiring lock
+        if tokio::fs::try_exists(&self.stats_ctx.stats_path).await? {
+            return self.stats_ctx.load().await;
+        }
+
+        let config = self.config_ctx.load().await?;
+        if !config.stats.is_empty() {
+            let migrated = config.stats.clone();
+            self.stats_ctx.save(&migrated).await?;
+            let mut config = config;
+            config.stats = UsageStats::default();
+            self.config_ctx.save_raw(&config).await?;
+            return Ok(migrated);
+        }
+
+        Ok(UsageStats::default())
+    }
+
+    pub(crate) async fn load(&self) -> Result<UsageStats> {
+        let _lock = self.stats_ctx.acquire_lock()?;
+        self.load_with_migration().await
+    }
+
     pub(crate) async fn record_selection(
         &self,
         key_id: &str,
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        let _lock = self.ctx.acquire_config_lock()?;
-        let mut config = self.ctx.load().await?;
-        config.stats.record_selection(key_id, tool, model);
-        self.ctx.save_raw(&config).await
+        let _lock = self.stats_ctx.acquire_lock()?;
+        let mut stats = self.load_with_migration().await?;
+        stats.record_selection(key_id, tool, model);
+        self.stats_ctx.save(&stats).await
     }
 
     pub(crate) async fn record_tokens(
@@ -29,9 +136,9 @@ impl UsageStatsStore {
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
     ) -> Result<()> {
-        let _lock = self.ctx.acquire_config_lock()?;
-        let mut config = self.ctx.load().await?;
-        config.stats.record_tokens(
+        let _lock = self.stats_ctx.acquire_lock()?;
+        let mut stats = self.load_with_migration().await?;
+        stats.record_tokens(
             key_id,
             model,
             prompt_tokens,
@@ -39,6 +146,164 @@ impl UsageStatsStore {
             cache_read_input_tokens,
             cache_creation_input_tokens,
         );
-        self.ctx.save_raw(&config).await
+        self.stats_ctx.save(&stats).await
+    }
+
+    pub(crate) async fn remove_key(&self, key_id: &str) -> Result<()> {
+        let _lock = self.stats_ctx.acquire_lock()?;
+        let mut stats = self.load_with_migration().await?;
+        stats.remove_key(key_id);
+        self.stats_ctx.save(&stats).await
+    }
+
+    pub(crate) async fn clear(&self) -> Result<()> {
+        let _lock = self.stats_ctx.acquire_lock()?;
+        self.stats_ctx.save(&UsageStats::default()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_store(dir: &TempDir) -> UsageStatsStore {
+        let config_dir = dir.path().to_path_buf();
+        let config_path = config_dir.join("config.json");
+        let ctx = ConfigContext {
+            config_path,
+            config_dir,
+        };
+        UsageStatsStore::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn load_returns_default_when_no_file() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        let stats = store.load().await.unwrap();
+        assert!(stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_selection_creates_stats_file() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        store
+            .record_selection("key1", "claude", Some("opus"))
+            .await
+            .unwrap();
+        assert!(dir.path().join("stats.json").exists());
+        let stats = store.load().await.unwrap();
+        assert_eq!(stats.total_selections, 1);
+        assert_eq!(*stats.tool_counts.get("claude").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn record_tokens_accumulates() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        store
+            .record_tokens("key1", Some("gpt-4o"), 100, 50, 80, 10)
+            .await
+            .unwrap();
+        store
+            .record_tokens("key1", Some("gpt-4o"), 200, 100, 0, 0)
+            .await
+            .unwrap();
+        let stats = store.load().await.unwrap();
+        assert_eq!(stats.total_prompt_tokens, 300);
+        assert_eq!(stats.total_completion_tokens, 150);
+        assert_eq!(stats.total_tokens, 450);
+        assert_eq!(stats.total_cache_read_input_tokens, 80);
+    }
+
+    #[tokio::test]
+    async fn clear_resets_stats() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        store
+            .record_selection("key1", "claude", None)
+            .await
+            .unwrap();
+        assert!(!store.load().await.unwrap().is_empty());
+        store.clear().await.unwrap();
+        assert!(store.load().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn migrates_stats_from_config_json() {
+        let dir = TempDir::new().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let config_path = config_dir.join("config.json");
+        let ctx = ConfigContext {
+            config_path: config_path.clone(),
+            config_dir,
+        };
+
+        // Write a config.json with inline stats
+        let mut stats = UsageStats::default();
+        stats.record_selection("key1", "claude", Some("opus"));
+        let config = crate::services::session_store::StoredConfig {
+            stats,
+            ..Default::default()
+        };
+        let data = serde_json::to_string_pretty(&config).unwrap();
+        tokio::fs::write(&config_path, &data).await.unwrap();
+
+        let store = UsageStatsStore::new(ctx);
+        let loaded = store.load().await.unwrap();
+        assert_eq!(loaded.total_selections, 1);
+
+        // stats.json should now exist
+        assert!(dir.path().join("stats.json").exists());
+
+        // config.json stats should be cleared
+        let config_data = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let config: crate::services::session_store::StoredConfig =
+            serde_json::from_str(&config_data).unwrap();
+        assert!(config.stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_not_touch_config_when_stats_file_exists() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+
+        // Create stats.json directly
+        store
+            .record_selection("key1", "claude", None)
+            .await
+            .unwrap();
+
+        // Write config.json with different stats (should be ignored)
+        let mut stats = UsageStats::default();
+        stats.record_selection("key2", "codex", None);
+        stats.record_selection("key2", "codex", None);
+        let config = crate::services::session_store::StoredConfig {
+            stats,
+            ..Default::default()
+        };
+        let data = serde_json::to_string_pretty(&config).unwrap();
+        tokio::fs::write(dir.path().join("config.json"), &data)
+            .await
+            .unwrap();
+
+        let loaded = store.load().await.unwrap();
+        assert_eq!(loaded.total_selections, 1); // from stats.json, not config.json
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stats_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        store
+            .record_selection("key1", "claude", None)
+            .await
+            .unwrap();
+        let metadata = std::fs::metadata(dir.path().join("stats.json")).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 }
