@@ -729,4 +729,104 @@ mod tests {
         let result = explain_copilot_error(&body);
         assert!(!result.is_empty());
     }
+
+    #[test]
+    fn openai_to_anthropic_null_content() {
+        // choices[0].message.content is null — should not panic
+        let resp = json!({
+            "id": "chatcmpl-xxx",
+            "choices": [{
+                "message": {"role": "assistant", "content": null},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+        });
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        // Should produce a valid response without panicking
+        assert_eq!(result["model"], "claude-sonnet-4");
+        assert_eq!(result["id"], "chatcmpl-xxx");
+    }
+
+    #[test]
+    fn openai_to_anthropic_sse_null_usage() {
+        // Usage fields absent — SSE should still be valid
+        let resp = json!({
+            "id": "chatcmpl-xxx",
+            "choices": [{
+                "message": {"role": "assistant", "content": "Hi!"},
+                "finish_reason": "stop"
+            }]
+        });
+        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4");
+        assert!(
+            sse.contains("event: message_start"),
+            "must emit message_start"
+        );
+        assert!(
+            sse.contains("event: message_stop"),
+            "must emit message_stop"
+        );
+        // input_tokens/output_tokens should fall back to 0
+        assert!(sse.contains("\"input_tokens\":0"));
+    }
+
+    #[test]
+    fn explain_copilot_error_nested_json_no_error_key() {
+        // Outer message contains JSON but the nested JSON has no "error" key —
+        // should fall back to the outer message text.
+        let nested = json!({"status": "bad", "detail": "something broke"}).to_string();
+        let body = json!({
+            "error": {
+                "message": nested
+            }
+        })
+        .to_string();
+        let result = explain_copilot_error(&body);
+        // Falls back to the outer message (the raw nested JSON string)
+        assert_eq!(result, nested);
+    }
+
+    #[test]
+    fn openai_to_anthropic_empty_choices() {
+        let resp = json!({
+            "id": "chatcmpl-xxx",
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+        });
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        // Should convert gracefully without panicking
+        assert_eq!(result["model"], "claude-sonnet-4");
+        assert_eq!(result["id"], "chatcmpl-xxx");
+    }
+
+    #[test]
+    fn openai_to_anthropic_tool_calls_with_empty_args() {
+        // tool_calls where arguments is an empty string — should not crash
+        let resp = json!({
+            "id": "chatcmpl-xxx",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "do_thing", "arguments": ""}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        assert_eq!(result["model"], "claude-sonnet-4");
+        // Should produce a tool_use content block
+        let content = result["content"]
+            .as_array()
+            .expect("content should be array");
+        let has_tool_use = content
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+        assert!(has_tool_use, "should have a tool_use content block");
+    }
 }

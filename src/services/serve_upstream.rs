@@ -547,4 +547,43 @@ mod tests {
             RouterResponse::Buffered { .. } => panic!("expected streaming response"),
         }
     }
+
+    #[test]
+    fn build_anthropic_request_missing_model_uses_default() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let (fallback_model, request) = build_anthropic_request(&body, true);
+
+        assert_eq!(fallback_model, "claude-sonnet-4-5");
+        assert_eq!(request["model"], "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn build_anthropic_request_non_stream() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let (_fallback_model, request) = build_anthropic_request(&body, false);
+
+        assert_eq!(request["stream"], false);
+    }
+
+    #[test]
+    fn normalize_openai_request_model_no_op_when_neither_flag() {
+        let mut body = json!({"model": "claude-sonnet-4-6"});
+        normalize_openai_request_model(&mut body, false, false);
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn normalize_openai_request_model_no_op_missing_model_field() {
+        let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+        normalize_openai_request_model(&mut body, true, false);
+        // No crash, and no model field is inserted
+        assert!(body.get("model").is_none());
+    }
 }

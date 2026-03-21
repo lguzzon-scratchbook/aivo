@@ -1467,4 +1467,58 @@ data: [DONE]\n";
         let messages = req["messages"].as_array().unwrap();
         assert!(messages[0]["content"].is_null());
     }
+
+    #[test]
+    fn is_responses_api_error_detects_input_bracket() {
+        // The detector looks for literal `"input[` in the raw body string,
+        // matching how OpenAI formats Responses API validation errors.
+        assert!(is_responses_api_error(
+            r#"{"error":{"message":"Invalid value for \"input[0].content\""}}"#
+        ));
+    }
+
+    #[test]
+    fn is_responses_api_error_detects_fc_prefix() {
+        assert!(is_responses_api_error(
+            r#"{"error":"tool call id begins with 'fc' which is reserved"}"#
+        ));
+    }
+
+    #[test]
+    fn is_responses_api_error_false_for_normal_error() {
+        assert!(!is_responses_api_error(r#"{"error":"rate limited"}"#));
+    }
+
+    #[test]
+    fn build_responses_url_with_v1_suffix() {
+        let url = build_responses_url("https://api.openai.com/v1");
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        // Must not produce /v1/v1/responses
+        assert!(!url.contains("/v1/v1"));
+    }
+
+    #[test]
+    fn build_responses_url_without_v1_suffix() {
+        let url = build_responses_url("https://api.example.com");
+        assert_eq!(url, "https://api.example.com/v1/responses");
+    }
+
+    #[test]
+    fn convert_openai_sse_to_anthropic_done_only() {
+        // A stream consisting of only the [DONE] sentinel should produce
+        // a minimal valid Anthropic SSE stream (message_start + message_stop).
+        let result = convert_openai_sse_to_anthropic("data: [DONE]\n", 200).unwrap();
+        assert!(
+            result.contains("event: message_start"),
+            "must emit message_start"
+        );
+        assert!(
+            result.contains("event: message_stop"),
+            "must emit message_stop"
+        );
+        assert!(
+            result.contains("\"stop_reason\":\"end_turn\""),
+            "must have a stop_reason"
+        );
+    }
 }

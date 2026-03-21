@@ -556,4 +556,67 @@ mod tests {
             "http://127.0.0.1:9999"
         );
     }
+
+    #[test]
+    fn set_local_base_url_overwrites_existing() {
+        use super::set_local_base_url;
+        let mut env = HashMap::from([(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://old-url.example.com".to_string(),
+        )]);
+        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", 12345);
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://127.0.0.1:12345"
+        );
+    }
+
+    #[test]
+    fn patch_opencode_config_content_preserves_non_placeholder() {
+        let mut env = HashMap::from([(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            "{\"baseUrl\":\"https://api.openai.com/v1\"}".to_string(),
+        )]);
+
+        patch_opencode_config_content(&mut env, 24860);
+
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").unwrap(),
+            "{\"baseUrl\":\"https://api.openai.com/v1\"}"
+        );
+    }
+
+    #[test]
+    fn patch_opencode_config_content_replaces_multiple_occurrences() {
+        use crate::constants::PLACEHOLDER_LOOPBACK_URL;
+
+        let content = format!(
+            "{{\"url1\":\"{}\",\"url2\":\"{}\"}}",
+            PLACEHOLDER_LOOPBACK_URL, PLACEHOLDER_LOOPBACK_URL
+        );
+        let mut env = HashMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), content)]);
+
+        patch_opencode_config_content(&mut env, 55555);
+
+        let result = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+        assert!(!result.contains(PLACEHOLDER_LOOPBACK_URL));
+        assert_eq!(result.matches("http://127.0.0.1:55555").count(), 2);
+    }
+
+    #[test]
+    fn patch_opencode_config_content_uses_constant() {
+        use crate::constants::PLACEHOLDER_LOOPBACK_URL;
+
+        let mut env = HashMap::from([(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            format!("{{\"baseUrl\":\"{}\"}}", PLACEHOLDER_LOOPBACK_URL),
+        )]);
+
+        patch_opencode_config_content(&mut env, 9876);
+
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").unwrap(),
+            "{\"baseUrl\":\"http://127.0.0.1:9876\"}"
+        );
+    }
 }

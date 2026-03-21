@@ -130,8 +130,7 @@ impl DoctorCommand {
             .unwrap_or(0);
 
         ping_keys_streaming(keys, |id, result| {
-            has_problems |=
-                print_key_result(id, result, active_key_id.as_deref(), max_name_len);
+            has_problems |= print_key_result(id, result, active_key_id.as_deref(), max_name_len);
         })
         .await;
 

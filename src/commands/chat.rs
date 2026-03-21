@@ -283,8 +283,7 @@ impl ChatCommand {
 
             match result {
                 Ok(turn) => {
-                    let prompt_text: String =
-                        history.iter().map(|m| m.content.as_str()).collect();
+                    let prompt_text: String = history.iter().map(|m| m.content.as_str()).collect();
                     let usage = turn.usage_or_estimate(&prompt_text);
                     self.session_store
                         .record_tokens(

@@ -1118,4 +1118,74 @@ mod tests {
         let b = HEALTH_RESPONSE.clone();
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn is_failover_status_boundary_499() {
+        // 499 is a non-standard client error — should NOT trigger failover
+        assert!(!is_failover_status(499));
+    }
+
+    #[test]
+    fn is_failover_status_boundary_600() {
+        // 600 is outside the 5xx range — should NOT trigger failover
+        assert!(!is_failover_status(600));
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_malformed_json_body() {
+        // A non-JSON body with status 200 should fail to parse and return an error
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(200, CONTENT_TYPE_JSON, b"not valid json".to_vec()),
+            false,
+            "gpt-4o",
+        );
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_empty_body_non_stream() {
+        // An empty body with status 200 should fail to parse and return an error
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(200, CONTENT_TYPE_JSON, Vec::new()),
+            false,
+            "gpt-4o",
+        );
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn convert_chat_response_for_responses_route_error_stream_passthrough() {
+        // A 400 error response passes through unchanged even when client wants stream
+        let error_body = br#"{"error":{"message":"bad request"}}"#;
+        let response = convert_chat_response_for_responses_route(
+            RouterResponse::buffered(400, CONTENT_TYPE_JSON, error_body.to_vec()),
+            true,
+            "gpt-4o",
+        )
+        .unwrap();
+
+        match response {
+            RouterResponse::Buffered { status, body, .. } => {
+                assert_eq!(status, 400);
+                assert_eq!(body, error_body);
+            }
+            _ => panic!("expected buffered error passthrough"),
+        }
+    }
+
+    #[test]
+    fn responses_router_config_openai_protocol() {
+        let state = test_state(ProviderProtocol::Openai);
+        let config = responses_router_config(&state);
+
+        assert_eq!(config.target_protocol, ProviderProtocol::Openai);
+        assert_eq!(config.target_base_url, "https://example.com/v1");
+        assert_eq!(config.api_key, "secret");
+        assert!(config.copilot_token_manager.is_none());
+        assert!(config.model_prefix.is_none());
+        assert!(!config.requires_reasoning_content);
+        assert!(config.actual_model.is_none());
+        assert!(config.max_tokens_cap.is_none());
+        assert!(config.responses_api_supported.is_none());
+    }
 }

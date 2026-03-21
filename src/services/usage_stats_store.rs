@@ -156,6 +156,7 @@ impl UsageStatsStore {
         self.stats_ctx.save(&stats).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn clear(&self) -> Result<()> {
         let _lock = self.stats_ctx.acquire_lock()?;
         self.stats_ctx.save(&UsageStats::default()).await

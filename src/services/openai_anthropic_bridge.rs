@@ -613,4 +613,148 @@ mod tests {
         assert_eq!(extract_openai_text(Some(&json!(42))), "42");
         assert_eq!(extract_openai_text(Some(&json!(true))), "true");
     }
+
+    #[test]
+    fn convert_openai_to_anthropic_invalid_tool_args_json() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "do_stuff", "arguments": "not json"}
+                }]}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        // Invalid JSON arguments should fall back to {}
+        let tool_block = &converted["messages"][1]["content"][0];
+        assert_eq!(tool_block["type"], "tool_use");
+        assert_eq!(tool_block["input"], json!({}));
+    }
+
+    #[test]
+    fn convert_anthropic_to_openai_null_usage_subfields() {
+        let resp = json!({
+            "id": "msg_1",
+            "model": "test",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"input_tokens": null, "output_tokens": null}
+        });
+        let converted = convert_anthropic_to_openai_chat_response(&resp, "fallback");
+        assert_eq!(converted["usage"]["prompt_tokens"], 0);
+        assert_eq!(converted["usage"]["completion_tokens"], 0);
+        assert_eq!(converted["usage"]["total_tokens"], 0);
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_sse_empty_choices() {
+        // No SSE chunk conversion function exists; test convert with empty messages array
+        let body = json!({"model": "gpt-4o", "messages": []});
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        assert!(converted["messages"].as_array().unwrap().is_empty());
+        assert_eq!(converted["model"], "gpt-4o");
+        assert_eq!(converted["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_sse_null_content() {
+        // Tool calls with null content in assistant message
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "call tool"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_data", "arguments": "{\"x\":1}"}
+                    }]
+                }
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        // Assistant content should have only the tool_use block (no text block since content is null)
+        let assistant_content = converted["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(assistant_content.len(), 1);
+        assert_eq!(assistant_content[0]["type"], "tool_use");
+        assert_eq!(assistant_content[0]["name"], "get_data");
+    }
+
+    #[test]
+    fn convert_anthropic_to_openai_empty_text_blocks() {
+        let resp = json!({
+            "id": "msg_1",
+            "model": "test",
+            "content": [{"type": "text", "text": ""}],
+            "usage": {"input_tokens": 5, "output_tokens": 2}
+        });
+        let converted = convert_anthropic_to_openai_chat_response(&resp, "fallback");
+        // Empty text is skipped, so content should be null (no text_parts collected)
+        assert!(converted["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn convert_anthropic_to_openai_cache_tokens_summed() {
+        let resp = json!({
+            "id": "msg_1",
+            "model": "test",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 30
+            }
+        });
+        let converted = convert_anthropic_to_openai_chat_response(&resp, "fallback");
+        // prompt_tokens = input_tokens + cache_read + cache_creation = 10 + 20 + 30 = 60
+        assert_eq!(converted["usage"]["prompt_tokens"], 60);
+        assert_eq!(converted["usage"]["completion_tokens"], 5);
+        assert_eq!(converted["usage"]["total_tokens"], 65);
+        assert_eq!(converted["usage"]["cache_read_input_tokens"], 20);
+        assert_eq!(converted["usage"]["cache_creation_input_tokens"], 30);
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_developer_role_mapped() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "developer", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        // "developer" falls through to the _ match arm which calls openai_user_to_anthropic
+        // preserving the role as-is ("developer")
+        let messages = converted["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "developer");
+        // Content should be converted properly
+        assert!(messages[0]["content"].is_string() || messages[0]["content"].is_array());
+    }
 }

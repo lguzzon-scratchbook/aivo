@@ -160,10 +160,7 @@ pub async fn ping_key(key: ApiKey) -> PingResult {
 
 /// Pings keys concurrently and calls `on_result(key_id, result)` for each as it resolves.
 /// Decrypt failures are reported immediately; successful decrypts are spawned and awaited in order.
-pub async fn ping_keys_streaming(
-    keys: Vec<ApiKey>,
-    mut on_result: impl FnMut(&str, &PingResult),
-) {
+pub async fn ping_keys_streaming(keys: Vec<ApiKey>, mut on_result: impl FnMut(&str, &PingResult)) {
     let mut handles = Vec::new();
     for mut key in keys {
         let id = key.id.clone();
@@ -972,10 +969,7 @@ impl KeysCommand {
         }
 
         if self.session_store.delete_key(&key_to_remove.id).await? {
-            let _ = self
-                .session_store
-                .remove_key_stats(&key_to_remove.id)
-                .await;
+            let _ = self.session_store.remove_key_stats(&key_to_remove.id).await;
             println!(
                 "{} Removed key: {}",
                 style::success_symbol(),

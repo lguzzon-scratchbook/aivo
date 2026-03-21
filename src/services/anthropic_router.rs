@@ -391,4 +391,54 @@ mod tests {
             "https://openrouter.ai/api/v1/messages/count_tokens"
         );
     }
+
+    #[test]
+    fn route_from_path_returns_none_for_unknown() {
+        assert_eq!(AnthropicRoute::from_request_path("/v1/completions"), None);
+        assert_eq!(AnthropicRoute::from_request_path("/v1/embeddings"), None);
+        assert_eq!(AnthropicRoute::from_request_path("/v1/models"), None);
+        assert_eq!(AnthropicRoute::from_request_path("/health"), None);
+        assert_eq!(AnthropicRoute::from_request_path(""), None);
+    }
+
+    #[test]
+    fn route_from_path_bare_chat_completions() {
+        // /chat/completions without /v1 prefix should still route correctly
+        let route = AnthropicRoute::from_request_path("/chat/completions");
+        assert_eq!(route, Some(AnthropicRoute::ChatCompletions));
+    }
+
+    #[test]
+    fn build_endpoint_url_no_trailing_slash() {
+        let url = build_endpoint_url("https://api.example.com/v1", "messages");
+        assert_eq!(url, "https://api.example.com/v1/messages");
+        // Ensure no double slashes
+        assert!(!url.contains("//messages"));
+    }
+
+    #[test]
+    fn build_endpoint_url_with_trailing_slash() {
+        let url = build_endpoint_url("https://api.example.com/v1/", "messages");
+        assert_eq!(url, "https://api.example.com/v1/messages");
+        // Trailing slash on base URL should not produce double slashes
+        assert!(!url.contains("//messages"));
+    }
+
+    #[test]
+    fn route_endpoint_and_patch_route_consistent() {
+        // endpoint() and patch_route() should return the same value for every variant
+        let routes = [
+            AnthropicRoute::Messages,
+            AnthropicRoute::CountTokens,
+            AnthropicRoute::ChatCompletions,
+        ];
+        for route in routes {
+            assert_eq!(
+                route.endpoint(),
+                route.patch_route(),
+                "endpoint() and patch_route() must match for {:?}",
+                route
+            );
+        }
+    }
 }

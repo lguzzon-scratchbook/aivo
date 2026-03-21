@@ -379,17 +379,17 @@ fn print_help() {
         let padded = format!("{:<10}", name);
         println!("  {}{}", style::cyan(&padded), style::dim(desc));
     };
-    print_cmd("run",    "Launch AI tool, or use the saved start flow");
-    print_cmd("chat",   "Start the interactive chat TUI");
-    print_cmd("serve",  "Start a local OpenAI-compatible API server");
-    print_cmd("keys",   "Manage API keys (use, rm, add, cat, edit)");
-    print_cmd("use",    "Switch active API key");
+    print_cmd("run", "Launch AI tool, or use the saved start flow");
+    print_cmd("chat", "Start the interactive chat TUI");
+    print_cmd("serve", "Start a local OpenAI-compatible API server");
+    print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
+    print_cmd("use", "Switch active API key");
     print_cmd("models", "List available models from the active provider");
-    print_cmd("ping",   "Health-check API keys");
-    print_cmd("alias",  "Create, list, or remove model aliases");
+    print_cmd("ping", "Health-check API keys");
+    print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("doctor", "Run a comprehensive health check");
-    print_cmd("stats",  "Show usage statistics");
-    print_cmd("ls",     "Show saved keys, tools, and current directory state");
+    print_cmd("stats", "Show usage statistics");
+    print_cmd("ls", "Show saved keys, tools, and current directory state");
     print_cmd("update", "Update to the latest version");
     println!();
     println!(

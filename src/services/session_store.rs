@@ -175,11 +175,7 @@ pub struct UsageCounter {
     #[serde(rename = "totalTokens", default, skip_serializing_if = "is_zero")]
     pub total_tokens: u64,
     /// Per-tool selection counts (only populated in key_usage entries).
-    #[serde(
-        rename = "perTool",
-        default,
-        skip_serializing_if = "HashMap::is_empty"
-    )]
+    #[serde(rename = "perTool", default, skip_serializing_if = "HashMap::is_empty")]
     pub per_tool: HashMap<String, u64>,
     /// Per-model selection counts (only populated in key_usage entries).
     #[serde(
@@ -956,6 +952,7 @@ impl SessionStore {
         self.stats.load().await
     }
 
+    #[allow(dead_code)]
     pub async fn clear_stats(&self) -> Result<()> {
         self.stats.clear().await
     }

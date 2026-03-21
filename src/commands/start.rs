@@ -374,4 +374,20 @@ mod tests {
     fn normalize_returns_raw_string_for_unparseable_url() {
         assert_eq!(normalize_provider_label("not-a-url"), "not-a-url");
     }
+
+    #[test]
+    fn normalize_provider_label_url_with_port() {
+        assert_eq!(
+            normalize_provider_label("https://localhost:8080/v1"),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn normalize_provider_label_url_with_deep_path() {
+        assert_eq!(
+            normalize_provider_label("https://api.deepseek.com/v1/chat"),
+            "api.deepseek.com"
+        );
+    }
 }

@@ -2215,4 +2215,101 @@ mod tests {
     fn test_extract_content_text_null() {
         assert_eq!(extract_content_text(Some(&json!(null))), "");
     }
+
+    #[test]
+    fn test_accumulate_chat_sse_malformed_json_skipped() {
+        // Malformed JSON data lines should be skipped; valid lines should be accumulated
+        let sse = "data: {invalid json!!!}\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\
+                   data: not even close to json\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
+                   data: [DONE]\n";
+        let result = accumulate_chat_sse(sse);
+        // Valid lines should be accumulated, malformed lines silently skipped
+        assert_eq!(result["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(result["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn test_convert_chat_response_to_responses_sse_null_usage() {
+        // Chat response with usage containing null fields should still produce valid SSE
+        let chat = json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {
+                "prompt_tokens": null,
+                "completion_tokens": null,
+                "total_tokens": null
+            }
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        // Should contain all required events
+        assert!(sse.contains("event: response.created\n"));
+        assert!(sse.contains("event: response.completed\n"));
+        // Usage should still be included (with null values passed through as-is)
+        assert!(sse.contains("\"input_tokens\""));
+        assert!(sse.contains("\"output_tokens\""));
+        // Should contain the text content
+        assert!(sse.contains("hi"));
+    }
+
+    #[test]
+    fn test_convert_responses_to_chat_actual_model_override() {
+        // When actual_model is set, it should override the model from the request body
+        let body = json!({
+            "model": "gpt-4o",
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        });
+        let config = ResponsesToChatRouterConfig {
+            target_base_url: "https://example.com/v1".to_string(),
+            api_key: String::new(),
+            target_protocol: ProviderProtocol::Openai,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: Some("kimi-k2.5".to_string()),
+            max_tokens_cap: None,
+            responses_api_supported: None,
+        };
+        let chat = convert_responses_to_chat_request(&body, &config);
+        // The model in the chat request should be the actual_model, not the original
+        assert_eq!(chat["model"], "kimi-k2.5");
+    }
+
+    #[test]
+    fn test_extract_chat_response_payload_no_choices_no_output() {
+        // Response with neither choices nor output should return empty text and tool_calls
+        let chat = json!({"id": "chatcmpl-123", "object": "chat.completion"});
+        let (text, tool_calls, reasoning) = extract_chat_response_payload(&chat);
+        assert!(
+            text.is_empty(),
+            "text should be empty when no choices/output"
+        );
+        assert!(
+            tool_calls.is_empty(),
+            "tool_calls should be empty when no choices/output"
+        );
+        assert!(
+            reasoning.is_empty(),
+            "reasoning should be empty when no choices/output"
+        );
+    }
+
+    #[test]
+    fn test_chat_usage_to_responses_usage_null_tokens() {
+        // Usage with null prompt_tokens should gracefully return the null value
+        // (defaults to json!(0) only when the key is missing entirely)
+        let chat = json!({
+            "usage": {
+                "prompt_tokens": null,
+                "completion_tokens": 5,
+                "total_tokens": 5
+            }
+        });
+        let usage = chat_usage_to_responses_usage(&chat).expect("usage should be Some");
+        // prompt_tokens is present but null — the function clones it as-is
+        assert!(usage["input_tokens"].is_null());
+        assert_eq!(usage["output_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 5);
+    }
 }

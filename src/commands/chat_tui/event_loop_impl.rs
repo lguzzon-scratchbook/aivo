@@ -70,8 +70,11 @@ impl ChatTuiApp {
             attachments: vec![],
         });
 
-        let prompt_text: String = self.history.iter()
-            .rev().skip(1) // skip the assistant message we just pushed
+        let prompt_text: String = self
+            .history
+            .iter()
+            .rev()
+            .skip(1) // skip the assistant message we just pushed
             .map(|m| m.content.as_str())
             .collect();
         let usage = turn.usage_or_estimate(&prompt_text);

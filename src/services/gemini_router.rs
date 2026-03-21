@@ -1446,4 +1446,114 @@ mod tests {
         let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
         assert!(result["messages"].is_array());
     }
+
+    #[test]
+    fn test_convert_openai_to_gemini_malformed_tool_args() {
+        // Tool call with invalid JSON in arguments should default to {}
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "not valid json {{{["
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let result = convert_openai_to_gemini(&response);
+        let parts = result["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        // The functionCall part should exist with args defaulting to {}
+        assert_eq!(parts[0]["functionCall"]["name"], "get_weather");
+        assert!(
+            parts[0]["functionCall"]["args"].is_object(),
+            "malformed arguments should default to empty object"
+        );
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_null_content() {
+        // message.content is null (common with tool call responses)
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let result = convert_openai_to_gemini(&response);
+        let parts = result["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        // Should produce an empty text part (fallback when no content and no tool_calls)
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "");
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_missing_usage_fields() {
+        // Usage present but with null/missing individual fields
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+            "usage": {}
+        });
+        let result = convert_openai_to_gemini(&response);
+        // usageMetadata should be present but with null values for missing fields
+        let usage = result
+            .get("usageMetadata")
+            .expect("usageMetadata should be present");
+        assert!(usage["promptTokenCount"].is_null());
+        assert!(usage["candidatesTokenCount"].is_null());
+        assert!(usage["totalTokenCount"].is_null());
+    }
+
+    #[test]
+    fn test_convert_openai_to_gemini_sse_empty_choices_produces_valid_sse() {
+        let response = serde_json::json!({"choices": []});
+        let sse = convert_openai_to_gemini_sse(&response);
+        // Must start with "data: " and end with double newline for SSE protocol
+        assert!(sse.starts_with("data: "));
+        assert!(sse.ends_with("\n\n"));
+        // Must contain STOP finish reason (default)
+        assert!(sse.contains("STOP"));
+        // Must be parseable JSON after "data: "
+        let json_str = sse.strip_prefix("data: ").unwrap().trim();
+        let parsed: Value = serde_json::from_str(json_str).expect("SSE data should be valid JSON");
+        assert!(parsed["candidates"].is_array());
+    }
+
+    #[test]
+    fn test_repair_single_tool_call_non_json_arguments() {
+        // Non-JSON arguments string should not panic; should produce valid JSON output
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["file_path"],
+            "properties": {
+                "file_path": {"type": "string"}
+            }
+        });
+        let mut tc = serde_json::json!({
+            "function": {
+                "name": "ReadFile",
+                "arguments": "this is not json at all !!!"
+            }
+        });
+        repair_single_tool_call(&mut tc, &schema);
+        // Should not panic and arguments should be valid JSON
+        let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+        let args: Value =
+            serde_json::from_str(args_str).expect("repaired arguments should be valid JSON");
+        // The required file_path param should be filled with "." since it's path-like
+        assert_eq!(args["file_path"], ".");
+    }
 }

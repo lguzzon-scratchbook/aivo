@@ -520,4 +520,150 @@ mod tests {
             json!({"content": "not valid json"})
         );
     }
+
+    #[test]
+    fn convert_openai_to_gemini_invalid_tool_args_json() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "do_stuff", "arguments": "not json"}
+                }]}
+            ]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        // Invalid JSON arguments should fall back to {}
+        let fc = &converted["contents"][1]["parts"][0]["functionCall"];
+        assert_eq!(fc["name"], "do_stuff");
+        assert_eq!(fc["args"], json!({}));
+    }
+
+    #[test]
+    fn convert_gemini_to_openai_null_function_call_args() {
+        // Missing args field entirely → defaults to {}
+        let resp_missing = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "do_stuff"}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let converted = convert_gemini_to_openai_chat_response(&resp_missing, "gemini-2.5-pro");
+        let tool_call = &converted["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tool_call["function"]["name"], "do_stuff");
+        let args: Value =
+            serde_json::from_str(tool_call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({}));
+
+        // Explicit null args → serialized as "null", doesn't panic
+        let resp_null = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "do_stuff", "args": null}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let converted_null = convert_gemini_to_openai_chat_response(&resp_null, "gemini-2.5-pro");
+        let tool_call_null = &converted_null["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tool_call_null["function"]["name"], "do_stuff");
+        assert!(tool_call_null["function"]["arguments"].as_str().is_some());
+    }
+
+    #[test]
+    fn convert_gemini_to_openai_max_tokens_finish_reason() {
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "truncated output"}]},
+                "finishReason": "MAX_TOKENS"
+            }]
+        });
+        let converted = convert_gemini_to_openai_chat_response(&resp, "gemini-2.5-pro");
+        assert_eq!(converted["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn convert_gemini_to_openai_null_usage_metadata() {
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": null,
+                "candidatesTokenCount": null
+            }
+        });
+        let converted = convert_gemini_to_openai_chat_response(&resp, "gemini-2.5-pro");
+        assert_eq!(converted["usage"]["prompt_tokens"], 0);
+        assert_eq!(converted["usage"]["completion_tokens"], 0);
+        assert_eq!(converted["usage"]["total_tokens"], 0);
+    }
+
+    #[test]
+    fn convert_gemini_to_openai_missing_function_call_id() {
+        let resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "my_func", "args": {"key": "val"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let converted = convert_gemini_to_openai_chat_response(&resp, "gemini-2.5-pro");
+        let tool_call = &converted["choices"][0]["message"]["tool_calls"][0];
+        // Missing id should generate a synthetic one like "call_0"
+        assert_eq!(tool_call["id"], "call_0");
+        assert_eq!(tool_call["function"]["name"], "my_func");
+    }
+
+    #[test]
+    fn parse_tool_content_json_object_passthrough() {
+        let content = json!("{\"result\": 42, \"status\": \"ok\"}");
+        let parsed = parse_tool_content(Some(&content));
+        // Valid JSON object string should be parsed, not double-wrapped
+        assert_eq!(parsed["result"], 42);
+        assert_eq!(parsed["status"], "ok");
+        assert!(parsed.get("content").is_none());
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_tool_choice_specific_function() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "call X"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "X", "description": "do X", "parameters": {"type": "object"}}
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "X"}
+            }
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        let fc_config = &converted["toolConfig"]["functionCallingConfig"];
+        assert_eq!(fc_config["mode"], "ANY");
+        assert_eq!(fc_config["allowedFunctionNames"][0], "X");
+    }
 }

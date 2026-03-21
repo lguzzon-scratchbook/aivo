@@ -143,21 +143,96 @@ impl LsCommand {
         record: &DirectoryStartRecord,
         keys: &[crate::services::session_store::ApiKey],
     ) {
-        let key_name = keys
-            .iter()
-            .find(|key| key.id == record.key_id)
-            .map(|key| key.display_name().to_string())
-            .unwrap_or_else(|| record.key_id.clone());
-        let model = record.model.as_deref().unwrap_or("(tool default)");
+        let (tool, key_name, model) = format_directory_start_line(record, keys);
 
         println!(
             "  {} {} · {} · {}",
             style::dim("start:"),
-            style::cyan(&record.tool),
+            style::cyan(&tool),
             key_name,
             model
         );
     }
 }
 
+fn format_directory_start_line(
+    record: &DirectoryStartRecord,
+    keys: &[crate::services::session_store::ApiKey],
+) -> (String, String, String) {
+    let key_name = keys
+        .iter()
+        .find(|key| key.id == record.key_id)
+        .map(|key| key.display_name().to_string())
+        .unwrap_or_else(|| record.key_id.clone());
+    let model = record
+        .model
+        .as_deref()
+        .unwrap_or("(tool default)")
+        .to_string();
+
+    (record.tool.clone(), key_name, model)
+}
+
 // Tests for path search utilities are in services::path_search
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::session_store::{ApiKey, DirectoryStartRecord};
+
+    fn make_key(id: &str, name: &str) -> ApiKey {
+        ApiKey::new_with_protocol(
+            id.to_string(),
+            name.to_string(),
+            "https://api.example.com/v1".to_string(),
+            None,
+            "sk-test".to_string(),
+        )
+    }
+
+    fn make_record(key_id: &str, tool: &str, model: Option<&str>) -> DirectoryStartRecord {
+        DirectoryStartRecord {
+            key_id: key_id.to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            tool: tool.to_string(),
+            model: model.map(ToString::to_string),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn format_directory_start_uses_key_name_when_found() {
+        let keys = vec![make_key("abc", "My OpenAI Key")];
+        let record = make_record("abc", "claude", Some("gpt-4o"));
+
+        let (_tool, key_name, _model) = format_directory_start_line(&record, &keys);
+        assert_eq!(key_name, "My OpenAI Key");
+    }
+
+    #[test]
+    fn format_directory_start_falls_back_to_key_id() {
+        let keys = vec![make_key("xyz", "Other Key")];
+        let record = make_record("abc", "claude", Some("gpt-4o"));
+
+        let (_tool, key_name, _model) = format_directory_start_line(&record, &keys);
+        assert_eq!(key_name, "abc");
+    }
+
+    #[test]
+    fn format_directory_start_shows_tool_default_when_no_model() {
+        let keys = vec![make_key("abc", "My Key")];
+        let record = make_record("abc", "codex", None);
+
+        let (_tool, _key_name, model) = format_directory_start_line(&record, &keys);
+        assert_eq!(model, "(tool default)");
+    }
+
+    #[test]
+    fn format_directory_start_shows_model_when_present() {
+        let keys = vec![make_key("abc", "My Key")];
+        let record = make_record("abc", "gemini", Some("gpt-4o"));
+
+        let (_tool, _key_name, model) = format_directory_start_line(&record, &keys);
+        assert_eq!(model, "gpt-4o");
+    }
+}

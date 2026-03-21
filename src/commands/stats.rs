@@ -49,9 +49,7 @@ impl StatsCommand {
         let filtering_by_key = if let Some(ref q) = search {
             let matched: HashSet<&str> = keys
                 .iter()
-                .filter(|k| {
-                    k.name.to_lowercase().contains(q) || k.id.to_lowercase().starts_with(q)
-                })
+                .filter(|k| k.name.to_lowercase().contains(q) || k.id.to_lowercase().starts_with(q))
                 .map(|k| k.id.as_str())
                 .collect();
             if !matched.is_empty() {
@@ -111,7 +109,11 @@ impl StatsCommand {
             "  {} {:>w$}  {}",
             style::cyan(format!("{:<8}", "launches")),
             fmt(total_sel),
-            style::dim(format!("(tool {} · chat {})", fmt(tool_runs), fmt(chat_runs))),
+            style::dim(format!(
+                "(tool {} · chat {})",
+                fmt(tool_runs),
+                fmt(chat_runs)
+            )),
             w = val_w
         );
         println!(
@@ -180,8 +182,17 @@ impl StatsCommand {
             .collect();
         if !existing_key_usage.is_empty() && (!searching || filtering_by_key) {
             println!();
-            println!("{} {}", style::bold("By key"), style::dim("(times · tokens)"));
-            print_usage_section(&existing_key_usage, |id| key_display_name(id, &keys), fmt, !searching);
+            println!(
+                "{} {}",
+                style::bold("By key"),
+                style::dim("(times · tokens)")
+            );
+            print_usage_section(
+                &existing_key_usage,
+                |id| key_display_name(id, &keys),
+                fmt,
+                !searching,
+            );
         }
 
         // By model
@@ -191,7 +202,11 @@ impl StatsCommand {
         }
         if !model_usage.is_empty() {
             println!();
-            println!("{} {}", style::bold("By model"), style::dim("(times · tokens)"));
+            println!(
+                "{} {}",
+                style::bold("By model"),
+                style::dim("(times · tokens)")
+            );
             print_usage_section(&model_usage, |name| name.to_string(), fmt, !searching);
         }
 
@@ -231,7 +246,11 @@ fn print_usage_section(
     rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
 
     let name_w = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
-    let sel_w = rows.iter().map(|(_, s, _)| fmt(*s).len()).max().unwrap_or(0);
+    let sel_w = rows
+        .iter()
+        .map(|(_, s, _)| fmt(*s).len())
+        .max()
+        .unwrap_or(0);
     let tok_w = rows
         .iter()
         .map(|(_, _, t)| fmt(*t).len())
@@ -248,13 +267,7 @@ fn print_usage_section(
         } else {
             String::new()
         };
-        println!(
-            "  {} {} {}{}",
-            style::cyan(&pn),
-            ps,
-            pt,
-            bar_str,
-        );
+        println!("  {} {} {}{}", style::cyan(&pn), ps, pt, bar_str,);
     }
 }
 
