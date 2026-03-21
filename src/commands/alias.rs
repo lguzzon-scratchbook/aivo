@@ -170,13 +170,17 @@ impl AliasCommand {
         println!("{}", style::dim("Create, list, or remove model aliases."));
         println!();
         println!("{}", style::bold("Actions:"));
-        let print_row = |label: &str, description: &str| {
-            println!("  {:<24} {}", label, style::dim(description));
+        let print_row = |label: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<14}", label)),
+                style::dim(desc)
+            );
         };
-        print_row("(no args)", "- List all aliases");
-        print_row("name=model", "- Create or update an alias");
-        print_row("name model", "- Create or update an alias");
-        print_row("rm <name>", "- Remove an alias");
+        print_row("(no args)", "List all aliases");
+        print_row("name=model", "Create or update an alias");
+        print_row("name model", "Create or update an alias");
+        print_row("rm <name>", "Remove an alias");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo alias fast=claude-haiku-4-5"));

@@ -359,110 +359,69 @@ impl ChatCommand {
         );
         println!();
         println!("{}", style::bold("Options:"));
-        println!(
-            "  {}  {}",
-            style::cyan("-m, --model <model>"),
-            style::dim("Specify AI model (saved for next session)")
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt(
+            "-m, --model <model>",
+            "Specify AI model (saved for next session)",
         );
-        println!(
-            "  {}  {}",
-            style::cyan("-k, --key <id|name>"),
-            style::dim("Select API key by ID or name (-k opens key picker)")
+        print_opt(
+            "-k, --key <id|name>",
+            "Select API key by ID or name (-k opens key picker)",
         );
-        println!(
-            "  {}  {}",
-            style::cyan("-x, --execute <message>"),
-            style::dim("Send one message and exit (-x with no value reads stdin until Ctrl-D)")
+        print_opt(
+            "-x, --execute <message>",
+            "Send one message and exit (-x with no value reads stdin until Ctrl-D)",
         );
-        println!(
-            "  {}  {}",
-            style::cyan("--attach <path>"),
-            style::dim("Queue a text file or image for the next message")
+        print_opt(
+            "--attach <path>",
+            "Queue a text file or image for the next message",
         );
         println!();
         println!("{}", style::bold("Slash Commands:"));
-        println!(
-            "  {}  {}",
-            style::cyan("/new"),
-            style::dim("Start a fresh chat with the current key and model")
+        let print_cmd = |label: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<18}", label)),
+                style::dim(desc)
+            );
+        };
+        print_cmd("/new", "Start a fresh chat with the current key and model");
+        print_cmd("/resume [query]", "Resume a saved chat from this directory");
+        print_cmd("/model [name]", "Switch the current chat model");
+        print_cmd(
+            "/key [id|name]",
+            "Switch to another saved key for this chat",
         );
-        println!(
-            "  {}  {}",
-            style::cyan("/resume [query]"),
-            style::dim("Resume a saved chat from this directory")
+        print_cmd(
+            "/attach <path>",
+            "Attach a text file or image to the next message",
         );
-        println!(
-            "  {}  {}",
-            style::cyan("/model [name]"),
-            style::dim("Switch the current chat model")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("/key [id|name]"),
-            style::dim("Switch to another saved key for this chat")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("/attach <path>"),
-            style::dim("Attach a text file or image to the next message")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("/detach <n>"),
-            style::dim("Remove one queued attachment by number")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("/clear"),
-            style::dim("Clear queued attachments from the composer")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("/help / /exit"),
-            style::dim("Open command help / leave chat")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("//message"),
-            style::dim("Send a literal leading slash")
-        );
+        print_cmd("/detach <n>", "Remove one queued attachment by number");
+        print_cmd("/clear", "Clear queued attachments from the composer");
+        print_cmd("/help / /exit", "Open command help / leave chat");
+        print_cmd("//message", "Send a literal leading slash");
         println!();
         println!("{}", style::bold("Keys:"));
-        println!(
-            "  {}  {}",
-            style::cyan("Enter / Ctrl+J"),
-            style::dim("Send message / insert newline")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("Ctrl+V"),
-            style::dim("Paste system clipboard (text or image)")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("Ctrl+R / F1"),
-            style::dim("Open resume picker / show help")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("Ctrl+P / Ctrl+N"),
-            style::dim("Previous / next input")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("Ctrl+M"),
-            style::dim("Change model")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("Ctrl+T"),
-            style::dim("Show / hide thinking blocks")
-        );
-        println!(
-            "  {}  {}",
-            style::cyan("AIVO_REDUCE_MOTION=1"),
-            style::dim("Disable chat TUI motion effects")
-        );
+        let print_key = |label: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<22}", label)),
+                style::dim(desc)
+            );
+        };
+        print_key("Enter / Ctrl+J", "Send message / insert newline");
+        print_key("Ctrl+V", "Paste system clipboard (text or image)");
+        print_key("Ctrl+R / F1", "Open resume picker / show help");
+        print_key("Ctrl+P / Ctrl+N", "Previous / next input");
+        print_key("Ctrl+M", "Change model");
+        print_key("Ctrl+T", "Show / hide thinking blocks");
+        print_key("AIVO_REDUCE_MOTION=1", "Disable chat TUI motion effects");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo chat"));

@@ -390,8 +390,11 @@ fn print_help() {
     println!();
     println!("{}", style::bold("Options:"));
     let print_opt = |flag: &str, desc: &str| {
-        let padded = format!("{:<14}", flag);
-        println!("  {}{}", style::dim(&padded), desc);
+        println!(
+            "  {}{}",
+            style::cyan(format!("{:<16}", flag)),
+            style::dim(desc)
+        );
     };
     print_opt("-h, --help", "Display help information");
     print_opt("-v, --version", "Display the current version");

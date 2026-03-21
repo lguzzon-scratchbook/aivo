@@ -157,21 +157,19 @@ impl ServeCommand {
         );
         println!();
         println!("{}", style::bold("Options:"));
-        println!(
-            "  {}  {}",
-            style::cyan("-p, --port <PORT>"),
-            style::dim("Port to listen on (default: 24860)")
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt("-p, --port <PORT>", "Port to listen on (default: 24860)");
+        print_opt(
+            "-k, --key <id|name>",
+            "Select API key by ID or name (-k opens key picker)",
         );
-        println!(
-            "  {}   {}",
-            style::cyan("-k, --key <id|name>"),
-            style::dim("Select API key by ID or name (-k opens key picker)")
-        );
-        println!(
-            "  {}           {}",
-            style::cyan("--log"),
-            style::dim("Enable request logging to ~/.config/aivo/logs/")
-        );
+        print_opt("--log", "Enable request logging to ~/.config/aivo/logs/");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo serve"));

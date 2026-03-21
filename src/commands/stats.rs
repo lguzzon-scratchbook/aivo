@@ -222,14 +222,20 @@ impl StatsCommand {
         );
         println!();
         println!("{}", style::bold("Options:"));
-        println!(
-            "  {}  Human-readable numbers (K/M/B)",
-            style::dim("-H, --human         ")
-        );
-        println!(
-            "  {}  Search by key, model, or tool name",
-            style::dim("-s, --search <QUERY>")
-        );
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt("-H, --human", "Human-readable numbers (K/M/B)");
+        print_opt("-s, --search <QUERY>", "Search by key, model, or tool name");
+        println!();
+        println!("{}", style::bold("Examples:"));
+        println!("  {}", style::dim("aivo stats"));
+        println!("  {}", style::dim("aivo stats -H"));
+        println!("  {}", style::dim("aivo stats -s openrouter"));
     }
 }
 

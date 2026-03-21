@@ -88,20 +88,20 @@ impl InfoCommand {
                 .await;
             } else {
                 for key in &keys {
-                let is_active = active_key_id.as_deref() == Some(key.id.as_str());
-                let marker = if is_active {
-                    style::bullet_symbol()
-                } else {
-                    style::empty_bullet_symbol()
-                };
-                println!(
-                    "  {} {}  {:width$}  {}",
-                    marker,
-                    style::cyan(key.short_id()),
-                    key.display_name(),
-                    style::dim(truncate_url_for_display(&key.base_url, 50)),
-                    width = max_name_len
-                );
+                    let is_active = active_key_id.as_deref() == Some(key.id.as_str());
+                    let marker = if is_active {
+                        style::bullet_symbol()
+                    } else {
+                        style::empty_bullet_symbol()
+                    };
+                    println!(
+                        "  {} {}  {:width$}  {}",
+                        marker,
+                        style::cyan(key.short_id()),
+                        key.display_name(),
+                        style::dim(truncate_url_for_display(&key.base_url, 50)),
+                        width = max_name_len
+                    );
                 }
             }
         }
@@ -223,7 +223,11 @@ impl InfoCommand {
         println!();
         println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
-            println!("  {:<18} {}", flag, style::dim(desc));
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
         };
         print_opt("--ping", "Ping all keys and show pass/fail summary");
         println!();

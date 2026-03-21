@@ -62,11 +62,21 @@ impl UpdateCommand {
         );
         println!();
         println!("{}", style::bold("Options:"));
-        println!(
-            "  {}, {}    Force update even if installed via a package manager",
-            style::cyan("-f"),
-            style::cyan("--force")
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt(
+            "-f, --force",
+            "Force update even if installed via a package manager",
         );
+        println!();
+        println!("{}", style::bold("Examples:"));
+        println!("  {}", style::dim("aivo update"));
+        println!("  {}", style::dim("aivo update --force"));
     }
 
     /// Creates a new UpdateCommand instance

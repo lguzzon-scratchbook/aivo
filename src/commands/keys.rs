@@ -1046,33 +1046,43 @@ impl KeysCommand {
 
     // Shows usage information.
     pub fn print_help() {
-        let print_row = |label: &str, description: &str| {
-            println!("  {:<18} {}", label, style::dim(description));
+        let print_row = |label: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<18}", label)),
+                style::dim(desc)
+            );
         };
 
         println!("{} aivo keys [action]", style::bold("Usage:"));
         println!();
+        println!(
+            "{}",
+            style::dim("Manage API keys: add, remove, activate, and inspect.")
+        );
+        println!();
         println!("{}", style::bold("Actions:"));
-        print_row("(no action)", "- List all API keys");
-        print_row("use [id|name]", "- Activate a specific API key");
-        print_row("cat [id|name]", "- Display details for a key");
-        print_row("rm [id|name]", "- Remove an API key");
-        print_row("add [name]", "- Add an API key");
-        print_row("edit [id|name]", "- Edit an API key");
-        print_row("ping [id|name]", "- Health-check API keys (or: aivo ping)");
+        print_row("(no action)", "List all API keys");
+        print_row("use [id|name]", "Activate a specific API key");
+        print_row("cat [id|name]", "Display details for a key");
+        print_row("rm [id|name]", "Remove an API key");
+        print_row("add [name]", "Add an API key");
+        print_row("edit [id|name]", "Edit an API key");
+        print_row("ping [id|name]", "Health-check API keys (or: aivo ping)");
         println!();
         println!("{}", style::bold("Add Flags:"));
-        print_row("--name <name>", "- Set key name");
-        print_row("--base-url <url>", "- Set provider base URL");
-        print_row("--key <api-key>", "- Set provider API key");
+        print_row("--name <name>", "Set key name");
+        print_row("--base-url <url>", "Set provider base URL");
+        print_row("--key <api-key>", "Set provider API key");
+        println!();
+        println!("{}", style::bold("Examples:"));
+        println!("  {}", style::dim("aivo keys"));
+        println!("  {}", style::dim("aivo keys use openrouter"));
         println!(
             "  {}",
-            style::dim(
-                "Example: aivo keys add --name abc --base-url https://example.io --key sk-..."
-            )
+            style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
         );
     }
-
 }
 
 // Formats an API key as a choice string for interactive selectors.

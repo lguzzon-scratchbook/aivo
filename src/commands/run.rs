@@ -201,42 +201,38 @@ impl RunCommand {
         );
         println!();
         println!("{}", style::bold("Options:"));
-        println!(
-            "  {}  {}",
-            style::cyan("-m, --model <model>"),
-            style::dim("Specify AI model to use")
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt("-m, --model <model>", "Specify AI model to use");
+        print_opt(
+            "-k, --key <id|name>",
+            "Select API key by ID or name (-k opens key picker)",
         );
-        println!(
-            "  {}  {}",
-            style::cyan("-k, --key <id|name>"),
-            style::dim("Select API key by ID or name (-k opens key picker)")
-        );
-        println!(
-            "  {}          {}",
-            style::cyan("--env <k=v>"),
-            style::dim("Inject environment variable")
-        );
-        println!(
-            "  {}              {}",
-            style::cyan("--debug"),
-            style::dim("Enable debug output")
-        );
-        println!(
-            "  {}            {}",
-            style::cyan("--dry-run"),
-            style::dim("Print resolved command and environment without launching")
+        print_opt("--env <k=v>", "Inject environment variable");
+        print_opt("--debug", "Enable debug output");
+        print_opt(
+            "--dry-run",
+            "Print resolved command and environment without launching",
         );
         println!();
         println!("{}", style::bold("Tools:"));
-        println!(
-            "  {}    {}",
-            style::cyan("claude"),
-            style::dim("Claude Code")
-        );
-        println!("  {}     {}", style::cyan("codex"), style::dim("Codex"));
-        println!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
-        println!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
-        println!("  {}        {}", style::cyan("pi"), style::dim("Pi"));
+        let print_tool = |label: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<12}", label)),
+                style::dim(desc)
+            );
+        };
+        print_tool("claude", "Claude Code");
+        print_tool("codex", "Codex");
+        print_tool("gemini", "Gemini");
+        print_tool("opencode", "OpenCode");
+        print_tool("pi", "Pi");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo run claude"));

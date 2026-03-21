@@ -302,15 +302,48 @@ impl ChatTuiApp {
             )),
             Line::from(""),
         ];
+        let max_cmd_width = SLASH_COMMANDS
+            .iter()
+            .map(|c| display_width(c.help_label))
+            .max()
+            .unwrap_or(0);
         for command in SLASH_COMMANDS {
+            let pad = max_cmd_width + 2 - display_width(command.help_label);
             lines.push(Line::from(vec![
                 Span::styled(command.help_label, cmd_style),
                 Span::styled(
-                    format!("  {}", command.description),
+                    format!("{}{}", " ".repeat(pad), command.description),
                     Style::default().fg(TEXT),
                 ),
             ]));
         }
+
+        let keybindings: &[(&str, &str)] = &[
+            ("Enter", "send message / run command"),
+            ("Ctrl+J", "insert newline"),
+            ("Ctrl+V", "paste clipboard text/image"),
+            ("↑/↓", "menu / history / line nav"),
+            ("←/→", "move cursor"),
+            ("Home/Ctrl+A", "line start"),
+            ("End/Ctrl+E", "line end"),
+            ("Ctrl+←/→", "word jump"),
+            ("Ctrl+W", "delete word backward"),
+            ("Ctrl+K", "kill to end of line"),
+            ("Ctrl+L", "clear prompt"),
+            ("Ctrl+T", "toggle thinking blocks"),
+            ("Tab", "complete command or path"),
+            ("PgUp/PgDn", "scroll half page"),
+            ("Ctrl+↑/↓", "scroll 3 lines"),
+            ("Mouse wheel", "scroll 3 lines"),
+            ("Shift+mouse", "select and copy text"),
+            ("Ctrl+Home/End", "jump to top/bottom"),
+            ("Esc", "cancel / close overlay"),
+        ];
+        let max_key_width = keybindings
+            .iter()
+            .map(|(key, _)| display_width(key))
+            .max()
+            .unwrap_or(0);
         lines.extend([
             Line::from(""),
             Line::from(Span::styled(
@@ -318,97 +351,18 @@ impl ChatTuiApp {
                 Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Enter", key_style),
+        ]);
+        for (key, desc) in keybindings {
+            let pad = max_key_width + 2 - display_width(key);
+            lines.push(Line::from(vec![
+                Span::styled(*key, key_style),
                 Span::styled(
-                    "       send message / run command",
+                    format!("{}{}", " ".repeat(pad), desc),
                     Style::default().fg(TEXT),
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+J", key_style),
-                Span::styled("      insert newline", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+V", key_style),
-                Span::styled(
-                    "      paste system clipboard text/image",
-                    Style::default().fg(TEXT),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("↑/↓", key_style),
-                Span::styled(
-                    "         command/path list / history / line nav",
-                    Style::default().fg(TEXT),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("←/→", key_style),
-                Span::styled("         move cursor", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Home/Ctrl+A", key_style),
-                Span::styled("  line start", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("End/Ctrl+E", key_style),
-                Span::styled("   line end", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+←/→", key_style),
-                Span::styled("    word jump", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+W", key_style),
-                Span::styled("      delete word backward", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+K", key_style),
-                Span::styled("      kill to end of line", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+L", key_style),
-                Span::styled("      clear prompt", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+T", key_style),
-                Span::styled("      toggle thinking blocks", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Shift+mouse", key_style),
-                Span::styled(" select and copy text", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Tab", key_style),
-                Span::styled(
-                    "         complete command or attach path",
-                    Style::default().fg(TEXT),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("PgUp/PgDn", key_style),
-                Span::styled("   scroll half page", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+↑/↓", key_style),
-                Span::styled("    scroll 3 lines", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Mouse wheel", key_style),
-                Span::styled(" scroll 3 lines", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+Home/End", key_style),
-                Span::styled(" jump to top/bottom", Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("Esc", key_style),
-                Span::styled(
-                    "         cancel request / close overlay",
-                    Style::default().fg(TEXT),
-                ),
-            ]),
+            ]));
+        }
+        lines.extend([
             Line::from(""),
             Line::from(Span::styled(
                 "//message sends a literal leading slash",

@@ -492,14 +492,24 @@ fn test_composer_empty_lines_align_with_cursor_position() {
 
     let cell_row = |r: u16| -> String {
         (0..20)
-            .map(|x| buf.cell((x, r)).unwrap().symbol().chars().next().unwrap_or(' '))
+            .map(|x| {
+                buf.cell((x, r))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
             .collect()
     };
 
     assert!(cell_row(0).starts_with("> hello"), "row 0");
     assert!(cell_row(1).starts_with("  hel"), "row 1");
     assert!(cell_row(2).starts_with("  sadf"), "row 2");
-    assert!(cell_row(5).starts_with("  dsf"), "row 5: dsf must align with cursor_position y=5");
+    assert!(
+        cell_row(5).starts_with("  dsf"),
+        "row 5: dsf must align with cursor_position y=5"
+    );
 
     // cursor_position must agree
     let (cx, cy) = cursor_position("hello\nhel\nsadf\n\n\ndsf", 17, 20, 2);

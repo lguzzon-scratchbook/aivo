@@ -176,21 +176,19 @@ impl ModelsCommand {
         );
         println!();
         println!("{}", style::bold("Options:"));
-        println!(
-            "  {}  {}",
-            style::cyan("-k, --key <id|name>"),
-            style::dim("Select API key by ID or name (-k opens key picker)")
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt(
+            "-k, --key <id|name>",
+            "Select API key by ID or name (-k opens key picker)",
         );
-        println!(
-            "  {}        {}",
-            style::cyan("-r, --refresh"),
-            style::dim("Bypass cache and fetch fresh model list")
-        );
-        println!(
-            "  {} {}",
-            style::cyan("-s, --search <query>"),
-            style::dim("Filter models by substring match")
-        );
+        print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
+        print_opt("-s, --search <query>", "Filter models by substring match");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo models"));
