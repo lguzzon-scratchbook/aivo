@@ -73,7 +73,12 @@ impl FuzzySelect {
 
             let term_width = term.size().1 as usize;
 
-            let prompt_line = format!("{}: {}", crate::style::bold(&self.prompt), query);
+            let hint = if query.is_empty() && count > page_size {
+                format!(" {}", crate::style::dim("(type to filter)"))
+            } else {
+                String::new()
+            };
+            let prompt_line = format!("{}: {}{}", crate::style::bold(&self.prompt), query, hint);
             term.write_line(&truncate_to_width(&prompt_line, term_width))?;
 
             let items_drawn = if count == 0 {
@@ -81,6 +86,14 @@ impl FuzzySelect {
                 1
             } else {
                 let mut lines = 0;
+                if page_start > 0 {
+                    let above = page_start;
+                    term.write_line(&format!(
+                        "  {}",
+                        crate::style::dim(&format!("↑ {} more above", above))
+                    ))?;
+                    lines += 1;
+                }
                 for (i, (_, item)) in filtered.iter().enumerate().take(end_idx).skip(page_start) {
                     let is_selected = i == selection;
                     let symbol = if is_selected {
@@ -95,6 +108,14 @@ impl FuzzySelect {
                     };
                     let line = format!("{} {}", symbol, styled_item);
                     term.write_line(&truncate_to_width(&line, term_width))?;
+                    lines += 1;
+                }
+                if end_idx < count {
+                    let below = count - end_idx;
+                    term.write_line(&format!(
+                        "  {}",
+                        crate::style::dim(&format!("↓ {} more below", below))
+                    ))?;
                     lines += 1;
                 }
                 lines
