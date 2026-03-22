@@ -61,6 +61,20 @@ aivo keys add ollama
 aivo claude --model llama3.2
 ```
 
+## Commands
+
+| Command | Description |
+| ------- | ----------- |
+| [run](#run) | Launch an AI tool (claude, codex, gemini, opencode, pi) |
+| [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
+| [serve](#serve) | Local OpenAI-compatible API server |
+| [keys](#keys) | Manage API keys (add, use, rm, cat, edit, ping) |
+| [models](#models) | List available models from the active provider |
+| [alias](#alias) | Create short names for models |
+| [ls](#ls) | Show system info, keys, tools, and directory state |
+| [stats](#stats) | Show usage statistics |
+| [update](#update) | Update to the latest version |
+
 ## run
 
 Launch an AI tool with the active provider key. All extra arguments are passed through to the underlying tool.
