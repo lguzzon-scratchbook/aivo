@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::services::copilot_auth::{
-    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
+    COPILOT_EDITOR_VERSION, COPILOT_INITIATOR_HEADER, COPILOT_INTEGRATION_ID,
+    COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
@@ -109,6 +110,7 @@ pub async fn authorized_openai_post(
     target_url: &str,
     api_key: &str,
     copilot_token_manager: Option<&CopilotTokenManager>,
+    initiator: Option<&str>,
 ) -> Result<reqwest::RequestBuilder> {
     if let Some(tm) = copilot_token_manager {
         let (token, api_endpoint) = tm.get_token().await?;
@@ -119,7 +121,8 @@ pub async fn authorized_openai_post(
             .header("Content-Type", CONTENT_TYPE_JSON)
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
-            .header("Openai-Intent", COPILOT_OPENAI_INTENT))
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .header(COPILOT_INITIATOR_HEADER, initiator.unwrap_or("user")))
     } else {
         Ok(client
             .post(target_url)
@@ -538,6 +541,51 @@ pub fn router_http_client() -> reqwest::Client {
     router_http_client_with_timeout(300)
 }
 
+/// Detects `X-Initiator` value from an Anthropic Messages API body.
+/// Returns `"user"` for genuine user messages, `"agent"` for tool results / follow-ups.
+pub fn copilot_initiator_from_anthropic(body: &Value) -> &'static str {
+    let messages = match body.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return "user",
+    };
+    let last = match messages.last() {
+        Some(m) => m,
+        None => return "user",
+    };
+    let role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "user" {
+        return "agent";
+    }
+    // Check if the content contains tool_result blocks
+    if let Some(content) = last.get("content").and_then(|c| c.as_array()) {
+        let has_tool_result = content
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+        if has_tool_result {
+            return "agent";
+        }
+    }
+    "user"
+}
+
+/// Detects `X-Initiator` value from an OpenAI Chat Completions body.
+/// Returns `"user"` for genuine user messages, `"agent"` for tool/assistant follow-ups.
+pub fn copilot_initiator_from_openai(body: &Value) -> &'static str {
+    let messages = match body.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return "user",
+    };
+    let last = match messages.last() {
+        Some(m) => m,
+        None => return "user",
+    };
+    let role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    match role {
+        "user" => "user",
+        _ => "agent",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,5 +966,77 @@ mod tests {
         let req = "POST /v1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer token\r\n\r\n{}";
         let headers = extract_passthrough_headers(req).unwrap();
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_copilot_initiator_from_anthropic_user_message() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+        assert_eq!(copilot_initiator_from_anthropic(&body), "user");
+    }
+
+    #[test]
+    fn test_copilot_initiator_from_anthropic_tool_result() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "read", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "file contents"}]}
+            ]
+        });
+        assert_eq!(copilot_initiator_from_anthropic(&body), "agent");
+    }
+
+    #[test]
+    fn test_copilot_initiator_from_anthropic_empty_messages() {
+        let body = json!({"messages": []});
+        assert_eq!(copilot_initiator_from_anthropic(&body), "user");
+    }
+
+    #[test]
+    fn test_copilot_initiator_from_anthropic_assistant_last() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"}
+            ]
+        });
+        assert_eq!(copilot_initiator_from_anthropic(&body), "agent");
+    }
+
+    #[test]
+    fn test_copilot_initiator_from_openai_user_message() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+        assert_eq!(copilot_initiator_from_openai(&body), "user");
+    }
+
+    #[test]
+    fn test_copilot_initiator_from_openai_tool_message() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"}
+            ]
+        });
+        assert_eq!(copilot_initiator_from_openai(&body), "agent");
+    }
+
+    #[test]
+    fn test_copilot_initiator_from_openai_assistant_message() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"}
+            ]
+        });
+        assert_eq!(copilot_initiator_from_openai(&body), "agent");
     }
 }

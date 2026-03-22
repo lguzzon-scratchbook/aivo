@@ -22,8 +22,10 @@ use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
-    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
+    COPILOT_EDITOR_VERSION, COPILOT_INITIATOR_HEADER, COPILOT_INTEGRATION_ID,
+    COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::http_utils::copilot_initiator_from_openai;
 use crate::services::http_utils::sse_data_payload;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
@@ -937,6 +939,7 @@ where
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
 
     let request = build_openai_chat_request(model, messages, true)?;
+    let initiator = copilot_initiator_from_openai(&request);
 
     let mut response = send_with_retry(|| {
         client
@@ -946,6 +949,7 @@ where
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .header(COPILOT_INITIATOR_HEADER, initiator)
             .json(&request)
     })
     .await?;
@@ -1084,6 +1088,7 @@ where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     let request = build_openai_chat_request(model, messages, false)?;
+    let initiator = copilot_initiator_from_openai(&request);
 
     let response = send_with_retry(|| {
         client
@@ -1093,6 +1098,7 @@ where
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .header(COPILOT_INITIATOR_HEADER, initiator)
             .json(&request)
     })
     .await?;

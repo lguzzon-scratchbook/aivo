@@ -24,6 +24,7 @@ const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/toke
 pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.95.0";
 pub const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 pub const COPILOT_OPENAI_INTENT: &str = "conversation-panel";
+pub const COPILOT_INITIATOR_HEADER: &str = "X-Initiator";
 
 #[derive(Deserialize)]
 struct DeviceCodeResponse {

@@ -136,11 +136,17 @@ pub(crate) async fn send_openai_chat(
     normalize_openai_request_model(body, context.is_openrouter, context.is_copilot);
 
     let url = http_utils::build_chat_completions_url(&context.upstream_base_url);
+    let initiator = if context.is_copilot {
+        Some(http_utils::copilot_initiator_from_openai(body))
+    } else {
+        None
+    };
     let req = http_utils::authorized_openai_post(
         &context.client,
         &url,
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
+        initiator,
     )
     .await?;
 
@@ -158,6 +164,7 @@ pub(crate) async fn send_openai_embeddings(
         &url,
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
+        None,
     )
     .await?;
 

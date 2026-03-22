@@ -228,11 +228,17 @@ async fn forward_to_provider(
             }
             ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
                 let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
+                let initiator = if config.copilot_token_manager.is_some() {
+                    Some(http_utils::copilot_initiator_from_openai(&req_body))
+                } else {
+                    None
+                };
                 let response = http_utils::authorized_openai_post(
                     client.as_ref(),
                     &target_url,
                     &config.api_key,
                     config.copilot_token_manager.as_deref(),
+                    initiator,
                 )
                 .await?
                 .json(&req_body)

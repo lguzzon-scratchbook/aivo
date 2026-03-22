@@ -214,6 +214,7 @@ async fn try_responses_api_passthrough(
         &target_url,
         &config.api_key,
         config.copilot_token_manager.as_deref(),
+        None,
     )
     .await
     .ok()?
@@ -377,6 +378,7 @@ async fn forward_request(
         &target_url,
         &config.api_key,
         config.copilot_token_manager.as_deref(),
+        None,
     )
     .await?;
 
@@ -453,11 +455,17 @@ async fn forward_openai_protocol(
     client: &reqwest::Client,
 ) -> Result<AttemptOutcome<Value>> {
     let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
+    let initiator = if config.copilot_token_manager.is_some() {
+        Some(http_utils::copilot_initiator_from_openai(body))
+    } else {
+        None
+    };
     let response = http_utils::authorized_openai_post(
         client,
         &target_url,
         &config.api_key,
         config.copilot_token_manager.as_deref(),
+        initiator,
     )
     .await?
     .json(body)

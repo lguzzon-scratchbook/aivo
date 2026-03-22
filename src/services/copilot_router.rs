@@ -16,7 +16,8 @@ use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
 };
 use crate::services::copilot_auth::{
-    COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, COPILOT_OPENAI_INTENT, CopilotTokenManager,
+    COPILOT_EDITOR_VERSION, COPILOT_INITIATOR_HEADER, COPILOT_INTEGRATION_ID,
+    COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 use crate::services::http_utils;
 use crate::services::model_names;
@@ -90,6 +91,7 @@ async fn handle_messages(
 
     // Forward to Copilot API
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
+    let initiator = http_utils::copilot_initiator_from_anthropic(&body);
 
     let resp = client
         .post(&url)
@@ -98,6 +100,7 @@ async fn handle_messages(
         .header("Editor-Version", COPILOT_EDITOR_VERSION)
         .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
         .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+        .header(COPILOT_INITIATOR_HEADER, initiator)
         .json(&openai_req)
         .send()
         .await?;
