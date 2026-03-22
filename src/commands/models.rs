@@ -16,7 +16,8 @@ use crate::services::copilot_auth::{
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::provider_profile::{
-    ModelListingStrategy, cloudflare_ai_base, provider_profile_for_key, provider_profile_for_base_url,
+    ModelListingStrategy, cloudflare_ai_base, provider_profile_for_base_url,
+    provider_profile_for_key,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -113,7 +114,10 @@ impl ModelsCommand {
         };
 
         let profile = provider_profile_for_base_url(&key.base_url);
-        let is_static = matches!(profile.model_listing_strategy, ModelListingStrategy::Static(_));
+        let is_static = matches!(
+            profile.model_listing_strategy,
+            ModelListingStrategy::Static(_)
+        );
 
         let client = http_utils::router_http_client();
         let mut models = fetch_models_with_spinner(
@@ -164,7 +168,9 @@ impl ModelsCommand {
         if is_static {
             eprintln!(
                 "{}",
-                style::dim("Note: This provider does not have a model listing API. Showing a built-in list.")
+                style::dim(
+                    "Note: This provider does not have a model listing API. Showing a built-in list."
+                )
             );
         }
 
@@ -256,9 +262,7 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
     let profile = provider_profile_for_key(key);
 
     match profile.model_listing_strategy {
-        ModelListingStrategy::Static(models) => {
-            Ok(models.iter().map(|s| s.to_string()).collect())
-        }
+        ModelListingStrategy::Static(models) => Ok(models.iter().map(|s| s.to_string()).collect()),
         ModelListingStrategy::Ollama => {
             crate::services::ollama::ensure_ready().await?;
             crate::services::ollama::list_models().await

@@ -295,9 +295,16 @@ mod tests {
         ] {
             let profile = provider_profile_for_base_url(url);
             assert_eq!(profile.kind, ProviderKind::AnthropicCompatible, "{url}");
-            assert_eq!(profile.default_protocol, ProviderProtocol::Anthropic, "{url}");
+            assert_eq!(
+                profile.default_protocol,
+                ProviderProtocol::Anthropic,
+                "{url}"
+            );
             assert!(
-                matches!(profile.model_listing_strategy, ModelListingStrategy::Static(_)),
+                matches!(
+                    profile.model_listing_strategy,
+                    ModelListingStrategy::Static(_)
+                ),
                 "expected Static model listing for MiniMax at {url}"
             );
         }

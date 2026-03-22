@@ -279,6 +279,100 @@ pub(crate) fn parse_sse_chunk(data: &str) -> Option<ChatResponseChunk> {
         })
 }
 
+/// Parses a Responses API SSE data line and returns a text delta if present.
+pub(crate) fn parse_responses_chunk(data: &str) -> Option<ChatResponseChunk> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let event_type = value.get("type")?.as_str()?;
+    if event_type == "response.output_text.delta" {
+        let delta = value.get("delta")?.as_str()?;
+        if delta.is_empty() {
+            None
+        } else {
+            Some(ChatResponseChunk::Content(delta.to_string()))
+        }
+    } else {
+        None
+    }
+}
+
+/// Extracts usage from a Responses API SSE `response.completed` event.
+pub(crate) fn parse_responses_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let event_type = value.get("type")?.as_str()?;
+    if event_type != "response.completed" {
+        return None;
+    }
+    let usage = value.get("response")?.get("usage")?;
+    let update = TokenUsageUpdate {
+        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
+        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
+        cache_read_input_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(parse_token_u64),
+        cache_creation_input_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(parse_token_u64),
+    };
+    if update.is_empty() {
+        None
+    } else {
+        Some(update)
+    }
+}
+
+/// Extracts the assistant message from a non-streaming Responses API response.
+pub(crate) fn extract_responses_message(body: &serde_json::Value) -> AssistantResponse {
+    let mut content_parts = Vec::new();
+    for output in body
+        .get("output")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if output.get("type").and_then(|v| v.as_str()) == Some("message") {
+            for part in output
+                .get("content")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    content_parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    AssistantResponse {
+        content: content_parts.concat(),
+        reasoning_content: None,
+    }
+}
+
+/// Extracts usage from a non-streaming Responses API response.
+pub(crate) fn extract_responses_usage(body: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = body.get("usage")?;
+    let update = TokenUsageUpdate {
+        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
+        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
+        cache_read_input_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(parse_token_u64),
+        cache_creation_input_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(parse_token_u64),
+    };
+    if update.is_empty() {
+        None
+    } else {
+        Some(TokenUsage {
+            prompt_tokens: update.prompt_tokens.unwrap_or(0),
+            completion_tokens: update.completion_tokens.unwrap_or(0),
+            cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
+            cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
+        })
+    }
+}
+
 /// Parses an Anthropic SSE data line and returns either a text or thinking delta.
 pub(crate) fn parse_anthropic_chunk(data: &str) -> Option<ChatResponseChunk> {
     let event: AnthropicStreamEvent = serde_json::from_str(data).ok()?;
@@ -608,6 +702,73 @@ mod tests {
                 completion_tokens: 3,
                 cache_read_input_tokens: 90,
                 cache_creation_input_tokens: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_responses_chunk_text_delta() {
+        let data = r#"{"type":"response.output_text.delta","delta":"Hello","item_id":"msg_1","output_index":0,"content_index":0}"#;
+        assert_eq!(
+            parse_responses_chunk(data),
+            Some(ChatResponseChunk::Content("Hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_responses_chunk_non_delta_event() {
+        let data = r#"{"type":"response.created","response":{"id":"resp_1"}}"#;
+        assert_eq!(parse_responses_chunk(data), None);
+    }
+
+    #[test]
+    fn test_parse_responses_usage_chunk() {
+        let data = r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#;
+        let update = parse_responses_usage_chunk(data).unwrap();
+        assert_eq!(update.prompt_tokens, Some(10));
+        assert_eq!(update.completion_tokens, Some(5));
+    }
+
+    #[test]
+    fn test_parse_responses_usage_chunk_non_completed() {
+        let data = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
+        assert_eq!(parse_responses_usage_chunk(data), None);
+    }
+
+    #[test]
+    fn test_extract_responses_message() {
+        let body = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello world"}]
+            }]
+        });
+        assert_eq!(
+            extract_responses_message(&body),
+            AssistantResponse {
+                content: "Hello world".to_string(),
+                reasoning_content: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_extract_responses_usage() {
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15
+            }
+        });
+        assert_eq!(
+            extract_responses_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         );
     }

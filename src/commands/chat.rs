@@ -34,11 +34,14 @@ use crate::services::session_store::{
 };
 use crate::style;
 
-use super::chat_request_builder::{build_anthropic_request, build_openai_chat_request};
+use super::chat_request_builder::{
+    build_anthropic_request, build_openai_chat_request, build_responses_request,
+};
 use super::chat_response_parser::{
     ChatResponseChunk, ChatTurnResult, extract_anthropic_usage, extract_openai_message,
-    extract_openai_usage, merge_token_usage, normalize_reasoning_content, parse_anthropic_chunk,
-    parse_anthropic_usage_chunk, parse_openai_usage_chunk, parse_sse_chunk,
+    extract_openai_usage, extract_responses_message, extract_responses_usage, merge_token_usage,
+    normalize_reasoning_content, parse_anthropic_chunk, parse_anthropic_usage_chunk,
+    parse_openai_usage_chunk, parse_responses_chunk, parse_responses_usage_chunk, parse_sse_chunk,
 };
 
 // Re-export for submodules (chat_tui uses ThinkTagParser, chat_tui_format uses TokenUsage)
@@ -73,6 +76,8 @@ enum ChatFormat {
     OpenAI,
     /// Anthropic native: POST /v1/messages
     Anthropic,
+    /// OpenAI Responses API: POST /v1/responses
+    Responses,
 }
 
 /// ChatCommand provides an interactive REPL for chatting with AI models
@@ -447,10 +452,7 @@ impl ChatCommand {
             "  {}",
             style::dim("git diff | aivo chat -x \"Summarize changes in one sentence\"")
         );
-        println!(
-            "  {}",
-            style::dim("cat error.log | aivo -x")
-        );
+        println!("  {}", style::dim("cat error.log | aivo -x"));
     }
 }
 
@@ -469,13 +471,39 @@ where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     if let Some(tm) = copilot_tm {
-        return send_copilot_request(client, tm, model, history, spinning, on_chunk).await;
+        match send_copilot_request(client, tm, model, history, spinning, on_chunk).await {
+            ok @ Ok(_) => return ok,
+            Err(e) if is_responses_api_required(&e) => {
+                match send_copilot_responses_request(client, tm, model, history, spinning, on_chunk)
+                    .await
+                {
+                    Ok(content) => {
+                        *format = ChatFormat::Responses;
+                        return Ok(content);
+                    }
+                    Err(responses_err) => return Err(responses_err),
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     match format {
         ChatFormat::OpenAI => {
             match send_chat_request(client, key, model, history, spinning, on_chunk).await {
                 ok @ Ok(_) => ok,
+                Err(e) if is_responses_api_required(&e) => {
+                    // Model requires the Responses API instead of Chat Completions
+                    match send_responses_request(client, key, model, history, spinning, on_chunk)
+                        .await
+                    {
+                        Ok(content) => {
+                            *format = ChatFormat::Responses;
+                            Ok(content)
+                        }
+                        Err(responses_err) => Err(responses_err),
+                    }
+                }
                 Err(e) if is_format_mismatch(&e) => {
                     // Provider doesn't speak OpenAI format; try Anthropic
                     match send_anthropic_request(client, key, model, history, spinning, on_chunk)
@@ -493,6 +521,9 @@ where
         }
         ChatFormat::Anthropic => {
             send_anthropic_request(client, key, model, history, spinning, on_chunk).await
+        }
+        ChatFormat::Responses => {
+            send_responses_request(client, key, model, history, spinning, on_chunk).await
         }
     }
 }
@@ -689,7 +720,9 @@ fn new_chat_session_id() -> String {
         u16::from_be_bytes([bytes[4], bytes[5]]),
         u16::from_be_bytes([bytes[6], bytes[7]]),
         u16::from_be_bytes([bytes[8], bytes[9]]),
-        u64::from_be_bytes([0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]]),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ]),
     )
 }
 
@@ -1151,6 +1184,171 @@ where
     })
 }
 
+/// Sends a chat request via GitHub Copilot using the Responses API.
+async fn send_copilot_responses_request<F>(
+    client: &Client,
+    tm: &CopilotTokenManager,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    let (copilot_token, api_endpoint) = tm.get_token().await?;
+    let url = format!("{}/responses", api_endpoint.trim_end_matches('/'));
+
+    let request = build_responses_request(model, messages, true)?;
+
+    let mut response = send_with_retry(|| {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", copilot_token))
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .json(&request)
+    })
+    .await?;
+
+    if response.status().is_server_error() {
+        return send_copilot_responses_non_streaming(
+            client,
+            &url,
+            &copilot_token,
+            model,
+            messages,
+            spinning,
+            on_chunk,
+        )
+        .await;
+    }
+
+    if !response.status().is_success() {
+        style::stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let mut full_content = String::new();
+    let mut usage = None;
+    let mut line_buf = String::new();
+
+    while let Some(chunk) = response.chunk().await? {
+        let text = String::from_utf8_lossy(&chunk);
+        line_buf.push_str(&text);
+
+        while let Some(pos) = line_buf.find('\n') {
+            let line = line_buf[..pos].trim_end_matches('\r').to_string();
+            line_buf = line_buf[pos + 1..].to_string();
+
+            if let Some(data) = sse_data_payload(&line) {
+                if let Some(tokens) = parse_responses_usage_chunk(data) {
+                    merge_token_usage(&mut usage, tokens);
+                }
+                if let Some(chunk) = parse_responses_chunk(data) {
+                    style::stop_spinner(spinning);
+                    if let ChatResponseChunk::Content(ref content) = chunk {
+                        full_content.push_str(content);
+                    }
+                    on_chunk(chunk)?;
+                }
+            }
+        }
+    }
+
+    let tail = line_buf.trim();
+    if !tail.is_empty()
+        && let Some(data) = sse_data_payload(tail)
+    {
+        if let Some(tokens) = parse_responses_usage_chunk(data) {
+            merge_token_usage(&mut usage, tokens);
+        }
+        if let Some(chunk) = parse_responses_chunk(data) {
+            style::stop_spinner(spinning);
+            if let ChatResponseChunk::Content(ref content) = chunk {
+                full_content.push_str(content);
+            }
+            on_chunk(chunk)?;
+        }
+    }
+
+    if full_content.is_empty() {
+        return send_copilot_responses_non_streaming(
+            client,
+            &url,
+            &copilot_token,
+            model,
+            messages,
+            spinning,
+            on_chunk,
+        )
+        .await;
+    }
+
+    Ok(ChatTurnResult {
+        content: full_content,
+        reasoning_content: None,
+        usage,
+    })
+}
+
+/// Non-streaming fallback for Copilot Responses API.
+async fn send_copilot_responses_non_streaming<F>(
+    client: &Client,
+    url: &str,
+    copilot_token: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    let request = build_responses_request(model, messages, false)?;
+
+    let response = send_with_retry(|| {
+        client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", copilot_token))
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .header("Editor-Version", COPILOT_EDITOR_VERSION)
+            .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+            .header("Openai-Intent", COPILOT_OPENAI_INTENT)
+            .json(&request)
+    })
+    .await?;
+
+    if !response.status().is_success() {
+        style::stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let body: serde_json::Value = response.json().await?;
+    let response = extract_responses_message(&body);
+    let usage = extract_responses_usage(&body);
+
+    if response.content.is_empty() {
+        style::stop_spinner(spinning);
+        anyhow::bail!("Provider returned an empty response");
+    }
+
+    style::stop_spinner(spinning);
+    on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
+
+    Ok(ChatTurnResult {
+        content: response.content,
+        reasoning_content: None,
+        usage,
+    })
+}
+
 /// Trims chat history to keep at most `max_messages` messages.
 /// If there's a system message at the start, it's always preserved.
 /// Drops the oldest non-system messages first.
@@ -1186,6 +1384,166 @@ fn is_format_mismatch(e: &anyhow::Error) -> bool {
             && (msg.contains("endpoint") || msg.contains("route") || msg.contains("path")))
         || (msg.contains("method not allowed")
             && (msg.contains("endpoint") || msg.contains("route") || msg.contains("path")))
+}
+
+/// Returns true when the error suggests trying the Responses API.
+/// Matches the specific "unsupported_api_for_model" code as well as any 400 error,
+/// since newer models may only be accessible via /v1/responses.
+fn is_responses_api_required(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("unsupported_api_for_model")
+        || msg.contains("400 bad request")
+        || (msg.contains("not accessible") && msg.contains("/chat/completions"))
+}
+
+/// Sends a chat request via the OpenAI Responses API (/v1/responses).
+/// Tries streaming first; falls back to non-streaming on server errors.
+async fn send_responses_request<F>(
+    client: &Client,
+    key: &ApiKey,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    let base = normalize_base_url(&key.base_url);
+    let url = format!("{}/v1/responses", base);
+
+    let request = build_responses_request(model, messages, true)?;
+
+    let mut response = send_with_retry(|| {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+            .json(&request)
+    })
+    .await?;
+
+    if response.status().is_server_error() {
+        return send_responses_non_streaming(
+            client, &url, key, model, messages, spinning, on_chunk,
+        )
+        .await;
+    }
+
+    if !response.status().is_success() {
+        style::stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let mut full_content = String::new();
+    let mut usage = None;
+    let mut line_buf = String::new();
+
+    while let Some(chunk) = response.chunk().await? {
+        let text = String::from_utf8_lossy(&chunk);
+        line_buf.push_str(&text);
+
+        while let Some(pos) = line_buf.find('\n') {
+            let line = line_buf[..pos].trim_end_matches('\r').to_string();
+            line_buf = line_buf[pos + 1..].to_string();
+
+            if let Some(data) = sse_data_payload(&line) {
+                if let Some(tokens) = parse_responses_usage_chunk(data) {
+                    merge_token_usage(&mut usage, tokens);
+                }
+                if let Some(chunk) = parse_responses_chunk(data) {
+                    style::stop_spinner(spinning);
+                    if let ChatResponseChunk::Content(ref content) = chunk {
+                        full_content.push_str(content);
+                    }
+                    on_chunk(chunk)?;
+                }
+            }
+        }
+    }
+
+    let tail = line_buf.trim();
+    if !tail.is_empty()
+        && let Some(data) = sse_data_payload(tail)
+    {
+        if let Some(tokens) = parse_responses_usage_chunk(data) {
+            merge_token_usage(&mut usage, tokens);
+        }
+        if let Some(chunk) = parse_responses_chunk(data) {
+            style::stop_spinner(spinning);
+            if let ChatResponseChunk::Content(ref content) = chunk {
+                full_content.push_str(content);
+            }
+            on_chunk(chunk)?;
+        }
+    }
+
+    if full_content.is_empty() {
+        return send_responses_non_streaming(
+            client, &url, key, model, messages, spinning, on_chunk,
+        )
+        .await;
+    }
+
+    Ok(ChatTurnResult {
+        content: full_content,
+        reasoning_content: None,
+        usage,
+    })
+}
+
+/// Non-streaming fallback for OpenAI Responses API.
+async fn send_responses_non_streaming<F>(
+    client: &Client,
+    url: &str,
+    key: &ApiKey,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    let request = build_responses_request(model, messages, false)?;
+
+    let response = send_with_retry(|| {
+        client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
+            .json(&request)
+    })
+    .await?;
+
+    if !response.status().is_success() {
+        style::stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let body: serde_json::Value = response.json().await?;
+    let response = extract_responses_message(&body);
+    let usage = extract_responses_usage(&body);
+
+    if response.content.is_empty() {
+        style::stop_spinner(spinning);
+        anyhow::bail!("Provider returned an empty response");
+    }
+
+    style::stop_spinner(spinning);
+    on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
+
+    Ok(ChatTurnResult {
+        content: response.content,
+        reasoning_content: None,
+        usage,
+    })
 }
 
 /// Sends a request using Anthropic's native /v1/messages API.
@@ -1460,5 +1818,31 @@ mod tests {
         assert!(!is_format_mismatch(&e));
         let e = anyhow::anyhow!("API returned 429 Too Many Requests");
         assert!(!is_format_mismatch(&e));
+    }
+
+    #[test]
+    fn test_is_responses_api_required_unsupported_code() {
+        let e = anyhow::anyhow!(
+            r#"API returned 400 Bad Request — {{"error":{{"message":"model \"gpt-5.4\" is not accessible via the /chat/completions endpoint","code":"unsupported_api_for_model"}}}}"#
+        );
+        assert!(is_responses_api_required(&e));
+    }
+
+    #[test]
+    fn test_is_responses_api_required_not_accessible() {
+        let e = anyhow::anyhow!("model is not accessible via the /chat/completions endpoint");
+        assert!(is_responses_api_required(&e));
+    }
+
+    #[test]
+    fn test_is_responses_api_required_generic_400() {
+        let e = anyhow::anyhow!("API returned 400 Bad Request — invalid something");
+        assert!(is_responses_api_required(&e));
+    }
+
+    #[test]
+    fn test_is_responses_api_required_unrelated_error() {
+        let e = anyhow::anyhow!("API returned 401 Unauthorized");
+        assert!(!is_responses_api_required(&e));
     }
 }
