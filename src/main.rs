@@ -390,11 +390,16 @@ fn print_help() {
     };
     print_shortcut("use", "keys use");
     print_shortcut("ping", "keys ping");
+    print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
     print_shortcut("claude|codex|gemini|opencode|pi", "run <tool>");
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo claude -m kimi-k2.5"));
     println!("  {}", style::dim("aivo chat -x \"hello\""));
+    println!(
+        "  {}",
+        style::dim("git diff | aivo -x \"summarize changes\"")
+    );
     println!("  {}", style::dim("aivo gemini -k mykey -m minimax-m2.7"));
     println!("  {}", style::dim("aivo ls --ping"));
     println!();

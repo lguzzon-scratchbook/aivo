@@ -214,7 +214,6 @@ impl RunCommand {
             "Select API key by ID or name (-k opens key picker)",
         );
         print_opt("--env <k=v>", "Inject environment variable");
-        print_opt("--debug", "Enable debug output");
         print_opt(
             "--dry-run",
             "Print resolved command and environment without launching",

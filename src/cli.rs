@@ -274,7 +274,7 @@ pub struct ChatArgs {
     #[arg(short = 'r', long)]
     pub refresh: bool,
 
-    /// Send one message, print response, then exit (non-interactive)
+    /// Send one message and exit; reads stdin when no value given
     #[arg(
         short = 'x',
         long = "execute",

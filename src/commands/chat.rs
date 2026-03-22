@@ -339,7 +339,7 @@ impl ChatCommand {
 
     pub fn print_help() {
         println!(
-            "{} aivo chat [--model <model>] [-x <message>] [--attach <path> ...]",
+            "{} aivo chat [--model <model>] [-x [message]] [--attach <path> ...]",
             style::bold("Usage:")
         );
         println!();
@@ -377,8 +377,12 @@ impl ChatCommand {
             "Select API key by ID or name (-k opens key picker)",
         );
         print_opt(
-            "-x, --execute <message>",
-            "Send one message and exit (-x with no value reads stdin until Ctrl-D)",
+            "-x, --execute [message]",
+            "Send one message and exit (reads stdin when no value given)",
+        );
+        print_opt(
+            "-r, --refresh",
+            "Bypass model cache and fetch a fresh list for the picker",
         );
         print_opt(
             "--attach <path>",
@@ -441,7 +445,11 @@ impl ChatCommand {
         println!("  {}", style::dim("aivo -x \"Summarize this repository\""));
         println!(
             "  {}",
-            style::dim("git diff --cached | aivo chat -x \"Summarize changes in one sentence\"")
+            style::dim("git diff | aivo chat -x \"Summarize changes in one sentence\"")
+        );
+        println!(
+            "  {}",
+            style::dim("cat error.log | aivo -x")
         );
     }
 }
