@@ -673,7 +673,16 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
 }
 
 fn new_chat_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    use rand::Rng;
+    let bytes: [u8; 16] = rand::thread_rng().r#gen();
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        u64::from_be_bytes([0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]]),
+    )
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
