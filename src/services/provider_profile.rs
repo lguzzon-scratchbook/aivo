@@ -22,6 +22,7 @@ pub enum ModelListingStrategy {
     Anthropic,
     CloudflareSearch,
     OpenAiCompatible,
+    Static(&'static [&'static str]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,18 @@ pub struct ProviderProfile {
     pub quirks: ProviderQuirks,
     pub model_listing_strategy: ModelListingStrategy,
     pub serve_flags: ServeFlags,
+}
+
+pub static MINIMAX_MODELS: &[&str] = &[
+    "minimax-m2.7",
+    "minimax-m2.7-highspeed",
+    "minimax-m2.5",
+    "minimax-m2.5-highspeed",
+    "m2-her",
+];
+
+pub fn is_minimax_base(base_url: &str) -> bool {
+    base_url.contains("minimax.io") || base_url.contains("minimaxi.com")
 }
 
 pub fn is_copilot_base(base_url: &str) -> bool {
@@ -181,6 +194,19 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
         };
     }
 
+    if is_minimax_base(base_url) {
+        return ProviderProfile {
+            kind: ProviderKind::AnthropicCompatible,
+            default_protocol: ProviderProtocol::Anthropic,
+            quirks,
+            model_listing_strategy: ModelListingStrategy::Static(MINIMAX_MODELS),
+            serve_flags: ServeFlags {
+                is_copilot: false,
+                is_openrouter: false,
+            },
+        };
+    }
+
     match detect_provider_protocol(base_url) {
         ProviderProtocol::Anthropic => ProviderProfile {
             kind: ProviderKind::AnthropicCompatible,
@@ -262,8 +288,24 @@ mod tests {
     }
 
     #[test]
+    fn classifies_minimax_with_static_models() {
+        for url in [
+            "https://api.minimax.io/anthropic/v1",
+            "https://api.minimaxi.com/anthropic",
+        ] {
+            let profile = provider_profile_for_base_url(url);
+            assert_eq!(profile.kind, ProviderKind::AnthropicCompatible, "{url}");
+            assert_eq!(profile.default_protocol, ProviderProtocol::Anthropic, "{url}");
+            assert!(
+                matches!(profile.model_listing_strategy, ModelListingStrategy::Static(_)),
+                "expected Static model listing for MiniMax at {url}"
+            );
+        }
+    }
+
+    #[test]
     fn classifies_anthropic_compatible_endpoints() {
-        let profile = provider_profile_for_base_url("https://api.minimax.io/anthropic/v1");
+        let profile = provider_profile_for_base_url("https://api.anthropic.com");
         assert_eq!(profile.kind, ProviderKind::AnthropicCompatible);
         assert_eq!(profile.default_protocol, ProviderProtocol::Anthropic);
         assert_eq!(

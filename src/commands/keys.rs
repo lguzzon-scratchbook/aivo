@@ -235,7 +235,7 @@ async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
                 Err(_) => Ok(PingStatus::Unreachable),
             }
         }
-        ModelListingStrategy::Anthropic => {
+        ModelListingStrategy::Anthropic | ModelListingStrategy::Static(_) => {
             let base = key.base_url.trim_end_matches('/');
             let url = if base.ends_with("/v1") {
                 format!("{}/models", base)
