@@ -9,17 +9,18 @@ npm install -g @yuanchuan/aivo
 ```
 
 This package downloads the matching prebuilt binary for your platform during install.
+If `aivo` is not recognized right away on Windows, open a new terminal and try again.
 
 ## Update
 
 ```bash
-npm install -g @yuanchuan/aivo@latest
+aivo update
 ```
 
-Or:
+If the npm-managed install needs repair, run:
 
 ```bash
-npm update -g @yuanchuan/aivo
+npm install -g @yuanchuan/aivo@latest
 ```
 
 ## Usage

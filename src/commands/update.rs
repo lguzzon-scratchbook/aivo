@@ -11,12 +11,15 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::errors::ExitCode;
+use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::style;
 
 const GITHUB_API: &str = "https://api.github.com/repos/yuanchuan/aivo/releases/latest";
 const GITHUB_RELEASES_LATEST: &str = "https://github.com/yuanchuan/aivo/releases/latest";
 const GITHUB_LATEST_DOWNLOAD_BASE: &str =
     "https://github.com/yuanchuan/aivo/releases/latest/download";
+const NPM_UPDATE_COMMAND: &str = "npm install -g @yuanchuan/aivo@latest";
+const NPM_UPDATE_ARGS: [&str; 3] = ["install", "-g", "@yuanchuan/aivo@latest"];
 
 /// UpdateCommand handles CLI self-update via GitHub Releases
 pub struct UpdateCommand {
@@ -54,11 +57,11 @@ impl UpdateCommand {
         println!();
         println!(
             "{}",
-            style::dim("Update the CLI tool to the latest version from GitHub Releases.")
+            style::dim("Update the CLI tool to the latest version.")
         );
         println!(
             "{}",
-            style::dim("Downloads and verifies the binary with SHA-256 checksum.")
+            style::dim("Delegates to Homebrew or npm when installed via those package managers.")
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -109,7 +112,10 @@ impl UpdateCommand {
                     PackageManager::Homebrew => {
                         return Ok(self.update_via_homebrew());
                     }
-                    PackageManager::Npm | PackageManager::Cargo => {
+                    PackageManager::Npm => {
+                        return self.update_via_npm(&manager);
+                    }
+                    PackageManager::Cargo => {
                         eprintln!(
                             "{} aivo was installed via {}.",
                             style::yellow("Warning:"),
@@ -510,6 +516,52 @@ impl UpdateCommand {
             }
         }
     }
+
+    fn update_via_npm(&self, manager: &ManagedInstall) -> Result<ExitCode> {
+        #[cfg(windows)]
+        {
+            eprintln!(
+                "{} Windows npm installs are updated by the npm shim, not by aivo.exe directly.",
+                style::yellow("Warning:")
+            );
+            eprintln!("  {} {}", style::dim("Run:"), style::green("aivo update"));
+            eprintln!(
+                "  {} {}",
+                style::dim("Or repair with:"),
+                style::green(manager.upgrade_command)
+            );
+            return Ok(ExitCode::UserError);
+        }
+
+        #[cfg(not(windows))]
+        let npm_path = resolve_command_path("npm").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not find npm on PATH. Run this command manually: {}",
+                manager.upgrade_command
+            )
+        })?;
+
+        #[cfg(not(windows))]
+        {
+            println!("{} Updating via npm...", style::arrow_symbol());
+            println!(
+                "  {} {}",
+                style::dim("Running:"),
+                style::green(manager.upgrade_command)
+            );
+
+            let status = Command::new(&npm_path)
+                .args(NPM_UPDATE_ARGS)
+                .status()
+                .with_context(|| format!("Failed to launch npm at {}", npm_path.display()))?;
+
+            return Ok(if status.success() {
+                ExitCode::Success
+            } else {
+                ExitCode::UserError
+            });
+        }
+    }
 }
 
 fn parse_digest_sha256(digest: &str) -> Option<String> {
@@ -629,6 +681,18 @@ fn get_install_path() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
+fn resolve_command_path(program: &str) -> Option<PathBuf> {
+    let dirs = collect_path_dirs();
+    find_in_dirs(program, &dirs)
+}
+
+fn normalize_install_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_ascii_lowercase()
+}
+
 /// Detected package manager type
 enum PackageManager {
     Homebrew,
@@ -651,19 +715,19 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
         return None;
     }
 
-    let path_str = install_path.to_string_lossy();
+    let path_str = normalize_install_path(install_path);
 
     // npm: .../node_modules/@yuanchuan/aivo/...
     if path_str.contains("/node_modules/") {
         return Some(ManagedInstall {
             kind: PackageManager::Npm,
             name: "npm",
-            upgrade_command: "npm install -g @yuanchuan/aivo",
+            upgrade_command: NPM_UPDATE_COMMAND,
         });
     }
 
     // Homebrew: /opt/homebrew/Cellar/..., /usr/local/Cellar/..., /home/linuxbrew/.linuxbrew/Cellar/...
-    if path_str.contains("/Cellar/") || path_str.contains("/homebrew/") {
+    if path_str.contains("/cellar/") || path_str.contains("/homebrew/") {
         return Some(ManagedInstall {
             kind: PackageManager::Homebrew,
             name: "Homebrew",
@@ -801,7 +865,7 @@ mod tests {
         assert!(result.is_some());
         let m = result.unwrap();
         assert_eq!(m.name, "npm");
-        assert_eq!(m.upgrade_command, "npm install -g @yuanchuan/aivo");
+        assert_eq!(m.upgrade_command, NPM_UPDATE_COMMAND);
     }
 
     #[test]
@@ -812,6 +876,18 @@ mod tests {
         let result = detect_managed_install(path);
         assert!(result.is_some());
         assert_eq!(result.unwrap().name, "npm");
+    }
+
+    #[test]
+    fn test_detect_npm_windows_path() {
+        let path = Path::new(
+            r"C:\Users\user\AppData\Roaming\npm\node_modules\@yuanchuan\aivo\native\aivo.exe",
+        );
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.name, "npm");
+        assert_eq!(m.upgrade_command, NPM_UPDATE_COMMAND);
     }
 
     #[test]
@@ -859,6 +935,14 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_cargo_windows_path() {
+        let path = Path::new(r"C:\Users\user\.cargo\bin\aivo.exe");
+        let result = detect_managed_install(path);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "Cargo");
+    }
+
+    #[test]
     fn test_detect_direct_download() {
         let path = Path::new("/usr/local/bin/aivo");
         let result = detect_managed_install(path);
@@ -870,5 +954,16 @@ mod tests {
         let path = Path::new("/home/user/bin/aivo");
         let result = detect_managed_install(path);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_normalize_install_path_strips_verbatim_prefix() {
+        let path = Path::new(
+            r"\\?\C:\Users\User\AppData\Roaming\npm\node_modules\@yuanchuan\aivo\aivo.exe",
+        );
+        assert_eq!(
+            normalize_install_path(path),
+            "c:/users/user/appdata/roaming/npm/node_modules/@yuanchuan/aivo/aivo.exe"
+        );
     }
 }

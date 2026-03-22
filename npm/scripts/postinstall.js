@@ -11,17 +11,22 @@ const { resolvePlatformAsset } = require("../lib/platform");
 const pkg = require(path.join(getPackageRoot(), "package.json"));
 
 const MAX_REDIRECTS = 5;
+const REPAIR_COMMAND = "npm install -g @yuanchuan/aivo@latest";
 
-async function main() {
-  if (process.env.AIVO_SKIP_POSTINSTALL === "1") {
+async function main(options = {}) {
+  const platform = options.platform || process.platform;
+  const arch = options.arch || process.arch;
+  const env = options.env || process.env;
+  const fsImpl = options.fsImpl || fs;
+  const logger = options.logger || console;
+
+  if (env.AIVO_SKIP_POSTINSTALL === "1") {
     return;
   }
 
-  const { assetName } = resolvePlatformAsset();
+  const { assetName } = resolvePlatformAsset(platform, arch);
   const version = pkg.version;
-  const baseUrl =
-    process.env.AIVO_INSTALL_BASE_URL ||
-    `https://github.com/yuanchuan/aivo/releases/download/v${version}`;
+  const baseUrl = env.AIVO_INSTALL_BASE_URL || getReleaseBaseUrl(version);
   const checksumUrl = `${baseUrl}/${assetName}.sha256`;
   const binaryUrl = `${baseUrl}/${assetName}`;
 
@@ -41,19 +46,68 @@ async function main() {
   }
 
   const nativeDir = getNativeDir();
-  const binaryPath = getInstalledBinaryPath();
-  fs.mkdirSync(nativeDir, { recursive: true });
-  fs.writeFileSync(binaryPath, binary);
+  const binaryPath = getInstalledBinaryPath(platform, arch);
+  installBinary({
+    binary,
+    binaryPath,
+    nativeDir,
+    platform,
+    fsImpl
+  });
 
-  if (process.platform !== "win32") {
-    fs.chmodSync(binaryPath, 0o755);
+  logger.log(`Installed aivo ${version} (${assetName})`);
+  if (platform === "win32") {
+    logger.log("If `aivo` is not recognized yet, open a new terminal and try again.");
   }
-
-  console.log(`Installed aivo ${version} (${assetName})`);
 }
 
 function downloadText(url) {
   return downloadBuffer(url).then((buffer) => buffer.toString("utf8"));
+}
+
+function getReleaseBaseUrl(version) {
+  return `https://github.com/yuanchuan/aivo/releases/download/v${version}`;
+}
+
+function installBinary({ binary, binaryPath, nativeDir, platform, fsImpl = fs }) {
+  const tempPath = path.join(
+    nativeDir,
+    `${path.basename(binaryPath)}.tmp-${process.pid}-${Date.now()}`
+  );
+
+  fsImpl.mkdirSync(nativeDir, { recursive: true });
+
+  try {
+    fsImpl.writeFileSync(tempPath, binary);
+    if (platform !== "win32") {
+      fsImpl.chmodSync(tempPath, 0o755);
+    }
+    fsImpl.renameSync(tempPath, binaryPath);
+  } catch (error) {
+    cleanupTempFile(fsImpl, tempPath);
+    throw new Error(`Failed to install ${path.basename(binaryPath)}: ${error.message}`);
+  }
+}
+
+function cleanupTempFile(fsImpl, tempPath) {
+  if (typeof fsImpl.rmSync === "function") {
+    fsImpl.rmSync(tempPath, { force: true });
+    return;
+  }
+
+  try {
+    fsImpl.unlinkSync(tempPath);
+  } catch {
+    // ignore cleanup failures
+  }
+}
+
+function formatInstallError(error, platform = process.platform) {
+  const lines = [error.message, `Repair with: ${REPAIR_COMMAND}`];
+  if (platform === "win32") {
+    lines.push("If you just installed aivo, open a new terminal and try again.");
+  }
+  return lines.join("\n");
 }
 
 function downloadBuffer(url, redirectCount = 0) {
@@ -106,7 +160,19 @@ function downloadBuffer(url, redirectCount = 0) {
   });
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(formatInstallError(error));
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  REPAIR_COMMAND,
+  downloadBuffer,
+  downloadText,
+  formatInstallError,
+  getReleaseBaseUrl,
+  installBinary,
+  main
+};

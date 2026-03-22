@@ -18,16 +18,16 @@ Homebrew:
 brew install yuanchuan/tap/aivo
 ```
 
-npm:
-
-```bash
-npm install -g @yuanchuan/aivo
-```
-
 Install script:
 
 ```bash
 curl -fsSL https://yuanchuan.dev/aivo/install.sh | sh
+```
+
+npm (only recommended for windows users):
+
+```bash
+npm install -g @yuanchuan/aivo
 ```
 
 Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/releases).
@@ -261,6 +261,14 @@ Update to the latest version:
 
 ```bash
 aivo update
+```
+
+`aivo update` delegates to Homebrew or npm when `aivo` was installed by those package managers.
+
+If an npm-managed install needs repair, run:
+
+```bash
+npm install -g @yuanchuan/aivo@latest
 ```
 
 ## Development
