@@ -555,11 +555,11 @@ impl UpdateCommand {
                 .status()
                 .with_context(|| format!("Failed to launch npm at {}", npm_path.display()))?;
 
-            return Ok(if status.success() {
+            Ok(if status.success() {
                 ExitCode::Success
             } else {
                 ExitCode::UserError
-            });
+            })
         }
     }
 }
