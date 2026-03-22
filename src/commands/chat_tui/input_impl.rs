@@ -339,7 +339,11 @@ impl ChatTuiApp {
                 self.draft = path.insertion_text;
                 self.cursor = self.draft.len();
                 self.command_menu.reset();
-                Ok(false)
+                if path.is_dir {
+                    Ok(false)
+                } else {
+                    self.submit_draft().await
+                }
             }
         }
     }
