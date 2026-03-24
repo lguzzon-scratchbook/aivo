@@ -1,3 +1,5 @@
+use std::process::Command;
+
 use super::*;
 
 pub(super) fn read_system_clipboard() -> Result<ClipboardPayload> {

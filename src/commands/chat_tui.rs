@@ -1,7 +1,6 @@
 use std::env;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
