@@ -85,8 +85,8 @@ fn print_ping_result(result: &PingResult, max_name_len: usize) {
     );
 }
 
-fn detect_base_url(name: &str) -> Option<&'static str> {
-    crate::services::known_providers::find_by_name_substring(name).map(|p| p.base_url)
+fn detect_base_url(name: &str) -> Option<&str> {
+    crate::services::known_providers::find_by_name_substring(name).map(|p| p.base_url.as_str())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

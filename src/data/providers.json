@@ -1,0 +1,15 @@
+[
+  {"name": "openrouter", "base_url": "https://openrouter.ai/api/v1"},
+  {"name": "vercel", "base_url": "https://ai-gateway.vercel.sh/v1"},
+  {"name": "fireworks", "base_url": "https://api.fireworks.ai/inference/v1"},
+  {"name": "minimax", "base_url": "https://api.minimax.io/anthropic"},
+  {"name": "deepseek", "base_url": "https://api.deepseek.com/v1"},
+  {"name": "moonshot", "base_url": "https://api.moonshot.ai/v1"},
+  {"name": "anthropic", "base_url": "https://api.anthropic.com"},
+  {"name": "openai", "base_url": "https://api.openai.com"},
+  {"name": "qwen", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+  {"name": "zai", "base_url": "https://api.z.ai/v1"},
+  {"name": "groq", "base_url": "https://api.groq.com/openai/v1"},
+  {"name": "xai", "base_url": "https://api.x.ai/v1"},
+  {"name": "mistral", "base_url": "https://api.mistral.ai/v1"}
+]
