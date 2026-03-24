@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## Project Overview
 
 `aivo` is a Rust CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, Ollama (local models), and native APIs.
@@ -11,20 +13,39 @@
 
 ```bash
 cargo build --release   # Compile optimized binary to target/release/aivo
-cargo test              # Run all tests (~1500 tests)
+cargo test --features test-fast-crypto  # Run all tests (~1500 tests, fast crypto for CI/dev)
+cargo test -- test_name                 # Run a single test by name
 cargo clippy            # Lint (fix all warnings before committing)
 cargo fmt               # Format code (run before committing)
 ```
+
+The `test-fast-crypto` feature uses reduced PBKDF2 iterations for faster test runs. Tests also work without it (`cargo test`), just slower.
+
+A `Makefile` wraps common workflows: `make test`, `make build`, `make clippy`, `make install`, `make release`.
 
 ## Git Conventions
 
 * Always squash merge to main. Never fast-forward. Command: `git merge --squash <branch> && git commit`
 * Do not commit automatically to the fix.
 
+## Release Process
+
+1. Bump version in both `Cargo.toml` and `npm/package.json` **first** — never tag without updating the version.
+2. Run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test`.
+3. `cargo build --release && cargo install --path .` to verify the binary.
+4. Commit: `git add -A && git commit -m "chore: release vX.Y.Z"`
+5. Tag and push: `git tag vX.Y.Z && git push origin main --tags`
+
 ## CLI / UX Conventions
 
 > [!NOTE]
 > When formatting CLI help text, pay close attention to alignment, spacing, bracket style, and description consistency. Match existing patterns exactly rather than inventing new formatting.
+
+When implementing interactive UI (pickers, prompts, formatted output), verify before presenting as done:
+* **Keyboard handling**: arrow keys, Ctrl+P/N navigation, ESC to cancel (restore terminal state), Ctrl+C cleanup
+* **Selection state**: pre-select the currently active item when editing existing values
+* **Alignment**: consistent padding and column alignment with existing UI in the codebase
+* **Edge cases**: empty input, single item, long strings that could break alignment
 
 ## Code Review
 
@@ -118,6 +139,10 @@ SessionStore → EnvironmentInjector → AILauncher
 | `system_env.rs`                 | System environment helpers (CWD, home dir, etc.)                        |
 | `launch_runtime.rs`             | Router startup, temp dir writing (Pi agent dir), runtime env patching   |
 | `launch_args.rs`                | CLI arg injection (model flags, teammate mode, codex/pi model prefixing)|
+
+### Cross-Platform
+
+Platform-specific code is gated behind `cfg(unix)` / `cfg(windows)`. Unix uses `libc` for signal handling; Windows uses `windows-sys` for file locking. Ensure new platform-specific code is similarly gated.
 
 ### Data Model
 
