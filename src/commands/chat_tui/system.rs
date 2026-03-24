@@ -1,6 +1,7 @@
-use std::process::Command;
-
 use super::*;
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 pub(super) fn read_system_clipboard() -> Result<ClipboardPayload> {
     #[cfg(target_os = "macos")]

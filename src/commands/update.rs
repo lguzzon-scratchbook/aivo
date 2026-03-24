@@ -19,6 +19,7 @@ const GITHUB_RELEASES_LATEST: &str = "https://github.com/yuanchuan/aivo/releases
 const GITHUB_LATEST_DOWNLOAD_BASE: &str =
     "https://github.com/yuanchuan/aivo/releases/latest/download";
 const NPM_UPDATE_COMMAND: &str = "npm install -g @yuanchuan/aivo@latest";
+#[cfg(not(windows))]
 const NPM_UPDATE_ARGS: [&str; 3] = ["install", "-g", "@yuanchuan/aivo@latest"];
 
 /// UpdateCommand handles CLI self-update via GitHub Releases
@@ -681,6 +682,7 @@ fn get_install_path() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
+#[cfg(not(windows))]
 fn resolve_command_path(program: &str) -> Option<PathBuf> {
     let dirs = collect_path_dirs();
     find_in_dirs(program, &dirs)
