@@ -139,23 +139,22 @@ async fn run_router(
                 return;
             }
 
-            let response =
-                match handle_anthropic_to_upstream(
-                    &request,
-                    &config,
-                    &client,
-                    &active_protocol,
-                    &native_anthropic_failed,
-                )
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(e) => {
-                        let error = http_utils::http_error_response(500, &e.to_string());
-                        let _ = socket.write_all(error.as_bytes()).await;
-                        return;
-                    }
-                };
+            let response = match handle_anthropic_to_upstream(
+                &request,
+                &config,
+                &client,
+                &active_protocol,
+                &native_anthropic_failed,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    let error = http_utils::http_error_response(500, &e.to_string());
+                    let _ = socket.write_all(error.as_bytes()).await;
+                    return;
+                }
+            };
 
             let _ = write_router_response(&mut socket, response).await;
         });
@@ -214,10 +213,7 @@ async fn try_native_anthropic(
     let mut headers = passthrough_headers.clone();
     headers.insert("x-api-key", HeaderValue::from_str(&config.target_api_key)?);
     headers.insert("Content-Type", HeaderValue::from_static(CONTENT_TYPE_JSON));
-    headers.insert(
-        "anthropic-version",
-        HeaderValue::from_static("2023-06-01"),
-    );
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     headers.insert("User-Agent", HeaderValue::from_static("aivo-router/1.0"));
 
     let response = client
@@ -262,9 +258,14 @@ async fn handle_anthropic_to_upstream(
         .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
 
     if model_is_claude
-        && let Some(response) =
-            try_native_anthropic(&body, config, client, &passthrough_headers, native_anthropic_failed)
-                .await?
+        && let Some(response) = try_native_anthropic(
+            &body,
+            config,
+            client,
+            &passthrough_headers,
+            native_anthropic_failed,
+        )
+        .await?
     {
         return Ok(response);
     }

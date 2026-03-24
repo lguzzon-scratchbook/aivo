@@ -90,7 +90,7 @@ impl FuzzySelect {
                     let above = page_start;
                     term.write_line(&format!(
                         "  {}",
-                        crate::style::dim(&format!("↑ {} more above", above))
+                        crate::style::dim(format!("↑ {} more above", above))
                     ))?;
                     lines += 1;
                 }
@@ -114,7 +114,7 @@ impl FuzzySelect {
                     let below = count - end_idx;
                     term.write_line(&format!(
                         "  {}",
-                        crate::style::dim(&format!("↓ {} more below", below))
+                        crate::style::dim(format!("↓ {} more below", below))
                     ))?;
                     lines += 1;
                 }
