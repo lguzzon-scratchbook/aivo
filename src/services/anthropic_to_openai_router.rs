@@ -269,7 +269,7 @@ async fn handle_anthropic_to_upstream(
                     let openai_response =
                         convert_gemini_to_openai_chat_response(&google_response, &model);
                     let r = if requested_stream {
-                        let openai_sse = convert_openai_chat_response_to_sse(&openai_response);
+                        let openai_sse = convert_openai_chat_response_to_sse(&openai_response)?;
                         let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
                         RouterResponse::Buffered {
                             status: 200,
@@ -318,7 +318,7 @@ async fn handle_anthropic_to_upstream(
                     let resp: Value = serde_json::from_str(&response_body)?;
                     let openai_response = convert_responses_to_chat_response(&resp);
                     let r = if requested_stream {
-                        let openai_sse = convert_openai_chat_response_to_sse(&openai_response);
+                        let openai_sse = convert_openai_chat_response_to_sse(&openai_response)?;
                         let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
                         RouterResponse::Buffered {
                             status: 200,
@@ -542,7 +542,7 @@ fn convert_openai_to_anthropic(response_body: &str, status_code: u16) -> Result<
             include_created: true,
             usage_value_mode: UsageValueMode::CoerceU64,
         },
-    );
+    )?;
 
     Ok(anthropic_resp.to_string())
 }

@@ -15,6 +15,7 @@ use crate::services::system_env;
 
 pub const ENCRYPTION_MARKER: &str = "enc:";
 pub const V3_ENCRYPTION_MARKER: &str = "enc3:";
+pub const V4_ENCRYPTION_MARKER: &str = "enc4:";
 
 const IV_LENGTH: usize = 16;
 const SALT_LENGTH: usize = 32;
@@ -68,7 +69,8 @@ fn derive_key_v3_inner() -> SecretKey {
     let homedir: String = system_env::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let machine_id = system_env::machine_id().unwrap_or_default();
+    // Use legacy machine_id to preserve backward compatibility with existing v3 keys
+    let machine_id = system_env::machine_id_legacy().unwrap_or_default();
     let machine_data = format!("{}:{}:{}", username, homedir, machine_id);
 
     let mut hasher = Sha256::new();
@@ -83,8 +85,40 @@ fn derive_key_v3_inner() -> SecretKey {
     SecretKey(key)
 }
 
+fn derive_key_v4() -> SecretKey {
+    static CACHED_KEY: OnceLock<SecretKey> = OnceLock::new();
+    CACHED_KEY.get_or_init(derive_key_v4_inner).clone()
+}
+
+fn derive_key_v4_inner() -> SecretKey {
+    let username = system_env::username().unwrap_or_default();
+    let homedir: String = system_env::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let machine_id = system_env::machine_id().unwrap_or_default();
+    let machine_data = format!("{}:{}:{}", username, homedir, machine_id);
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"aivo-salt-v4");
+    hasher.update(machine_data.as_bytes());
+    let salt_full = hasher.finalize();
+    let salt = &salt_full[..SALT_LENGTH];
+
+    let mut key = [0u8; KEY_LENGTH];
+    pbkdf2_hmac::<Sha256>(machine_data.as_bytes(), salt, ITERATIONS, &mut key);
+
+    SecretKey(key)
+}
+
 pub fn is_encrypted(value: &str) -> bool {
-    value.starts_with(V3_ENCRYPTION_MARKER) || value.starts_with(ENCRYPTION_MARKER)
+    value.starts_with(V4_ENCRYPTION_MARKER)
+        || value.starts_with(V3_ENCRYPTION_MARKER)
+        || value.starts_with(ENCRYPTION_MARKER)
+}
+
+/// Returns true if the value uses the latest encryption version (v4).
+pub fn is_current_encryption(value: &str) -> bool {
+    value.starts_with(V4_ENCRYPTION_MARKER)
 }
 
 type Aes256Gcm16 = AesGcm<Aes256, U16, U16>;
@@ -98,7 +132,7 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
         return Ok(plaintext.to_string());
     }
 
-    let key = derive_key_v3();
+    let key = derive_key_v4();
     let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
 
     let mut iv = [0u8; IV_LENGTH];
@@ -115,7 +149,7 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
 
     Ok(format!(
         "{}{}",
-        V3_ENCRYPTION_MARKER,
+        V4_ENCRYPTION_MARKER,
         BASE64.encode(&combined)
     ))
 }
@@ -129,7 +163,9 @@ pub fn decrypt(encrypted_data: &str) -> Result<String> {
         return Err(anyhow::anyhow!("Invalid encrypted data: missing marker"));
     }
 
-    let (key, marker_len) = if encrypted_data.starts_with(V3_ENCRYPTION_MARKER) {
+    let (key, marker_len) = if encrypted_data.starts_with(V4_ENCRYPTION_MARKER) {
+        (derive_key_v4(), V4_ENCRYPTION_MARKER.len())
+    } else if encrypted_data.starts_with(V3_ENCRYPTION_MARKER) {
         (derive_key_v3(), V3_ENCRYPTION_MARKER.len())
     } else {
         (derive_key(), ENCRYPTION_MARKER.len())
@@ -160,8 +196,8 @@ pub fn decrypt(encrypted_data: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Aes256Gcm16, ENCRYPTION_MARKER, IV_LENGTH, V3_ENCRYPTION_MARKER, decrypt, derive_key,
-        encrypt, is_encrypted,
+        Aes256Gcm16, ENCRYPTION_MARKER, IV_LENGTH, V3_ENCRYPTION_MARKER, V4_ENCRYPTION_MARKER,
+        decrypt, derive_key, derive_key_v3, encrypt, is_current_encryption, is_encrypted,
     };
     use aes_gcm::aead::{Aead, KeyInit, generic_array::GenericArray};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -172,9 +208,9 @@ mod tests {
         let plaintext = "test-api-key-12345";
         let encrypted = encrypt(plaintext).unwrap();
 
-        assert!(encrypted.starts_with(V3_ENCRYPTION_MARKER));
+        assert!(encrypted.starts_with(V4_ENCRYPTION_MARKER));
 
-        let data = &encrypted[V3_ENCRYPTION_MARKER.len()..];
+        let data = &encrypted[V4_ENCRYPTION_MARKER.len()..];
         let decoded = BASE64.decode(data).unwrap();
         assert!(decoded.len() >= 32);
     }
@@ -199,9 +235,18 @@ mod tests {
     fn test_is_encrypted_detection() {
         assert!(is_encrypted("enc:abc123"));
         assert!(is_encrypted("enc3:abc123"));
+        assert!(is_encrypted("enc4:abc123"));
         assert!(!is_encrypted("plain-text"));
         assert!(!is_encrypted(""));
         assert!(!is_encrypted("enc"));
+    }
+
+    #[test]
+    fn test_is_current_encryption() {
+        assert!(is_current_encryption("enc4:abc123"));
+        assert!(!is_current_encryption("enc3:abc123"));
+        assert!(!is_current_encryption("enc:abc123"));
+        assert!(!is_current_encryption("plain-text"));
     }
 
     #[test]
@@ -222,6 +267,55 @@ mod tests {
         let v2_encrypted = format!("{}{}", ENCRYPTION_MARKER, BASE64.encode(&combined));
         let decrypted = decrypt(&v2_encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_legacy_v3_decrypt() {
+        let plaintext = "legacy-api-key-v3";
+        let key = derive_key_v3();
+        let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
+
+        let mut iv = [0u8; IV_LENGTH];
+        rand::thread_rng().fill_bytes(&mut iv);
+        let nonce = GenericArray::from_slice(&iv);
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
+
+        let mut combined = Vec::with_capacity(IV_LENGTH + ciphertext.len());
+        combined.extend_from_slice(&iv);
+        combined.extend_from_slice(&ciphertext);
+
+        let v3_encrypted = format!("{}{}", V3_ENCRYPTION_MARKER, BASE64.encode(&combined));
+        let decrypted = decrypt(&v3_encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_v3_to_v4_migration_roundtrip() {
+        let plaintext = "migrate-me-v3-to-v4";
+        let key = derive_key_v3();
+        let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
+
+        let mut iv = [0u8; IV_LENGTH];
+        rand::thread_rng().fill_bytes(&mut iv);
+        let nonce = GenericArray::from_slice(&iv);
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
+
+        let mut combined = Vec::with_capacity(IV_LENGTH + ciphertext.len());
+        combined.extend_from_slice(&iv);
+        combined.extend_from_slice(&ciphertext);
+        let v3_encrypted = format!("{}{}", V3_ENCRYPTION_MARKER, BASE64.encode(&combined));
+
+        // Decrypt old v3 key
+        let decrypted = decrypt(&v3_encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // Re-encrypt with v4
+        let v4_encrypted = encrypt(&decrypted).unwrap();
+        assert!(v4_encrypted.starts_with(V4_ENCRYPTION_MARKER));
+
+        // Verify v4 roundtrip
+        let decrypted_v4 = decrypt(&v4_encrypted).unwrap();
+        assert_eq!(decrypted_v4, plaintext);
     }
 
     #[test]

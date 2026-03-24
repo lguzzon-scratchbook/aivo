@@ -348,7 +348,7 @@ async fn handle_chat_completions_with_filter(
             }
         };
     if requested_stream {
-        let sse = convert_openai_chat_response_to_sse(&chat_response);
+        let sse = convert_openai_chat_response_to_sse(&chat_response)?;
         Ok(http_utils::http_response(200, "text/event-stream", &sse))
     } else {
         Ok(http_utils::http_json_response(

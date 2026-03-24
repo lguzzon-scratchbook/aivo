@@ -197,7 +197,10 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
         let (mut socket, peer_addr) = accept?;
         let peer_ip = peer_addr.ip().to_string();
         let state = state.clone();
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => continue, // semaphore closed during shutdown
+        };
         let expected_auth = expected_auth.clone();
 
         tokio::spawn(async move {

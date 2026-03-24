@@ -199,9 +199,8 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
     serde_json::to_value(response).expect("typed openai chat response should serialize")
 }
 
-pub fn convert_openai_chat_response_to_sse(resp: &Value) -> String {
-    let response: OpenAIChatResponse =
-        serde_json::from_value(resp.clone()).expect("openai chat response should be typed");
+pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde_json::Error> {
+    let response: OpenAIChatResponse = serde_json::from_value(resp.clone())?;
     let id = response.id;
     let model = response.model;
     let created = response.created.unwrap_or_else(current_unix_ts);
@@ -303,7 +302,7 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> String {
         })
     ));
     events.push_str("data: [DONE]\n\n");
-    events
+    Ok(events)
 }
 
 fn openai_user_to_anthropic(msg: &Value, role: &str) -> Value {

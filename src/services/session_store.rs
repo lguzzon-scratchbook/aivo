@@ -1152,9 +1152,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify the file contains encrypted key (v3 marker)
+        // Verify the file contains encrypted key (v4 marker)
         let file_content = tokio::fs::read_to_string(&config_path).await.unwrap();
-        assert!(file_content.contains("enc3:"));
+        assert!(file_content.contains("enc4:"));
         assert!(!file_content.contains("sk-secret-12345"));
 
         // Verify we can still read back the decrypted key

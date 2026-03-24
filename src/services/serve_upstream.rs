@@ -257,7 +257,7 @@ async fn finalize_anthropic_response(
         Ok(RouterResponse::buffered(
             200,
             "text/event-stream",
-            convert_openai_chat_response_to_sse(&openai_resp).into_bytes(),
+            convert_openai_chat_response_to_sse(&openai_resp)?.into_bytes(),
         ))
     } else {
         Ok(RouterResponse::buffered(
@@ -303,7 +303,7 @@ async fn finalize_gemini_response(
         Ok(RouterResponse::buffered(
             200,
             "text/event-stream",
-            convert_openai_chat_response_to_sse(&openai_resp).into_bytes(),
+            convert_openai_chat_response_to_sse(&openai_resp)?.into_bytes(),
         ))
     } else {
         Ok(RouterResponse::buffered(
@@ -343,7 +343,7 @@ async fn finalize_openai_response(
         return Ok(RouterResponse::buffered(
             200,
             "text/event-stream",
-            convert_openai_chat_response_to_sse(&openai_resp).into_bytes(),
+            convert_openai_chat_response_to_sse(&openai_resp)?.into_bytes(),
         ));
     }
 

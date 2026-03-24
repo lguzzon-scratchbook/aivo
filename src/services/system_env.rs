@@ -137,11 +137,48 @@ pub fn machine_id() -> Option<String> {
 fn parse_macos_platform_uuid(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let pos = line.find("IOPlatformUUID")?;
+        let rest = &line[pos..];
+        // Skip past `"IOPlatformUUID" = "` to find the value
+        let eq_pos = rest.find('=')?;
+        let after_eq = &rest[eq_pos + 1..];
+        let open_quote = after_eq.find('"')?;
+        let value_start = open_quote + 1;
+        let close_quote = after_eq[value_start..].find('"')?;
+        let uuid = after_eq[value_start..value_start + close_quote]
+            .trim()
+            .to_string();
+        (!uuid.is_empty()).then_some(uuid)
+    })
+}
+
+/// Legacy parser preserved for v3 key derivation backward compatibility.
+/// The original parser incorrectly extracted `=` instead of the UUID value.
+#[cfg(target_os = "macos")]
+fn parse_macos_platform_uuid_legacy(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let pos = line.find("IOPlatformUUID")?;
         let start = line[pos..].find('"').map(|i| pos + i + 1)?;
         let end = line[start..].find('"').map(|i| start + i)?;
         let uuid = line[start..end].trim().to_string();
         (!uuid.is_empty()).then_some(uuid)
     })
+}
+
+/// Legacy machine ID using the buggy UUID parser, preserved for v3 key derivation.
+pub fn machine_id_legacy() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .ok()?;
+        parse_macos_platform_uuid_legacy(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        machine_id()
+    }
 }
 
 fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
@@ -193,20 +230,28 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_macos_platform_uuid_extracts_value() {
-        // The parser hops between quote pairs: first `"` after the key name,
-        // then the next `"`.  For the standard ioreg format this yields `=`
-        // (the text between the closing key-quote and the opening value-quote).
-        // Changing this would alter the encryption key derived from machine_id.
         let output = r#"    "IOPlatformUUID" = "12345678-1234-1234-1234-123456789ABC""#;
-
-        assert_eq!(parse_macos_platform_uuid(output).as_deref(), Some("="));
+        assert_eq!(
+            parse_macos_platform_uuid(output).as_deref(),
+            Some("12345678-1234-1234-1234-123456789ABC")
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_macos_platform_uuid_rejects_blank_values() {
-        // When there is no content between the two quote hops the result is empty.
-        let output = r#"    "IOPlatformUUID"""#;
+        let output = r#"    "IOPlatformUUID" = """#;
         assert_eq!(parse_macos_platform_uuid(output), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_macos_platform_uuid_legacy_returns_equals() {
+        // Legacy parser preserved for v3 backward compatibility — returns "="
+        let output = r#"    "IOPlatformUUID" = "12345678-1234-1234-1234-123456789ABC""#;
+        assert_eq!(
+            parse_macos_platform_uuid_legacy(output).as_deref(),
+            Some("=")
+        );
     }
 }

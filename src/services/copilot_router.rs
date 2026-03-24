@@ -117,11 +117,11 @@ async fn handle_messages(
 
     if is_streaming {
         // Convert to Anthropic SSE format
-        let sse = openai_to_anthropic_sse(&openai_resp, &model);
+        let sse = openai_to_anthropic_sse(&openai_resp, &model)?;
         Ok(http_utils::http_response(200, "text/event-stream", &sse))
     } else {
         // Convert to Anthropic Messages response
-        let anthropic_resp = openai_to_anthropic(&openai_resp, &model);
+        let anthropic_resp = openai_to_anthropic(&openai_resp, &model)?;
         let json = serde_json::to_string(&anthropic_resp)?;
         Ok(http_utils::http_json_response(200, &json))
     }
@@ -195,8 +195,8 @@ fn anthropic_to_openai(body: &Value) -> Value {
 
 // --- Response conversion: OpenAI Chat Completions → Anthropic Messages ---
 
-fn openai_to_anthropic(resp: &Value, model: &str) -> Value {
-    convert_openai_to_anthropic_message(
+fn openai_to_anthropic(resp: &Value, model: &str) -> Result<Value> {
+    Ok(convert_openai_to_anthropic_message(
         resp,
         &OpenAIToAnthropicConfig {
             fallback_id: "msg_copilot",
@@ -204,12 +204,12 @@ fn openai_to_anthropic(resp: &Value, model: &str) -> Value {
             include_created: false,
             usage_value_mode: UsageValueMode::PreserveJson,
         },
-    )
+    )?)
 }
 
 /// Converts an OpenAI response to Anthropic SSE event stream.
-fn openai_to_anthropic_sse(resp: &Value, model: &str) -> String {
-    let anthropic = openai_to_anthropic(resp, model);
+fn openai_to_anthropic_sse(resp: &Value, model: &str) -> Result<String> {
+    let anthropic = openai_to_anthropic(resp, model)?;
     let mut events = String::new();
 
     let input_tokens = anthropic["usage"]["input_tokens"].as_i64().unwrap_or(0);
@@ -306,7 +306,7 @@ fn openai_to_anthropic_sse(resp: &Value, model: &str) -> String {
     // message_stop
     events.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
 
-    events
+    Ok(events)
 }
 
 // HTTP utilities are now provided by crate::services::http_utils
@@ -454,7 +454,7 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": "5", "completion_tokens": 3, "total_tokens": 8}
         });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4.6");
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4.6").unwrap();
         assert_eq!(result["id"], "chatcmpl-xxx");
         assert_eq!(result["model"], "claude-sonnet-4.6");
         assert_eq!(result["content"][0]["text"], "Hello!");
@@ -469,7 +469,7 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "Hi!"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 2}
         });
-        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4");
+        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4").unwrap();
         assert!(sse.contains("event: message_start"));
         assert!(sse.contains("event: content_block_start"));
         assert!(sse.contains("event: content_block_delta"));
@@ -496,7 +496,7 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5}
         });
-        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4");
+        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4").unwrap();
         assert!(sse.contains("\"type\":\"tool_use\""));
         assert!(sse.contains("\"name\":\"read_file\""));
         assert!(sse.contains("input_json_delta"));
@@ -536,7 +536,7 @@ mod tests {
             ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5}
         });
-        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4.6");
+        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4.6").unwrap();
         assert!(sse.contains("Checking..."));
         assert!(sse.contains("\"type\":\"tool_use\""));
         assert!(sse.contains("\"name\":\"exec\""));
@@ -679,7 +679,7 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 5, "completion_tokens": 0}
         });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4").unwrap();
         // Converter still produces a response with model set correctly
         assert_eq!(result["model"], "claude-sonnet-4");
         assert_eq!(result["id"], "chatcmpl-xxx");
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn test_openai_to_anthropic_missing_choices() {
         let resp = json!({"id": "chatcmpl-xxx"});
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4").unwrap();
         assert_eq!(result["model"], "claude-sonnet-4");
     }
 
@@ -699,7 +699,7 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0}
         });
-        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4");
+        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4").unwrap();
         assert!(sse.contains("event: message_start"));
         assert!(sse.contains("event: message_stop"));
     }
@@ -744,7 +744,7 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 5, "completion_tokens": 0}
         });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4").unwrap();
         // Should produce a valid response without panicking
         assert_eq!(result["model"], "claude-sonnet-4");
         assert_eq!(result["id"], "chatcmpl-xxx");
@@ -760,7 +760,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4");
+        let sse = openai_to_anthropic_sse(&resp, "claude-sonnet-4").unwrap();
         assert!(
             sse.contains("event: message_start"),
             "must emit message_start"
@@ -796,7 +796,7 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 5, "completion_tokens": 0}
         });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4").unwrap();
         // Should convert gracefully without panicking
         assert_eq!(result["model"], "claude-sonnet-4");
         assert_eq!(result["id"], "chatcmpl-xxx");
@@ -821,7 +821,7 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5}
         });
-        let result = openai_to_anthropic(&resp, "claude-sonnet-4");
+        let result = openai_to_anthropic(&resp, "claude-sonnet-4").unwrap();
         assert_eq!(result["model"], "claude-sonnet-4");
         // Should produce a tool_use content block
         let content = result["content"]

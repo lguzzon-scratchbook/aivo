@@ -17,9 +17,8 @@ pub struct OpenAIToAnthropicConfig<'a> {
 pub fn convert_openai_to_anthropic_message(
     resp: &Value,
     config: &OpenAIToAnthropicConfig<'_>,
-) -> Value {
-    let response: OpenAIChatResponseView =
-        serde_json::from_value(resp.clone()).expect("openai chat response should be typed");
+) -> Result<Value, serde_json::Error> {
+    let response: OpenAIChatResponseView = serde_json::from_value(resp.clone())?;
 
     let mut content: Vec<Value> = Vec::new();
     let mut final_finish_reason = "stop";
@@ -81,7 +80,7 @@ pub fn convert_openai_to_anthropic_message(
     copy_optional_usage_field(resp, &mut anthropic_resp, "cache_read_input_tokens");
     copy_optional_usage_field(resp, &mut anthropic_resp, "cache_creation_input_tokens");
 
-    anthropic_resp
+    Ok(anthropic_resp)
 }
 
 fn map_finish_reason(finish_reason: &str) -> &'static str {
@@ -159,7 +158,8 @@ mod tests {
                 include_created: true,
                 usage_value_mode: UsageValueMode::CoerceU64,
             },
-        );
+        )
+        .unwrap();
 
         let content = result["content"].as_array().unwrap();
         assert_eq!(result["id"], "chatcmpl-123");
@@ -196,7 +196,8 @@ mod tests {
                 include_created: false,
                 usage_value_mode: UsageValueMode::PreserveJson,
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(result["id"], "msg_copilot");
         assert_eq!(result["model"], "claude-sonnet-4");
@@ -230,7 +231,8 @@ mod tests {
                 include_created: false,
                 usage_value_mode: UsageValueMode::CoerceU64,
             },
-        );
+        )
+        .unwrap();
 
         let content = result["content"].as_array().unwrap();
         assert_eq!(result["stop_reason"], "max_tokens");
@@ -260,11 +262,28 @@ mod tests {
                 include_created: false,
                 usage_value_mode: UsageValueMode::CoerceU64,
             },
-        );
+        )
+        .unwrap();
 
         let content = result["content"].as_array().unwrap();
         assert_eq!(result["stop_reason"], "end_turn");
         assert_eq!(content.len(), 1);
         assert_eq!(content[0], json!({"type": "text", "text": ""}));
+    }
+
+    #[test]
+    fn test_convert_openai_to_anthropic_message_malformed_response_returns_error() {
+        // A non-object value that can't deserialize into OpenAIChatResponseView
+        let resp = json!("not an object");
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg_default",
+                model: "unknown",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        );
+        assert!(result.is_err());
     }
 }

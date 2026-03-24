@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use zeroize::Zeroizing;
 
 use crate::errors::{CLIError, ErrorCategory};
-use crate::services::session_crypto::{decrypt, encrypt, is_encrypted};
+use crate::services::session_crypto::{decrypt, encrypt, is_current_encryption, is_encrypted};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, ConfigContext, GeminiProviderProtocol, OpenAICompatibilityMode,
     StoredConfig,
@@ -83,7 +83,42 @@ impl ApiKeyStore {
 
     /// Gets all API keys without decrypting secrets.
     pub(crate) async fn get_keys(&self) -> Result<Vec<ApiKey>> {
-        Ok(self.ctx.load().await?.api_keys)
+        let config = self.ctx.load().await?;
+        self.maybe_migrate_encryption(&config.api_keys).await;
+        Ok(config.api_keys)
+    }
+
+    /// Re-encrypts any keys still using older encryption versions (v2/v3) to v4.
+    async fn maybe_migrate_encryption(&self, keys: &[ApiKey]) {
+        let needs_migration = keys
+            .iter()
+            .any(|k| is_encrypted(&k.key) && !is_current_encryption(&k.key));
+        if !needs_migration {
+            return;
+        }
+
+        let Ok(_lock) = self.ctx.acquire_config_lock() else {
+            return;
+        };
+        let Ok(mut config) = self.ctx.load().await else {
+            return;
+        };
+
+        let mut changed = false;
+        for key in &mut config.api_keys {
+            if is_encrypted(&key.key)
+                && !is_current_encryption(&key.key)
+                && let Ok(plaintext) = decrypt(&key.key)
+                && let Ok(re_encrypted) = encrypt(&plaintext)
+            {
+                key.key = Zeroizing::new(re_encrypted);
+                changed = true;
+            }
+        }
+
+        if changed {
+            let _ = self.ctx.save_raw(&config).await;
+        }
     }
 
     /// Decrypts a single key's secret in place.
