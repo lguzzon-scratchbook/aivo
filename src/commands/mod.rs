@@ -13,16 +13,15 @@ pub(crate) fn normalize_base_url(url: &str) -> &str {
 
 /// Truncates a URL for display while preserving both the prefix and suffix.
 pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
-    if url.len() <= max_len {
+    let char_count = url.chars().count();
+    if char_count <= max_len {
         return url.to_string();
     }
     let keep_suffix = 15.min(max_len / 3);
     let keep_prefix = max_len.saturating_sub(keep_suffix + 1);
-    format!(
-        "{}…{}",
-        &url[..keep_prefix],
-        &url[url.len() - keep_suffix..]
-    )
+    let prefix: String = url.chars().take(keep_prefix).collect();
+    let suffix: String = url.chars().skip(char_count - keep_suffix).collect();
+    format!("{prefix}…{suffix}")
 }
 
 pub mod alias;

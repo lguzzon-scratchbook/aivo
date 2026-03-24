@@ -337,8 +337,9 @@ fn key_display_name(key_id: &str, keys: &[ApiKey]) -> String {
         .find(|k| k.id == key_id)
         .map(|k| k.display_name().to_string())
         .unwrap_or_else(|| {
-            if key_id.len() > 8 {
-                format!("{}…", &key_id[..8])
+            if key_id.chars().count() > 8 {
+                let truncated: String = key_id.chars().take(8).collect();
+                format!("{truncated}…")
             } else {
                 key_id.to_string()
             }

@@ -39,10 +39,14 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
 
 // Creates a safe preview of an API key, handling short keys without panicking.
 fn key_preview(key: &str) -> String {
-    if key.len() <= 10 {
-        format!("{}...", &key[..3.min(key.len())])
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 10 {
+        let prefix: String = chars.iter().take(3).collect();
+        format!("{prefix}...")
     } else {
-        format!("{}...{}", &key[..6], &key[key.len() - 4..])
+        let prefix: String = chars.iter().take(6).collect();
+        let suffix: String = chars.iter().skip(chars.len() - 4).collect();
+        format!("{prefix}...{suffix}")
     }
 }
 
