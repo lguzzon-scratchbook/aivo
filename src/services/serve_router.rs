@@ -805,7 +805,7 @@ async fn write_router_response(
 async fn write_chunk(socket: &mut tokio::net::TcpStream, chunk: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let formatted = format_http_chunk(chunk);
+    let formatted = http_utils::format_http_chunk(chunk);
     if formatted.is_empty() {
         return Ok(());
     }
@@ -872,17 +872,6 @@ fn convert_chat_response_for_responses_route(
             })
         }
     }
-}
-
-fn format_http_chunk(chunk: &[u8]) -> Vec<u8> {
-    if chunk.is_empty() {
-        return Vec::new();
-    }
-
-    let mut formatted = format!("{:X}\r\n", chunk.len()).into_bytes();
-    formatted.extend_from_slice(chunk);
-    formatted.extend_from_slice(b"\r\n");
-    formatted
 }
 
 #[cfg(test)]
@@ -1062,8 +1051,8 @@ mod tests {
 
     #[test]
     fn format_http_chunk_adds_hex_prefix_and_trailer() {
-        assert_eq!(format_http_chunk(b"hello"), b"5\r\nhello\r\n");
-        assert!(format_http_chunk(b"").is_empty());
+        assert_eq!(http_utils::format_http_chunk(b"hello"), b"5\r\nhello\r\n");
+        assert!(http_utils::format_http_chunk(b"").is_empty());
     }
 
     #[test]
@@ -1104,7 +1093,7 @@ mod tests {
     #[test]
     fn format_http_chunk_large_payload() {
         let data = vec![b'x'; 256];
-        let chunk = format_http_chunk(&data);
+        let chunk = http_utils::format_http_chunk(&data);
         // 256 = 0x100
         assert!(chunk.starts_with(b"100\r\n"));
         assert!(chunk.ends_with(b"\r\n"));
@@ -1112,7 +1101,7 @@ mod tests {
 
     #[test]
     fn format_http_chunk_single_byte() {
-        let chunk = format_http_chunk(b"a");
+        let chunk = http_utils::format_http_chunk(b"a");
         assert_eq!(chunk, b"1\r\na\r\n");
     }
 

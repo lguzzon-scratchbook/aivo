@@ -2,7 +2,6 @@
 //! Handles process spawning with environment injection and stdio passthrough.
 
 use anyhow::{Context, Result};
-use reqwest::Client;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -369,7 +368,7 @@ impl AILauncher {
         model: Option<&str>,
     ) -> Result<(Option<String>, Vec<String>)> {
         let requested_model = model.map(|m| m.strip_prefix("aivo/").unwrap_or(m).to_string());
-        let client = Client::new();
+        let client = crate::services::http_utils::router_http_client();
 
         // Check cache first — skip the spinner if we get a hit
         let fetch_result = if let Some(cached) = self.cache.get(&key.base_url).await {

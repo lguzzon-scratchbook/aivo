@@ -651,6 +651,108 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_converter_text_only_stop() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-sonnet-4-5");
+        let input = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":5}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"content\":\"Hi\""));
+        assert!(output.contains("\"finish_reason\":\"stop\""));
+        assert!(!output.contains("\"tool_calls\""));
+        assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_anthropic_converter_max_tokens_reason() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-sonnet-4-5");
+        let input = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_3\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":5}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Truncated\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":10}}\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"finish_reason\":\"length\""));
+    }
+
+    #[test]
+    fn test_anthropic_converter_empty_input() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-sonnet-4-5");
+        let output = converter.push_bytes(b"").unwrap();
+        assert!(output.is_empty());
+        let finish = converter.finish().unwrap();
+        // Should still emit a finish even with no content
+        assert!(finish.contains("\"finish_reason\":\"stop\""));
+        assert!(finish.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_anthropic_converter_fallback_model() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("my-fallback");
+        // No message_start with model → should use fallback
+        let input = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        let output = converter.push_bytes(input.as_bytes()).unwrap();
+        assert!(output.contains("\"model\":\"my-fallback\""));
+    }
+
+    #[test]
+    fn test_anthropic_converter_ignores_invalid_json() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("model");
+        let input = "data: {not valid json}\n\n";
+        let output = converter.push_bytes(input.as_bytes()).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_gemini_converter_text_only() {
+        let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-pro");
+        let input = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"content\":\"Hello world\""));
+        assert!(output.contains("\"finish_reason\":\"stop\""));
+        assert!(output.contains("\"prompt_tokens\":5"));
+        assert!(output.contains("\"completion_tokens\":2"));
+    }
+
+    #[test]
+    fn test_gemini_converter_max_tokens() {
+        let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-pro");
+        let input = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}]},\"finishReason\":\"MAX_TOKENS\"}]}\n\n";
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+        assert!(output.contains("\"finish_reason\":\"length\""));
+    }
+
+    #[test]
+    fn test_gemini_converter_safety_filter() {
+        let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-pro");
+        let input = "data: {\"candidates\":[{\"finishReason\":\"SAFETY\"}]}\n\n";
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+        assert!(output.contains("\"finish_reason\":\"content_filter\""));
+    }
+
+    #[test]
+    fn test_gemini_converter_empty_input() {
+        let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-pro");
+        let output = converter.push_bytes(b"").unwrap();
+        assert!(output.is_empty());
+        let finish = converter.finish().unwrap();
+        assert!(finish.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[test]
     fn test_gemini_stream_converter_emits_openai_sse() {
         let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-pro");
         let input = concat!(

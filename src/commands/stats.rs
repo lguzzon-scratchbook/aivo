@@ -356,13 +356,10 @@ fn bar(value: u64, max_value: u64) -> String {
     let full = eighths / 8;
     let frac = eighths % 8;
     let mut s = "█".repeat(full);
-    if frac > 0 {
-        s.push(
-            ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][frac]
-                .chars()
-                .next()
-                .unwrap(),
-        );
+    if frac > 0
+        && let Some(ch) = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][frac].chars().next()
+    {
+        s.push(ch);
     }
     if s.is_empty() {
         s.push('▏');

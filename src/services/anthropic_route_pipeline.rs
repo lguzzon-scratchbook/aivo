@@ -146,8 +146,8 @@ pub(crate) fn inject_chat_completions_cache_control(body: &mut Value) {
 
 pub(crate) fn inject_cache_control_on_last_block(value: &mut Value) {
     match value {
-        Value::String(_) => {
-            let text = value.as_str().unwrap().to_string();
+        Value::String(s) => {
+            let text = s.clone();
             *value = json!([{
                 "type": "text",
                 "text": text,

@@ -8,7 +8,7 @@
  * Flow:
  * Anthropic /v1/messages → Router → OpenAI /v1/chat/completions
  */
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -165,20 +165,15 @@ async fn write_router_response(
     socket: &mut tokio::net::TcpStream,
     response: RouterResponse,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
     match response {
         RouterResponse::Buffered {
             status,
             content_type,
             body,
         } => {
-            let headers = http_utils::http_response_head(status, &content_type, body.len());
-            socket.write_all(headers.as_bytes()).await?;
-            socket.write_all(&body).await?;
+            http_utils::write_buffered_response(socket, status, &content_type, &body).await?;
         }
     }
-
     Ok(())
 }
 
@@ -270,7 +265,7 @@ async fn handle_anthropic_to_upstream(
         return Ok(response);
     }
 
-    let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content);
+    let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content)?;
     // Only inject cache_control for Claude models — other providers don't support it
     // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
     if model_is_claude {
@@ -365,7 +360,7 @@ async fn handle_anthropic_to_upstream(
                 }
             }
             ProviderProtocol::ResponsesApi => {
-                let mut responses_body = convert_chat_to_responses_request(&req_body);
+                let mut responses_body = convert_chat_to_responses_request(&req_body)?;
                 responses_body["stream"] = json!(false);
                 let url = build_responses_url(&config.target_base_url);
                 let response = client
@@ -393,7 +388,7 @@ async fn handle_anthropic_to_upstream(
                     })
                 } else {
                     let resp: Value = serde_json::from_str(&response_body)?;
-                    let openai_response = convert_responses_to_chat_response(&resp);
+                    let openai_response = convert_responses_to_chat_response(&resp)?;
                     let r = if requested_stream {
                         let openai_sse = convert_openai_chat_response_to_sse(&openai_response)?;
                         let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
@@ -498,7 +493,7 @@ async fn handle_anthropic_to_upstream(
     }))
 }
 
-fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value {
+fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Result<Value> {
     let mut req = convert_anthropic_to_openai_request(
         body,
         &AnthropicToOpenAIConfig {
@@ -511,11 +506,11 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Value 
             fallback_tool_arguments_json: "{}",
         },
     );
-    let mut typed_req: OpenAIChatRequest =
-        serde_json::from_value(req).expect("anthropic -> openai request should be typed");
+    let mut typed_req: OpenAIChatRequest = serde_json::from_value(req)
+        .context("failed to convert anthropic request to typed OpenAI request")?;
     stringify_typed_message_content(&mut typed_req);
-    req = serde_json::to_value(typed_req).expect("typed openai request should serialize");
-    req
+    req = serde_json::to_value(typed_req).context("failed to serialize typed OpenAI request")?;
+    Ok(req)
 }
 
 /// Flatten any array-valued `content` fields to plain strings.
@@ -546,19 +541,19 @@ fn is_responses_api_error(body: &str) -> bool {
 }
 
 /// Convert OpenAI Chat Completions request → Responses API request.
-fn convert_chat_to_responses_request(openai_req: &Value) -> Value {
-    let openai_req: OpenAIChatRequest =
-        serde_json::from_value(openai_req.clone()).expect("openai chat request should be typed");
+fn convert_chat_to_responses_request(openai_req: &Value) -> Result<Value> {
+    let openai_req: OpenAIChatRequest = serde_json::from_value(openai_req.clone())
+        .context("failed to parse openai chat request for responses conversion")?;
     serde_json::to_value(convert_typed_chat_to_responses_request(&openai_req))
-        .expect("responses request should serialize")
+        .context("failed to serialize responses request")
 }
 
 /// Convert Responses API response → OpenAI Chat Completions response.
-fn convert_responses_to_chat_response(resp: &Value) -> Value {
+fn convert_responses_to_chat_response(resp: &Value) -> Result<Value> {
     let response: ResponsesResponse =
-        serde_json::from_value(resp.clone()).expect("responses response should be typed");
+        serde_json::from_value(resp.clone()).context("failed to parse responses API response")?;
     serde_json::to_value(convert_typed_responses_to_chat_response(&response))
-        .expect("openai chat response should serialize")
+        .context("failed to serialize openai chat response")
 }
 
 fn prepare_gateway_model_metadata(
@@ -1209,7 +1204,7 @@ mod tests {
             "stream": true
         });
 
-        let req = anthropic_to_openai(&body, false);
+        let req = anthropic_to_openai(&body, false).unwrap();
         let messages = req["messages"].as_array().unwrap();
 
         assert_eq!(req["model"], "gpt-4o-mini");
@@ -1264,7 +1259,7 @@ mod tests {
             }]
         });
 
-        let req = anthropic_to_openai(&body, true);
+        let req = anthropic_to_openai(&body, true).unwrap();
         let messages = req["messages"].as_array().unwrap();
 
         assert_eq!(messages[0]["role"], "assistant");
@@ -1290,7 +1285,7 @@ mod tests {
             }]
         });
 
-        let req = anthropic_to_openai(&body, true);
+        let req = anthropic_to_openai(&body, true).unwrap();
         let messages = req["messages"].as_array().unwrap();
 
         assert_eq!(messages[0]["role"], "assistant");
@@ -1429,7 +1424,7 @@ data: [DONE]\n";
             }]
         });
 
-        let req = anthropic_to_openai(&body, false);
+        let req = anthropic_to_openai(&body, false).unwrap();
         let messages = req["messages"].as_array().unwrap();
 
         // content must be present (null) for strict providers like Cloudflare Workers AI
@@ -1495,7 +1490,7 @@ data: [DONE]\n";
             "model": "gpt-4o",
             "messages": []
         });
-        let req = anthropic_to_openai(&body, false);
+        let req = anthropic_to_openai(&body, false).unwrap();
         let messages = req["messages"].as_array().unwrap();
         assert!(messages.is_empty());
     }

@@ -178,37 +178,20 @@ async fn write_router_response(
     socket: &mut tokio::net::TcpStream,
     response: RouterResponse,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
     match response {
         RouterResponse::Buffered {
             status,
             content_type,
             body,
         } => {
-            let headers = http_utils::http_response_head(status, &content_type, body.len());
-            socket.write_all(headers.as_bytes()).await?;
-            socket.write_all(&body).await?;
+            http_utils::write_buffered_response(socket, status, &content_type, &body).await?;
         }
         RouterResponse::Streaming {
             status,
             content_type,
-            mut upstream,
+            upstream,
         } => {
-            let headers = http_utils::http_chunked_response_head(status, &content_type);
-            socket.write_all(headers.as_bytes()).await?;
-
-            while let Some(chunk) = upstream.chunk().await? {
-                if chunk.is_empty() {
-                    continue;
-                }
-                let chunk_len = format!("{:X}\r\n", chunk.len());
-                socket.write_all(chunk_len.as_bytes()).await?;
-                socket.write_all(&chunk).await?;
-                socket.write_all(b"\r\n").await?;
-            }
-
-            socket.write_all(b"0\r\n\r\n").await?;
+            http_utils::write_streaming_response(socket, status, &content_type, upstream).await?;
         }
     }
     Ok(())

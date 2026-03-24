@@ -95,7 +95,11 @@ impl CopilotTokenManager {
         }
 
         // Exchange GitHub token for Copilot token
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client
             .get(COPILOT_TOKEN_URL)
             .header("Authorization", format!("token {}", self.github_token))
@@ -140,7 +144,11 @@ impl CopilotTokenManager {
 pub async fn device_flow_login() -> Result<String> {
     use crate::style;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     // Step 1: Request device code
     let resp = client
@@ -239,5 +247,55 @@ mod tests {
     #[test]
     fn test_default_interval() {
         assert_eq!(default_interval(), 5);
+    }
+
+    #[test]
+    fn test_device_code_response_deserialize() {
+        let json = r#"{"device_code":"abc123","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","interval":8}"#;
+        let resp: DeviceCodeResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.device_code, "abc123");
+        assert_eq!(resp.user_code, "ABCD-1234");
+        assert_eq!(resp.verification_uri, "https://github.com/login/device");
+        assert_eq!(resp.interval, 8);
+    }
+
+    #[test]
+    fn test_device_code_response_default_interval() {
+        let json =
+            r#"{"device_code":"abc","user_code":"XY-12","verification_uri":"https://example.com"}"#;
+        let resp: DeviceCodeResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.interval, 5);
+    }
+
+    #[test]
+    fn test_access_token_response_with_token() {
+        let json = r#"{"access_token":"gho_abc123"}"#;
+        let resp: AccessTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token.as_deref(), Some("gho_abc123"));
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_access_token_response_with_error() {
+        let json = r#"{"error":"authorization_pending"}"#;
+        let resp: AccessTokenResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.access_token.is_none());
+        assert_eq!(resp.error.as_deref(), Some("authorization_pending"));
+    }
+
+    #[test]
+    fn test_copilot_token_response_deserialize() {
+        let json = r#"{"token":"tok_abc","expires_at":1700000000,"endpoints":{"api":"https://api.githubcopilot.com"}}"#;
+        let resp: CopilotTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.token, "tok_abc");
+        assert_eq!(resp.expires_at, 1700000000);
+        assert_eq!(resp.endpoints.api, "https://api.githubcopilot.com");
+    }
+
+    #[tokio::test]
+    async fn test_copilot_token_manager_cache_starts_empty() {
+        let mgr = CopilotTokenManager::new("gho_test".to_string());
+        let cached = mgr.cached.read().await;
+        assert!(cached.is_none());
     }
 }

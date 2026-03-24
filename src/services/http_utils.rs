@@ -148,7 +148,10 @@ where
         let (mut socket, _) = listener.accept().await?;
         let state = state.clone();
         let handler = handler.clone();
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => continue, // semaphore closed; skip connection
+        };
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -437,6 +440,52 @@ pub fn http_chunked_response_head_with_extra(
         content_type,
         format_extra_headers(extra)
     )
+}
+
+/// Formats a single chunk for HTTP chunked transfer encoding.
+/// Returns empty vec for empty input.
+pub fn format_http_chunk(chunk: &[u8]) -> Vec<u8> {
+    if chunk.is_empty() {
+        return Vec::new();
+    }
+    let mut formatted = format!("{:X}\r\n", chunk.len()).into_bytes();
+    formatted.extend_from_slice(chunk);
+    formatted.extend_from_slice(b"\r\n");
+    formatted
+}
+
+/// Writes a buffered HTTP response (status + headers + body) to a TCP stream.
+pub async fn write_buffered_response(
+    socket: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let headers = http_response_head(status, content_type, body.len());
+    socket.write_all(headers.as_bytes()).await?;
+    socket.write_all(body).await?;
+    Ok(())
+}
+
+/// Streams a reqwest Response as chunked HTTP to a TCP stream.
+pub async fn write_streaming_response(
+    socket: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    mut upstream: reqwest::Response,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let headers = http_chunked_response_head(status, content_type);
+    socket.write_all(headers.as_bytes()).await?;
+    while let Some(chunk) = upstream.chunk().await? {
+        let formatted = format_http_chunk(&chunk);
+        if !formatted.is_empty() {
+            socket.write_all(&formatted).await?;
+        }
+    }
+    socket.write_all(b"0\r\n\r\n").await?;
+    Ok(())
 }
 
 /// Formats an HTTP response with the correct status line, Content-Type, and body.

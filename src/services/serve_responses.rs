@@ -204,10 +204,9 @@ impl OpenAIToResponsesStreamConverter {
                         },
                     );
                 }
-                let state = self
-                    .tool_calls
-                    .get_mut(&index)
-                    .expect("tool state inserted");
+                let Some(state) = self.tool_calls.get_mut(&index) else {
+                    continue;
+                };
 
                 if let Some(call_id) = tool_call.get("id").and_then(|v| v.as_str())
                     && !call_id.is_empty()

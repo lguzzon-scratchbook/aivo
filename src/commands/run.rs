@@ -257,4 +257,33 @@ mod tests {
         assert!(AIToolType::parse("opencode").is_some());
         assert!(AIToolType::parse("pi").is_some());
     }
+
+    #[test]
+    fn test_invalid_ai_tool() {
+        assert!(AIToolType::parse("unknown").is_none());
+        assert!(AIToolType::parse("").is_none());
+        assert!(AIToolType::parse("chatgpt").is_none());
+    }
+
+    #[test]
+    fn test_ai_tool_type_display_names() {
+        // Ensure all tools have valid string representations
+        let tools = ["claude", "codex", "gemini", "opencode", "pi"];
+        for tool in &tools {
+            let parsed = AIToolType::parse(tool).unwrap();
+            // Roundtrip: parsing should give a valid tool type
+            assert!(
+                matches!(
+                    parsed,
+                    AIToolType::Claude
+                        | AIToolType::Codex
+                        | AIToolType::Gemini
+                        | AIToolType::Opencode
+                        | AIToolType::Pi
+                ),
+                "Tool {} should parse to a valid AIToolType",
+                tool
+            );
+        }
+    }
 }

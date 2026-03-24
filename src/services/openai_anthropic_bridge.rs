@@ -196,7 +196,9 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         },
     };
 
-    serde_json::to_value(response).expect("typed openai chat response should serialize")
+    serde_json::to_value(response).unwrap_or_else(
+        |_| serde_json::json!({"error": "failed to serialize openai chat response"}),
+    )
 }
 
 pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde_json::Error> {

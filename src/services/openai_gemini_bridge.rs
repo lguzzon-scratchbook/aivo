@@ -266,8 +266,10 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         "role": "assistant",
         "content": if text_parts.is_empty() { Value::Null } else { Value::String(text_parts.join("\n")) }
     });
-    if message["content"].is_null() {
-        message.as_object_mut().unwrap().remove("content");
+    if message["content"].is_null()
+        && let Some(obj) = message.as_object_mut()
+    {
+        obj.remove("content");
     }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);

@@ -71,3 +71,198 @@ impl DirectoryStartsStore {
         Ok(removed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::session_store::{ApiKey, ConfigContext, StoredConfig};
+    use tempfile::TempDir;
+
+    fn make_store(temp_dir: &TempDir) -> DirectoryStartsStore {
+        let config_path = temp_dir.path().join("config.json");
+        let config_dir = temp_dir.path().to_path_buf();
+        DirectoryStartsStore {
+            ctx: ConfigContext {
+                config_path,
+                config_dir,
+            },
+        }
+    }
+
+    async fn write_config_with_key(store: &DirectoryStartsStore, key_id: &str, base_url: &str) {
+        let config = StoredConfig {
+            api_keys: vec![ApiKey::new_with_protocol(
+                key_id.to_string(),
+                "test".to_string(),
+                base_url.to_string(),
+                None,
+                "sk-test".to_string(),
+            )],
+            ..StoredConfig::new()
+        };
+        let data = serde_json::to_string_pretty(&config).unwrap();
+        tokio::fs::create_dir_all(&store.ctx.config_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(&store.ctx.config_path, &data)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_directory_start_returns_none_when_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        let result = store.get_directory_start("/tmp/test").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_and_get_directory_start_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "claude",
+                Some("gpt-4o"),
+            )
+            .await
+            .unwrap();
+
+        let record = store
+            .get_directory_start("/tmp/test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.key_id, "key1");
+        assert_eq!(record.base_url, "http://localhost");
+        assert_eq!(record.tool, "claude");
+        assert_eq!(record.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn set_directory_start_with_empty_model_stores_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "claude",
+                Some("  "),
+            )
+            .await
+            .unwrap();
+
+        let record = store
+            .get_directory_start("/tmp/test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.model.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_directory_start_with_none_model() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start("/tmp/test", "key1", "http://localhost", "codex", None)
+            .await
+            .unwrap();
+
+        let record = store
+            .get_directory_start("/tmp/test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.tool, "codex");
+        assert!(record.model.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_directory_start_prunes_stale_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        // Write config with key1
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        // Set directory start for key1
+        store
+            .set_directory_start("/tmp/test", "key1", "http://localhost", "claude", None)
+            .await
+            .unwrap();
+
+        // Now write a config WITHOUT key1 (simulating key deletion)
+        let config = StoredConfig::new();
+        let data = serde_json::to_string_pretty(&config).unwrap();
+        tokio::fs::write(&store.ctx.config_path, &data)
+            .await
+            .unwrap();
+
+        // Should return None and prune the stale record
+        let result = store.get_directory_start("/tmp/test").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_directory_start_removes_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start("/tmp/test", "key1", "http://localhost", "claude", None)
+            .await
+            .unwrap();
+
+        assert!(store.clear_directory_start("/tmp/test").await.unwrap());
+        assert!(!store.clear_directory_start("/tmp/test").await.unwrap());
+
+        let result = store.get_directory_start("/tmp/test").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_directory_start_overwrites_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start("/tmp/test", "key1", "http://localhost", "claude", None)
+            .await
+            .unwrap();
+
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "codex",
+                Some("gpt-4o"),
+            )
+            .await
+            .unwrap();
+
+        let record = store
+            .get_directory_start("/tmp/test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.tool, "codex");
+        assert_eq!(record.model.as_deref(), Some("gpt-4o"));
+    }
+}

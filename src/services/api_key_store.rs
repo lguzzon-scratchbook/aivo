@@ -355,3 +355,180 @@ impl ApiKeyStore {
         self.ctx.save_raw(&config).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::session_store::ConfigContext;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    fn make_store(temp_dir: &TempDir) -> ApiKeyStore {
+        let config_path = temp_dir.path().join("config.json");
+        let config_dir = temp_dir.path().to_path_buf();
+        ApiKeyStore {
+            ctx: ConfigContext {
+                config_path,
+                config_dir,
+            },
+        }
+    }
+
+    #[test]
+    fn generate_key_id_produces_valid_ids() {
+        let existing = HashSet::new();
+        let id = generate_key_id(&existing).unwrap();
+        assert_eq!(id.len(), KEY_ID_LENGTH);
+        assert!(id.chars().all(|c| KEY_ID_ALPHABET.contains(&(c as u8))));
+    }
+
+    #[test]
+    fn generate_key_id_avoids_collisions() {
+        let mut existing = HashSet::new();
+        // Generate several IDs and ensure no duplicates
+        for _ in 0..50 {
+            let id = generate_key_id(&existing).unwrap();
+            assert!(!existing.contains(&id));
+            existing.insert(id);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_active_key_nonexistent_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        let result = store.set_active_key("nonexistent").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn chat_model_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        // No model set initially
+        let model = store.get_chat_model("key1").await.unwrap();
+        assert!(model.is_none());
+
+        // Set and retrieve
+        store.set_chat_model("key1", "gpt-4o").await.unwrap();
+        let model = store.get_chat_model("key1").await.unwrap();
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
+
+        // Overwrite
+        store.set_chat_model("key1", "claude-sonnet").await.unwrap();
+        let model = store.get_chat_model("key1").await.unwrap();
+        assert_eq!(model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[tokio::test]
+    async fn get_keys_and_active_id_info_returns_both() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+        store.set_active_key(&id).await.unwrap();
+
+        let (keys, active_id) = store.get_keys_and_active_id_info().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(active_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn get_active_key_info_returns_without_decryption() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        // No active key
+        let info = store.get_active_key_info().await.unwrap();
+        assert!(info.is_none());
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-secret")
+            .await
+            .unwrap();
+        store.set_active_key(&id).await.unwrap();
+
+        let info = store.get_active_key_info().await.unwrap().unwrap();
+        assert_eq!(info.id, id);
+        assert_eq!(info.name, "test");
+        // Key should still be encrypted (not decrypted)
+        assert!(is_encrypted(&info.key));
+    }
+
+    #[tokio::test]
+    async fn delete_key_clears_chat_models() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+        store.set_chat_model(&id, "gpt-4o").await.unwrap();
+
+        store.delete_key(&id).await.unwrap();
+
+        let model = store.get_chat_model(&id).await.unwrap();
+        assert!(model.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_key_returns_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        assert!(!store.delete_key("nonexistent").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_key_responses_api_supported_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .set_key_responses_api_supported(&id, Some(true))
+                .await
+                .unwrap()
+        );
+
+        let key = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(key.responses_api_supported, Some(true));
+    }
+
+    #[tokio::test]
+    async fn update_key_returns_base_url_changed() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let id = store
+            .add_key_with_protocol("test", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        // Same base_url — no change
+        let (found, changed) = store
+            .update_key(&id, "test", "http://localhost", None, "sk-new")
+            .await
+            .unwrap();
+        assert!(found);
+        assert!(!changed);
+
+        // Different base_url — changed
+        let (found, changed) = store
+            .update_key(&id, "test", "http://new-host", None, "sk-new")
+            .await
+            .unwrap();
+        assert!(found);
+        assert!(changed);
+    }
+}

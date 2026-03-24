@@ -30,6 +30,7 @@ pub mod protocol_fallback;
 pub mod provider_profile;
 pub mod provider_protocol;
 pub mod request_log;
+pub mod responses_chat_conversion;
 pub mod responses_to_chat_router;
 pub mod serve_responses;
 pub mod serve_router;

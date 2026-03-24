@@ -502,3 +502,353 @@ impl ChatSessionStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::session_store::{ApiKey, ConfigContext, StoredChatMessage, StoredConfig};
+    use tempfile::TempDir;
+
+    fn make_store(temp_dir: &TempDir) -> ChatSessionStore {
+        let config_path = temp_dir.path().join("config.json");
+        let config_dir = temp_dir.path().to_path_buf();
+        ChatSessionStore {
+            ctx: ConfigContext {
+                config_path,
+                config_dir,
+            },
+        }
+    }
+
+    async fn setup_store_with_key(temp_dir: &TempDir) -> (ChatSessionStore, String) {
+        let store = make_store(temp_dir);
+        let key_id = "abc".to_string();
+        let base_url = "http://localhost".to_string();
+
+        // Write a config with one key so list_chat_sessions validates it
+        let config = StoredConfig {
+            api_keys: vec![ApiKey::new_with_protocol(
+                key_id.clone(),
+                "test".to_string(),
+                base_url.clone(),
+                None,
+                "sk-test".to_string(),
+            )],
+            active_key_id: Some(key_id.clone()),
+            ..StoredConfig::new()
+        };
+        let data = serde_json::to_string_pretty(&config).unwrap();
+        tokio::fs::write(&store.ctx.config_path, &data)
+            .await
+            .unwrap();
+
+        (store, key_id)
+    }
+
+    fn sample_messages() -> Vec<StoredChatMessage> {
+        vec![StoredChatMessage {
+            role: "user".to_string(),
+            content: "hello world".to_string(),
+            reasoning_content: None,
+            id: None,
+            timestamp: None,
+            attachments: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_session_returns_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        let result = store.get_chat_session("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_and_get_session_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                &sample_messages(),
+                "hello world",
+                "hello world",
+            )
+            .await
+            .unwrap();
+
+        let session = store.get_chat_session("sess1").await.unwrap().unwrap();
+        assert_eq!(session.session_id, "sess1");
+        assert_eq!(session.model, "gpt-4o");
+        assert_eq!(session.key_id, key_id);
+
+        let messages = session.decrypt_messages().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_file_and_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                &sample_messages(),
+                "hello",
+                "hello",
+            )
+            .await
+            .unwrap();
+
+        let deleted = store.delete_chat_session("sess1").await.unwrap();
+        assert!(deleted);
+
+        // Session should be gone
+        let session = store.get_chat_session("sess1").await.unwrap();
+        assert!(session.is_none());
+
+        // Deleting again returns false
+        let deleted = store.delete_chat_session("sess1").await.unwrap();
+        assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn remove_sessions_for_key_cleans_up() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        // Create two sessions for same key
+        for sid in &["sess1", "sess2"] {
+            store
+                .save_chat_session_with_id(
+                    &key_id,
+                    "http://localhost",
+                    "/tmp/test",
+                    sid,
+                    "gpt-4o",
+                    &sample_messages(),
+                    "title",
+                    "preview",
+                )
+                .await
+                .unwrap();
+        }
+
+        store.remove_sessions_for_key(&key_id).await.unwrap();
+
+        // Both should be gone
+        assert!(store.get_chat_session("sess1").await.unwrap().is_none());
+        assert!(store.get_chat_session("sess2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_filters_by_key_and_cwd() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        // Save session in /tmp/a
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/a",
+                "sess-a",
+                "gpt-4o",
+                &sample_messages(),
+                "title-a",
+                "preview-a",
+            )
+            .await
+            .unwrap();
+
+        // Save session in /tmp/b
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/b",
+                "sess-b",
+                "gpt-4o",
+                &sample_messages(),
+                "title-b",
+                "preview-b",
+            )
+            .await
+            .unwrap();
+
+        let sessions = store
+            .list_chat_sessions(&key_id, "http://localhost", "/tmp/a")
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "sess-a");
+    }
+
+    #[tokio::test]
+    async fn save_session_preserves_created_at() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                &sample_messages(),
+                "title",
+                "preview",
+            )
+            .await
+            .unwrap();
+
+        let first = store.get_chat_session("sess1").await.unwrap().unwrap();
+        let original_created = first.created_at.clone();
+
+        // Save again (update)
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                &sample_messages(),
+                "title2",
+                "preview2",
+            )
+            .await
+            .unwrap();
+
+        let updated = store.get_chat_session("sess1").await.unwrap().unwrap();
+        assert_eq!(updated.created_at, original_created);
+        // updated_at should be different (or at least not earlier)
+        assert!(updated.updated_at >= original_created);
+    }
+
+    #[tokio::test]
+    async fn rebuild_index_recovers_from_corrupted_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        // Save a session (creates index + file)
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                &sample_messages(),
+                "title",
+                "preview",
+            )
+            .await
+            .unwrap();
+
+        // Corrupt the index file (triggers rebuild via load_index() Err path)
+        let index_path = store.sessions_dir().join("index.json");
+        tokio::fs::write(&index_path, b"not valid json {{{")
+            .await
+            .unwrap();
+
+        // list_chat_sessions should rebuild the index from session files
+        let sessions = store
+            .list_chat_sessions(&key_id, "http://localhost", "/tmp/test")
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "sess1");
+    }
+
+    #[test]
+    fn compute_session_title_uses_last_user_message() {
+        let messages = vec![
+            StoredChatMessage {
+                role: "user".to_string(),
+                content: "first question".to_string(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "assistant".to_string(),
+                content: "answer".to_string(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "user".to_string(),
+                content: "second question".to_string(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+        ];
+        let title = compute_session_title(&messages, "model");
+        assert_eq!(title, "second question");
+    }
+
+    #[test]
+    fn compute_session_title_falls_back_to_model() {
+        let messages: Vec<StoredChatMessage> = vec![];
+        let title = compute_session_title(&messages, "gpt-4o");
+        assert_eq!(title, "gpt-4o");
+    }
+
+    #[test]
+    fn compute_session_preview_joins_recent_messages() {
+        let messages = vec![
+            StoredChatMessage {
+                role: "user".to_string(),
+                content: "hello  world".to_string(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "assistant".to_string(),
+                content: "hi  there".to_string(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+        ];
+        let preview = compute_session_preview(&messages, "model");
+        assert_eq!(preview, "hello world · hi there");
+    }
+
+    #[test]
+    fn compute_session_preview_falls_back_to_model() {
+        let messages: Vec<StoredChatMessage> = vec![];
+        let preview = compute_session_preview(&messages, "gpt-4o");
+        assert_eq!(preview, "gpt-4o");
+    }
+
+    #[test]
+    fn first_non_empty_line_skips_blank_lines() {
+        assert_eq!(first_non_empty_line("\n\n  hello\nworld"), "hello");
+        assert_eq!(first_non_empty_line(""), "");
+        assert_eq!(first_non_empty_line("  \n  \n  "), "");
+    }
+}
