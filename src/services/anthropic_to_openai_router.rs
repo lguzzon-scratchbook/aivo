@@ -13,9 +13,9 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
-use std::sync::atomic::AtomicU8;
 
 use crate::services::anthropic_chat_request::{
     AnthropicToOpenAIConfig, convert_anthropic_to_openai_request,
@@ -23,7 +23,9 @@ use crate::services::anthropic_chat_request::{
 use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
 };
-use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
+use crate::services::anthropic_route_pipeline::{
+    CacheControlPatch, RequestContext, RequestPatch, inject_chat_completions_cache_control,
+};
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::model_names::{
     infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_provider_attempt,
@@ -70,6 +72,9 @@ struct AnthropicToOpenAIRouterState {
     config: Arc<AnthropicToOpenAIRouterConfig>,
     client: reqwest::Client,
     active_protocol: Arc<AtomicU8>,
+    /// Set to true after a native Anthropic attempt returns a protocol mismatch,
+    /// so we don't waste a round-trip on every subsequent Claude request.
+    native_anthropic_failed: Arc<AtomicBool>,
 }
 
 enum RouterResponse {
@@ -96,6 +101,7 @@ impl AnthropicToOpenAIRouter {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
             active_protocol: active_protocol.clone(),
+            native_anthropic_failed: Arc::new(AtomicBool::new(false)),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, active_protocol, handle))
@@ -111,6 +117,7 @@ async fn run_router(
         let config = state.config.clone();
         let client = state.client.clone();
         let active_protocol = state.active_protocol.clone();
+        let native_anthropic_failed = state.native_anthropic_failed.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -133,7 +140,13 @@ async fn run_router(
             }
 
             let response =
-                match handle_anthropic_to_upstream(&request, &config, &client, &active_protocol)
+                match handle_anthropic_to_upstream(
+                    &request,
+                    &config,
+                    &client,
+                    &active_protocol,
+                    &native_anthropic_failed,
+                )
                     .await
                 {
                     Ok(response) => response,
@@ -178,25 +191,88 @@ fn apply_model_prefix(model: &str, prefix: Option<&str>) -> String {
     }
 }
 
+/// Try sending the request in native Anthropic format to the upstream's `/v1/messages`.
+/// Returns `Some(response)` on success or non-mismatch error, `None` on protocol mismatch.
+async fn try_native_anthropic(
+    body: &Value,
+    config: &AnthropicToOpenAIRouterConfig,
+    client: &reqwest::Client,
+    passthrough_headers: &HeaderMap,
+    native_anthropic_failed: &AtomicBool,
+) -> Result<Option<RouterResponse>> {
+    if native_anthropic_failed.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+
+    let mut native_body = body.clone();
+    let ctx = RequestContext {
+        upstream_base_url: &config.target_base_url,
+    };
+    CacheControlPatch.patch_json("messages", &mut native_body, &ctx)?;
+
+    let url = http_utils::build_target_url(&config.target_base_url, "/v1/messages");
+    let mut headers = passthrough_headers.clone();
+    headers.insert("x-api-key", HeaderValue::from_str(&config.target_api_key)?);
+    headers.insert("Content-Type", HeaderValue::from_static(CONTENT_TYPE_JSON));
+    headers.insert(
+        "anthropic-version",
+        HeaderValue::from_static("2023-06-01"),
+    );
+    headers.insert("User-Agent", HeaderValue::from_static("aivo-router/1.0"));
+
+    let response = client
+        .post(&url)
+        .headers(headers)
+        .json(&native_body)
+        .send()
+        .await?;
+
+    let status_code = response.status().as_u16();
+    if is_protocol_mismatch(status_code) {
+        native_anthropic_failed.store(true, Ordering::Relaxed);
+        return Ok(None);
+    }
+
+    let content_type = http_utils::response_content_type(&response);
+    let response_body = response.bytes().await?;
+    Ok(Some(RouterResponse::Buffered {
+        status: status_code,
+        content_type,
+        body: response_body.to_vec(),
+    }))
+}
+
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
 async fn handle_anthropic_to_upstream(
     request: &str,
     config: &Arc<AnthropicToOpenAIRouterConfig>,
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
+    native_anthropic_failed: &Arc<AtomicBool>,
 ) -> Result<RouterResponse> {
     let passthrough_headers = http_utils::extract_passthrough_headers(request)?;
     let body_str = http_utils::extract_request_body(request)?;
 
     let body: Value = serde_json::from_str(body_str)?;
+
+    // If the model is Claude, try native Anthropic first — preserves model name and prompt caching.
+    let model_is_claude = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
+
+    if model_is_claude
+        && let Some(response) =
+            try_native_anthropic(&body, config, client, &passthrough_headers, native_anthropic_failed)
+                .await?
+    {
+        return Ok(response);
+    }
+
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content);
     // Only inject cache_control for Claude models — other providers don't support it
     // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
-    if simplified
-        .get("model")
-        .and_then(|m| m.as_str())
-        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
-    {
+    if model_is_claude {
         inject_chat_completions_cache_control(&mut simplified);
     }
     // Map Anthropic thinking config to OpenAI reasoning_effort
