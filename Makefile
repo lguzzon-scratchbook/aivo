@@ -1,7 +1,7 @@
 # Makefile for aivo CLI
 # Quick commands for development
 
-.PHONY: build build-debug build-release test check clippy clean install fmt release publish
+.PHONY: build build-debug build-release test check clippy clean install fmt release
 
 # Default target
 .DEFAULT_GOAL := help
@@ -47,5 +47,3 @@ release: test clippy build ## Full release workflow (test, lint, build)
 	@echo "Release binary ready at: target/release/aivo"
 	@ls -lh target/release/aivo | awk '{print "Size:", $$5}'
 
-publish: ## Trigger GitHub release (reads version from Cargo.toml)
-	gh workflow run release.yml -f version=v$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')

@@ -1,32 +1,15 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (e.g. v0.14.3)'
-        required: true
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
 
 jobs:
-  create-tag:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Create and push tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "${{ inputs.version }}"
-          git push origin "${{ inputs.version }}"
-
   test:
-    needs: create-tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -118,39 +101,41 @@ jobs:
           cd artifacts
           for f in aivo-*; do sha256sum "$f" > "$f.sha256"; done
 
-      - name: Generate changelog
+      - name: Extract changelog
         id: changelog
         run: |
-          TAG="${{ inputs.version }}"
-          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1)
+          TAG="${{ github.ref_name }}"
+          VER="${TAG#v}"
 
-          if [ -z "$PREV_TAG" ]; then
-            RANGE="$TAG"
-          else
-            RANGE="${PREV_TAG}..${TAG}"
-          fi
-
-          FEATS=$(git log "$RANGE" --oneline --grep="^feat:" --format="- %s" | sed 's/^- feat: /- /')
-          FIXES=$(git log "$RANGE" --oneline --grep="^fix:" --format="- %s" | sed 's/^- fix: /- /')
-          REFACTORS=$(git log "$RANGE" --oneline --grep="^refactor:" --format="- %s" | sed 's/^- refactor: /- /')
-          OTHER=$(git log "$RANGE" --oneline --format="%s" | grep -v -E "^(feat|fix|refactor|style|chore|docs|test|ci):" | sed 's/^/- /')
-
+          # Try CHANGELOG.md first
           BODY=""
-          if [ -n "$FEATS" ]; then
-            BODY="${BODY}### Features\n${FEATS}\n\n"
-          fi
-          if [ -n "$FIXES" ]; then
-            BODY="${BODY}### Fixes\n${FIXES}\n\n"
-          fi
-          if [ -n "$REFACTORS" ]; then
-            BODY="${BODY}### Refactoring\n${REFACTORS}\n\n"
-          fi
-          if [ -n "$OTHER" ]; then
-            BODY="${BODY}### Other\n${OTHER}\n\n"
+          if [ -f CHANGELOG.md ]; then
+            BODY=$(awk "/^## v?${VER}/{found=1; next} /^## v/{if(found) exit} found" CHANGELOG.md)
+            BODY=$(echo "$BODY" | sed -e '/./,$!d' -e :a -e '/^\s*$/{ $d; N; ba; }')
           fi
 
+          # Fallback: auto-generate from commits
           if [ -z "$BODY" ]; then
-            BODY="Release ${TAG}"
+            PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1)
+            if [ -z "$PREV_TAG" ]; then
+              RANGE="$TAG"
+            else
+              RANGE="${PREV_TAG}..${TAG}"
+            fi
+
+            FEATS=$(git log "$RANGE" --oneline --grep="^feat:" --format="- %s" | sed 's/^- feat: /- /')
+            FIXES=$(git log "$RANGE" --oneline --grep="^fix:" --format="- %s" | sed 's/^- fix: /- /')
+            REFACTORS=$(git log "$RANGE" --oneline --grep="^refactor:" --format="- %s" | sed 's/^- refactor: /- /')
+            OTHER=$(git log "$RANGE" --oneline --format="%s" | grep -v -E "^(feat|fix|refactor|style|chore|docs|test|ci):" | sed 's/^/- /')
+
+            if [ -n "$FEATS" ]; then BODY="${BODY}### Features\n${FEATS}\n\n"; fi
+            if [ -n "$FIXES" ]; then BODY="${BODY}### Fixes\n${FIXES}\n\n"; fi
+            if [ -n "$REFACTORS" ]; then BODY="${BODY}### Refactoring\n${REFACTORS}\n\n"; fi
+            if [ -n "$OTHER" ]; then BODY="${BODY}### Other\n${OTHER}\n\n"; fi
+
+            if [ -z "$BODY" ]; then
+              BODY="Release ${TAG}"
+            fi
           fi
 
           {
@@ -161,8 +146,8 @@ jobs:
 
       - name: Publish release
         run: |
-          gh release create "${{ inputs.version }}" \
-            --title "${{ inputs.version }}" \
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
             --notes "${{ steps.changelog.outputs.body }}" \
             artifacts/*
         env:
@@ -186,7 +171,7 @@ jobs:
 
       - name: Set npm package version
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
           cd npm
           npm pkg set version="$VERSION"
@@ -212,7 +197,7 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
 
           DARWIN_ARM64_SHA=$(cut -d' ' -f1 < artifacts/aivo-darwin-arm64.sha256)

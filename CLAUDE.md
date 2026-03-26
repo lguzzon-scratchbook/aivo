@@ -30,11 +30,12 @@ A `Makefile` wraps common workflows: `make test`, `make build`, `make clippy`, `
 
 ## Release Process
 
-1. Bump version in both `Cargo.toml` and `npm/package.json` **first** — never tag without updating the version.
-2. Run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test`.
-3. `cargo build --release && cargo install --path .` to verify the binary.
-4. Commit: `git add -A && git commit -m "chore: release vX.Y.Z"`
-5. Tag and push: `git tag vX.Y.Z && git push origin main --tags`
+1. Optionally add release notes to `CHANGELOG.md` under a `## vX.Y.Z` heading (auto-generated from commits if omitted).
+2. Bump version in both `Cargo.toml` and `npm/package.json` **first** — never tag without updating the version.
+3. Run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test`.
+4. `cargo build --release && cargo install --path .` to verify the binary.
+5. Commit: `git add -A && git commit -m "chore: release vX.Y.Z"`
+6. Tag and push: `git tag vX.Y.Z && git push origin main --tags`
 
 ## CLI / UX Conventions
 
