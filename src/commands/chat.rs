@@ -806,7 +806,6 @@ where
             .post(&url)
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
     .await?;
@@ -937,7 +936,6 @@ where
             .post(url)
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
     .await?;
@@ -1419,7 +1417,6 @@ where
             .post(&url)
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
     .await?;
@@ -1515,7 +1512,6 @@ where
             .post(url)
             .header("Authorization", format!("Bearer {}", key.key.as_str()))
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
     .await?;
@@ -1572,7 +1568,6 @@ where
             .header("x-api-key", key.key.as_str())
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
     .await?;
@@ -1677,7 +1672,6 @@ where
             .header("x-api-key", key.key.as_str())
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
             .json(&request)
     })
     .await?;

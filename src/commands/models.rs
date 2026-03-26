@@ -298,7 +298,6 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             let response = client
                 .get(&url)
                 .header("x-goog-api-key", key.key.as_str())
-                .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
                 .send()
                 .await?;
 
@@ -331,7 +330,6 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                 .get(&url)
                 .header("x-api-key", key.key.as_str())
                 .header("anthropic-version", "2023-06-01")
-                .header("User-Agent", format!("aivo/{}", crate::version::VERSION))
                 .send()
                 .await?;
 
@@ -353,7 +351,6 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             let cloudflare_base = cloudflare_ai_base(base)
                 .ok_or_else(|| anyhow::anyhow!("Failed to normalize Cloudflare AI base URL"))?;
             let auth = format!("Bearer {}", key.key.as_str());
-            let user_agent = format!("aivo/{}", crate::version::VERSION);
             let mut page = 1u32;
             let mut seen = HashSet::new();
             let mut models = Vec::new();
@@ -366,7 +363,6 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                 let response = client
                     .get(&url)
                     .header("Authorization", &auth)
-                    .header("User-Agent", &user_agent)
                     .send()
                     .await?;
 
@@ -405,14 +401,12 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             }
             candidates.extend(model_endpoints(base));
             let auth = format!("Bearer {}", key.key.as_str());
-            let user_agent = format!("aivo/{}", crate::version::VERSION);
 
             let mut last_err = String::new();
             for url in &candidates {
                 let response = client
                     .get(url)
                     .header("Authorization", &auth)
-                    .header("User-Agent", &user_agent)
                     .send()
                     .await?;
 

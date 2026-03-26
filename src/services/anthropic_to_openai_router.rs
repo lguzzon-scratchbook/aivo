@@ -209,7 +209,6 @@ async fn try_native_anthropic(
     headers.insert("x-api-key", HeaderValue::from_str(&config.target_api_key)?);
     headers.insert("Content-Type", HeaderValue::from_static(CONTENT_TYPE_JSON));
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-    headers.insert("User-Agent", HeaderValue::from_static("aivo-router/1.0"));
 
     let response = client
         .post(&url)
@@ -318,7 +317,6 @@ async fn handle_anthropic_to_upstream(
                     .headers(attempt_headers)
                     .header("x-goog-api-key", config.target_api_key.as_str())
                     .header("Content-Type", CONTENT_TYPE_JSON)
-                    .header("User-Agent", "aivo-router/1.0")
                     .json(&google_body)
                     .send()
                     .await?;
@@ -368,7 +366,6 @@ async fn handle_anthropic_to_upstream(
                     .headers(attempt_headers)
                     .header("Authorization", format!("Bearer {}", config.target_api_key))
                     .header("Content-Type", CONTENT_TYPE_JSON)
-                    .header("User-Agent", "aivo-router/1.0")
                     .json(&responses_body)
                     .send()
                     .await?;
@@ -416,7 +413,6 @@ async fn handle_anthropic_to_upstream(
                     .headers(attempt_headers)
                     .header("Authorization", format!("Bearer {}", config.target_api_key))
                     .header("Content-Type", CONTENT_TYPE_JSON)
-                    .header("User-Agent", "aivo-router/1.0")
                     .json(&req_body)
                     .send()
                     .await?;

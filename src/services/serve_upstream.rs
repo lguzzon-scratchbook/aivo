@@ -84,7 +84,6 @@ pub(crate) async fn send_anthropic_chat(
         .header("x-api-key", context.upstream_api_key.as_str())
         .header("anthropic-version", "2023-06-01")
         .header("Content-Type", CONTENT_TYPE_JSON)
-        .header("User-Agent", "aivo-serve/1.0")
         .json(&anthropic_req)
         .send()
         .await?;
@@ -120,7 +119,6 @@ pub(crate) async fn send_gemini_chat(
         .post(&url)
         .header("x-goog-api-key", context.upstream_api_key.as_str())
         .header("Content-Type", CONTENT_TYPE_JSON)
-        .header("User-Agent", "aivo-serve/1.0")
         .json(&gemini_req)
         .send()
         .await?;
