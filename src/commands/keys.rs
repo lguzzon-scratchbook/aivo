@@ -31,6 +31,58 @@ fn term_read_line(prompt: &str) -> std::io::Result<String> {
     Ok(input.trim().to_string())
 }
 
+// Reads a line from stdin with masked echo (prints '*' per character) for secrets.
+fn term_read_secret(prompt: &str) -> std::io::Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::terminal;
+    use std::io::Write;
+
+    print!("{}", prompt);
+    std::io::stdout().flush()?;
+
+    terminal::enable_raw_mode()?;
+    let mut input = String::new();
+    let mut stdout = std::io::stdout();
+    let result = loop {
+        match event::read() {
+            Ok(Event::Key(KeyEvent {
+                code, modifiers, ..
+            })) => match code {
+                KeyCode::Enter => {
+                    let _ = write!(stdout, "\r\n");
+                    let _ = stdout.flush();
+                    break Ok(input);
+                }
+                KeyCode::Backspace => {
+                    if !input.is_empty() {
+                        input.pop();
+                        let _ = write!(stdout, "\x08 \x08");
+                        let _ = stdout.flush();
+                    }
+                }
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = write!(stdout, "\r\n");
+                    let _ = stdout.flush();
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "interrupted",
+                    ));
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    let _ = write!(stdout, "*");
+                    let _ = stdout.flush();
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
 // Reads a confirmation from stdin (y/yes for true, anything else for false).
 fn confirm(prompt: &str) -> std::io::Result<bool> {
     let input = term_read_line(&format!("{} [y/N]: ", prompt))?;
@@ -617,7 +669,7 @@ impl KeysCommand {
         // API Key
         let api_key = loop {
             let preview = key_preview(&key.key);
-            let input = read_line_with_default(&format!("API Key [{}]: ", preview))?;
+            let input = term_read_secret(&format!("API Key [{}]: ", preview))?;
             let value = if input.is_empty() {
                 key.key.as_str().to_string()
             } else {
@@ -905,7 +957,7 @@ impl KeysCommand {
             key.to_string()
         } else {
             loop {
-                let input = read_line("API Key: ")?;
+                let input = term_read_secret(&style::dim("API Key: "))?;
                 if !input.is_empty() {
                     break input;
                 }
