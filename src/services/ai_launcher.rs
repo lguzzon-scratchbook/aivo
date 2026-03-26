@@ -11,7 +11,8 @@ use tokio::signal;
 use crate::errors::{CLIError, ErrorCategory};
 use crate::services::environment_injector::EnvironmentInjector;
 use crate::services::launch_args::{
-    build_preview_notes, build_runtime_args, merge_preview_env, preview_args,
+    build_preview_notes, build_runtime_args, inject_codex_provider_config, merge_preview_env,
+    preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
     cleanup_runtime_artifacts, persist_runtime_discoveries, prepare_runtime_env,
@@ -154,15 +155,19 @@ impl AILauncher {
             options.env.as_ref(),
             options.debug,
         );
-        let runtime = prepare_runtime_env(options.tool, env).await?;
+        let mut runtime = prepare_runtime_env(options.tool, env).await?;
 
-        let runtime_args = build_runtime_args(
+        let mut runtime_args = build_runtime_args(
             options.tool,
             &options.args,
             resolved.model.as_deref(),
             &runtime.env,
         )
         .await?;
+
+        if options.tool == AIToolType::Codex {
+            inject_codex_provider_config(&mut runtime.env, &mut runtime_args.args);
+        }
 
         // Check if the tool binary is available on PATH before attempting to spawn
         let path_dirs = collect_path_dirs();
@@ -247,7 +252,7 @@ impl AILauncher {
 
     pub async fn prepare_launch(&self, options: &LaunchOptions) -> Result<PreparedLaunch> {
         let resolved = self.resolve_launch_context(options, false).await?;
-        let env_vars = merge_preview_env(&resolved.tool_config.env_vars, options.env.as_ref());
+        let mut env_vars = merge_preview_env(&resolved.tool_config.env_vars, options.env.as_ref());
         let args = preview_args(
             options.tool,
             &options.args,
@@ -260,6 +265,10 @@ impl AILauncher {
             resolved.model.as_deref(),
             &resolved.tool_config.env_vars,
         );
+
+        if options.tool == AIToolType::Codex {
+            rewrite_codex_preview_env(&mut env_vars);
+        }
 
         Ok(PreparedLaunch {
             tool: options.tool,

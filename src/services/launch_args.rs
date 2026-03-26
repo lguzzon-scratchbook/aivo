@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
 
+use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::codex_model_map::map_model_for_codex_cli;
 
@@ -39,15 +40,17 @@ pub(crate) fn preview_args(
 
     let use_responses_router = uses_responses_to_chat_router(env);
     let args = inject_codex_model(model, &args, use_responses_router);
-    if should_preview_codex_model_catalog(model, use_responses_router) {
+    let args = if should_preview_codex_model_catalog(model, use_responses_router) {
         let mut preview = vec![
             "--config".to_string(),
             "model_catalog_json=\"<temp:aivo-codex-model-catalog.json>\"".to_string(),
         ];
         preview.extend(args);
-        return preview;
-    }
-    args
+        preview
+    } else {
+        args
+    };
+    preview_codex_provider_config_args(env, args)
 }
 
 pub(crate) fn build_preview_notes(
@@ -146,6 +149,9 @@ pub(crate) fn build_preview_notes(
     {
         notes.push("writes a temporary Codex model catalog file at launch time".to_string());
     }
+    if tool == AIToolType::Codex && env.contains_key("OPENAI_BASE_URL") {
+        notes.push("injects `--config model_provider=aivo` to bypass codex auth.json".to_string());
+    }
 
     if tool == AIToolType::Pi
         && model.is_some()
@@ -194,6 +200,89 @@ pub(crate) async fn build_runtime_args(
 fn uses_responses_to_chat_router(env: &HashMap<String, String>) -> bool {
     env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER")
         || env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER")
+}
+
+/// Converts Codex `OPENAI_BASE_URL` + `OPENAI_API_KEY` env vars into
+/// `--config model_provider` CLI flags so codex uses a custom provider
+/// named "aivo" instead of its built-in auth flow.
+///
+/// Bypasses `~/.codex/auth.json` and avoids the deprecated `OPENAI_BASE_URL`
+/// env var warning. Must be called after `prepare_runtime_env` (placeholder
+/// URLs resolved) and before `spawn_child`.
+pub(crate) fn inject_codex_provider_config(
+    env: &mut HashMap<String, String>,
+    args: &mut Vec<String>,
+) {
+    if args.iter().any(|a| a.contains("model_provider")) {
+        return;
+    }
+    let base_url = match env.remove("OPENAI_BASE_URL") {
+        Some(url) => url,
+        None => return,
+    };
+    let api_key = match env.remove("OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            env.insert("OPENAI_BASE_URL".to_string(), base_url);
+            return;
+        }
+    };
+
+    env.insert("AIVO_CODEX_API_KEY".to_string(), api_key);
+
+    let escaped_url = base_url.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut config_args = vec![
+        "--config".to_string(),
+        "model_provider=\"aivo\"".to_string(),
+        "--config".to_string(),
+        "model_providers.aivo.name=\"aivo\"".to_string(),
+        "--config".to_string(),
+        format!("model_providers.aivo.base_url=\"{}\"", escaped_url),
+        "--config".to_string(),
+        "model_providers.aivo.env_key=\"AIVO_CODEX_API_KEY\"".to_string(),
+    ];
+    config_args.append(args);
+    *args = config_args;
+}
+
+/// Rewrites env vars for the dry-run preview so it reflects what codex
+/// will actually receive at runtime.
+pub(crate) fn rewrite_codex_preview_env(env: &mut HashMap<String, String>) {
+    if let Some(api_key) = env.remove("OPENAI_API_KEY") {
+        env.insert("AIVO_CODEX_API_KEY".to_string(), api_key);
+    }
+    env.remove("OPENAI_BASE_URL");
+}
+
+/// Preview-only: prepends model_provider `--config` flags for Codex args
+/// without mutating the env map.
+fn preview_codex_provider_config_args(
+    env: &HashMap<String, String>,
+    args: Vec<String>,
+) -> Vec<String> {
+    let base_url = match env.get("OPENAI_BASE_URL") {
+        Some(url) => url.as_str(),
+        None => return args,
+    };
+
+    let display_url = if base_url == PLACEHOLDER_LOOPBACK_URL {
+        "http://127.0.0.1:<port>"
+    } else {
+        base_url
+    };
+
+    let mut prefix = vec![
+        "--config".to_string(),
+        "model_provider=\"aivo\"".to_string(),
+        "--config".to_string(),
+        "model_providers.aivo.name=\"aivo\"".to_string(),
+        "--config".to_string(),
+        format!("model_providers.aivo.base_url=\"{}\"", display_url),
+        "--config".to_string(),
+        "model_providers.aivo.env_key=\"AIVO_CODEX_API_KEY\"".to_string(),
+    ];
+    prefix.extend(args);
+    prefix
 }
 
 fn maybe_push_router_note(
@@ -579,5 +668,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.args, vec!["explain this code"]);
+    }
+
+    #[test]
+    fn test_inject_codex_provider_config_direct_openai() {
+        let mut env = HashMap::from([
+            ("OPENAI_BASE_URL".into(), "https://api.openai.com/v1".into()),
+            ("OPENAI_API_KEY".into(), "sk-test-key".into()),
+        ]);
+        let mut args = vec!["-m".into(), "o4-mini".into()];
+        inject_codex_provider_config(&mut env, &mut args);
+
+        assert!(!env.contains_key("OPENAI_BASE_URL"));
+        assert!(!env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(env.get("AIVO_CODEX_API_KEY").unwrap(), "sk-test-key");
+        assert_eq!(
+            args,
+            vec![
+                "--config",
+                "model_provider=\"aivo\"",
+                "--config",
+                "model_providers.aivo.name=\"aivo\"",
+                "--config",
+                "model_providers.aivo.base_url=\"https://api.openai.com/v1\"",
+                "--config",
+                "model_providers.aivo.env_key=\"AIVO_CODEX_API_KEY\"",
+                "-m",
+                "o4-mini",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inject_codex_provider_config_local_router() {
+        let mut env = HashMap::from([
+            ("OPENAI_BASE_URL".into(), "http://127.0.0.1:54321".into()),
+            ("OPENAI_API_KEY".into(), "provider-key".into()),
+        ]);
+        let mut args = vec!["-m".into(), "claude-sonnet-4-6".into()];
+        inject_codex_provider_config(&mut env, &mut args);
+
+        assert_eq!(env.get("AIVO_CODEX_API_KEY").unwrap(), "provider-key");
+        assert!(args[5].contains("http://127.0.0.1:54321"));
+    }
+
+    #[test]
+    fn test_inject_codex_provider_config_ollama() {
+        let mut env = HashMap::from([
+            ("OPENAI_BASE_URL".into(), "http://127.0.0.1:12345".into()),
+            ("OPENAI_API_KEY".into(), "ollama".into()),
+        ]);
+        let mut args = vec![];
+        inject_codex_provider_config(&mut env, &mut args);
+
+        assert_eq!(env.get("AIVO_CODEX_API_KEY").unwrap(), "ollama");
+        assert!(args.contains(&"model_provider=\"aivo\"".to_string()));
+    }
+
+    #[test]
+    fn test_inject_codex_provider_config_noop_without_base_url() {
+        let mut env = HashMap::from([("OPENAI_API_KEY".into(), "sk-key".into())]);
+        let mut args = vec!["prompt".into()];
+        inject_codex_provider_config(&mut env, &mut args);
+
+        assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "sk-key");
+        assert_eq!(args, vec!["prompt"]);
+    }
+
+    #[test]
+    fn test_inject_codex_provider_config_noop_without_api_key() {
+        let mut env =
+            HashMap::from([("OPENAI_BASE_URL".into(), "https://api.openai.com/v1".into())]);
+        let mut args = vec!["prompt".into()];
+        inject_codex_provider_config(&mut env, &mut args);
+
+        // base_url should be restored
+        assert!(env.contains_key("OPENAI_BASE_URL"));
+        assert_eq!(args, vec!["prompt"]);
+    }
+
+    #[test]
+    fn test_inject_codex_provider_config_skips_if_model_provider_in_args() {
+        let mut env = HashMap::from([
+            ("OPENAI_BASE_URL".into(), "https://api.openai.com/v1".into()),
+            ("OPENAI_API_KEY".into(), "sk-key".into()),
+        ]);
+        let mut args = vec![
+            "--config".into(),
+            "model_provider=\"custom\"".into(),
+            "-m".into(),
+            "gpt-4o".into(),
+        ];
+        inject_codex_provider_config(&mut env, &mut args);
+
+        // Should not modify anything
+        assert!(env.contains_key("OPENAI_BASE_URL"));
+        assert!(env.contains_key("OPENAI_API_KEY"));
+        assert!(!env.contains_key("AIVO_CODEX_API_KEY"));
+    }
+
+    #[test]
+    fn test_inject_codex_provider_config_preserves_existing_args() {
+        let mut env = HashMap::from([
+            ("OPENAI_BASE_URL".into(), "https://api.openai.com/v1".into()),
+            ("OPENAI_API_KEY".into(), "sk-key".into()),
+        ]);
+        let mut args = vec![
+            "--config".into(),
+            "model_catalog_json=\"/tmp/cat.json\"".into(),
+            "-m".into(),
+            "gpt-4o".into(),
+            "fix bug".into(),
+        ];
+        inject_codex_provider_config(&mut env, &mut args);
+
+        // Config flags prepended, original args preserved at the end
+        assert_eq!(args[8], "--config");
+        assert_eq!(args[9], "model_catalog_json=\"/tmp/cat.json\"");
+        assert_eq!(args[10], "-m");
+        assert_eq!(args[11], "gpt-4o");
+        assert_eq!(args[12], "fix bug");
+    }
+
+    #[test]
+    fn test_rewrite_codex_preview_env() {
+        let mut env = HashMap::from([
+            ("OPENAI_BASE_URL".into(), "https://api.openai.com/v1".into()),
+            ("OPENAI_API_KEY".into(), "sk-key".into()),
+            ("CODEX_MODEL".into(), "gpt-4o".into()),
+        ]);
+        rewrite_codex_preview_env(&mut env);
+
+        assert!(!env.contains_key("OPENAI_BASE_URL"));
+        assert!(!env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(env.get("AIVO_CODEX_API_KEY").unwrap(), "sk-key");
+        assert_eq!(env.get("CODEX_MODEL").unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_preview_codex_provider_config_args_with_base_url() {
+        let env = HashMap::from([("OPENAI_BASE_URL".into(), "https://api.openai.com/v1".into())]);
+        let args = vec!["-m".into(), "gpt-4o".into()];
+        let result = preview_codex_provider_config_args(&env, args);
+
+        assert_eq!(result[0], "--config");
+        assert_eq!(result[1], "model_provider=\"aivo\"");
+        assert!(result[5].contains("https://api.openai.com/v1"));
+        assert_eq!(result[8], "-m");
+        assert_eq!(result[9], "gpt-4o");
+    }
+
+    #[test]
+    fn test_preview_codex_provider_config_args_placeholder_url() {
+        let env = HashMap::from([("OPENAI_BASE_URL".into(), PLACEHOLDER_LOOPBACK_URL.into())]);
+        let args = vec!["-m".into(), "model".into()];
+        let result = preview_codex_provider_config_args(&env, args);
+
+        assert!(result[5].contains("http://127.0.0.1:<port>"));
+    }
+
+    #[test]
+    fn test_preview_codex_provider_config_args_noop_without_base_url() {
+        let env = HashMap::new();
+        let args = vec!["-m".into(), "gpt-4o".into()];
+        let result = preview_codex_provider_config_args(&env, args);
+
+        assert_eq!(result, vec!["-m", "gpt-4o"]);
     }
 }
