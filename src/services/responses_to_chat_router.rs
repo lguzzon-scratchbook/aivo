@@ -491,7 +491,59 @@ async fn forward_openai_protocol(
     } else {
         None
     };
-    Ok(classify_attempt(status, body_text, parsed))
+    let result = classify_attempt(status, body_text, parsed);
+
+    // If Copilot rejected the model specifically because /chat/completions
+    // is unsupported for it, fall back to /responses.
+    if config.copilot_token_manager.is_some()
+        && let AttemptOutcome::ProviderError {
+            body: ref error_body,
+            ..
+        } = result
+        && (error_body.contains("unsupported_api_for_model")
+            || (error_body.contains("not support") && error_body.contains("chat/completions")))
+        && let Ok(fallback) = try_copilot_responses_fallback(body, config, client).await
+    {
+        return Ok(fallback);
+    }
+
+    Ok(result)
+}
+
+/// Converts a Chat Completions request to Responses API format and sends it to
+/// Copilot's /responses endpoint. Returns the response converted back to Chat
+/// Completions format.
+async fn try_copilot_responses_fallback(
+    body: &Value,
+    config: &ResponsesToChatRouterConfig,
+    client: &reqwest::Client,
+) -> Result<AttemptOutcome<Value>> {
+    let responses_body = responses_chat_conversion::convert_chat_to_responses_request(body);
+    let target_url = build_target_url(&config.target_base_url, "/v1/responses");
+    let response = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+        None,
+    )
+    .await?
+    .json(&responses_body)
+    .send()
+    .await?;
+
+    let status = response.status().as_u16();
+    let body_text = response.text().await?;
+    if status == 200 {
+        let resp_value: Value = serde_json::from_str(&body_text)?;
+        let chat_value = responses_chat_conversion::convert_responses_json_to_chat(&resp_value);
+        Ok(AttemptOutcome::Success(chat_value))
+    } else {
+        Ok(AttemptOutcome::ProviderError {
+            status,
+            body: body_text,
+        })
+    }
 }
 
 async fn forward_anthropic_protocol(
@@ -650,6 +702,13 @@ fn apply_selected_model(
     protocol: ProviderProtocol,
 ) {
     if config.copilot_token_manager.is_some() {
+        // For Copilot, only apply model name normalization (e.g. claude-sonnet-4-6 → claude-sonnet-4.6)
+        if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+            let copilot_name = crate::services::model_names::copilot_model_name(model);
+            if copilot_name != model {
+                body["model"] = Value::String(copilot_name);
+            }
+        }
         return;
     }
 

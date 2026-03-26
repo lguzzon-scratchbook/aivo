@@ -103,8 +103,8 @@ pub async fn bind_local_listener() -> Result<(tokio::net::TcpListener, u16)> {
 /// Builds an authorized POST request for OpenAI-compatible upstreams.
 ///
 /// In Copilot mode, exchanges the GitHub token for a short-lived Copilot token
-/// and targets the Copilot chat completions endpoint. Otherwise, posts directly
-/// to `target_url` with standard bearer auth.
+/// and targets the Copilot API at the path derived from `target_url`.  Otherwise,
+/// posts directly to `target_url` with standard bearer auth.
 pub async fn authorized_openai_post(
     client: &reqwest::Client,
     target_url: &str,
@@ -114,7 +114,8 @@ pub async fn authorized_openai_post(
 ) -> Result<reqwest::RequestBuilder> {
     if let Some(tm) = copilot_token_manager {
         let (token, api_endpoint) = tm.get_token().await?;
-        let copilot_url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
+        let copilot_path = copilot_path_from_target(target_url);
+        let copilot_url = format!("{}{}", api_endpoint.trim_end_matches('/'), copilot_path);
         Ok(client
             .post(&copilot_url)
             .header("Authorization", format!("Bearer {}", token))
@@ -528,6 +529,28 @@ pub fn http_request_read_error_response(error: &RequestReadError) -> String {
         RequestReadError::IncompleteHeaders => http_error_response(400, &error.to_string()),
         RequestReadError::Io(_) => http_error_response(400, &error.to_string()),
     }
+}
+
+/// Extracts the API path from a target URL for Copilot routing.
+/// Copilot's API doesn't use `/v1` prefix, so strip it.
+///
+/// - `"/v1/chat/completions"` → `"/chat/completions"`
+/// - `"/v1/responses"` → `"/responses"`
+/// - `"https://host/v1/chat/completions"` → `"/chat/completions"`
+fn copilot_path_from_target(target_url: &str) -> &str {
+    let path = if target_url.starts_with('/') {
+        target_url
+    } else {
+        target_url
+            .find("://")
+            .and_then(|i| {
+                target_url[i + 3..]
+                    .find('/')
+                    .map(|j| &target_url[i + 3 + j..])
+            })
+            .unwrap_or("/chat/completions")
+    };
+    path.strip_prefix("/v1").unwrap_or(path)
 }
 
 /// Constructs a target URL, avoiding `/v1` duplication when base already ends with `/v1`.
@@ -1087,5 +1110,40 @@ mod tests {
             ]
         });
         assert_eq!(copilot_initiator_from_openai(&body), "agent");
+    }
+
+    #[test]
+    fn copilot_path_strips_v1_prefix() {
+        assert_eq!(
+            copilot_path_from_target("/v1/chat/completions"),
+            "/chat/completions"
+        );
+        assert_eq!(copilot_path_from_target("/v1/responses"), "/responses");
+    }
+
+    #[test]
+    fn copilot_path_preserves_path_without_v1() {
+        assert_eq!(
+            copilot_path_from_target("/chat/completions"),
+            "/chat/completions"
+        );
+        assert_eq!(copilot_path_from_target("/responses"), "/responses");
+    }
+
+    #[test]
+    fn copilot_path_extracts_from_full_url() {
+        assert_eq!(
+            copilot_path_from_target("https://api.example.com/v1/chat/completions"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            copilot_path_from_target("https://api.example.com/v1/responses"),
+            "/responses"
+        );
+    }
+
+    #[test]
+    fn copilot_path_fallback_for_unexpected_input() {
+        assert_eq!(copilot_path_from_target("not-a-url"), "/chat/completions");
     }
 }

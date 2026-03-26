@@ -8,6 +8,11 @@
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::http_utils::{self, current_unix_ts};
 use crate::services::model_names::select_model_for_provider_attempt;
+use crate::services::openai_models::{
+    OpenAIChatRequest, ResponsesResponse,
+    convert_chat_to_responses_request as convert_typed_chat_to_responses,
+    convert_responses_to_chat_response as convert_typed_responses_to_chat,
+};
 use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::responses_to_chat_router::ResponsesToChatRouterConfig;
 use serde_json::{Value, json};
@@ -715,6 +720,39 @@ fn sse_event(event_type: &str, data: &Value) -> String {
 fn gen_id(prefix: &str) -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}_{}_{:06}", prefix, current_unix_ts(), n % 1_000_000)
+}
+
+// =============================================================================
+// CHAT COMPLETIONS → RESPONSES API CONVERSION
+// =============================================================================
+
+/// Converts an OpenAI Chat Completions request body to a Responses API request body.
+/// Delegates to the typed converter in `openai_models` to avoid duplicating conversion logic.
+pub fn convert_chat_to_responses_request(body: &Value) -> Value {
+    let Ok(typed): Result<OpenAIChatRequest, _> = serde_json::from_value(body.clone()) else {
+        return json!({"model": "gpt-4o", "input": [], "stream": false});
+    };
+    let mut resp = serde_json::to_value(convert_typed_chat_to_responses(&typed))
+        .unwrap_or_else(|_| json!({"model": "gpt-4o", "input": [], "stream": false}));
+    // Force non-streaming for the fallback path
+    resp["stream"] = json!(false);
+    resp
+}
+
+/// Converts a Responses API JSON response to Chat Completions format.
+/// Delegates to the typed converter in `openai_models` to avoid duplicating conversion logic.
+pub fn convert_responses_json_to_chat(resp: &Value) -> Value {
+    // Handle both direct response and wrapped {"response": ...} format
+    let inner = resp
+        .get("response")
+        .filter(|r| r.is_object())
+        .unwrap_or(resp);
+
+    let Ok(typed): Result<ResponsesResponse, _> = serde_json::from_value(inner.clone()) else {
+        return json!({"choices": [], "usage": {}});
+    };
+    serde_json::to_value(convert_typed_responses_to_chat(&typed))
+        .unwrap_or_else(|_| json!({"choices": [], "usage": {}}))
 }
 
 #[cfg(test)]
@@ -1486,5 +1524,125 @@ mod tests {
         assert!(usage["input_tokens"].is_null());
         assert_eq!(usage["output_tokens"], 5);
         assert_eq!(usage["total_tokens"], 5);
+    }
+
+    // ── convert_chat_to_responses_request ─────────────────────────────────────
+
+    #[test]
+    fn chat_to_responses_simple_message() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"}
+            ],
+            "max_tokens": 1024
+        });
+        let req = convert_chat_to_responses_request(&body);
+        assert_eq!(req["model"], "gpt-4o");
+        assert_eq!(req["instructions"], "You are helpful.");
+        assert_eq!(req["max_output_tokens"], 1024);
+        assert_eq!(req["stream"], false);
+        let input = req["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn chat_to_responses_tool_calls() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "What's the weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"loc\":\"SF\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"}
+            ]
+        });
+        let req = convert_chat_to_responses_request(&body);
+        let input = req["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "get_weather");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["output"], "Sunny");
+    }
+
+    #[test]
+    fn chat_to_responses_tools_converted() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "shell", "description": "Run cmd", "parameters": {}}}
+            ]
+        });
+        let req = convert_chat_to_responses_request(&body);
+        let tools = req["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "shell");
+    }
+
+    // ── convert_responses_json_to_chat ────────────────────────────────────────
+
+    #[test]
+    fn responses_json_to_chat_text() {
+        let resp = json!({
+            "id": "resp_123",
+            "object": "response",
+            "model": "gpt-4o",
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hello!"}]}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let chat = convert_responses_json_to_chat(&resp);
+        assert_eq!(chat["id"], "resp_123");
+        assert_eq!(chat["model"], "gpt-4o");
+        assert_eq!(chat["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(chat["choices"][0]["finish_reason"], "stop");
+        assert_eq!(chat["usage"]["prompt_tokens"], 10);
+        assert_eq!(chat["usage"]["completion_tokens"], 5);
+    }
+
+    #[test]
+    fn responses_json_to_chat_tool_calls() {
+        let resp = json!({
+            "id": "resp_456",
+            "model": "gpt-4o",
+            "output": [
+                {"type": "function_call", "call_id": "c1", "name": "read_file", "arguments": "{\"path\":\"test.rs\"}"}
+            ]
+        });
+        let chat = convert_responses_json_to_chat(&resp);
+        assert_eq!(chat["choices"][0]["finish_reason"], "tool_calls");
+        let tcs = chat["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["id"], "c1");
+        assert_eq!(tcs[0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn responses_json_to_chat_wrapped_response() {
+        let resp = json!({
+            "response": {
+                "id": "resp_789",
+                "model": "gpt-4o",
+                "output": [
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hi"}]}
+                ]
+            }
+        });
+        let chat = convert_responses_json_to_chat(&resp);
+        assert_eq!(chat["id"], "resp_789");
+        assert_eq!(chat["choices"][0]["message"]["content"], "Hi");
     }
 }

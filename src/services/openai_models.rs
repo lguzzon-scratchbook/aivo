@@ -251,14 +251,19 @@ enum ResponsesOutputItem {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIChatResponse {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<u64>,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<OpenAIChatChoice>,
+    #[serde(default)]
     pub usage: OpenAIChatUsage,
 }
 
@@ -346,8 +351,10 @@ pub(crate) struct OpenAIChatChunkToolCall {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIChatChoice {
+    #[serde(default)]
     pub index: u32,
     pub message: OpenAIChatResponseMessage,
+    #[serde(default)]
     pub finish_reason: String,
 }
 
@@ -360,10 +367,13 @@ pub(crate) struct OpenAIChatResponseMessage {
     pub tool_calls: Option<Vec<OpenAIChatToolCall>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIChatUsage {
+    #[serde(default)]
     pub prompt_tokens: u64,
+    #[serde(default)]
     pub completion_tokens: u64,
+    #[serde(default)]
     pub total_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
