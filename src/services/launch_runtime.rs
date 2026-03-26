@@ -204,7 +204,7 @@ pub(crate) async fn record_launch_tokens(
     model: Option<&str>,
     before: Option<&crate::services::global_stats::GlobalToolStats>,
 ) {
-    let after = match crate::services::global_stats::collect(tool.as_str(), true).await {
+    let after = match crate::services::global_stats::collect(tool.as_str(), false).await {
         Ok(Some(s)) => s,
         _ => return,
     };
