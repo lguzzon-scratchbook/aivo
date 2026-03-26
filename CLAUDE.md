@@ -94,7 +94,7 @@ SessionStore → EnvironmentInjector → AILauncher
 | `keys.rs`                | API key management (add, rm, use, edit, cat, list)         |
 | `models.rs`              | List available models from active provider (1h cache)      |
 | `serve.rs`               | Local OpenAI-compatible API server                         |
-| `stats.rs`               | Usage statistics display (tokens, requests, costs)         |
+| `stats.rs`               | Usage statistics display (aivo chat + global tool stats)   |
 | `update.rs`              | Self-update via GitHub Releases                            |
 
 #### `src/services/`
@@ -138,6 +138,7 @@ SessionStore → EnvironmentInjector → AILauncher
 | `path_search.rs`                | PATH scanning to find executables with platform-specific extensions     |
 | `system_env.rs`                 | System environment helpers (CWD, home dir, etc.)                        |
 | `launch_runtime.rs`             | Router startup, temp dir writing (Pi agent dir), runtime env patching   |
+| `global_stats.rs`               | Cross-tool stats aggregation (Claude/Codex/Gemini/OpenCode/Pi) with per-file caching; OpenCode uses `sqlite3` CLI |
 | `launch_args.rs`                | CLI arg injection (model flags, teammate mode, codex/pi model prefixing)|
 
 ### Cross-Platform

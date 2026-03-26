@@ -419,10 +419,21 @@ aivo ls --ping
 
 ## stats
 
-Show usage statistics: token counts, request counts, and cost breakdowns.
+Show usage statistics across all tools. Aggregates token counts from aivo chat, Claude Code, Codex, Gemini, OpenCode, and Pi by reading each tool's native data files. Per-file caching makes subsequent runs fast.
+
+OpenCode stats are read via the `sqlite3` CLI (preinstalled on macOS/Linux). If `sqlite3` is not available, OpenCode stats are silently skipped.
 
 ```bash
 aivo stats
+```
+
+#### Positional argument
+
+Show stats for a single tool:
+
+```bash
+aivo stats claude
+aivo stats chat
 ```
 
 #### `--numbers, -n`
@@ -439,6 +450,22 @@ Filter by key, model, or tool name:
 
 ```bash
 aivo stats -s openrouter
+```
+
+#### `--refresh, -r`
+
+Bypass cache and re-read all data files:
+
+```bash
+aivo stats -r
+```
+
+#### `--all, -a`
+
+Show all models (default: top 20, rest grouped as "others"):
+
+```bash
+aivo stats -a
 ```
 
 ## update
