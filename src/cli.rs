@@ -55,7 +55,8 @@ pub enum Commands {
     Alias(AliasArgs),
 
     /// Show system info, keys, tools, and directory state
-    Ls(LsArgs),
+    #[command(alias = "ls")]
+    Info(InfoArgs),
 
     /// Show usage statistics (tokens, requests, breakdowns)
     Stats(StatsArgs),
@@ -257,9 +258,9 @@ pub struct UpdateArgs {
     pub force: bool,
 }
 
-/// Arguments for the ls command
+/// Arguments for the info command
 #[derive(Args, Debug, Clone)]
-pub struct LsArgs {
+pub struct InfoArgs {
     /// Ping all keys and show pass/fail summary
     #[arg(long)]
     pub ping: bool,
@@ -318,7 +319,7 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
 #[allow(dead_code)]
 pub fn get_valid_commands() -> Vec<&'static str> {
     vec![
-        "update", "keys", "run", "chat", "models", "serve", "ls", "use",
+        "update", "keys", "run", "chat", "models", "serve", "info", "use",
     ]
 }
 

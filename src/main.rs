@@ -60,7 +60,7 @@ async fn main() {
             Some(Commands::Alias(_)) => {
                 AliasCommand::print_help();
             }
-            Some(Commands::Ls(_)) => {
+            Some(Commands::Info(_)) => {
                 InfoCommand::print_help();
             }
             Some(Commands::Stats(_)) => {
@@ -277,9 +277,9 @@ async fn main() {
                 .await
         }
 
-        Commands::Ls(ls_args) => {
+        Commands::Info(info_args) => {
             let command = InfoCommand::new(session_store, models_cache);
-            command.execute(ls_args.ping).await
+            command.execute(info_args.ping).await
         }
 
         Commands::Stats(stats_args) => {
@@ -375,7 +375,7 @@ fn print_help() {
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
     print_cmd("models", "List available models from the active provider");
     print_cmd("alias", "Create, list, or remove model aliases");
-    print_cmd("ls", "Show system info, keys, tools, and directory state");
+    print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd("stats", "Show usage statistics");
     print_cmd("update", "Update to the latest version");
     println!();
@@ -384,6 +384,7 @@ fn print_help() {
         let padded = format!("{:<10}", alias);
         println!("  {}{}", style::cyan(&padded), style::dim(expansion));
     };
+    print_shortcut("ls", "info");
     print_shortcut("use", "keys use");
     print_shortcut("ping", "keys ping");
     print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
@@ -401,7 +402,7 @@ fn print_help() {
         style::dim("git diff | aivo -x \"summarize changes\"")
     );
     println!("  {}", style::dim("aivo gemini -k mykey -m minimax-m2.7"));
-    println!("  {}", style::dim("aivo ls --ping"));
+    println!("  {}", style::dim("aivo info --ping"));
     println!();
     println!("{}", style::bold("Options:"));
     let print_opt = |flag: &str, desc: &str| {

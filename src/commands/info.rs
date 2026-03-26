@@ -210,7 +210,7 @@ impl InfoCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo ls [--ping]", style::bold("Usage:"));
+        println!("{} aivo info [--ping]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
@@ -232,8 +232,8 @@ impl InfoCommand {
         print_opt("--ping", "Ping all keys and show pass/fail summary");
         println!();
         println!("{}", style::bold("Examples:"));
-        println!("  {}", style::dim("aivo ls"));
-        println!("  {}", style::dim("aivo ls --ping"));
+        println!("  {}", style::dim("aivo info"));
+        println!("  {}", style::dim("aivo info --ping"));
     }
 
     fn print_directory_start(

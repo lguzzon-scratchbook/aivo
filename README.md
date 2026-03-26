@@ -71,7 +71,7 @@ aivo claude --model llama3.2
 | [keys](#keys) | Manage API keys (add, use, rm, cat, edit, ping) |
 | [models](#models) | List available models from the active provider |
 | [alias](#alias) | Create short names for models |
-| [ls](#ls) | Show system info, keys, tools, and directory state |
+| [info](#info) | Show system info, keys, tools, and directory state |
 | [stats](#stats) | Show usage statistics |
 | [update](#update) | Update to the latest version |
 
@@ -401,12 +401,12 @@ aivo chat -m best
 aivo alias rm fast
 ```
 
-## ls
+## info
 
-Show a compact overview of saved keys, installed tools, the remembered tool/model for the current directory, and the cached model count for the active key.
+Show a compact overview of saved keys, installed tools, the remembered tool/model for the current directory, and the cached model count for the active key. (`ls` is accepted as an alias.)
 
 ```bash
-aivo ls
+aivo info
 ```
 
 #### `--ping`
@@ -414,7 +414,7 @@ aivo ls
 Also health-check all keys:
 
 ```bash
-aivo ls --ping
+aivo info --ping
 ```
 
 ## stats

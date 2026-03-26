@@ -218,22 +218,42 @@ fn models_refresh_flag() {
 }
 
 #[test]
-fn ls_command() {
-    let cli = Cli::try_parse_from(["aivo", "ls"]).unwrap();
-    if let Some(Commands::Ls(args)) = cli.command {
+fn info_command() {
+    let cli = Cli::try_parse_from(["aivo", "info"]).unwrap();
+    if let Some(Commands::Info(args)) = cli.command {
         assert!(!args.ping);
     } else {
-        panic!("Expected Ls command");
+        panic!("Expected Info command");
     }
 }
 
 #[test]
-fn ls_command_with_ping() {
-    let cli = Cli::try_parse_from(["aivo", "ls", "--ping"]).unwrap();
-    if let Some(Commands::Ls(args)) = cli.command {
+fn info_command_with_ping() {
+    let cli = Cli::try_parse_from(["aivo", "info", "--ping"]).unwrap();
+    if let Some(Commands::Info(args)) = cli.command {
         assert!(args.ping);
     } else {
-        panic!("Expected Ls command");
+        panic!("Expected Info command");
+    }
+}
+
+#[test]
+fn ls_alias_for_info() {
+    let cli = Cli::try_parse_from(["aivo", "ls"]).unwrap();
+    if let Some(Commands::Info(args)) = cli.command {
+        assert!(!args.ping);
+    } else {
+        panic!("Expected Info command via ls alias");
+    }
+}
+
+#[test]
+fn ls_alias_with_ping() {
+    let cli = Cli::try_parse_from(["aivo", "ls", "--ping"]).unwrap();
+    if let Some(Commands::Info(args)) = cli.command {
+        assert!(args.ping);
+    } else {
+        panic!("Expected Info command via ls alias");
     }
 }
 
