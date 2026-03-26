@@ -75,6 +75,9 @@ struct AnthropicToOpenAIRouterState {
     /// Set to true after a native Anthropic attempt returns a protocol mismatch,
     /// so we don't waste a round-trip on every subsequent Claude request.
     native_anthropic_failed: Arc<AtomicBool>,
+    /// Set to true when the provider rejects `anthropic-beta` headers (e.g. Bedrock, Vertex AI).
+    /// Once learned, the header is stripped from all future requests.
+    beta_header_rejected: Arc<AtomicBool>,
 }
 
 enum RouterResponse {
@@ -102,6 +105,7 @@ impl AnthropicToOpenAIRouter {
             client: router_http_client(),
             active_protocol: active_protocol.clone(),
             native_anthropic_failed: Arc::new(AtomicBool::new(false)),
+            beta_header_rejected: Arc::new(AtomicBool::new(false)),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, active_protocol, handle))
@@ -118,6 +122,7 @@ async fn run_router(
         let client = state.client.clone();
         let active_protocol = state.active_protocol.clone();
         let native_anthropic_failed = state.native_anthropic_failed.clone();
+        let beta_header_rejected = state.beta_header_rejected.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -145,6 +150,7 @@ async fn run_router(
                 &client,
                 &active_protocol,
                 &native_anthropic_failed,
+                &beta_header_rejected,
             )
             .await
             {
@@ -185,6 +191,18 @@ fn apply_model_prefix(model: &str, prefix: Option<&str>) -> String {
     }
 }
 
+/// Build the standard headers for native Anthropic requests.
+fn build_native_anthropic_headers(
+    passthrough_headers: &HeaderMap,
+    api_key: &str,
+) -> Result<HeaderMap> {
+    let mut headers = passthrough_headers.clone();
+    headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
+    headers.insert("Content-Type", HeaderValue::from_static(CONTENT_TYPE_JSON));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    Ok(headers)
+}
+
 /// Try sending the request in native Anthropic format to the upstream's `/v1/messages`.
 /// Returns `Some(response)` on success or non-mismatch error, `None` on protocol mismatch.
 async fn try_native_anthropic(
@@ -193,6 +211,7 @@ async fn try_native_anthropic(
     client: &reqwest::Client,
     passthrough_headers: &HeaderMap,
     native_anthropic_failed: &AtomicBool,
+    beta_header_rejected: &AtomicBool,
 ) -> Result<Option<RouterResponse>> {
     if native_anthropic_failed.load(Ordering::Relaxed) {
         return Ok(None);
@@ -205,10 +224,7 @@ async fn try_native_anthropic(
     CacheControlPatch.patch_json("messages", &mut native_body, &ctx)?;
 
     let url = http_utils::build_target_url(&config.target_base_url, "/v1/messages");
-    let mut headers = passthrough_headers.clone();
-    headers.insert("x-api-key", HeaderValue::from_str(&config.target_api_key)?);
-    headers.insert("Content-Type", HeaderValue::from_static(CONTENT_TYPE_JSON));
-    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    let headers = build_native_anthropic_headers(passthrough_headers, &config.target_api_key)?;
 
     let response = client
         .post(&url)
@@ -221,6 +237,50 @@ async fn try_native_anthropic(
     if is_protocol_mismatch(status_code) {
         native_anthropic_failed.store(true, Ordering::Relaxed);
         return Ok(None);
+    }
+
+    // Detect beta header rejection: if a 400 mentions beta-related terms,
+    // learn to strip anthropic-beta and retry immediately.
+    if status_code == 400 && !beta_header_rejected.load(Ordering::Relaxed) {
+        let content_type = http_utils::response_content_type(&response);
+        let response_body = response.bytes().await?;
+        let body_str = String::from_utf8_lossy(&response_body);
+
+        if http_utils::is_beta_header_rejection(&body_str) {
+            beta_header_rejected.store(true, Ordering::Relaxed);
+            eprintln!("  • Provider rejected anthropic-beta header — retrying without it");
+
+            let mut retry_headers =
+                build_native_anthropic_headers(passthrough_headers, &config.target_api_key)?;
+            http_utils::strip_beta_headers(&mut retry_headers);
+
+            let retry_response = client
+                .post(&url)
+                .headers(retry_headers)
+                .json(&native_body)
+                .send()
+                .await?;
+
+            let retry_status = retry_response.status().as_u16();
+            if is_protocol_mismatch(retry_status) {
+                native_anthropic_failed.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+
+            let retry_ct = http_utils::response_content_type(&retry_response);
+            let retry_body = retry_response.bytes().await?;
+            return Ok(Some(RouterResponse::Buffered {
+                status: retry_status,
+                content_type: retry_ct,
+                body: retry_body.to_vec(),
+            }));
+        }
+
+        return Ok(Some(RouterResponse::Buffered {
+            status: status_code,
+            content_type,
+            body: response_body.to_vec(),
+        }));
     }
 
     let content_type = http_utils::response_content_type(&response);
@@ -239,8 +299,12 @@ async fn handle_anthropic_to_upstream(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
     native_anthropic_failed: &Arc<AtomicBool>,
+    beta_header_rejected: &Arc<AtomicBool>,
 ) -> Result<RouterResponse> {
-    let passthrough_headers = http_utils::extract_passthrough_headers(request)?;
+    let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
+    if beta_header_rejected.load(Ordering::Relaxed) {
+        http_utils::strip_beta_headers(&mut passthrough_headers);
+    }
     let body_str = http_utils::extract_request_body(request)?;
 
     let body: Value = serde_json::from_str(body_str)?;
@@ -258,6 +322,7 @@ async fn handle_anthropic_to_upstream(
             client,
             &passthrough_headers,
             native_anthropic_failed,
+            beta_header_rejected,
         )
         .await?
     {

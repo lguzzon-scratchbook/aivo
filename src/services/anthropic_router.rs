@@ -8,6 +8,7 @@ use anyhow::Result;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
@@ -26,6 +27,9 @@ pub struct AnthropicRouter {
 struct AnthropicRouterState {
     config: Arc<AnthropicRouterConfig>,
     client: reqwest::Client,
+    /// Set to true when the provider rejects `anthropic-beta` headers.
+    /// Once learned, the header is stripped from all future requests.
+    beta_header_rejected: Arc<AtomicBool>,
 }
 
 enum RouterResponse {
@@ -60,6 +64,7 @@ impl AnthropicRouter {
         let state = AnthropicRouterState {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
+            beta_header_rejected: Arc::new(AtomicBool::new(false)),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, handle))
@@ -71,6 +76,7 @@ async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterSta
         let (mut socket, _) = listener.accept().await?;
         let config = state.config.clone();
         let client = state.client.clone();
+        let beta_header_rejected = state.beta_header_rejected.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -91,7 +97,10 @@ async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterSta
 
             let result = if method_is_post {
                 match AnthropicRoute::from_request_path(path) {
-                    Some(route) => forward_request(&request, &config, &client, route).await,
+                    Some(route) => {
+                        forward_request(&request, &config, &client, route, &beta_header_rejected)
+                            .await
+                    }
                     None => {
                         let not_found = http_utils::http_response(
                             404,
@@ -202,8 +211,12 @@ async fn forward_request(
     config: &Arc<AnthropicRouterConfig>,
     client: &reqwest::Client,
     route: AnthropicRoute,
+    beta_header_rejected: &AtomicBool,
 ) -> Result<RouterResponse> {
-    let passthrough_headers = http_utils::extract_passthrough_headers(request)?;
+    let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
+    if beta_header_rejected.load(Ordering::Relaxed) {
+        http_utils::strip_beta_headers(&mut passthrough_headers);
+    }
     let body_str = http_utils::extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
@@ -226,6 +239,41 @@ async fn forward_request(
         .json(&body)
         .send()
         .await?;
+
+    // Detect beta header rejection: on 400, check if the provider rejected
+    // anthropic-beta headers, learn to strip them, and retry immediately.
+    if response.status() == 400 && !beta_header_rejected.load(Ordering::Relaxed) {
+        let content_type = http_utils::response_content_type(&response);
+        let response_body = response.bytes().await?.to_vec();
+
+        if http_utils::is_beta_header_rejection(&String::from_utf8_lossy(&response_body)) {
+            beta_header_rejected.store(true, Ordering::Relaxed);
+            eprintln!("  • Provider rejected anthropic-beta header — retrying without it");
+
+            let mut retry_headers = http_utils::extract_passthrough_headers(request)?;
+            http_utils::strip_beta_headers(&mut retry_headers);
+            let auth_value = format!("Bearer {}", config.upstream_api_key);
+            retry_headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
+            retry_headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
+            pipeline.patch_headers(route.patch_route(), &mut retry_headers, &ctx)?;
+
+            let retry_response = client
+                .post(&url)
+                .headers(retry_headers)
+                .json(&body)
+                .send()
+                .await?;
+
+            return classify_upstream_response(retry_response).await;
+        }
+
+        // Not a beta rejection — return the original 400 as-is
+        return Ok(RouterResponse::Buffered {
+            status: 400,
+            content_type,
+            body: response_body,
+        });
+    }
 
     classify_upstream_response(response).await
 }

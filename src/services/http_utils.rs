@@ -320,6 +320,21 @@ fn should_passthrough_header(name: &str) -> bool {
         || lower.starts_with("anthropic-")
 }
 
+/// Removes the `anthropic-beta` header from a HeaderMap.
+/// Used when a provider has been learned to reject beta headers (e.g. Bedrock, Vertex AI).
+pub fn strip_beta_headers(headers: &mut HeaderMap) {
+    headers.remove("anthropic-beta");
+}
+
+/// Returns true if a 400 error response body indicates the provider
+/// rejected an `anthropic-beta` header value.
+pub fn is_beta_header_rejection(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("invalid beta")
+        || lower.contains("anthropic-beta")
+        || (lower.contains("unexpected value") && lower.contains("beta"))
+}
+
 /// Extracts the HTTP request path from the first line (e.g., "POST /v1/messages HTTP/1.1" → "/v1/messages").
 pub fn extract_request_path(request: &str) -> String {
     let first_line = request.lines().next().unwrap_or("");
@@ -1145,5 +1160,55 @@ mod tests {
     #[test]
     fn copilot_path_fallback_for_unexpected_input() {
         assert_eq!(copilot_path_from_target("not-a-url"), "/chat/completions");
+    }
+
+    #[test]
+    fn test_strip_beta_headers_removes_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        strip_beta_headers(&mut headers);
+        assert!(headers.get("anthropic-beta").is_none());
+        assert!(headers.get("anthropic-version").is_some());
+    }
+
+    #[test]
+    fn test_strip_beta_headers_noop_without_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        strip_beta_headers(&mut headers);
+        assert!(headers.get("anthropic-version").is_some());
+    }
+
+    #[test]
+    fn test_is_beta_header_rejection_invalid_beta() {
+        assert!(is_beta_header_rejection(
+            r#"{"error":"Invalid beta: prompt-caching-2024-07-31"}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_beta_header_rejection_anthropic_beta_mentioned() {
+        assert!(is_beta_header_rejection(
+            r#"{"error":"Unknown header: anthropic-beta is not supported"}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_beta_header_rejection_unexpected_value() {
+        assert!(is_beta_header_rejection(
+            r#"{"error":"unexpected value in beta field"}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_beta_header_rejection_false_for_unrelated_error() {
+        assert!(!is_beta_header_rejection(r#"{"error":"model not found"}"#));
+        assert!(!is_beta_header_rejection(
+            r#"{"error":"rate limit exceeded"}"#
+        ));
     }
 }
