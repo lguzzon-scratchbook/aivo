@@ -185,69 +185,17 @@ pub(crate) async fn persist_runtime_discoveries(
     }
 }
 
-/// Snapshot global stats for a tool before launch (uses cache, fast).
-pub(crate) async fn snapshot_tool_stats(
-    tool: AIToolType,
-) -> Option<crate::services::global_stats::GlobalToolStats> {
-    crate::services::global_stats::collect(tool.as_str(), false)
-        .await
-        .ok()
-        .flatten()
-}
-
-/// After a tool exits, compute the delta between before/after global stats
-/// and record the tokens attributed to the key used for launch.
-pub(crate) async fn record_launch_tokens(
-    session_store: &SessionStore,
-    key: &ApiKey,
-    tool: AIToolType,
-    model: Option<&str>,
-    before: Option<&crate::services::global_stats::GlobalToolStats>,
-) {
-    let after = match crate::services::global_stats::collect(tool.as_str(), false).await {
-        Ok(Some(s)) => s,
-        _ => return,
-    };
-    let (bi, bo, bcr, bcw) = before
-        .map(|b| {
-            (
-                b.input_tokens,
-                b.output_tokens,
-                b.cache_read_tokens,
-                b.cache_write_tokens,
-            )
-        })
-        .unwrap_or((0, 0, 0, 0));
-    let di = after.input_tokens.saturating_sub(bi);
-    let do_ = after.output_tokens.saturating_sub(bo);
-    let dcr = after.cache_read_tokens.saturating_sub(bcr);
-    let dcw = after.cache_write_tokens.saturating_sub(bcw);
-    if di + do_ > 0 {
-        let _ = session_store
-            .record_tokens(&key.id, model, di, do_, dcr, dcw)
-            .await;
-    }
-}
-
-/// Walk Pi session JSONL files in the temp agent dir: copy them to
-/// `~/.pi/agent/sessions/` for long-term storage AND extract token
-/// usage from this session. Returns `(input, output, cache_read, cache_write)`.
-pub(crate) async fn process_pi_sessions(pi_agent_dir: Option<&str>) -> (u64, u64, u64, u64) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
+/// Walk Pi session JSONL files in the temp agent dir and copy them to
+/// `~/.pi/agent/sessions/` for long-term storage.
+pub(crate) async fn process_pi_sessions(pi_agent_dir: Option<&str>) {
     let temp_dir = match pi_agent_dir {
         Some(d) => d,
-        None => return (0, 0, 0, 0),
+        None => return,
     };
 
     let temp_sessions = std::path::PathBuf::from(temp_dir).join("sessions");
     let real_sessions = crate::services::system_env::home_dir()
         .map(|h| h.join(".pi").join("agent").join("sessions"));
-
-    let mut input = 0u64;
-    let mut output = 0u64;
-    let mut cache_read = 0u64;
-    let mut cache_write = 0u64;
 
     let mut dirs = vec![temp_sessions.clone()];
     while let Some(dir) = dirs.pop() {
@@ -274,37 +222,8 @@ pub(crate) async fn process_pi_sessions(pi_agent_dir: Option<&str>) -> (u64, u64
                 }
                 let _ = tokio::fs::copy(&path, &dest).await;
             }
-
-            let file = match tokio::fs::File::open(&path).await {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let reader = BufReader::new(file);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let v: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if v.get("type").and_then(|t| t.as_str()) != Some("message") {
-                    continue;
-                }
-                let usage = match v.get("message").and_then(|m| m.get("usage")) {
-                    Some(u) => u,
-                    None => continue,
-                };
-                input += usage.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
-                output += usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
-                cache_read += usage.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0);
-                cache_write += usage
-                    .get("cacheWrite")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-            }
         }
     }
-
-    (input, output, cache_read, cache_write)
 }
 
 pub(crate) async fn cleanup_runtime_artifacts(
