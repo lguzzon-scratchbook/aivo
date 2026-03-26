@@ -196,7 +196,6 @@ mod tests {
             .unwrap();
         assert!(dir.path().join("stats.json").exists());
         let stats = store.load().await.unwrap();
-        assert_eq!(stats.total_selections, 1);
         assert_eq!(*stats.tool_counts.get("claude").unwrap(), 1);
     }
 
@@ -213,10 +212,11 @@ mod tests {
             .await
             .unwrap();
         let stats = store.load().await.unwrap();
-        assert_eq!(stats.total_prompt_tokens, 300);
-        assert_eq!(stats.total_completion_tokens, 150);
-        assert_eq!(stats.total_tokens, 450);
-        assert_eq!(stats.total_cache_read_input_tokens, 80);
+        let key_stats = stats.key_usage.get("key1").unwrap();
+        assert_eq!(key_stats.prompt_tokens, 300);
+        assert_eq!(key_stats.completion_tokens, 150);
+        assert_eq!(key_stats.total_tokens, 450);
+        assert_eq!(key_stats.cache_read_input_tokens, 80);
     }
 
     #[tokio::test]
@@ -254,7 +254,7 @@ mod tests {
 
         let store = UsageStatsStore::new(ctx);
         let loaded = store.load().await.unwrap();
-        assert_eq!(loaded.total_selections, 1);
+        assert_eq!(*loaded.tool_counts.get("claude").unwrap(), 1);
 
         // stats.json should now exist
         assert!(dir.path().join("stats.json").exists());
@@ -291,7 +291,7 @@ mod tests {
             .unwrap();
 
         let loaded = store.load().await.unwrap();
-        assert_eq!(loaded.total_selections, 1); // from stats.json, not config.json
+        assert_eq!(*loaded.tool_counts.get("claude").unwrap(), 1); // from stats.json, not config.json
     }
 
     #[cfg(unix)]

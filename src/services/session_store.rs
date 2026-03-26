@@ -154,8 +154,6 @@ pub struct DirectoryStartRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct UsageCounter {
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub selections: u64,
     #[serde(rename = "promptTokens", default, skip_serializing_if = "is_zero")]
     pub prompt_tokens: u64,
     #[serde(rename = "completionTokens", default, skip_serializing_if = "is_zero")]
@@ -177,13 +175,6 @@ pub struct UsageCounter {
     /// Per-tool selection counts (only populated in key_usage entries).
     #[serde(rename = "perTool", default, skip_serializing_if = "HashMap::is_empty")]
     pub per_tool: HashMap<String, u64>,
-    /// Per-model selection counts (only populated in key_usage entries).
-    #[serde(
-        rename = "perModelSelections",
-        default,
-        skip_serializing_if = "HashMap::is_empty"
-    )]
-    pub per_model_selections: HashMap<String, u64>,
     /// Per-model total token counts (only populated in key_usage entries).
     #[serde(
         rename = "perModelTokens",
@@ -217,30 +208,6 @@ impl UsageCounter {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct UsageStats {
-    #[serde(rename = "totalSelections", default, skip_serializing_if = "is_zero")]
-    pub total_selections: u64,
-    #[serde(rename = "totalPromptTokens", default, skip_serializing_if = "is_zero")]
-    pub total_prompt_tokens: u64,
-    #[serde(
-        rename = "totalCompletionTokens",
-        default,
-        skip_serializing_if = "is_zero"
-    )]
-    pub total_completion_tokens: u64,
-    #[serde(
-        rename = "totalCacheReadInputTokens",
-        default,
-        skip_serializing_if = "is_zero"
-    )]
-    pub total_cache_read_input_tokens: u64,
-    #[serde(
-        rename = "totalCacheCreationInputTokens",
-        default,
-        skip_serializing_if = "is_zero"
-    )]
-    pub total_cache_creation_input_tokens: u64,
-    #[serde(rename = "totalTokens", default, skip_serializing_if = "is_zero")]
-    pub total_tokens: u64,
     #[serde(
         rename = "keyUsage",
         default,
@@ -273,20 +240,6 @@ impl UsageStats {
         let Some(removed) = self.key_usage.remove(key_id) else {
             return;
         };
-        self.total_selections = self.total_selections.saturating_sub(removed.selections);
-        self.total_prompt_tokens = self
-            .total_prompt_tokens
-            .saturating_sub(removed.prompt_tokens);
-        self.total_completion_tokens = self
-            .total_completion_tokens
-            .saturating_sub(removed.completion_tokens);
-        self.total_cache_read_input_tokens = self
-            .total_cache_read_input_tokens
-            .saturating_sub(removed.cache_read_input_tokens);
-        self.total_cache_creation_input_tokens = self
-            .total_cache_creation_input_tokens
-            .saturating_sub(removed.cache_creation_input_tokens);
-        self.total_tokens = self.total_tokens.saturating_sub(removed.total_tokens);
         for (tool, count) in &removed.per_tool {
             if let Some(tc) = self.tool_counts.get_mut(tool) {
                 *tc = tc.saturating_sub(*count);
@@ -295,15 +248,10 @@ impl UsageStats {
                 }
             }
         }
-        for (model, sel) in &removed.per_model_selections {
-            if let Some(mu) = self.model_usage.get_mut(model) {
-                mu.selections = mu.selections.saturating_sub(*sel);
-            }
-        }
         for (model, tok) in &removed.per_model_tokens {
             if let Some(mu) = self.model_usage.get_mut(model) {
                 mu.total_tokens = mu.total_tokens.saturating_sub(*tok);
-                if mu.selections == 0 && mu.total_tokens == 0 {
+                if mu.total_tokens == 0 {
                     self.model_usage.remove(model);
                 }
             }
@@ -311,9 +259,7 @@ impl UsageStats {
     }
 
     pub(crate) fn record_selection(&mut self, key_id: &str, tool: &str, _model: Option<&str>) {
-        self.total_selections = self.total_selections.saturating_add(1);
         let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
-        key_stats.selections = key_stats.selections.saturating_add(1);
         *key_stats.per_tool.entry(tool.to_string()).or_default() += 1;
 
         let tool_count = self.tool_counts.entry(tool.to_string()).or_default();
@@ -331,20 +277,6 @@ impl UsageStats {
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
     ) {
-        self.total_prompt_tokens = self.total_prompt_tokens.saturating_add(prompt_tokens);
-        self.total_completion_tokens = self
-            .total_completion_tokens
-            .saturating_add(completion_tokens);
-        self.total_cache_read_input_tokens = self
-            .total_cache_read_input_tokens
-            .saturating_add(cache_read_input_tokens);
-        self.total_cache_creation_input_tokens = self
-            .total_cache_creation_input_tokens
-            .saturating_add(cache_creation_input_tokens);
-        self.total_tokens = self
-            .total_tokens
-            .saturating_add(prompt_tokens.saturating_add(completion_tokens));
-
         let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
         key_stats.add_tokens(
             prompt_tokens,
@@ -356,21 +288,11 @@ impl UsageStats {
         let total = prompt_tokens.saturating_add(completion_tokens);
         if let Some(model) = model.filter(|value| !value.trim().is_empty() && total > 0) {
             *key_stats
-                .per_model_selections
-                .entry(model.to_string())
-                .or_default() += 1;
-            *key_stats
                 .per_model_tokens
                 .entry(model.to_string())
                 .or_default() += total;
             let model_stats = self.model_usage.entry(model.to_string()).or_default();
-            model_stats.selections = model_stats.selections.saturating_add(1);
-            model_stats.add_tokens(
-                prompt_tokens,
-                completion_tokens,
-                cache_read_input_tokens,
-                cache_creation_input_tokens,
-            );
+            model_stats.total_tokens = model_stats.total_tokens.saturating_add(total);
         }
     }
 }
@@ -1441,10 +1363,6 @@ mod tests {
             .unwrap();
 
         let stats = store.load_stats().await.unwrap();
-        assert_eq!(stats.total_selections, 1);
-        assert_eq!(stats.total_tokens, 15);
-        assert_eq!(stats.total_cache_read_input_tokens, 90);
-        assert_eq!(stats.total_cache_creation_input_tokens, 15);
         assert_eq!(stats.tool_counts.get("chat"), Some(&1));
         assert_eq!(
             stats
@@ -1737,17 +1655,11 @@ mod tests {
     #[test]
     fn remove_key_subtracts_from_globals() {
         let mut stats = UsageStats::default();
-        // Set up global totals (simulating legacy data that's larger than per-key)
-        stats.total_selections = 100;
-        stats.total_prompt_tokens = 5000;
-        stats.total_completion_tokens = 3000;
-        stats.total_tokens = 8000;
         stats.tool_counts.insert("claude".to_string(), 50);
         stats.tool_counts.insert("codex".to_string(), 30);
         stats.model_usage.insert(
             "gpt-4o".to_string(),
             UsageCounter {
-                selections: 40,
                 total_tokens: 6000,
                 ..Default::default()
             },
@@ -1755,25 +1667,17 @@ mod tests {
 
         // Key to remove has partial contributions
         let mut entry = UsageCounter::default();
-        entry.selections = 10;
         entry.prompt_tokens = 500;
         entry.completion_tokens = 300;
         entry.total_tokens = 800;
         entry.per_tool.insert("claude".to_string(), 5);
-        entry.per_model_selections.insert("gpt-4o".to_string(), 3);
         entry.per_model_tokens.insert("gpt-4o".to_string(), 1000);
         stats.key_usage.insert("key1".to_string(), entry);
 
         stats.remove_key("key1");
 
-        // Globals should be reduced, not zeroed
-        assert_eq!(stats.total_selections, 90);
-        assert_eq!(stats.total_prompt_tokens, 4500);
-        assert_eq!(stats.total_completion_tokens, 2700);
-        assert_eq!(stats.total_tokens, 7200);
         assert_eq!(stats.tool_counts.get("claude"), Some(&45));
         assert_eq!(stats.tool_counts.get("codex"), Some(&30));
-        assert_eq!(stats.model_usage.get("gpt-4o").unwrap().selections, 37);
         assert_eq!(stats.model_usage.get("gpt-4o").unwrap().total_tokens, 5000);
         assert!(stats.key_usage.get("key1").is_none());
     }
@@ -1781,9 +1685,9 @@ mod tests {
     #[test]
     fn remove_key_noop_for_missing_key() {
         let mut stats = UsageStats::default();
-        stats.total_selections = 10;
+        stats.tool_counts.insert("claude".to_string(), 10);
         stats.remove_key("nonexistent");
-        assert_eq!(stats.total_selections, 10);
+        assert_eq!(stats.tool_counts.get("claude"), Some(&10));
     }
 
     #[test]
@@ -1793,7 +1697,6 @@ mod tests {
         stats.model_usage.insert(
             "gpt-4o".to_string(),
             UsageCounter {
-                selections: 3,
                 total_tokens: 1000,
                 ..Default::default()
             },
@@ -1801,7 +1704,6 @@ mod tests {
 
         let mut entry = UsageCounter::default();
         entry.per_tool.insert("claude".to_string(), 5);
-        entry.per_model_selections.insert("gpt-4o".to_string(), 3);
         entry.per_model_tokens.insert("gpt-4o".to_string(), 1000);
         stats.key_usage.insert("key1".to_string(), entry);
 

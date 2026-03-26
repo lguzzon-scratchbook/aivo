@@ -570,11 +570,8 @@ fn aggregate_model_usage(
     let mut all_have_per_key = true;
     for (key_id, entry) in &stats.key_usage {
         if existing_keys.contains(key_id.as_str()) {
-            if entry.per_model_selections.is_empty() && entry.per_model_tokens.is_empty() {
+            if entry.per_model_tokens.is_empty() {
                 all_have_per_key = false;
-            }
-            for (model, sel) in &entry.per_model_selections {
-                result.entry(model.clone()).or_default().selections += sel;
             }
             for (model, tok) in &entry.per_model_tokens {
                 result.entry(model.clone()).or_default().total_tokens += tok;
@@ -796,13 +793,11 @@ mod tests {
     fn aggregate_model_usage_from_per_key() {
         let mut stats = UsageStats::default();
         let mut counter = UsageCounter::default();
-        counter.per_model_selections.insert("gpt-4o".to_string(), 3);
         counter.per_model_tokens.insert("gpt-4o".to_string(), 1000);
         stats.key_usage.insert("key1".to_string(), counter);
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
         let result = aggregate_model_usage(&stats, &keys);
-        assert_eq!(result.get("gpt-4o").unwrap().selections, 3);
         assert_eq!(result.get("gpt-4o").unwrap().total_tokens, 1000);
     }
 
@@ -811,7 +806,6 @@ mod tests {
         let mut stats = UsageStats::default();
         // Key with per-model data (new)
         let mut c1 = UsageCounter::default();
-        c1.per_model_selections.insert("gpt-4o".to_string(), 5);
         c1.per_model_tokens.insert("gpt-4o".to_string(), 1000);
         stats.key_usage.insert("new_key".to_string(), c1);
         // Key without per-model data (legacy)
@@ -819,14 +813,12 @@ mod tests {
         stats.key_usage.insert("legacy_key".to_string(), c2);
         // Global model_usage has the full picture
         let mut global = UsageCounter::default();
-        global.selections = 698;
         global.total_tokens = 500_000;
         stats.model_usage.insert("gpt-4o".to_string(), global);
 
         let keys: HashSet<&str> = ["new_key", "legacy_key"].into_iter().collect();
         let result = aggregate_model_usage(&stats, &keys);
         // Should fall back to global since legacy_key lacks per-model data
-        assert_eq!(result.get("gpt-4o").unwrap().selections, 698);
         assert_eq!(result.get("gpt-4o").unwrap().total_tokens, 500_000);
     }
 
