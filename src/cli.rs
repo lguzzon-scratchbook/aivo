@@ -228,6 +228,10 @@ pub struct ServeArgs {
 /// Arguments for the stats command
 #[derive(Args, Debug, Clone)]
 pub struct StatsArgs {
+    /// Show stats for a specific tool (claude, codex, gemini, opencode, pi, chat)
+    #[arg(value_name = "TOOL")]
+    pub tool: Option<String>,
+
     /// Exact numbers instead of human-readable
     #[arg(short = 'n', long)]
     pub numbers: bool,
@@ -235,6 +239,14 @@ pub struct StatsArgs {
     /// Search by key, model, or tool name (substring match)
     #[arg(short = 's', long, value_name = "QUERY")]
     pub search: Option<String>,
+
+    /// Bypass cache and re-read all data files
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
+
+    /// Show all models (default: top 20, rest grouped as "others")
+    #[arg(short = 'a', long)]
+    pub all: bool,
 }
 
 /// Arguments for the update command

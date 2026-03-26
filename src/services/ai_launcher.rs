@@ -15,7 +15,7 @@ use crate::services::launch_args::{
 };
 use crate::services::launch_runtime::{
     cleanup_runtime_artifacts, persist_runtime_discoveries, prepare_runtime_env,
-    record_launch_state,
+    process_pi_sessions, record_launch_state, record_launch_tokens, snapshot_tool_stats,
 };
 use crate::services::models_cache::ModelsCache;
 use crate::services::ollama;
@@ -166,7 +166,36 @@ impl AILauncher {
         )
         .await;
 
+        let stats_before = if options.tool != AIToolType::Pi {
+            snapshot_tool_stats(options.tool).await
+        } else {
+            None
+        };
+
         let result = self.wait_for_process(&mut child).await;
+
+        if options.tool == AIToolType::Pi {
+            // Pi: preserve session files and extract tokens in a single pass.
+            // The standard delta mechanism doesn't work reliably for Pi
+            // because Pi may write sessions to its own data dir rather
+            // than the temp agent dir, making the delta always zero.
+            let (i, o, cr, cw) = process_pi_sessions(runtime.pi_agent_dir.as_deref()).await;
+            if i + o > 0 {
+                let _ = self
+                    .session_store
+                    .record_tokens(&resolved.key.id, resolved.model.as_deref(), i, o, cr, cw)
+                    .await;
+            }
+        } else {
+            record_launch_tokens(
+                &self.session_store,
+                &resolved.key,
+                options.tool,
+                resolved.model.as_deref(),
+                stats_before.as_ref(),
+            )
+            .await;
+        }
 
         persist_runtime_discoveries(
             &self.session_store,

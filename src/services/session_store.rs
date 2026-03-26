@@ -1036,6 +1036,10 @@ impl SessionStore {
         self.sessions.delete_chat_session(session_id).await
     }
 
+    pub async fn count_chat_sessions(&self) -> u64 {
+        self.sessions.count_chat_sessions().await
+    }
+
     /// Removes session files for all sessions belonging to a key.
     #[allow(dead_code)]
     pub async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {

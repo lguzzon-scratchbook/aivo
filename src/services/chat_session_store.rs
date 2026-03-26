@@ -460,6 +460,13 @@ impl ChatSessionStore {
         self.save_index(&index).await
     }
 
+    pub(crate) async fn count_chat_sessions(&self) -> u64 {
+        self.load_index()
+            .await
+            .map(|idx| idx.entries.len() as u64)
+            .unwrap_or(0)
+    }
+
     pub(crate) async fn delete_chat_session(&self, session_id: &str) -> Result<bool> {
         self.migrate_sessions_if_needed().await?;
         let _lock = self.acquire_session_lock()?;

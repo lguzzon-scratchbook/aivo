@@ -15,6 +15,7 @@ pub mod copilot_router;
 pub mod directory_starts;
 pub mod environment_injector;
 pub mod gemini_router;
+pub mod global_stats;
 pub mod http_utils;
 pub mod known_providers;
 pub mod launch_args;
