@@ -19,6 +19,7 @@ use crate::services::launch_runtime::{
 };
 use crate::services::models_cache::ModelsCache;
 use crate::services::ollama;
+use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::services::provider_profile::{
     is_copilot_base, is_direct_openai_base, is_ollama_base, provider_profile_for_base_url,
 };
@@ -68,6 +69,17 @@ impl AIToolType {
             Self::Opencode,
             Self::Pi,
         ]
+    }
+
+    /// Returns installation instructions for the tool.
+    pub fn install_hint(&self) -> &'static str {
+        match self {
+            Self::Claude => "curl -fsSL https://claude.ai/install.sh | bash",
+            Self::Codex => "npm install -g @openai/codex",
+            Self::Gemini => "npm install -g @google/gemini-cli",
+            Self::Opencode => "curl -fsSL https://opencode.ai/install | bash",
+            Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
+        }
     }
 }
 
@@ -151,6 +163,23 @@ impl AILauncher {
             &runtime.env,
         )
         .await?;
+
+        // Check if the tool binary is available on PATH before attempting to spawn
+        let path_dirs = collect_path_dirs();
+        if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
+            let tool = options.tool;
+            eprintln!(
+                "{} '{}' is not installed or not found on PATH.",
+                crate::style::red("Error:"),
+                tool.as_str()
+            );
+            eprintln!();
+            eprintln!(
+                "  {}",
+                crate::style::dim(format!("Install: {}", tool.install_hint()))
+            );
+            anyhow::bail!("tool '{}' not found", tool.as_str());
+        }
 
         let mut child = self.spawn_child(
             &resolved.tool_config.command,
@@ -656,5 +685,13 @@ mod tests {
             preferred_opencode_mode("https://openrouter.ai/api/v1"),
             OpenAICompatibilityMode::Direct
         );
+    }
+
+    #[test]
+    fn test_install_hint_non_empty_for_all_tools() {
+        for tool in AIToolType::all() {
+            let hint = tool.install_hint();
+            assert!(!hint.is_empty(), "{:?} should have an install hint", tool);
+        }
     }
 }
