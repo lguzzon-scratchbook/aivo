@@ -384,15 +384,10 @@ fn print_help() {
         let padded = format!("{:<10}", alias);
         println!("  {}{}", style::cyan(&padded), style::dim(expansion));
     };
-    print_shortcut("ls", "info");
     print_shortcut("use", "keys use");
     print_shortcut("ping", "keys ping");
     print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
-    print_shortcut("claude", "run claude");
-    print_shortcut("codex", "run codex");
-    print_shortcut("gemini", "run gemini");
-    print_shortcut("opencode", "run opencode");
-    print_shortcut("pi", "run pi");
+    print_shortcut("claude/codex/gemini/opencode/pi", " run <tool>");
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo claude -m kimi-k2.5"));
