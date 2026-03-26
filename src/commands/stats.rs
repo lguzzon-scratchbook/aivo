@@ -812,8 +812,10 @@ mod tests {
         let c2 = UsageCounter::default();
         stats.key_usage.insert("legacy_key".to_string(), c2);
         // Global model_usage has the full picture
-        let mut global = UsageCounter::default();
-        global.total_tokens = 500_000;
+        let global = UsageCounter {
+            total_tokens: 500_000,
+            ..Default::default()
+        };
         stats.model_usage.insert("gpt-4o".to_string(), global);
 
         let keys: HashSet<&str> = ["new_key", "legacy_key"].into_iter().collect();

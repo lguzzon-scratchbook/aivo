@@ -713,9 +713,7 @@ mod tests {
     #[test]
     fn test_gemini_converter_text_only() {
         let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-pro");
-        let input = concat!(
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n\n",
-        );
+        let input = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n\n";
         let mut output = converter.push_bytes(input.as_bytes()).unwrap();
         output.push_str(&converter.finish().unwrap());
 

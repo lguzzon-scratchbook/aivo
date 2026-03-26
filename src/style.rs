@@ -23,6 +23,7 @@ pub enum StyleName {
     Yellow,
     Blue,
     Cyan,
+    #[allow(dead_code)]
     Magenta,
 }
 
@@ -76,12 +77,6 @@ pub fn bold(text: impl AsRef<str>) -> String {
 /// Convenience function to style text as blue.
 pub fn blue(text: impl AsRef<str>) -> String {
     style_text(StyleName::Blue, text)
-}
-
-/// Convenience function to style text as magenta/purple.
-#[allow(dead_code)]
-pub fn magenta(text: impl AsRef<str>) -> String {
-    style_text(StyleName::Magenta, text)
 }
 
 /// Convenience function for the "✓" success symbol.

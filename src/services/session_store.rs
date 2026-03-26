@@ -1666,10 +1666,12 @@ mod tests {
         );
 
         // Key to remove has partial contributions
-        let mut entry = UsageCounter::default();
-        entry.prompt_tokens = 500;
-        entry.completion_tokens = 300;
-        entry.total_tokens = 800;
+        let mut entry = UsageCounter {
+            prompt_tokens: 500,
+            completion_tokens: 300,
+            total_tokens: 800,
+            ..Default::default()
+        };
         entry.per_tool.insert("claude".to_string(), 5);
         entry.per_model_tokens.insert("gpt-4o".to_string(), 1000);
         stats.key_usage.insert("key1".to_string(), entry);
@@ -1679,7 +1681,7 @@ mod tests {
         assert_eq!(stats.tool_counts.get("claude"), Some(&45));
         assert_eq!(stats.tool_counts.get("codex"), Some(&30));
         assert_eq!(stats.model_usage.get("gpt-4o").unwrap().total_tokens, 5000);
-        assert!(stats.key_usage.get("key1").is_none());
+        assert!(!stats.key_usage.contains_key("key1"));
     }
 
     #[test]
@@ -1710,8 +1712,8 @@ mod tests {
         stats.remove_key("key1");
 
         // Zeroed tool count should be removed
-        assert!(stats.tool_counts.get("claude").is_none());
+        assert!(!stats.tool_counts.contains_key("claude"));
         // Zeroed model usage should be removed
-        assert!(stats.model_usage.get("gpt-4o").is_none());
+        assert!(!stats.model_usage.contains_key("gpt-4o"));
     }
 }

@@ -40,6 +40,7 @@ impl fmt::Display for ExitCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
     User,
+    #[allow(dead_code)]
     Network,
     Auth,
 }
@@ -48,6 +49,7 @@ pub enum ErrorCategory {
 #[derive(Debug)]
 pub struct CLIError {
     message: String,
+    #[allow(dead_code)] // used in binary crate's error handling
     category: ErrorCategory,
     details: Option<String>,
     suggestion: Option<String>,
@@ -67,22 +69,6 @@ impl CLIError {
             suggestion: suggestion.map(|s| s.into()),
         }
     }
-
-    /// Returns the error category for exit code mapping.
-    #[allow(dead_code)]
-    pub fn category(&self) -> ErrorCategory {
-        self.category
-    }
-
-    /// Returns the exit code for this error.
-    #[allow(dead_code)]
-    pub fn exit_code(&self) -> ExitCode {
-        match self.category {
-            ErrorCategory::User => ExitCode::UserError,
-            ErrorCategory::Network => ExitCode::NetworkError,
-            ErrorCategory::Auth => ExitCode::AuthError,
-        }
-    }
 }
 
 impl fmt::Display for CLIError {
@@ -100,32 +86,6 @@ impl fmt::Display for CLIError {
 
 impl std::error::Error for CLIError {}
 
-/// Classifies an error into a category based on message patterns.
-#[allow(dead_code)]
-pub fn classify_error(error: &dyn std::error::Error) -> ErrorCategory {
-    let msg = error.to_string().to_lowercase();
-    if msg.contains("connection")
-        || msg.contains("timeout")
-        || msg.contains("dns")
-        || msg.contains("network")
-    {
-        ErrorCategory::Network
-    } else if msg.contains("auth") || msg.contains("unauthorized") || msg.contains("401") {
-        ErrorCategory::Auth
-    } else {
-        ErrorCategory::User
-    }
-}
-
-#[allow(dead_code)]
-pub fn get_exit_code(error: &dyn std::error::Error) -> ExitCode {
-    match classify_error(error) {
-        ErrorCategory::User => ExitCode::UserError,
-        ErrorCategory::Network => ExitCode::NetworkError,
-        ErrorCategory::Auth => ExitCode::AuthError,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,16 +97,6 @@ mod tests {
         assert_eq!(ExitCode::NetworkError.code(), 2);
         assert_eq!(ExitCode::AuthError.code(), 3);
         assert_eq!(ExitCode::ToolExit(130).code(), 130);
-    }
-
-    #[test]
-    fn test_is_network_error() {
-        let network_err =
-            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
-        assert_eq!(classify_error(&network_err), ErrorCategory::Network);
-
-        let not_network = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        assert_eq!(classify_error(&not_network), ErrorCategory::User);
     }
 
     #[test]
@@ -174,18 +124,6 @@ mod tests {
         assert!(display.contains("Run 'aivo keys'"));
     }
 
-    #[test]
-    fn test_cli_error_exit_code() {
-        let err = CLIError::new(
-            "auth failed",
-            ErrorCategory::Auth,
-            None::<String>,
-            None::<String>,
-        );
-        assert_eq!(err.exit_code(), ExitCode::AuthError);
-    }
-
-    // Additional tests from tests/errors_test.rs
     #[test]
     fn test_cli_error_with_actionable_suggestion() {
         let err = CLIError::new(
@@ -217,24 +155,6 @@ mod tests {
         );
         let display = err.to_string();
         assert_eq!(display, "Simple error");
-    }
-
-    #[test]
-    fn test_classify_error_network_timeout_by_message() {
-        let err = std::io::Error::other("request timeout");
-        let category = classify_error(&err);
-        assert_eq!(
-            category,
-            ErrorCategory::Network,
-            "Should detect 'timeout' in message"
-        );
-    }
-
-    #[test]
-    fn test_get_exit_code() {
-        let err = std::io::Error::other("test");
-        let code = get_exit_code(&err);
-        assert_eq!(code, ExitCode::UserError);
     }
 
     #[test]

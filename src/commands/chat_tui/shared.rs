@@ -552,7 +552,6 @@ pub(super) enum SubmitAction {
     Command(SlashCommand),
 }
 
-#[allow(dead_code)]
 pub(super) enum ClipboardPayload {
     Text(String),
     Attachment(MessageAttachment),

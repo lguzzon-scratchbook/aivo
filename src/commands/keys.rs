@@ -1111,7 +1111,6 @@ fn prompt_pick_key(keys: &[ApiKey], prompt: &str, default: usize) -> Result<Opti
 }
 
 // Prompts the user to select a key from the given list without changing the active key.
-#[allow(dead_code)]
 pub(crate) fn prompt_pick_key_without_activation(
     keys: &[ApiKey],
     prompt: &str,
@@ -1128,7 +1127,7 @@ pub(crate) fn prompt_pick_key_without_activation(
 
 // Prompts the user to select a key from the given list and activates it.
 // Returns `Ok(Some(key))` if selected, `Ok(None)` if cancelled.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by binary crate (key_resolution.rs)
 pub(crate) async fn prompt_select_key(
     session_store: &SessionStore,
     keys: &[ApiKey],

@@ -315,20 +315,6 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
     env_map
 }
 
-/// Get the list of valid commands
-#[allow(dead_code)]
-pub fn get_valid_commands() -> Vec<&'static str> {
-    vec![
-        "update", "keys", "run", "chat", "models", "serve", "info", "use",
-    ]
-}
-
-/// Check if a command is a passthrough command (passes all args to underlying tool)
-#[allow(dead_code)]
-pub fn is_passthrough_command(command: &str) -> bool {
-    command == "run"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,21 +340,6 @@ mod tests {
         let env_map = parse_env_vars(&env_strings);
         assert_eq!(env_map.len(), 1);
         assert_eq!(env_map.get("VALID"), Some(&"key".to_string()));
-    }
-
-    #[test]
-    fn test_get_valid_commands() {
-        let commands = get_valid_commands();
-        assert!(commands.contains(&"update"));
-        assert!(commands.contains(&"keys"));
-        assert!(commands.contains(&"run"));
-        assert!(!commands.contains(&"stats"));
-    }
-
-    #[test]
-    fn test_is_passthrough_command() {
-        assert!(is_passthrough_command("run"));
-        assert!(!is_passthrough_command("keys"));
     }
 
     #[test]
@@ -697,12 +668,6 @@ mod tests {
         } else {
             panic!("Expected Keys command");
         }
-    }
-
-    #[test]
-    fn test_get_valid_commands_includes_use() {
-        let commands = get_valid_commands();
-        assert!(commands.contains(&"use"));
     }
 
     #[test]
