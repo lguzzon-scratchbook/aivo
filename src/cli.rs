@@ -140,6 +140,10 @@ pub struct RunArgs {
     )]
     pub key: Option<String>,
 
+    /// Bypass cache and fetch fresh model list for the model picker
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
+
     /// Enable debug output
     #[arg(long)]
     pub debug: bool,

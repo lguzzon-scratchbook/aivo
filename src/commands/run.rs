@@ -36,6 +36,7 @@ impl RunCommand {
         client: &Client,
         key: &ApiKey,
         flag_model: Option<String>,
+        refresh: bool,
     ) -> Result<Option<String>> {
         match flag_model {
             // No --model flag → don't override, let the tool use its default
@@ -47,7 +48,13 @@ impl RunCommand {
         }
 
         // Show picker (--model with no value)
-        let models_list = fetch_models_for_select(client, key, &self.cache).await;
+        let models_list = if refresh {
+            crate::commands::models::fetch_models_cached(client, key, &self.cache, true)
+                .await
+                .unwrap_or_default()
+        } else {
+            fetch_models_for_select(client, key, &self.cache).await
+        };
 
         if models_list.is_empty() {
             anyhow::bail!(
@@ -75,12 +82,22 @@ impl RunCommand {
         args: Vec<String>,
         debug: bool,
         dry_run: bool,
+        refresh: bool,
         model: Option<String>,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
     ) -> ExitCode {
         match self
-            .execute_internal(tool, args, debug, dry_run, model, env, key_override)
+            .execute_internal(
+                tool,
+                args,
+                debug,
+                dry_run,
+                refresh,
+                model,
+                env,
+                key_override,
+            )
             .await
         {
             Ok(code) => code,
@@ -98,6 +115,7 @@ impl RunCommand {
         args: Vec<String>,
         debug: bool,
         dry_run: bool,
+        refresh: bool,
         model: Option<String>,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
@@ -145,7 +163,7 @@ impl RunCommand {
         let picker_was_requested = model.as_ref().is_some_and(|m| m.is_empty());
         let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
-            let result = self.resolve_model(&client, key, model).await?;
+            let result = self.resolve_model(&client, key, model, refresh).await?;
             // If user explicitly opened the picker (--model with no value) and cancelled, exit
             if picker_was_requested && result.is_none() {
                 return Ok(ExitCode::Success);
@@ -213,6 +231,7 @@ impl RunCommand {
             "-k, --key <id|name>",
             "Select API key by ID or name (-k opens key picker)",
         );
+        print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
         print_opt("--env <k=v>", "Inject environment variable");
         print_opt(
             "--dry-run",

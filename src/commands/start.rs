@@ -21,6 +21,7 @@ pub struct StartFlowArgs {
     pub tool: Option<String>,
     pub debug: bool,
     pub dry_run: bool,
+    pub refresh: bool,
     pub yes: bool,
     pub envs: Vec<String>,
 }
@@ -72,7 +73,7 @@ impl StartCommand {
             .await?;
         let tool = self.resolve_tool(args.tool.as_deref(), remembered.as_ref())?;
         let model = self
-            .resolve_model(args.model, remembered.as_ref(), &key)
+            .resolve_model(args.model, remembered.as_ref(), &key, args.refresh)
             .await?;
         let env = parse_env_vars(&args.envs);
         let skip_confirm =
@@ -270,12 +271,13 @@ impl StartCommand {
         model_arg: Option<String>,
         remembered: Option<&DirectoryStartRecord>,
         key: &Resolved<ApiKey>,
+        refresh: bool,
     ) -> Result<Resolved<Option<String>>> {
         let should_prompt = model_arg.as_ref().is_some_and(|value| value.is_empty())
             || (model_arg.is_none() && remembered.is_none());
 
         if should_prompt {
-            return self.prompt_select_model(&key.value).await;
+            return self.prompt_select_model(&key.value, refresh).await;
         }
 
         match model_arg {
@@ -290,9 +292,19 @@ impl StartCommand {
         }
     }
 
-    async fn prompt_select_model(&self, key: &ApiKey) -> Result<Resolved<Option<String>>> {
+    async fn prompt_select_model(
+        &self,
+        key: &ApiKey,
+        refresh: bool,
+    ) -> Result<Resolved<Option<String>>> {
         let client = http_utils::router_http_client();
-        let models = fetch_models_for_select(&client, key, &self.cache).await;
+        let models = if refresh {
+            crate::commands::models::fetch_models_cached(&client, key, &self.cache, true)
+                .await
+                .unwrap_or_default()
+        } else {
+            fetch_models_for_select(&client, key, &self.cache).await
+        };
         if models.is_empty() {
             anyhow::bail!(
                 "No models found for this key. Use 'aivo models --refresh' or specify one with --model <name>."
