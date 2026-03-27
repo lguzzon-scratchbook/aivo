@@ -95,6 +95,37 @@ impl ChatTuiApp {
         };
         self.last_usage = turn.usage;
 
+        let assistant_content = self
+            .history
+            .last()
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let assistant_reasoning = self
+            .history
+            .last()
+            .and_then(|message| message.reasoning_content.clone());
+        let user_message = self
+            .history
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|message| message.role == "user")
+            .cloned();
+        if let Some(user_message) = user_message {
+            let _ = log_chat_turn(
+                &self.session_store,
+                &self.key,
+                &self.raw_model,
+                Some(&self.cwd),
+                Some(&self.session_id),
+                &user_message,
+                &assistant_content,
+                assistant_reasoning.as_deref(),
+                &usage,
+            )
+            .await;
+        }
+
         self.persist_history().await?;
         self.notice = None;
         Ok(())

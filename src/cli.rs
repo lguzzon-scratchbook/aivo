@@ -58,6 +58,9 @@ pub enum Commands {
     #[command(alias = "ls")]
     Info(InfoArgs),
 
+    /// Show recent local logs from chat, run, and serve
+    Logs(LogsArgs),
+
     /// Show usage statistics (tokens, requests, breakdowns)
     Stats(StatsArgs),
 
@@ -268,6 +271,78 @@ pub struct InfoArgs {
     /// Ping all keys and show pass/fail summary
     #[arg(long)]
     pub ping: bool,
+}
+
+/// Arguments for the logs command
+#[derive(Args, Debug, Clone)]
+pub struct LogsArgs {
+    /// Action: show, path, or status
+    #[arg(value_name = "ACTION")]
+    pub action: Option<String>,
+
+    /// Target ID for `aivo logs show <id>`
+    #[arg(value_name = "TARGET")]
+    pub target: Option<String>,
+
+    /// Maximum number of rows to display
+    #[arg(short = 'n', long, default_value_t = 20)]
+    pub limit: usize,
+
+    /// Output JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Continuously refresh matching logs
+    #[arg(long)]
+    pub watch: bool,
+
+    /// Refresh interval in seconds for --watch
+    #[arg(long, default_value_t = 1.0)]
+    pub interval: f32,
+
+    /// Emit newly seen entries as JSONL while watching
+    #[arg(long)]
+    pub jsonl: bool,
+
+    /// Show newest entries first instead of chronological order
+    #[arg(long)]
+    pub latest_first: bool,
+
+    /// Search title/body text
+    #[arg(short = 's', long, value_name = "QUERY", value_parser = non_empty())]
+    pub search: Option<String>,
+
+    /// Filter by source (chat, run, serve)
+    #[arg(long, value_name = "SOURCE", value_parser = non_empty())]
+    pub source: Option<String>,
+
+    /// Filter by tool
+    #[arg(long, value_name = "TOOL", value_parser = non_empty())]
+    pub tool: Option<String>,
+
+    /// Filter by model substring
+    #[arg(long, value_name = "MODEL", value_parser = non_empty())]
+    pub model: Option<String>,
+
+    /// Filter by saved key ID or name substring
+    #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
+    pub key: Option<String>,
+
+    /// Filter by working directory substring
+    #[arg(long, value_name = "PATH", value_parser = non_empty())]
+    pub cwd: Option<String>,
+
+    /// Filter events since this ISO-like timestamp/date
+    #[arg(long, value_name = "TIME", value_parser = non_empty())]
+    pub since: Option<String>,
+
+    /// Filter events until this ISO-like timestamp/date
+    #[arg(long, value_name = "TIME", value_parser = non_empty())]
+    pub until: Option<String>,
+
+    /// Only show errors (HTTP >= 400 or exit_code != 0)
+    #[arg(long)]
+    pub errors: bool,
 }
 
 /// Arguments for the chat command

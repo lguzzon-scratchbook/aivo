@@ -47,6 +47,7 @@ use super::chat_response_parser::{
 // Re-export for submodules (chat_tui uses ThinkTagParser, chat_tui_format uses TokenUsage)
 pub(crate) use super::chat_response_parser::ThinkTagParser;
 pub(crate) use super::chat_response_parser::TokenUsage;
+pub(crate) use chat_tui_format::format_time_ago_short;
 
 #[path = "chat_tui.rs"]
 mod chat_tui;
@@ -302,6 +303,18 @@ impl ChatCommand {
                             usage.cache_creation_input_tokens,
                         )
                         .await?;
+                    let _ = log_chat_turn(
+                        &self.session_store,
+                        &key,
+                        &raw_model,
+                        Some(&cwd),
+                        None,
+                        &history[0],
+                        &turn.content,
+                        turn.reasoning_content.as_deref(),
+                        &usage,
+                    )
+                    .await;
                     println!();
                     return Ok(ExitCode::Success);
                 }
@@ -745,6 +758,87 @@ fn retry_delay(attempt: usize, retry_after: Option<&reqwest::header::HeaderValue
     }
     let exp = 250u64.saturating_mul(1u64 << (attempt.saturating_sub(1).min(4)));
     Duration::from_millis(exp.min(4000))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_chat_turn(
+    session_store: &SessionStore,
+    key: &ApiKey,
+    raw_model: &str,
+    cwd: Option<&str>,
+    session_id: Option<&str>,
+    user_message: &ChatMessage,
+    assistant_content: &str,
+    reasoning_content: Option<&str>,
+    usage: &TokenUsage,
+) -> Result<()> {
+    let attachments = user_message
+        .attachments
+        .iter()
+        .map(|attachment| {
+            serde_json::json!({
+                "name": attachment.name,
+                "mime_type": attachment.mime_type,
+                "storage": attachment_storage_label(&attachment.storage),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    session_store
+        .logs()
+        .append(crate::services::log_store::LogEvent {
+            source: "chat".to_string(),
+            kind: "chat_turn".to_string(),
+            key_id: Some(key.id.clone()),
+            key_name: Some(key.display_name().to_string()),
+            base_url: Some(key.base_url.clone()),
+            tool: Some("chat".to_string()),
+            model: Some(raw_model.to_string()),
+            cwd: cwd.map(str::to_string),
+            session_id: session_id.map(str::to_string),
+            input_tokens: Some(usage.prompt_tokens as i64),
+            output_tokens: Some(usage.completion_tokens as i64),
+            cache_read_input_tokens: Some(usage.cache_read_input_tokens as i64),
+            cache_creation_input_tokens: Some(usage.cache_creation_input_tokens as i64),
+            title: Some(log_title(&user_message.content)),
+            body_text: Some(format!(
+                "User:\n{}\n\nAssistant:\n{}",
+                user_message.content, assistant_content
+            )),
+            payload_json: Some(serde_json::json!({
+                "user": {
+                    "content": user_message.content,
+                    "attachments": attachments,
+                },
+                "assistant": {
+                    "content": assistant_content,
+                    "reasoning_content": reasoning_content,
+                }
+            })),
+            ..Default::default()
+        })
+        .await?;
+    Ok(())
+}
+
+fn log_title(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(empty chat turn)");
+    let mut truncated = line.chars().take(120).collect::<String>();
+    if line.chars().count() > 120 {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn attachment_storage_label(storage: &AttachmentStorage) -> &'static str {
+    match storage {
+        AttachmentStorage::Inline { .. } => "inline",
+        AttachmentStorage::FileRef { .. } => "file_ref",
+    }
 }
 
 async fn send_with_retry<F>(mut build_request: F) -> Result<reqwest::Response>

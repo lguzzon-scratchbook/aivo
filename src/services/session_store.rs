@@ -13,6 +13,7 @@ use crate::services::system_env;
 use crate::services::api_key_store::ApiKeyStore;
 use crate::services::chat_session_store::ChatSessionStore;
 use crate::services::directory_starts::DirectoryStartsStore;
+use crate::services::log_store::LogStore;
 use crate::services::usage_stats_store::UsageStatsStore;
 
 /// Serde module for serializing/deserializing Zeroizing<String> as regular String
@@ -654,6 +655,7 @@ pub struct SessionStore {
     sessions: ChatSessionStore,
     stats: UsageStatsStore,
     dirs: DirectoryStartsStore,
+    logs: LogStore,
 }
 
 impl SessionStore {
@@ -687,6 +689,7 @@ impl SessionStore {
             sessions: ChatSessionStore { ctx: ctx.clone() },
             stats: UsageStatsStore::new(ctx.clone()),
             dirs: DirectoryStartsStore { ctx: ctx.clone() },
+            logs: LogStore::new(ctx.config_dir.clone()),
             ctx,
         }
     }
@@ -703,6 +706,10 @@ impl SessionStore {
     #[allow(dead_code)]
     pub fn get_config_path(&self) -> &PathBuf {
         &self.ctx.config_path
+    }
+
+    pub fn logs(&self) -> LogStore {
+        self.logs.clone()
     }
 
     // ── API Key management (delegated to ApiKeyStore) ─────────────────────

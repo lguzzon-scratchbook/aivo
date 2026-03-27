@@ -20,6 +20,7 @@ pub mod http_utils;
 pub mod known_providers;
 pub mod launch_args;
 pub mod launch_runtime;
+pub mod log_store;
 pub mod model_names;
 pub mod models_cache;
 pub mod ollama;

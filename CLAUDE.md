@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --release   # Compile optimized binary to target/release/aivo
-cargo test --features test-fast-crypto  # Run all tests (~1500 tests, fast crypto for CI/dev)
+cargo test --features test-fast-crypto  # Run all tests (~1900 tests, fast crypto for CI/dev)
 cargo test -- test_name                 # Run a single test by name
 cargo clippy            # Lint (fix all warnings before committing)
 cargo fmt               # Format code (run before committing)
@@ -93,6 +93,7 @@ SessionStore → EnvironmentInjector → AILauncher
 | `alias.rs`               | Model alias management (short names → full model names)    |
 | `info.rs`                | System info and health check (keys, tools, directory state; `--ping` for key pinging) |
 | `keys.rs`                | API key management (add, rm, use, edit, cat, list)         |
+| `logs.rs`                | Query local SQLite logs for chat, run, and serve activity  |
 | `models.rs`              | List available models from active provider (1h cache)      |
 | `serve.rs`               | Local OpenAI-compatible API server                         |
 | `stats.rs`               | Usage statistics display (aivo chat + global tool stats)   |
@@ -108,6 +109,7 @@ SessionStore → EnvironmentInjector → AILauncher
 | `chat_session_store.rs`         | Chat session persistence and titling                                    |
 | `directory_starts.rs`           | Per-directory remembered key + tool selections with stale detection     |
 | `usage_stats_store.rs`          | Usage statistics persistence with file locking                          |
+| `log_store.rs`                  | SQLite-backed event log (WAL mode) for chat, run, and serve activity    |
 | `ai_launcher.rs`                | Process spawning, signal forwarding (SIGINT/SIGTERM), stdio passthrough |
 | `environment_injector.rs`       | Tool-specific env var configuration, placeholder URL + router flag injection |
 | `provider_protocol.rs`          | Protocol detection from base URL                                        |

@@ -182,7 +182,7 @@ pub(super) fn truncate_for_display_width(text: &str, max_width: usize) -> String
     result
 }
 
-pub(super) fn format_time_ago_short(updated_at: &str) -> String {
+pub fn format_time_ago_short(updated_at: &str) -> String {
     let parsed = DateTime::parse_from_rfc3339(updated_at)
         .map(|value| value.with_timezone(&Utc))
         .ok();

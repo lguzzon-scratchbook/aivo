@@ -1,0 +1,840 @@
+use anyhow::{Context, Result};
+use chrono::Utc;
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
+use serde::Serialize;
+use serde_json::Value as JsonValue;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct LogStore {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LogEntry {
+    pub id: String,
+    pub ts_utc: String,
+    pub source: String,
+    pub kind: String,
+    pub event_group_id: Option<String>,
+    pub phase: Option<String>,
+    pub key_id: Option<String>,
+    pub key_name: Option<String>,
+    pub base_url: Option<String>,
+    pub tool: Option<String>,
+    pub model: Option<String>,
+    pub cwd: Option<String>,
+    pub session_id: Option<String>,
+    pub status_code: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
+    pub title: Option<String>,
+    pub body_text: Option<String>,
+    pub payload_json: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogEvent {
+    pub source: String,
+    pub kind: String,
+    pub event_group_id: Option<String>,
+    pub phase: Option<String>,
+    pub key_id: Option<String>,
+    pub key_name: Option<String>,
+    pub base_url: Option<String>,
+    pub tool: Option<String>,
+    pub model: Option<String>,
+    pub cwd: Option<String>,
+    pub session_id: Option<String>,
+    pub status_code: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
+    pub title: Option<String>,
+    pub body_text: Option<String>,
+    pub payload_json: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogQuery {
+    pub limit: usize,
+    pub search: Option<String>,
+    pub source: Option<String>,
+    pub tool: Option<String>,
+    pub model: Option<String>,
+    pub key_query: Option<String>,
+    pub cwd: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub errors_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogStatus {
+    pub path: String,
+    pub total_entries: u64,
+    pub file_size_bytes: u64,
+    pub counts_by_source: Vec<SourceCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCount {
+    pub source: String,
+    pub count: u64,
+}
+
+impl LogStore {
+    pub fn new(config_dir: PathBuf) -> Self {
+        Self {
+            path: config_dir.join("logs.db"),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub async fn append(&self, event: LogEvent) -> Result<String> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let id = new_log_id();
+            let ts_utc = Utc::now().to_rfc3339();
+            let payload_json = event.payload_json.map(|value| value.to_string());
+            let params = vec![
+                SqlValue::Text(id.clone()),
+                SqlValue::Text(ts_utc),
+                SqlValue::Text(event.source),
+                SqlValue::Text(event.kind),
+                option_text(event.event_group_id),
+                option_text(event.phase),
+                option_text(event.key_id),
+                option_text(event.key_name),
+                option_text(event.base_url),
+                option_text(event.tool),
+                option_text(event.model),
+                option_text(event.cwd),
+                option_text(event.session_id),
+                option_integer(event.status_code),
+                option_integer(event.exit_code),
+                option_integer(event.duration_ms),
+                option_integer(event.input_tokens),
+                option_integer(event.output_tokens),
+                option_integer(event.cache_read_input_tokens),
+                option_integer(event.cache_creation_input_tokens),
+                option_text(event.title),
+                option_text(event.body_text),
+                option_text(payload_json),
+            ];
+            conn.execute(
+                "insert into events (
+                    id, ts_utc, source, kind, event_group_id, phase, key_id, key_name, base_url, tool, model, cwd,
+                    session_id, status_code, exit_code, duration_ms, input_tokens, output_tokens,
+                    cache_read_input_tokens, cache_creation_input_tokens, title, body_text,
+                    payload_json
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params_from_iter(params),
+            )
+            .context("Failed to insert log entry")?;
+            Ok(id)
+        })
+        .await
+        .context("Failed to join log insert task")?
+    }
+
+    pub async fn list(&self, query: LogQuery) -> Result<Vec<LogEntry>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            if !path.exists() {
+                return Ok(Vec::new());
+            }
+            match open_read_connection(&path).and_then(|conn| list_with_connection(&conn, &query)) {
+                Ok(entries) => Ok(entries),
+                Err(direct_err) => {
+                    with_snapshot_connection(&path, |conn| list_with_connection(conn, &query))
+                        .with_context(|| {
+                            format!(
+                                "Failed to read SQLite logs directly from {:?}: {direct_err:#}",
+                                path
+                            )
+                        })
+                }
+            }
+        })
+        .await
+        .context("Failed to join log query task")?
+    }
+
+    #[allow(dead_code)]
+    pub async fn get(&self, id: &str) -> Result<Option<LogEntry>> {
+        let path = self.path.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if !path.exists() {
+                return Ok(None);
+            }
+            match open_read_connection(&path).and_then(|conn| get_with_connection(&conn, &id)) {
+                Ok(entry) => Ok(entry),
+                Err(direct_err) => with_snapshot_connection(&path, |conn| {
+                    get_with_connection(conn, &id)
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to read SQLite log entry directly from {:?}: {direct_err:#}",
+                        path
+                    )
+                }),
+            }
+        })
+        .await
+        .context("Failed to join log get task")?
+    }
+
+    pub async fn get_by_reference(&self, reference: &str) -> Result<Option<LogEntry>> {
+        let path = self.path.clone();
+        let reference = reference.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            if !path.exists() {
+                return Ok(None);
+            }
+            match open_read_connection(&path)
+                .and_then(|conn| get_by_reference_with_connection(&conn, &reference))
+            {
+                Ok(entry) => Ok(entry),
+                Err(direct_err) => with_snapshot_connection(&path, |conn| {
+                    get_by_reference_with_connection(conn, &reference)
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to read SQLite log entry directly from {:?}: {direct_err:#}",
+                        path
+                    )
+                }),
+            }
+        })
+        .await
+        .context("Failed to join log reference lookup task")?
+    }
+
+    pub async fn status(&self) -> Result<LogStatus> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            if !path.exists() {
+                return Ok(LogStatus {
+                    path: path.display().to_string(),
+                    total_entries: 0,
+                    file_size_bytes: 0,
+                    counts_by_source: Vec::new(),
+                });
+            }
+            match open_read_connection(&path).and_then(|conn| status_with_connection(&conn, &path))
+            {
+                Ok(status) => Ok(status),
+                Err(direct_err) => with_snapshot_connection(&path, |conn| {
+                    status_with_connection(conn, &path)
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to read SQLite log status directly from {:?}: {direct_err:#}",
+                        path
+                    )
+                }),
+            }
+        })
+        .await
+        .context("Failed to join log status task")?
+    }
+}
+
+fn normalize_query_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_text_filter(value: Option<String>) -> Option<String> {
+    normalize_query_value(value).map(|value| value.to_lowercase())
+}
+
+fn option_text(value: Option<String>) -> SqlValue {
+    value.map(SqlValue::Text).unwrap_or(SqlValue::Null)
+}
+
+fn option_integer(value: Option<i64>) -> SqlValue {
+    value.map(SqlValue::Integer).unwrap_or(SqlValue::Null)
+}
+
+pub fn new_log_id() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstvwxyz";
+    let mut rng = rand::thread_rng();
+    (0..12)
+        .map(|_| {
+            let index = rng.gen_range(0..ALPHABET.len());
+            ALPHABET[index] as char
+        })
+        .collect()
+}
+
+fn open_connection(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create log directory: {:?}", parent))?;
+    }
+    let conn = Connection::open(path)
+        .with_context(|| format!("Failed to open SQLite log database: {:?}", path))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .context("Failed to configure SQLite busy timeout")?;
+    conn.execute_batch(
+        "
+        pragma journal_mode = wal;
+        pragma synchronous = normal;
+        create table if not exists events (
+            id text primary key,
+            ts_utc text not null,
+            source text not null,
+            kind text not null,
+            event_group_id text,
+            phase text,
+            key_id text,
+            key_name text,
+            base_url text,
+            tool text,
+            model text,
+            cwd text,
+            session_id text,
+            status_code integer,
+            exit_code integer,
+            duration_ms integer,
+            input_tokens integer,
+            output_tokens integer,
+            cache_read_input_tokens integer,
+            cache_creation_input_tokens integer,
+            title text,
+            body_text text,
+            payload_json text
+        );
+        ",
+    )
+    .context("Failed to initialize SQLite log schema")?;
+    ensure_column_exists(&conn, "events", "event_group_id", "text")?;
+    ensure_column_exists(&conn, "events", "phase", "text")?;
+    conn.execute_batch(
+        "
+        create index if not exists idx_events_ts on events(ts_utc desc);
+        create index if not exists idx_events_source_ts on events(source, ts_utc desc);
+        create index if not exists idx_events_tool_ts on events(tool, ts_utc desc);
+        create index if not exists idx_events_model_ts on events(model, ts_utc desc);
+        create index if not exists idx_events_key_ts on events(key_id, ts_utc desc);
+        create index if not exists idx_events_cwd_ts on events(cwd, ts_utc desc);
+        create index if not exists idx_events_session_ts on events(session_id, ts_utc desc);
+        create index if not exists idx_events_group_ts on events(event_group_id, ts_utc desc);
+        ",
+    )
+    .context("Failed to initialize SQLite log indexes")?;
+    Ok(conn)
+}
+
+fn open_read_connection(path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open SQLite log database for reading: {:?}", path))
+}
+
+fn with_snapshot_connection<T, F>(path: &Path, op: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T>,
+{
+    let temp_dir = tempfile::tempdir().context("Failed to create temporary SQLite snapshot dir")?;
+    let snapshot_path = temp_dir.path().join("logs.db");
+    copy_sqlite_snapshot(path, &snapshot_path)?;
+    let conn = Connection::open(&snapshot_path)
+        .with_context(|| format!("Failed to open SQLite log snapshot: {:?}", snapshot_path))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .context("Failed to configure SQLite snapshot busy timeout")?;
+    op(&conn)
+}
+
+fn copy_sqlite_snapshot(path: &Path, snapshot_path: &Path) -> Result<()> {
+    std::fs::copy(path, snapshot_path).with_context(|| {
+        format!(
+            "Failed to copy SQLite log database from {:?} to {:?}",
+            path, snapshot_path
+        )
+    })?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        if sidecar.exists() {
+            let snapshot_sidecar = sqlite_sidecar_path(snapshot_path, suffix);
+            std::fs::copy(&sidecar, &snapshot_sidecar).with_context(|| {
+                format!(
+                    "Failed to copy SQLite sidecar from {:?} to {:?}",
+                    sidecar, snapshot_sidecar
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.display(), suffix))
+}
+
+fn event_select_columns(include_run_phase_fields: bool) -> String {
+    let phase_cols: [&str; 2] = if include_run_phase_fields {
+        ["event_group_id", "phase"]
+    } else {
+        ["null as event_group_id", "null as phase"]
+    };
+    let columns: &[&str] = &[
+        "id",
+        "ts_utc",
+        "source",
+        "kind",
+        phase_cols[0],
+        phase_cols[1],
+        "key_id",
+        "key_name",
+        "base_url",
+        "tool",
+        "model",
+        "cwd",
+        "session_id",
+        "status_code",
+        "exit_code",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "title",
+        "body_text",
+        "payload_json",
+    ];
+    columns.join(", ")
+}
+
+fn build_list_query(query: &LogQuery, include_run_phase_fields: bool) -> (String, Vec<SqlValue>) {
+    let mut sql = format!(
+        "select {} from events where 1 = 1",
+        event_select_columns(include_run_phase_fields)
+    );
+    let mut params: Vec<SqlValue> = Vec::new();
+
+    if let Some(source) = normalize_text_filter(query.source.clone()) {
+        sql.push_str(" and source = ?");
+        params.push(SqlValue::Text(source));
+    }
+    if let Some(tool) = normalize_text_filter(query.tool.clone()) {
+        sql.push_str(" and lower(coalesce(tool, '')) like ?");
+        params.push(SqlValue::Text(format!("%{tool}%")));
+    }
+    if let Some(model) = normalize_text_filter(query.model.clone()) {
+        sql.push_str(" and lower(coalesce(model, '')) like ?");
+        params.push(SqlValue::Text(format!("%{model}%")));
+    }
+    if let Some(key_query) = normalize_text_filter(query.key_query.clone()) {
+        sql.push_str(
+            " and (
+                lower(coalesce(key_id, '')) like ?
+                or lower(coalesce(key_name, '')) like ?
+            )",
+        );
+        let term = format!("%{key_query}%");
+        params.push(SqlValue::Text(term.clone()));
+        params.push(SqlValue::Text(term));
+    }
+    if let Some(cwd) = normalize_text_filter(query.cwd.clone()) {
+        sql.push_str(" and lower(coalesce(cwd, '')) like ?");
+        params.push(SqlValue::Text(format!("%{cwd}%")));
+    }
+    if let Some(since) = normalize_query_value(query.since.clone()) {
+        sql.push_str(" and ts_utc >= ?");
+        params.push(SqlValue::Text(since));
+    }
+    if let Some(until) = normalize_query_value(query.until.clone()) {
+        sql.push_str(" and ts_utc <= ?");
+        params.push(SqlValue::Text(until));
+    }
+    if query.errors_only {
+        sql.push_str(
+            " and (
+                (status_code is not null and status_code >= 400)
+                or (exit_code is not null and exit_code != 0)
+            )",
+        );
+    }
+    if let Some(search) = normalize_text_filter(query.search.clone()) {
+        sql.push_str(
+            " and (
+                lower(coalesce(title, '')) like ?
+                or lower(coalesce(body_text, '')) like ?
+                or lower(coalesce(model, '')) like ?
+                or lower(coalesce(tool, '')) like ?
+                or lower(coalesce(key_name, '')) like ?
+                or lower(coalesce(key_id, '')) like ?
+                or lower(coalesce(base_url, '')) like ?
+                or lower(coalesce(cwd, '')) like ?
+            )",
+        );
+        let term = format!("%{search}%");
+        for _ in 0..8 {
+            params.push(SqlValue::Text(term.clone()));
+        }
+    }
+
+    sql.push_str(" order by ts_utc desc limit ?");
+    params.push(SqlValue::Integer(query.limit.max(1) as i64));
+    (sql, params)
+}
+
+fn is_legacy_log_schema_error(err: &rusqlite::Error) -> bool {
+    let message = err.to_string();
+    message.contains("no such column: event_group_id") || message.contains("no such column: phase")
+}
+
+fn list_with_connection(conn: &Connection, query: &LogQuery) -> Result<Vec<LogEntry>> {
+    let (sql, params) = build_list_query(query, true);
+    let mut statement = match conn.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(err) if is_legacy_log_schema_error(&err) => {
+            let (legacy_sql, legacy_params) = build_list_query(query, false);
+            let mut statement = conn
+                .prepare(&legacy_sql)
+                .with_context(|| format!("Failed to prepare legacy log query: {legacy_sql}"))?;
+            let rows = statement
+                .query_map(params_from_iter(legacy_params), map_log_row)
+                .context("Failed to read legacy log rows")?;
+            let mut entries = Vec::new();
+            for row in rows {
+                entries.push(row?);
+            }
+            return Ok(entries);
+        }
+        Err(err) => {
+            let err_text = err.to_string();
+            return Err(err).with_context(|| {
+                format!("Failed to prepare log query: {sql}; sqlite error: {err_text}")
+            });
+        }
+    };
+    let rows = statement
+        .query_map(params_from_iter(params), map_log_row)
+        .context("Failed to read log rows")?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+fn get_with_connection(conn: &Connection, id: &str) -> Result<Option<LogEntry>> {
+    let modern_sql = format!(
+        "select {} from events where id = ?",
+        event_select_columns(true)
+    );
+    match conn.query_row(&modern_sql, [id], map_log_row).optional() {
+        Ok(entry) => Ok(entry),
+        Err(err) if is_legacy_log_schema_error(&err) => conn
+            .query_row(
+                &format!(
+                    "select {} from events where id = ?",
+                    event_select_columns(false)
+                ),
+                [id],
+                map_log_row,
+            )
+            .optional()
+            .context("Failed to load legacy log entry"),
+        Err(err) => {
+            let err_text = err.to_string();
+            Err(err).with_context(|| {
+                format!(
+                    "Failed to load log entry with query: {modern_sql}; sqlite error: {err_text}"
+                )
+            })
+        }
+    }
+}
+
+fn get_by_reference_with_connection(
+    conn: &Connection,
+    reference: &str,
+) -> Result<Option<LogEntry>> {
+    if let Some(entry) = get_with_connection(conn, reference)? {
+        return Ok(Some(entry));
+    }
+
+    let modern_sql = format!(
+        "select {} from events where event_group_id = ? order by ts_utc desc limit 1",
+        event_select_columns(true)
+    );
+    match conn
+        .query_row(&modern_sql, [reference], map_log_row)
+        .optional()
+    {
+        Ok(entry) => Ok(entry),
+        Err(err) if is_legacy_log_schema_error(&err) => Ok(None),
+        Err(err) => {
+            let err_text = err.to_string();
+            Err(err).with_context(|| {
+                format!(
+                    "Failed to load log entry by group reference with query: {modern_sql}; sqlite error: {err_text}"
+                )
+            })
+        }
+    }
+}
+
+fn status_with_connection(conn: &Connection, path: &Path) -> Result<LogStatus> {
+    let total_entries: u64 = conn
+        .query_row("select count(*) from events", [], |row| row.get(0))
+        .context("Failed to count log entries")?;
+
+    let mut statement = conn
+        .prepare("select source, count(*) from events group by source order by source")
+        .context("Failed to prepare log status query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SourceCount {
+                source: row.get(0)?,
+                count: row.get::<_, i64>(1)? as u64,
+            })
+        })
+        .context("Failed to read log status rows")?;
+
+    let mut counts_by_source = Vec::new();
+    for row in rows {
+        counts_by_source.push(row?);
+    }
+
+    let file_size_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+
+    Ok(LogStatus {
+        path: path.display().to_string(),
+        total_entries,
+        file_size_bytes,
+        counts_by_source,
+    })
+}
+
+fn map_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
+    let payload_json: Option<String> = row.get(22)?;
+    let payload_json = payload_json.and_then(|raw| serde_json::from_str(&raw).ok());
+    Ok(LogEntry {
+        id: row.get(0)?,
+        ts_utc: row.get(1)?,
+        source: row.get(2)?,
+        kind: row.get(3)?,
+        event_group_id: row.get(4)?,
+        phase: row.get(5)?,
+        key_id: row.get(6)?,
+        key_name: row.get(7)?,
+        base_url: row.get(8)?,
+        tool: row.get(9)?,
+        model: row.get(10)?,
+        cwd: row.get(11)?,
+        session_id: row.get(12)?,
+        status_code: row.get(13)?,
+        exit_code: row.get(14)?,
+        duration_ms: row.get(15)?,
+        input_tokens: row.get(16)?,
+        output_tokens: row.get(17)?,
+        cache_read_input_tokens: row.get(18)?,
+        cache_creation_input_tokens: row.get(19)?,
+        title: row.get(20)?,
+        body_text: row.get(21)?,
+        payload_json,
+    })
+}
+
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let pragma = format!("pragma table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .with_context(|| format!("Failed to inspect SQLite schema for {table}"))?;
+    let found = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("Failed to read SQLite schema rows")?
+        .filter_map(|row| row.ok())
+        .any(|name| name == column);
+    if !found {
+        conn.execute(
+            &format!("alter table {table} add column {column} {column_type}"),
+            [],
+        )
+        .with_context(|| format!("Failed to add SQLite column {column} to {table}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn store(dir: &TempDir) -> LogStore {
+        LogStore::new(dir.path().to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn append_and_get_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let id = store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                event_group_id: Some("run-1".to_string()),
+                phase: Some("finished".to_string()),
+                key_id: Some("key1".to_string()),
+                key_name: Some("primary".to_string()),
+                base_url: Some("https://api.openai.com".to_string()),
+                tool: Some("claude".to_string()),
+                model: Some("claude-sonnet-4-6".to_string()),
+                cwd: Some("/repo".to_string()),
+                exit_code: Some(0),
+                duration_ms: Some(1234),
+                title: Some("claude".to_string()),
+                body_text: Some("--resume 123".to_string()),
+                payload_json: Some(serde_json::json!({"args":["--resume","123"]})),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let entry = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(entry.source, "run");
+        assert_eq!(entry.tool.as_deref(), Some("claude"));
+        assert_eq!(entry.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn list_supports_filters() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+
+        store
+            .append(LogEvent {
+                source: "chat".to_string(),
+                kind: "chat_turn".to_string(),
+                key_id: Some("key1".to_string()),
+                key_name: Some("alpha".to_string()),
+                tool: Some("chat".to_string()),
+                model: Some("gpt-4o".to_string()),
+                cwd: Some("/repo".to_string()),
+                session_id: Some("session-1".to_string()),
+                duration_ms: Some(10),
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                cache_read_input_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                title: Some("Summarize".to_string()),
+                body_text: Some("User: summarize\nAssistant: ok".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .append(LogEvent {
+                source: "serve".to_string(),
+                kind: "serve_request".to_string(),
+                key_id: Some("key2".to_string()),
+                key_name: Some("beta".to_string()),
+                tool: Some("serve".to_string()),
+                model: Some("text-embedding-3-small".to_string()),
+                status_code: Some(500),
+                duration_ms: Some(42),
+                title: Some("POST /v1/embeddings".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let filtered = store
+            .list(LogQuery {
+                limit: 10,
+                source: Some("chat".to_string()),
+                search: Some("summarize".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].source, "chat");
+
+        let errors = store
+            .list(LogQuery {
+                limit: 10,
+                errors_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].source, "serve");
+    }
+
+    #[test]
+    fn new_log_id_is_short_and_alphanumeric() {
+        let id = new_log_id();
+        assert_eq!(id.len(), 12);
+        assert!(
+            id.chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_reference_returns_latest_group_event() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                event_group_id: Some("runabc123xyz".to_string()),
+                phase: Some("started".to_string()),
+                tool: Some("claude".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let finished_id = store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                event_group_id: Some("runabc123xyz".to_string()),
+                phase: Some("finished".to_string()),
+                tool: Some("claude".to_string()),
+                exit_code: Some(0),
+                duration_ms: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let entry = store
+            .get_by_reference("runabc123xyz")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.id, finished_id);
+        assert_eq!(entry.phase.as_deref(), Some("finished"));
+    }
+}

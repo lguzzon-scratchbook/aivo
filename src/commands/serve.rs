@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::net::IpAddr;
 
 use crate::errors::ExitCode;
+use crate::services::log_store::LogStore;
 use crate::services::provider_profile::provider_profile_for_key;
 use crate::services::request_log::RequestLogger;
 use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
@@ -21,17 +22,19 @@ pub struct ServeParams {
     pub auth_token: Option<String>,
 }
 
-pub struct ServeCommand;
+pub struct ServeCommand {
+    log_store: LogStore,
+}
 
 impl Default for ServeCommand {
     fn default() -> Self {
-        Self::new()
+        Self::new(LogStore::new(std::path::PathBuf::from(".config/aivo")))
     }
 }
 
 impl ServeCommand {
-    pub fn new() -> Self {
-        Self
+    pub fn new(log_store: LogStore) -> Self {
+        Self { log_store }
     }
 
     pub async fn execute(&self, params: ServeParams) -> ExitCode {
@@ -129,7 +132,7 @@ impl ServeCommand {
         let failover_count = failover_keys.len();
         let log_display = logger.as_ref().map(|l| l.path_display().to_string());
         let auth_display = config.auth_token.clone();
-        let router = ServeRouter::new(config, key)
+        let router = ServeRouter::new(config, key, self.log_store.clone())
             .with_logger(logger)
             .with_failover_keys(failover_keys);
 

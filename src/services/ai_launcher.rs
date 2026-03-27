@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::time::Instant;
 use tokio::process::Command;
 #[cfg(unix)]
 use tokio::signal;
@@ -18,6 +19,7 @@ use crate::services::launch_runtime::{
     cleanup_runtime_artifacts, persist_runtime_discoveries, prepare_runtime_env,
     process_pi_sessions, record_launch_state,
 };
+use crate::services::log_store::{LogEvent, new_log_id};
 use crate::services::models_cache::ModelsCache;
 use crate::services::ollama;
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
@@ -169,6 +171,10 @@ impl AILauncher {
             inject_codex_provider_config(&mut runtime.env, &mut runtime_args.args);
         }
 
+        let event_group_id = new_log_id();
+        let cwd = crate::services::system_env::current_dir_string();
+        let log_args = runtime_args.args.clone();
+
         // Check if the tool binary is available on PATH before attempting to spawn
         let path_dirs = collect_path_dirs();
         if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
@@ -186,11 +192,68 @@ impl AILauncher {
             anyhow::bail!("tool '{}' not found", tool.as_str());
         }
 
-        let mut child = self.spawn_child(
+        let base_event = || LogEvent {
+            source: "run".to_string(),
+            kind: "tool_launch".to_string(),
+            event_group_id: Some(event_group_id.clone()),
+            key_id: Some(resolved.key.id.clone()),
+            key_name: Some(resolved.key.display_name().to_string()),
+            base_url: Some(resolved.key.base_url.clone()),
+            tool: Some(options.tool.as_str().to_string()),
+            model: resolved.model.clone(),
+            cwd: cwd.clone(),
+            title: Some(format!(
+                "{} {}",
+                options.tool.as_str(),
+                resolved.key.display_name()
+            )),
+            ..Default::default()
+        };
+
+        let _ = self
+            .session_store
+            .logs()
+            .append(LogEvent {
+                phase: Some("started".to_string()),
+                body_text: if log_args.is_empty() {
+                    None
+                } else {
+                    Some(log_args.join(" "))
+                },
+                payload_json: Some(serde_json::json!({
+                    "command": resolved.tool_config.command,
+                    "args": log_args,
+                    "debug": options.debug,
+                })),
+                ..base_event()
+            })
+            .await;
+
+        let child_result = self.spawn_child(
             &resolved.tool_config.command,
             &runtime_args.args,
             runtime.env,
-        )?;
+        );
+        let mut child = match child_result {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = self
+                    .session_store
+                    .logs()
+                    .append(LogEvent {
+                        phase: Some("finished".to_string()),
+                        exit_code: Some(1),
+                        duration_ms: Some(0),
+                        body_text: Some(err.to_string()),
+                        payload_json: Some(serde_json::json!({
+                            "error": err.to_string(),
+                        })),
+                        ..base_event()
+                    })
+                    .await;
+                return Err(err);
+            }
+        };
 
         record_launch_state(
             &self.session_store,
@@ -200,6 +263,7 @@ impl AILauncher {
         )
         .await;
 
+        let started_at = Instant::now();
         let result = self.wait_for_process(&mut child).await;
 
         if options.tool == AIToolType::Pi {
@@ -221,6 +285,23 @@ impl AILauncher {
             runtime.pi_agent_dir.as_deref(),
         )
         .await;
+
+        let exit_code = result.as_ref().ok().copied();
+        let _ = self
+            .session_store
+            .logs()
+            .append(LogEvent {
+                phase: Some("finished".to_string()),
+                exit_code: exit_code.map(i64::from),
+                duration_ms: Some(started_at.elapsed().as_millis() as i64),
+                payload_json: Some(serde_json::json!({
+                    "command": resolved.tool_config.command,
+                    "args": runtime_args.args,
+                    "debug": options.debug,
+                })),
+                ..base_event()
+            })
+            .await;
 
         result
     }

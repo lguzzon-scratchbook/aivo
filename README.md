@@ -72,6 +72,7 @@ aivo claude --model llama3.2
 | [models](#models) | List available models from the active provider |
 | [alias](#alias) | Create short names for models |
 | [info](#info) | Show system info, keys, tools, and directory state |
+| [logs](#logs) | Query local SQLite logs for chat, run, and serve |
 | [stats](#stats) | Show usage statistics |
 | [update](#update) | Update to the latest version |
 
@@ -415,6 +416,69 @@ Also health-check all keys:
 
 ```bash
 aivo info --ping
+```
+
+## logs
+
+Query the local SQLite log database used by aivo chat, run, and serve. Chat logs include turn content and token usage. `run` logs record launch metadata only. `serve` logs record request metadata only.
+
+By default, `aivo logs` prints entries in chronological order like traditional system logs. Use `--latest-first` to show newest entries first.
+
+```bash
+aivo logs
+```
+
+#### `show <id>`
+
+Show one entry in detail:
+
+```bash
+aivo logs show 7m2q8k4v9cpr
+```
+
+#### `path`
+
+Print the SQLite database path:
+
+```bash
+aivo logs path
+```
+
+#### `status`
+
+Show entry counts and database size:
+
+```bash
+aivo logs status
+```
+
+#### Quick search
+
+A bare word is treated as a search query:
+
+```bash
+aivo logs claude
+aivo logs "rate limit"
+```
+
+#### Filters
+
+```bash
+aivo logs --source chat -n 5
+aivo logs --tool claude --errors
+aivo logs -s "rate limit"
+aivo logs --json
+aivo logs --latest-first
+```
+
+#### Live watch
+
+Poll and refresh matching logs continuously:
+
+```bash
+aivo logs --source run --watch
+aivo logs --watch --interval 2
+aivo logs --watch --jsonl
 ```
 
 ## stats

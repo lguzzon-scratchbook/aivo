@@ -18,8 +18,8 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    AliasCommand, ChatCommand, InfoCommand, KeysCommand, ModelsCommand, RunCommand, ServeCommand,
-    ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    AliasCommand, ChatCommand, InfoCommand, KeysCommand, LogsCommand, ModelsCommand, RunCommand,
+    ServeCommand, ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
     truncate_url_for_display,
 };
 use errors::ExitCode;
@@ -62,6 +62,9 @@ async fn main() {
             }
             Some(Commands::Info(_)) => {
                 InfoCommand::print_help();
+            }
+            Some(Commands::Logs(_)) => {
+                LogsCommand::print_help();
             }
             Some(Commands::Stats(_)) => {
                 StatsCommand::print_help();
@@ -266,7 +269,7 @@ async fn main() {
             } else {
                 Vec::new()
             };
-            let command = ServeCommand::new();
+            let command = ServeCommand::new(session_store.logs());
             command
                 .execute(ServeParams {
                     port: serve_args.port,
@@ -284,6 +287,11 @@ async fn main() {
         Commands::Info(info_args) => {
             let command = InfoCommand::new(session_store, models_cache);
             command.execute(info_args.ping).await
+        }
+
+        Commands::Logs(logs_args) => {
+            let command = LogsCommand::new(session_store);
+            command.execute(logs_args).await
         }
 
         Commands::Stats(stats_args) => {
@@ -380,6 +388,7 @@ fn print_help() {
     print_cmd("models", "List available models from the active provider");
     print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("info", "Show system info, keys, tools, and directory state");
+    print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
     print_cmd("update", "Update to the latest version");
     println!();

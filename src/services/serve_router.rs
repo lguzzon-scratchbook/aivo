@@ -13,6 +13,7 @@ use crate::commands::models::fetch_models;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
+use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch,
 };
@@ -53,6 +54,7 @@ pub struct ServeRouterConfig {
 pub struct ServeRouter {
     config: ServeRouterConfig,
     key: ApiKey,
+    log_store: LogStore,
     logger: Option<RequestLogger>,
     failover_keys: Vec<ApiKey>,
 }
@@ -63,6 +65,7 @@ struct ServeState {
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
     active_protocol: Arc<AtomicU8>,
+    log_store: LogStore,
     logger: Option<RequestLogger>,
     failover_keys: Arc<Vec<FailoverEntry>>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -76,10 +79,11 @@ struct FailoverEntry {
 }
 
 impl ServeRouter {
-    pub fn new(config: ServeRouterConfig, key: ApiKey) -> Self {
+    pub fn new(config: ServeRouterConfig, key: ApiKey, log_store: LogStore) -> Self {
         Self {
             config,
             key,
+            log_store,
             logger: None,
             failover_keys: Vec::new(),
         }
@@ -159,6 +163,7 @@ impl ServeRouter {
             key: self.key,
             copilot_tokens,
             active_protocol: Arc::new(AtomicU8::new(initial_protocol.to_u8())),
+            log_store: self.log_store,
             logger: self.logger,
             failover_keys: Arc::new(failover_entries),
             shutdown: shutdown.clone(),
@@ -264,14 +269,10 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             let request_start = std::time::Instant::now();
 
             // Extract model from request body for logging (best-effort)
-            let log_model = if state.logger.is_some() {
-                http_utils::extract_request_body(&request)
-                    .ok()
-                    .and_then(|body| serde_json::from_str::<Value>(body).ok())
-                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
-            } else {
-                None
-            };
+            let log_model = http_utils::extract_request_body(&request)
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
 
             let result = match path_no_query {
                 "/health" => Ok(RouterResponse::buffered(
@@ -338,25 +339,48 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             }
 
             // Log request (non-blocking, non-fatal)
+            let latency_ms = request_start.elapsed().as_millis();
+            let method = request
+                .split_whitespace()
+                .next()
+                .unwrap_or("GET")
+                .to_string();
+
             if let Some(ref logger) = state.logger {
-                let latency_ms = request_start.elapsed().as_millis() as u64;
-                let method = request
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("GET")
-                    .to_string();
                 logger
                     .log(crate::services::request_log::RequestLogEntry {
                         timestamp: chrono::Utc::now().to_rfc3339(),
-                        method,
+                        method: method.clone(),
                         path: path_no_query.to_string(),
-                        model: log_model,
+                        model: log_model.clone(),
                         status: response_status,
-                        latency_ms,
-                        ip: peer_ip,
+                        latency_ms: latency_ms as u64,
+                        ip: peer_ip.clone(),
                     })
                     .await;
             }
+
+            let _ = state
+                .log_store
+                .append(LogEvent {
+                    source: "serve".to_string(),
+                    kind: "serve_request".to_string(),
+                    key_id: Some(state.key.id.clone()),
+                    key_name: Some(state.key.display_name().to_string()),
+                    base_url: Some(state.key.base_url.clone()),
+                    tool: Some("serve".to_string()),
+                    model: log_model,
+                    status_code: Some(response_status as i64),
+                    duration_ms: Some(latency_ms as i64),
+                    title: Some(format!("{method} {path_no_query}")),
+                    payload_json: Some(json!({
+                        "method": method,
+                        "path": path_no_query,
+                        "ip": peer_ip,
+                    })),
+                    ..Default::default()
+                })
+                .await;
         });
     }
 }
@@ -454,13 +478,18 @@ fn is_failover_status(status: u16) -> bool {
 
 /// Builds a temporary ServeState from a FailoverEntry, sharing the client.
 /// Logger is intentionally omitted — failover attempts are not individually logged.
-fn failover_state(entry: &FailoverEntry, client: &reqwest::Client) -> ServeState {
+fn failover_state(
+    entry: &FailoverEntry,
+    client: &reqwest::Client,
+    log_store: &LogStore,
+) -> ServeState {
     ServeState {
         config: entry.config.clone(), // Arc clone — O(1) atomic increment
         client: client.clone(),
         key: entry.key.clone(),
         copilot_tokens: entry.copilot_tokens.clone(),
         active_protocol: Arc::new(AtomicU8::new(entry.active_protocol.load(Ordering::Relaxed))),
+        log_store: log_store.clone(),
         logger: None,
         failover_keys: Arc::new(Vec::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -492,7 +521,7 @@ macro_rules! impl_with_failover {
                 status
             );
             for entry in state.failover_keys.iter() {
-                let fstate = failover_state(entry, &state.client);
+                let fstate = failover_state(entry, &state.client, &state.log_store);
                 if let Ok(resp) = $handler(request, &fstate).await {
                     let s = match &resp {
                         RouterResponse::Buffered { status, .. } => *status,
@@ -907,6 +936,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             active_protocol: Arc::new(AtomicU8::new(protocol.to_u8())),
+            log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -1038,6 +1068,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             active_protocol: Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8())),
+            log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -1204,7 +1235,7 @@ mod tests {
         };
 
         let client = http_utils::router_http_client();
-        let state = failover_state(&entry, &client);
+        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()));
 
         assert_eq!(
             state.config.upstream_base_url,
@@ -1236,7 +1267,7 @@ mod tests {
         };
 
         let client = http_utils::router_http_client();
-        let state = failover_state(&entry, &client);
+        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()));
 
         // Arc should be a clone of the same allocation, not a new copy
         assert!(Arc::ptr_eq(&entry.config, &state.config));
@@ -1261,7 +1292,7 @@ mod tests {
         };
 
         let client = http_utils::router_http_client();
-        let state = failover_state(&entry, &client);
+        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()));
 
         // Failover state should have no failover keys (no cascading)
         assert!(state.failover_keys.is_empty());
