@@ -329,6 +329,23 @@ async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
     }
 }
 
+/// Warms the model cache for a newly added key so subsequent commands are instant.
+fn sync_models_in_background(key_id: &str, base_url: &str) {
+    if crate::services::provider_profile::is_ollama_base(base_url) {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["models", "--refresh", "--key", key_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 impl KeysCommand {
     /// Creates a new KeysCommand instance
     pub fn new(session_store: SessionStore) -> Self {
@@ -891,6 +908,7 @@ impl KeysCommand {
                 style::dim("(uses Copilot subscription)")
             );
 
+            sync_models_in_background(&id, &base_url);
             return Ok(ExitCode::Success);
         }
 
@@ -990,6 +1008,7 @@ impl KeysCommand {
             style::dim("(uses this key)")
         );
 
+        sync_models_in_background(&id, &base_url);
         Ok(ExitCode::Success)
     }
 
