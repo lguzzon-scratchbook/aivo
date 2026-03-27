@@ -584,8 +584,18 @@ fn preferred_gemini_protocol(base_url: &str) -> GeminiProviderProtocol {
 }
 
 fn preferred_opencode_mode(base_url: &str) -> OpenAICompatibilityMode {
-    if provider_profile_for_base_url(base_url).default_protocol == ProviderProtocol::Openai {
-        OpenAICompatibilityMode::Direct
+    if is_direct_openai_base(base_url) {
+        return OpenAICompatibilityMode::Direct;
+    }
+    let profile = provider_profile_for_base_url(base_url);
+    if profile.default_protocol == ProviderProtocol::Openai {
+        // Direct connection works for plain OpenAI-compatible endpoints,
+        // but use router if the provider has quirks that need request transformation.
+        if profile.quirks.has_quirks() {
+            OpenAICompatibilityMode::Router
+        } else {
+            OpenAICompatibilityMode::Direct
+        }
     } else {
         OpenAICompatibilityMode::Router
     }

@@ -60,6 +60,12 @@ impl ProviderQuirks {
         }
     }
 
+    pub fn has_quirks(&self) -> bool {
+        self.model_prefix.is_some()
+            || self.requires_reasoning_content
+            || self.max_tokens_cap.is_some()
+    }
+
     pub fn inject(&self, env: &mut HashMap<String, String>, prefix: &str) {
         if let Some(pfx) = self.model_prefix {
             env.insert(format!("{prefix}_MODEL_PREFIX"), pfx.to_string());
