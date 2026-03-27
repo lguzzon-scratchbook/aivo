@@ -479,7 +479,7 @@ async fn parse_gemini_file(path: &Path) -> Option<FileEntry> {
 // Non-cached tool collectors (OpenCode via SQLite, Pi)
 // ---------------------------------------------------------------------------
 
-/// OpenCode: ~/.local/share/opencode/opencode.db (SQLite via sqlite3 CLI)
+/// OpenCode: ~/.local/share/opencode/opencode.db (SQLite via rusqlite)
 async fn collect_opencode() -> Result<Option<GlobalToolStats>> {
     let home = match system_env::home_dir() {
         Some(h) => h,
@@ -495,56 +495,73 @@ async fn collect_opencode() -> Result<Option<GlobalToolStats>> {
         return Ok(None);
     }
 
-    let query = "SELECT session_id, json_extract(data, '$.modelID'), json_extract(data, '$.tokens.input'), json_extract(data, '$.tokens.output'), json_extract(data, '$.tokens.cache.read'), json_extract(data, '$.tokens.cache.write') FROM message WHERE json_extract(data, '$.role') = 'assistant' AND json_extract(data, '$.tokens') IS NOT NULL;";
+    tokio::task::spawn_blocking(move || {
+        let conn = match rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
 
-    let output = tokio::process::Command::new("sqlite3")
-        .arg("-separator")
-        .arg("\t")
-        .arg(&db_path)
-        .arg(query)
-        .output()
-        .await;
+        let mut stmt = match conn.prepare(
+            "SELECT session_id,
+                    json_extract(data, '$.modelID'),
+                    json_extract(data, '$.tokens.input'),
+                    json_extract(data, '$.tokens.output'),
+                    json_extract(data, '$.tokens.cache.read'),
+                    json_extract(data, '$.tokens.cache.write')
+             FROM message
+             WHERE json_extract(data, '$.role') = 'assistant'
+               AND json_extract(data, '$.tokens') IS NOT NULL",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
 
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Ok(None), // sqlite3 not found or query failed
-    };
+        let mut stats = GlobalToolStats::default();
+        let mut session_ids = HashSet::new();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut stats = GlobalToolStats::default();
-    let mut session_ids = HashSet::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, u64>(2).unwrap_or(0),
+                row.get::<_, u64>(3).unwrap_or(0),
+                row.get::<_, u64>(4).unwrap_or(0),
+                row.get::<_, u64>(5).unwrap_or(0),
+            ))
+        });
 
-    for line in stdout.lines() {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 6 {
-            continue;
+        let rows = match rows {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        for row in rows.flatten() {
+            let (session_id, model, input, output, cache_read, cache_write) = row;
+
+            session_ids.insert(session_id);
+            stats.input_tokens += input;
+            stats.output_tokens += output;
+            stats.cache_read_tokens += cache_read;
+            stats.cache_write_tokens += cache_write;
+
+            if !model.is_empty() {
+                let key = normalize_model_for_display(&model);
+                let entry = stats.models.entry(key).or_default();
+                entry.input_tokens += input;
+                entry.output_tokens += output;
+            }
         }
-        let session_id = cols[0];
-        let model = cols[1];
-        let input: u64 = cols[2].parse().unwrap_or(0);
-        let output: u64 = cols[3].parse().unwrap_or(0);
-        let cache_read: u64 = cols[4].parse().unwrap_or(0);
-        let cache_write: u64 = cols[5].parse().unwrap_or(0);
 
-        session_ids.insert(session_id.to_string());
-        stats.input_tokens += input;
-        stats.output_tokens += output;
-        stats.cache_read_tokens += cache_read;
-        stats.cache_write_tokens += cache_write;
-
-        if !model.is_empty() {
-            let key = normalize_model_for_display(model);
-            let entry = stats.models.entry(key).or_default();
-            entry.input_tokens += input;
-            entry.output_tokens += output;
+        stats.sessions = session_ids.len() as u64;
+        if stats.sessions == 0 {
+            return Ok(None);
         }
-    }
-
-    stats.sessions = session_ids.len() as u64;
-    if stats.sessions == 0 {
-        return Ok(None);
-    }
-    Ok(Some(stats))
+        Ok(Some(stats))
+    })
+    .await?
 }
 
 /// Pi: ~/.pi/agent/sessions/**/*.jsonl

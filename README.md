@@ -485,8 +485,6 @@ aivo logs --watch --jsonl
 
 Show usage statistics across all tools. Aggregates token counts from aivo chat, Claude Code, Codex, Gemini, OpenCode, and Pi by reading each tool's native data files. Per-file caching makes subsequent runs fast.
 
-OpenCode stats are read via the `sqlite3` CLI (preinstalled on macOS/Linux). If `sqlite3` is not available, OpenCode stats are silently skipped.
-
 ```bash
 aivo stats
 ```

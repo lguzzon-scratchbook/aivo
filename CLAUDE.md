@@ -141,7 +141,7 @@ SessionStore → EnvironmentInjector → AILauncher
 | `path_search.rs`                | PATH scanning to find executables with platform-specific extensions     |
 | `system_env.rs`                 | System environment helpers (CWD, home dir, etc.)                        |
 | `launch_runtime.rs`             | Router startup, temp dir writing (Pi agent dir), runtime env patching   |
-| `global_stats.rs`               | Cross-tool stats aggregation (Claude/Codex/Gemini/OpenCode/Pi) with per-file caching; OpenCode uses `sqlite3` CLI |
+| `global_stats.rs`               | Cross-tool stats aggregation (Claude/Codex/Gemini/OpenCode/Pi) with per-file caching |
 | `launch_args.rs`                | CLI arg injection (model flags, teammate mode, codex/pi model prefixing)|
 
 ### Cross-Platform
