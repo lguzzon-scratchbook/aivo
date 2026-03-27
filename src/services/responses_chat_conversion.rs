@@ -29,7 +29,13 @@ pub fn is_responses_api_format(body: &Value) -> bool {
 pub(crate) fn cap_token_value(v: &Value, cap: Option<u64>) -> Value {
     if let Some(limit) = cap {
         http_utils::parse_token_u64(v)
-            .map(|n| json!(n.min(limit)))
+            .map(|n| {
+                if n == 0 {
+                    json!(n)
+                } else {
+                    json!(n.min(limit))
+                }
+            })
             .unwrap_or(v.clone())
     } else {
         v.clone()
@@ -126,7 +132,11 @@ pub fn convert_responses_to_chat_request(
                         .filter(|r| matches!(*r, "system" | "user" | "assistant" | "tool"))
                         .unwrap_or("user");
                     let content = extract_content_text(item.get("content"));
-                    messages.push(json!({"role": role, "content": content}));
+                    let mut msg = json!({"role": role, "content": content});
+                    if role == "assistant" {
+                        attach_reasoning_content(&mut msg, item, config.requires_reasoning_content);
+                    }
+                    messages.push(msg);
                 }
                 Some("function_call") => {
                     // Use call_id as the Chat Completions tool_calls[].id so it matches
@@ -142,26 +152,12 @@ pub fn convert_responses_to_chat_request(
                         .get("arguments")
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    // Moonshot requires reasoning_content on assistant tool-call turns
-                    let reasoning_content = item
-                        .get("reasoning_content")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            if config.requires_reasoning_content {
-                                Some(" ".to_string()) // single-space sentinel
-                            } else {
-                                None
-                            }
-                        });
                     let mut msg = json!({
                         "role": "assistant",
                         "content": null,
                         "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}]
                     });
-                    if let Some(rc) = reasoning_content {
-                        msg["reasoning_content"] = json!(rc);
-                    }
+                    attach_reasoning_content(&mut msg, item, config.requires_reasoning_content);
                     messages.push(msg);
                 }
                 Some("function_call_output") => {
@@ -238,7 +234,30 @@ pub fn convert_responses_to_chat_request(
         }
     }
 
+    // Copy reasoning fields
+    if let Some(reasoning) = body.get("reasoning").and_then(|r| r.as_object()) {
+        if let Some(effort) = reasoning.get("effort").and_then(|e| e.as_str()) {
+            chat["reasoning_effort"] = json!(effort);
+        }
+    } else if let Some(effort) = body.get("reasoning_effort").and_then(|e| e.as_str()) {
+        chat["reasoning_effort"] = json!(effort);
+    }
+    cap_reasoning_effort(&mut chat);
+
     chat
+}
+
+/// Copies `reasoning_content` from a source item onto a Chat Completions message.
+/// Falls back to a single-space sentinel when the provider requires a non-empty value.
+fn attach_reasoning_content(msg: &mut Value, source: &Value, requires: bool) {
+    let rc = source
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| requires.then(|| " ".to_string()));
+    if let Some(rc) = rc {
+        msg["reasoning_content"] = json!(rc);
+    }
 }
 
 /// Extracts text from a content value (handles string, array of content parts)
@@ -300,6 +319,7 @@ pub fn parse_provider_response(text: &str) -> anyhow::Result<Value> {
 /// Reads an SSE chat completions stream and returns a synthesized non-streaming response.
 pub fn accumulate_chat_sse(text: &str) -> Value {
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     // (id, name, accumulated_args)
     let mut tool_calls_acc: Vec<(String, String, String)> = Vec::new();
     let mut finish_reason = String::from("stop");
@@ -315,6 +335,9 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
 
                 if let Some(c) = delta["content"].as_str() {
                     content.push_str(c);
+                }
+                if let Some(rc) = delta["reasoning_content"].as_str() {
+                    reasoning_content.push_str(rc);
                 }
                 if let Some(tcs) = delta["tool_calls"].as_array() {
                     for tc in tcs {
@@ -358,9 +381,17 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
                 })
             })
             .collect();
-        json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": tcs}, "finish_reason": "tool_calls"}]})
+        let mut msg = json!({"role": "assistant", "content": null, "tool_calls": tcs});
+        if !reasoning_content.is_empty() {
+            msg["reasoning_content"] = json!(reasoning_content);
+        }
+        json!({"choices": [{"message": msg, "finish_reason": "tool_calls"}]})
     } else {
-        json!({"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": finish_reason}]})
+        let mut msg = json!({"role": "assistant", "content": content});
+        if !reasoning_content.is_empty() {
+            msg["reasoning_content"] = json!(reasoning_content);
+        }
+        json!({"choices": [{"message": msg, "finish_reason": finish_reason}]})
     }
 }
 
@@ -487,6 +518,7 @@ pub fn convert_chat_response_to_responses_sse(
     } else {
         // Text message response
         let msg_id = gen_id("msg");
+        let has_reasoning = !reasoning_content.is_empty();
 
         sse.push_str(&sse_event(
             "response.output_item.added",
@@ -499,6 +531,7 @@ pub fn convert_chat_response_to_responses_sse(
                 }
             }),
         ));
+        // Output text part (always present, even if empty)
         sse.push_str(&sse_event(
             "response.content_part.added",
             &json!({
@@ -535,10 +568,38 @@ pub fn convert_chat_response_to_responses_sse(
                 "part": {"type": "output_text", "text": content}
             }),
         ));
+
+        // Reasoning part (if present)
+        if has_reasoning {
+            sse.push_str(&sse_event(
+                "response.content_part.added",
+                &json!({
+                    "type": "response.content_part.added",
+                    "response_id": resp_id, "item_id": msg_id,
+                    "output_index": 0, "content_index": 1,
+                    "part": {"type": "reasoning", "reasoning": ""}
+                }),
+            ));
+            sse.push_str(&sse_event(
+                "response.content_part.done",
+                &json!({
+                    "type": "response.content_part.done",
+                    "response_id": resp_id, "item_id": msg_id,
+                    "output_index": 0, "content_index": 1,
+                    "part": {"type": "reasoning", "reasoning": reasoning_content}
+                }),
+            ));
+        }
+
+        let mut content_parts =
+            vec![json!({"type": "output_text", "text": content, "annotations": []})];
+        if has_reasoning {
+            content_parts.push(json!({"type": "reasoning", "reasoning": reasoning_content}));
+        }
         let done_item = json!({
             "id": msg_id, "type": "message", "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": content, "annotations": []}]
+            "content": content_parts
         });
         sse.push_str(&sse_event(
             "response.output_item.done",
@@ -550,7 +611,7 @@ pub fn convert_chat_response_to_responses_sse(
         output_items.push(json!({
             "id": msg_id, "type": "message", "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": content, "annotations": []}]
+            "content": content_parts
         }));
     }
 
@@ -580,16 +641,19 @@ fn chat_usage_to_responses_usage(chat: &Value) -> Option<Value> {
 
     let input_tokens = usage
         .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
         .cloned()
         .unwrap_or_else(|| json!(0));
     let output_tokens = usage
         .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
         .cloned()
         .unwrap_or_else(|| json!(0));
-    let total_tokens = usage
-        .get("total_tokens")
-        .cloned()
-        .unwrap_or_else(|| json!(0));
+    let total_tokens = usage.get("total_tokens").cloned().unwrap_or_else(|| {
+        let input = input_tokens.as_u64().unwrap_or(0);
+        let output = output_tokens.as_u64().unwrap_or(0);
+        json!(input + output)
+    });
 
     let mut response_usage = json!({
         "input_tokens": input_tokens,

@@ -323,6 +323,9 @@ pub(crate) struct OpenAIChatChunkChoice {
 pub(crate) struct OpenAIChatChunkDelta {
     #[serde(default)]
     pub content: Option<String>,
+    /// DeepSeek-reasoner thinking content (streamed before `content`)
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub function_call: Option<OpenAIChatChunkFunctionCall>,
     #[serde(default)]
@@ -363,6 +366,9 @@ pub(crate) struct OpenAIChatResponseMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// DeepSeek-reasoner / Anthropic thinking content
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAIChatToolCall>>,
 }
@@ -554,6 +560,7 @@ pub(crate) fn convert_responses_to_chat_response(resp: &ResponsesResponse) -> Op
             message: OpenAIChatResponseMessage {
                 role: "assistant".to_string(),
                 content,
+                reasoning_content: None,
                 tool_calls,
             },
             finish_reason: finish_reason.to_string(),

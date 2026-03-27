@@ -119,13 +119,36 @@ impl ResponsesToChatRouter {
             responses_api_supported: responses_api_supported.clone(),
         };
         let handle = tokio::spawn(async move {
-            http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
+            http_utils::run_streaming_router(
+                listener,
+                Arc::new(state),
+                handle_router_request_streaming,
+            )
+            .await
         });
         Ok((port, active_protocol, responses_api_supported, handle))
     }
 }
 
-async fn handle_router_request(request: String, state: Arc<ResponsesToChatRouterState>) -> String {
+async fn handle_router_request_streaming(
+    request: String,
+    state: Arc<ResponsesToChatRouterState>,
+    mut socket: tokio::net::TcpStream,
+) {
+    use tokio::io::AsyncWriteExt;
+    let response = handle_router_request(request, &state, &mut socket).await;
+    if let Some(response) = response {
+        let _ = socket.write_all(response.as_bytes()).await;
+    }
+}
+
+/// Returns `Some(response)` for buffered responses, `None` if the handler
+/// already streamed the response directly to the socket.
+async fn handle_router_request(
+    request: String,
+    state: &ResponsesToChatRouterState,
+    socket: &mut tokio::net::TcpStream,
+) -> Option<String> {
     let path = http_utils::extract_request_path(&request);
 
     let is_api_path = matches!(
@@ -141,16 +164,20 @@ async fn handle_router_request(request: String, state: Arc<ResponsesToChatRouter
             state.client.as_ref(),
             &state.active_protocol,
             &state.responses_api_supported,
+            socket,
         )
         .await
         {
             Ok(r) => r,
-            Err(_) => http_utils::http_error_response(500, "Internal Server Error"),
+            Err(_) => Some(http_utils::http_error_response(
+                500,
+                "Internal Server Error",
+            )),
         }
     } else {
         match forward_request(&path, &request, &state.config, state.client.as_ref()).await {
-            Ok(r) => r,
-            Err(_) => http_utils::http_error_response(502, "Bad Gateway"),
+            Ok(r) => Some(r),
+            Err(_) => Some(http_utils::http_error_response(502, "Bad Gateway")),
         }
     }
 }
@@ -158,6 +185,8 @@ async fn handle_router_request(request: String, state: Arc<ResponsesToChatRouter
 /// Routes the request based on body format:
 /// - Responses API format (has "input" array): convert ↔ Chat Completions
 /// - Chat Completions format: filter non-function tools and forward
+///
+/// Returns `None` if the response was streamed directly to the socket.
 async fn handle_api_request(
     path: &str,
     request: &str,
@@ -165,7 +194,8 @@ async fn handle_api_request(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
     responses_api_supported: &Arc<AtomicU8>,
-) -> Result<String> {
+    socket: &mut tokio::net::TcpStream,
+) -> Result<Option<String>> {
     let body_str = http_utils::extract_request_body(request)?;
     let body: Value = serde_json::from_str(body_str)?;
 
@@ -177,11 +207,27 @@ async fn handle_api_request(
             && let Some(result) =
                 try_responses_api_passthrough(&body, config, client, responses_api_supported).await
         {
-            return result;
+            return Ok(Some(result?));
         }
-        handle_responses_api_via_chat(path, &body, config, client, active_protocol).await
+        Ok(Some(
+            handle_responses_api_via_chat(path, &body, config, client, active_protocol).await?,
+        ))
     } else {
-        handle_chat_completions_with_filter(path, &body, config, client, active_protocol).await
+        // For streaming Chat Completions, stream directly from upstream to client
+        if body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && stream_chat_completions(&body, config, client, active_protocol, socket)
+                .await
+                .is_ok()
+        {
+            return Ok(None); // already streamed to socket
+        }
+        Ok(Some(
+            handle_chat_completions_with_filter(path, &body, config, client, active_protocol)
+                .await?,
+        ))
     }
 }
 
@@ -323,7 +369,78 @@ async fn handle_responses_api_via_chat(
 }
 
 // =============================================================================
-// CHAT COMPLETIONS PATH: filter tools and forward
+// CHAT COMPLETIONS PATH: streaming passthrough
+// =============================================================================
+
+/// Applies shared request transforms (tool filtering, token caps, model selection).
+fn prepare_chat_completions_body(
+    body: &Value,
+    config: &ResponsesToChatRouterConfig,
+    protocol: ProviderProtocol,
+) -> Value {
+    let mut body = body.clone();
+    filter_tools(&mut body);
+    apply_max_tokens_cap_to_fields(
+        &mut body,
+        config.max_tokens_cap,
+        &["max_tokens", "max_output_tokens"],
+    );
+    apply_selected_model(&mut body, config, protocol);
+    body
+}
+
+/// Streams a Chat Completions request directly from upstream to the client socket,
+/// forwarding SSE chunks in real time so reasoning_content appears progressively.
+async fn stream_chat_completions(
+    body: &Value,
+    config: &Arc<ResponsesToChatRouterConfig>,
+    client: &reqwest::Client,
+    active_protocol: &Arc<AtomicU8>,
+    socket: &mut tokio::net::TcpStream,
+) -> Result<()> {
+    // Only stream for OpenAI protocol (the common case for DeepSeek, etc.)
+    let protocol = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
+    if protocol != ProviderProtocol::Openai {
+        anyhow::bail!("streaming passthrough only for OpenAI protocol");
+    }
+
+    let body = prepare_chat_completions_body(body, config, protocol);
+
+    let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
+    let initiator = if config.copilot_token_manager.is_some() {
+        Some(http_utils::copilot_initiator_from_openai(&body))
+    } else {
+        None
+    };
+    let response = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+        initiator,
+    )
+    .await?
+    .json(&body)
+    .send()
+    .await?;
+
+    let status = response.status().as_u16();
+    if status != 200 {
+        anyhow::bail!("upstream returned {status}");
+    }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_string();
+
+    http_utils::write_streaming_response(socket, 200, &content_type, response).await
+}
+
+// =============================================================================
+// CHAT COMPLETIONS PATH: filter tools and forward (buffered)
 // =============================================================================
 
 async fn handle_chat_completions_with_filter(
@@ -333,22 +450,15 @@ async fn handle_chat_completions_with_filter(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
 ) -> Result<String> {
-    let mut body = body.clone();
+    let body = prepare_chat_completions_body(
+        body,
+        config,
+        ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed)),
+    );
     let requested_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    filter_tools(&mut body);
-    apply_max_tokens_cap_to_fields(
-        &mut body,
-        config.max_tokens_cap,
-        &["max_tokens", "max_output_tokens"],
-    );
-    apply_selected_model(
-        &mut body,
-        config.as_ref(),
-        ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed)),
-    );
 
     let chat_response =
         match forward_openai_chat_request(&body, config, client, requested_stream, active_protocol)

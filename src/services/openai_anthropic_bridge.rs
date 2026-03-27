@@ -91,11 +91,19 @@ pub fn convert_openai_chat_to_anthropic_request(
 
 pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &str) -> Value {
     let mut text_parts: Vec<String> = Vec::new();
+    let mut thinking_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<OpenAIChatToolCall> = Vec::new();
 
     if let Some(content) = resp.get("content").and_then(|c| c.as_array()) {
         for block in content {
             match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "thinking" => {
+                    if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str())
+                        && !thinking.is_empty()
+                    {
+                        thinking_parts.push(thinking.to_string());
+                    }
+                }
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str())
                         && !text.is_empty()
@@ -183,6 +191,7 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
             message: OpenAIChatResponseMessage {
                 role: "assistant".to_string(),
                 content: (!text_parts.is_empty()).then(|| text_parts.join("\n")),
+                reasoning_content: (!thinking_parts.is_empty()).then(|| thinking_parts.join("\n")),
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             },
             finish_reason: finish_reason.to_string(),
@@ -214,11 +223,14 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde
         .unwrap_or(OpenAIChatResponseMessage {
             role: "assistant".to_string(),
             content: None,
+            reasoning_content: None,
             tool_calls: None,
         });
     let finish_reason = choice
         .map(|choice| Value::String(choice.finish_reason))
         .unwrap_or(Value::Null);
+
+    let reasoning_content = message.reasoning_content.as_deref().unwrap_or("");
 
     let mut events = String::new();
     events.push_str(&format!(
@@ -235,6 +247,24 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde
             }]
         })
     ));
+
+    // Emit reasoning_content before content (DeepSeek-reasoner thinking)
+    if !reasoning_content.is_empty() {
+        events.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"reasoning_content": reasoning_content},
+                    "finish_reason": Value::Null
+                }]
+            })
+        ));
+    }
 
     if let Some(text) = message.content.as_deref()
         && !text.is_empty()

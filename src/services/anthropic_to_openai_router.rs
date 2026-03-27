@@ -86,6 +86,8 @@ enum RouterResponse {
         content_type: String,
         body: Vec<u8>,
     },
+    /// Already streamed to socket — nothing to write.
+    AlreadyStreamed,
 }
 
 impl AnthropicToOpenAIRouter {
@@ -151,6 +153,7 @@ async fn run_router(
                 &active_protocol,
                 &native_anthropic_failed,
                 &beta_header_rejected,
+                &mut socket,
             )
             .await
             {
@@ -179,6 +182,7 @@ async fn write_router_response(
         } => {
             http_utils::write_buffered_response(socket, status, &content_type, &body).await?;
         }
+        RouterResponse::AlreadyStreamed => {}
     }
     Ok(())
 }
@@ -300,6 +304,7 @@ async fn handle_anthropic_to_upstream(
     active_protocol: &Arc<AtomicU8>,
     native_anthropic_failed: &Arc<AtomicBool>,
     beta_header_rejected: &Arc<AtomicBool>,
+    socket: &mut tokio::net::TcpStream,
 ) -> Result<RouterResponse> {
     let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
     if beta_header_rejected.load(Ordering::Relaxed) {
@@ -473,7 +478,7 @@ async fn handle_anthropic_to_upstream(
             _ => {
                 // OpenAI or Anthropic — use chat completions endpoint
                 let url = http_utils::build_chat_completions_url(&config.target_base_url);
-                let response = client
+                let mut response = client
                     .post(&url)
                     .headers(attempt_headers)
                     .header("Authorization", format!("Bearer {}", config.target_api_key))
@@ -495,6 +500,31 @@ async fn handle_anthropic_to_upstream(
                         .and_then(|v| v.to_str().ok())
                         .map(|ct| ct.contains("text/event-stream"))
                         .unwrap_or(false);
+
+                    // Stream OpenAI SSE → Anthropic SSE directly to socket
+                    if status_code == 200 && is_streaming {
+                        use tokio::io::AsyncWriteExt;
+                        let headers =
+                            http_utils::http_chunked_response_head(200, "text/event-stream");
+                        socket.write_all(headers.as_bytes()).await?;
+                        let mut converter = OpenAIStreamConverter::new();
+                        while let Some(chunk) = response.chunk().await? {
+                            let converted = converter.push_bytes(&chunk)?;
+                            if !converted.is_empty() {
+                                let formatted = http_utils::format_http_chunk(converted.as_bytes());
+                                socket.write_all(&formatted).await?;
+                            }
+                        }
+                        let tail = converter.finish()?;
+                        if !tail.is_empty() {
+                            let formatted = http_utils::format_http_chunk(tail.as_bytes());
+                            socket.write_all(&formatted).await?;
+                        }
+                        socket.write_all(b"0\r\n\r\n").await?;
+                        commit_protocol_switch(active_protocol, protocol, attempt);
+                        return Ok(RouterResponse::AlreadyStreamed);
+                    }
+
                     let response_body = response.text().await?;
                     // Detect Responses API validation errors leaking through
                     // Chat Completions — treat as protocol mismatch so the
@@ -505,9 +535,7 @@ async fn handle_anthropic_to_upstream(
                             body: response_body,
                         }
                     } else {
-                        let r = if status_code == 200
-                            && (is_streaming || response_body.starts_with("data:"))
-                        {
+                        let r = if status_code == 200 && response_body.starts_with("data:") {
                             let anthropic_sse =
                                 convert_openai_sse_to_anthropic(&response_body, status_code)?;
                             RouterResponse::Buffered {
@@ -843,6 +871,7 @@ fn finalize_stream_message(
     output_tokens: u64,
     cache_read_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+    thinking_block_idx: &mut Option<usize>,
     text_block_idx: &mut Option<usize>,
     tool_blocks: &mut HashMap<usize, StreamToolBlock>,
     stop_reason: &str,
@@ -856,6 +885,14 @@ fn finalize_stream_message(
         cache_read_input_tokens,
         cache_creation_input_tokens,
     );
+
+    if let Some(idx) = thinking_block_idx.take() {
+        append_sse_event(
+            output,
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": idx}),
+        );
+    }
 
     if let Some(idx) = text_block_idx.take() {
         append_sse_event(
@@ -920,6 +957,7 @@ struct OpenAIStreamConverter {
     message_started: bool,
     finished: bool,
     block_count: usize,
+    thinking_block_idx: Option<usize>,
     text_block_idx: Option<usize>,
     tool_blocks: HashMap<usize, StreamToolBlock>,
     message_id: String,
@@ -938,6 +976,7 @@ impl OpenAIStreamConverter {
             message_started: false,
             finished: false,
             block_count: 0,
+            thinking_block_idx: None,
             text_block_idx: None,
             tool_blocks: HashMap::new(),
             message_id: "msg".to_string(),
@@ -987,6 +1026,7 @@ impl OpenAIStreamConverter {
                 self.output_tokens,
                 self.cache_read_input_tokens,
                 self.cache_creation_input_tokens,
+                &mut self.thinking_block_idx,
                 &mut self.text_block_idx,
                 &mut self.tool_blocks,
                 fallback_stop,
@@ -1018,6 +1058,7 @@ impl OpenAIStreamConverter {
                     self.output_tokens,
                     self.cache_read_input_tokens,
                     self.cache_creation_input_tokens,
+                    &mut self.thinking_block_idx,
                     &mut self.text_block_idx,
                     &mut self.tool_blocks,
                     fallback_stop,
@@ -1060,6 +1101,50 @@ impl OpenAIStreamConverter {
         for choice in chunk.choices {
             let delta = choice.delta;
 
+            // DeepSeek-reasoner: emit reasoning_content as Anthropic thinking blocks
+            if let Some(thinking) = delta.reasoning_content.as_deref()
+                && !thinking.is_empty()
+            {
+                ensure_message_start(
+                    output,
+                    &mut self.message_started,
+                    &self.message_id,
+                    &self.model,
+                    self.input_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
+                );
+                if self.thinking_block_idx.is_none() {
+                    let idx = self.block_count;
+                    self.block_count += 1;
+                    self.thinking_block_idx = Some(idx);
+                    append_sse_event(
+                        output,
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {
+                                "type": "thinking",
+                                "thinking": ""
+                            }
+                        }),
+                    );
+                }
+                append_sse_event(
+                    output,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": self.thinking_block_idx.unwrap_or(0),
+                        "delta": {
+                            "type": "thinking_delta",
+                            "thinking": thinking
+                        }
+                    }),
+                );
+            }
+
             if let Some(text) = delta.content.as_deref()
                 && !text.is_empty()
             {
@@ -1072,6 +1157,14 @@ impl OpenAIStreamConverter {
                     self.cache_read_input_tokens,
                     self.cache_creation_input_tokens,
                 );
+                // Close thinking block before starting text block
+                if let Some(thinking_idx) = self.thinking_block_idx.take() {
+                    append_sse_event(
+                        output,
+                        "content_block_stop",
+                        json!({"type": "content_block_stop", "index": thinking_idx}),
+                    );
+                }
                 if self.text_block_idx.is_none() {
                     let idx = self.block_count;
                     self.block_count += 1;
@@ -1163,6 +1256,7 @@ impl OpenAIStreamConverter {
                     self.output_tokens,
                     self.cache_read_input_tokens,
                     self.cache_creation_input_tokens,
+                    &mut self.thinking_block_idx,
                     &mut self.text_block_idx,
                     &mut self.tool_blocks,
                     map_openai_finish_reason(finish_reason),

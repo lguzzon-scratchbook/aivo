@@ -143,46 +143,15 @@ where
     Handler: Fn(String, Arc<State>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = String> + Send + 'static,
 {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
-
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let state = state.clone();
+    run_router_core(listener, state, move |request, state, mut socket| {
         let handler = handler.clone();
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => continue, // semaphore closed; skip connection
-        };
-
-        tokio::spawn(async move {
+        async move {
             use tokio::io::AsyncWriteExt;
-
-            let _permit = permit;
-            let read_result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                read_full_request(&mut socket),
-            )
-            .await;
-
-            let request_bytes = match read_result {
-                Ok(Ok(b)) => b,
-                Ok(Err(err)) => {
-                    let response = http_request_read_error_response(&err);
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    return;
-                }
-                Err(_) => {
-                    let _ = socket
-                        .write_all(http_error_response(408, "Request read timed out").as_bytes())
-                        .await;
-                    return;
-                }
-            };
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
             let response = handler(request, state).await;
             let _ = socket.write_all(response.as_bytes()).await;
-        });
-    }
+        }
+    })
+    .await
 }
 
 /// Finds the end of HTTP headers (the position of the first `\r\n\r\n`).
@@ -482,6 +451,80 @@ pub async fn write_buffered_response(
     socket.write_all(headers.as_bytes()).await?;
     socket.write_all(body).await?;
     Ok(())
+}
+
+/// Like `run_text_router`, but passes the TCP socket to the handler so it can
+/// stream responses directly (e.g. forwarding upstream SSE chunks in real time).
+/// The handler is responsible for writing the full HTTP response to the socket.
+pub async fn run_streaming_router<State, Handler, Fut>(
+    listener: tokio::net::TcpListener,
+    state: Arc<State>,
+    handler: Handler,
+) -> Result<()>
+where
+    State: Send + Sync + 'static,
+    Handler: Fn(String, Arc<State>, tokio::net::TcpStream) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    run_router_core(listener, state, move |request, state, socket| {
+        let handler = handler.clone();
+        async move {
+            handler(request, state, socket).await;
+        }
+    })
+    .await
+}
+
+/// Shared accept-loop core for both text and streaming routers.
+async fn run_router_core<State, Handler, Fut>(
+    listener: tokio::net::TcpListener,
+    state: Arc<State>,
+    handler: Handler,
+) -> Result<()>
+where
+    State: Send + Sync + 'static,
+    Handler: Fn(String, Arc<State>, tokio::net::TcpStream) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let state = state.clone();
+        let handler = handler.clone();
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            let _permit = permit;
+            let read_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_full_request(&mut socket),
+            )
+            .await;
+
+            let request_bytes = match read_result {
+                Ok(Ok(b)) => b,
+                Ok(Err(err)) => {
+                    let response = http_request_read_error_response(&err);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = socket
+                        .write_all(http_error_response(408, "Request read timed out").as_bytes())
+                        .await;
+                    return;
+                }
+            };
+            let request = String::from_utf8_lossy(&request_bytes).into_owned();
+            handler(request, state, socket).await;
+        });
+    }
 }
 
 /// Streams a reqwest Response as chunked HTTP to a TCP stream.
