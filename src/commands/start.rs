@@ -59,25 +59,35 @@ impl StartCommand {
     async fn execute_internal(&self, args: StartFlowArgs) -> Result<ExitCode> {
         let cwd = system_env::current_dir_string()
             .ok_or_else(|| anyhow::anyhow!("Failed to determine the current directory"))?;
-        let remembered = self.session_store.get_directory_start(&cwd).await?;
 
-        if remembered.is_none() {
+        // Phase 1: Get the latest record (for tool default)
+        let latest = self.session_store.get_latest_directory_start(&cwd).await?;
+
+        if latest.is_none() {
             eprintln!(
                 "{}",
                 style::dim("No saved start record for this directory yet. I’ll help you pick one.")
             );
         }
 
-        let key = self
-            .resolve_key(args.key.as_deref(), remembered.as_ref())
+        // Resolve tool first (uses latest record for default)
+        let tool = self.resolve_tool(args.tool.as_deref(), latest.as_ref())?;
+
+        // Phase 2: Get the tool-specific record (for key/model defaults)
+        let tool_record = self
+            .session_store
+            .get_directory_start(&cwd, tool.value.as_str())
             .await?;
-        let tool = self.resolve_tool(args.tool.as_deref(), remembered.as_ref())?;
+
+        let key = self
+            .resolve_key(args.key.as_deref(), tool_record.as_ref())
+            .await?;
         let model = self
-            .resolve_model(args.model, remembered.as_ref(), &key, args.refresh)
+            .resolve_model(args.model, tool_record.as_ref(), &key, args.refresh)
             .await?;
         let env = parse_env_vars(&args.envs);
         let skip_confirm =
-            remembered.is_some() || (key.interactive && tool.interactive && model.interactive);
+            tool_record.is_some() || (key.interactive && tool.interactive && model.interactive);
 
         if args.dry_run {
             let plan = self

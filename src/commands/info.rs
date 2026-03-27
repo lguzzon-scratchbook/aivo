@@ -50,7 +50,8 @@ impl InfoCommand {
 
         let (keys, active_key_id) = self.session_store.get_keys_and_active_id_info().await?;
         let cwd = system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
-        let remembered = self.session_store.get_directory_start(&cwd).await?;
+        let mut remembered_all = self.session_store.get_all_directory_starts(&cwd).await?;
+        remembered_all.sort_by(|a, b| a.tool.cmp(&b.tool));
         let active_key = active_key_id
             .as_deref()
             .and_then(|active_id| keys.iter().find(|key| key.id == active_id));
@@ -127,16 +128,19 @@ impl InfoCommand {
             }
         }
 
-        // 4. Current directory + remembered start
+        // 4. Current directory + remembered starts
         println!();
         println!("{}", style::bold("Current directory:"));
         println!("  {}", style::dim(&cwd));
-        match remembered {
-            Some(record) => Self::print_directory_start(&record, &keys),
-            None => println!(
+        if remembered_all.is_empty() {
+            println!(
                 "  {}",
                 style::dim("No remembered start for this directory.")
-            ),
+            );
+        } else {
+            for record in &remembered_all {
+                Self::print_directory_start(record, &keys);
+            }
         }
 
         // 5. Active defaults

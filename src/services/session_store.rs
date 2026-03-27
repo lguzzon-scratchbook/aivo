@@ -140,6 +140,9 @@ impl ApiKey {
     }
 }
 
+/// Per-directory, per-tool start records. Outer key = cwd, inner key = tool name.
+pub type DirectoryStartsMap = HashMap<String, HashMap<String, DirectoryStartRecord>>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryStartRecord {
     #[serde(rename = "keyId")]
@@ -431,9 +434,10 @@ pub struct StoredConfig {
     #[serde(
         rename = "directory_starts",
         default,
-        skip_serializing_if = "HashMap::is_empty"
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_directory_starts"
     )]
-    pub directory_starts: HashMap<String, DirectoryStartRecord>,
+    pub directory_starts: DirectoryStartsMap,
     #[serde(
         rename = "stats",
         default,
@@ -447,6 +451,45 @@ pub struct StoredConfig {
     /// Sessions are now stored in individual files under sessions/.
     #[serde(rename = "chat_sessions", default, skip_serializing)]
     pub chat_sessions: HashMap<String, ChatSessionState>,
+}
+
+/// Deserialize directory_starts supporting both legacy flat format and new nested format.
+/// Legacy: `{ "/path": { "keyId": ..., "tool": "claude", ... } }`
+/// New:    `{ "/path": { "claude": { "keyId": ..., ... }, "codex": { ... } } }`
+fn deserialize_directory_starts<'de, D>(deserializer: D) -> Result<DirectoryStartsMap, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let raw: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
+    let mut result = DirectoryStartsMap::new();
+
+    for (cwd, value) in raw {
+        match value {
+            Value::Object(map) => {
+                // Check if this looks like a flat DirectoryStartRecord (has "keyId" field)
+                if map.contains_key("keyId") {
+                    // Legacy format: single record
+                    let record: DirectoryStartRecord =
+                        serde_json::from_value(Value::Object(map)).map_err(D::Error::custom)?;
+                    let mut tools = HashMap::new();
+                    tools.insert(record.tool.clone(), record);
+                    result.insert(cwd, tools);
+                } else {
+                    // New format: tool name → record
+                    let tools: HashMap<String, DirectoryStartRecord> =
+                        serde_json::from_value(Value::Object(map)).map_err(D::Error::custom)?;
+                    result.insert(cwd, tools);
+                }
+            }
+            _ => continue, // skip malformed entries
+        }
+    }
+
+    Ok(result)
 }
 
 impl Default for StoredConfig {
@@ -853,8 +896,23 @@ impl SessionStore {
 
     // ── Directory starts (delegated to DirectoryStartsStore) ──────────────
 
-    pub async fn get_directory_start(&self, cwd: &str) -> Result<Option<DirectoryStartRecord>> {
-        self.dirs.get_directory_start(cwd).await
+    pub async fn get_directory_start(
+        &self,
+        cwd: &str,
+        tool: &str,
+    ) -> Result<Option<DirectoryStartRecord>> {
+        self.dirs.get_directory_start(cwd, tool).await
+    }
+
+    pub async fn get_latest_directory_start(
+        &self,
+        cwd: &str,
+    ) -> Result<Option<DirectoryStartRecord>> {
+        self.dirs.get_latest_directory_start(cwd).await
+    }
+
+    pub async fn get_all_directory_starts(&self, cwd: &str) -> Result<Vec<DirectoryStartRecord>> {
+        self.dirs.get_all_directory_starts(cwd).await
     }
 
     pub async fn set_directory_start(
@@ -1322,7 +1380,7 @@ mod tests {
 
         assert!(
             store
-                .get_directory_start("/tmp/demo")
+                .get_directory_start("/tmp/demo", "claude")
                 .await
                 .unwrap()
                 .is_none()
@@ -1722,5 +1780,55 @@ mod tests {
         assert!(!stats.tool_counts.contains_key("claude"));
         // Zeroed model usage should be removed
         assert!(!stats.model_usage.contains_key("gpt-4o"));
+    }
+
+    #[test]
+    fn deserialize_legacy_flat_directory_starts() {
+        let json = r#"{
+            "api_keys": [],
+            "directory_starts": {
+                "/tmp/test": {
+                    "keyId": "key1",
+                    "baseUrl": "http://localhost",
+                    "tool": "claude",
+                    "model": "gpt-4o",
+                    "updatedAt": "2026-01-01T00:00:00Z"
+                }
+            }
+        }"#;
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+        let tools = config.directory_starts.get("/tmp/test").unwrap();
+        let record = tools.get("claude").unwrap();
+        assert_eq!(record.key_id, "key1");
+        assert_eq!(record.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn deserialize_nested_directory_starts() {
+        let json = r#"{
+            "api_keys": [],
+            "directory_starts": {
+                "/tmp/test": {
+                    "claude": {
+                        "keyId": "key1",
+                        "baseUrl": "http://localhost",
+                        "tool": "claude",
+                        "model": "gpt-4o",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    },
+                    "codex": {
+                        "keyId": "key2",
+                        "baseUrl": "http://other",
+                        "tool": "codex",
+                        "updatedAt": "2026-02-01T00:00:00Z"
+                    }
+                }
+            }
+        }"#;
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+        let tools = config.directory_starts.get("/tmp/test").unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.get("claude").unwrap().key_id, "key1");
+        assert_eq!(tools.get("codex").unwrap().key_id, "key2");
     }
 }

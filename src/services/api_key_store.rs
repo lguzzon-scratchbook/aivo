@@ -20,9 +20,10 @@ pub(crate) struct ApiKeyStore {
 
 fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
     config.chat_models.remove(key_id);
-    config
-        .directory_starts
-        .retain(|_, record| record.key_id != key_id);
+    for tools in config.directory_starts.values_mut() {
+        tools.retain(|_, record| record.key_id != key_id);
+    }
+    config.directory_starts.retain(|_, tools| !tools.is_empty());
     // chat_sessions are now stored in individual files; file cleanup is handled
     // asynchronously by remove_sessions_for_key().
     config

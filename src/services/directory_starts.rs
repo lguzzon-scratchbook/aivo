@@ -1,7 +1,12 @@
 use anyhow::Result;
 use chrono::Utc;
 
-use crate::services::session_store::{ConfigContext, DirectoryStartRecord};
+use crate::services::session_store::{ApiKey, ConfigContext, DirectoryStartRecord};
+
+fn has_valid_key(record: &DirectoryStartRecord, keys: &[ApiKey]) -> bool {
+    keys.iter()
+        .any(|key| key.id == record.key_id && key.base_url == record.base_url)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DirectoryStartsStore {
@@ -12,26 +17,64 @@ impl DirectoryStartsStore {
     pub(crate) async fn get_directory_start(
         &self,
         cwd: &str,
+        tool: &str,
     ) -> Result<Option<DirectoryStartRecord>> {
         let config = self.ctx.load().await?;
-        let Some(record) = config.directory_starts.get(cwd).cloned() else {
+        let Some(tools) = config.directory_starts.get(cwd) else {
+            return Ok(None);
+        };
+        let Some(record) = tools.get(tool).cloned() else {
             return Ok(None);
         };
 
-        let key_is_valid = config
-            .api_keys
-            .iter()
-            .any(|key| key.id == record.key_id && key.base_url == record.base_url);
-        if key_is_valid {
+        if has_valid_key(&record, &config.api_keys) {
             return Ok(Some(record));
         }
 
-        // Stale record — re-acquire exclusive lock, reload, remove, save.
+        // Stale record — remove just this tool's entry
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
-        config.directory_starts.remove(cwd);
+        if let Some(tools) = config.directory_starts.get_mut(cwd) {
+            tools.remove(tool);
+            if tools.is_empty() {
+                config.directory_starts.remove(cwd);
+            }
+        }
         self.ctx.save_raw(&config).await?;
         Ok(None)
+    }
+
+    pub(crate) async fn get_latest_directory_start(
+        &self,
+        cwd: &str,
+    ) -> Result<Option<DirectoryStartRecord>> {
+        let config = self.ctx.load().await?;
+        let Some(tools) = config.directory_starts.get(cwd) else {
+            return Ok(None);
+        };
+
+        let latest = tools
+            .values()
+            .filter(|record| has_valid_key(record, &config.api_keys))
+            .max_by_key(|r| &r.updated_at)
+            .cloned();
+
+        Ok(latest)
+    }
+
+    pub(crate) async fn get_all_directory_starts(
+        &self,
+        cwd: &str,
+    ) -> Result<Vec<DirectoryStartRecord>> {
+        let config = self.ctx.load().await?;
+        let Some(tools) = config.directory_starts.get(cwd) else {
+            return Ok(Vec::new());
+        };
+        Ok(tools
+            .values()
+            .filter(|record| has_valid_key(record, &config.api_keys))
+            .cloned()
+            .collect())
     }
 
     pub(crate) async fn set_directory_start(
@@ -44,8 +87,9 @@ impl DirectoryStartsStore {
     ) -> Result<()> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
-        config.directory_starts.insert(
-            cwd.to_string(),
+        let tools = config.directory_starts.entry(cwd.to_string()).or_default();
+        tools.insert(
+            tool.to_string(),
             DirectoryStartRecord {
                 key_id: key_id.to_string(),
                 base_url: base_url.to_string(),
@@ -115,7 +159,10 @@ mod tests {
         let store = make_store(&temp_dir);
         write_config_with_key(&store, "key1", "http://localhost").await;
 
-        let result = store.get_directory_start("/tmp/test").await.unwrap();
+        let result = store
+            .get_directory_start("/tmp/test", "claude")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -137,7 +184,7 @@ mod tests {
             .unwrap();
 
         let record = store
-            .get_directory_start("/tmp/test")
+            .get_directory_start("/tmp/test", "claude")
             .await
             .unwrap()
             .unwrap();
@@ -165,7 +212,7 @@ mod tests {
             .unwrap();
 
         let record = store
-            .get_directory_start("/tmp/test")
+            .get_directory_start("/tmp/test", "claude")
             .await
             .unwrap()
             .unwrap();
@@ -184,7 +231,7 @@ mod tests {
             .unwrap();
 
         let record = store
-            .get_directory_start("/tmp/test")
+            .get_directory_start("/tmp/test", "codex")
             .await
             .unwrap()
             .unwrap();
@@ -213,7 +260,10 @@ mod tests {
             .unwrap();
 
         // Should return None and prune the stale record
-        let result = store.get_directory_start("/tmp/test").await.unwrap();
+        let result = store
+            .get_directory_start("/tmp/test", "claude")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -231,7 +281,10 @@ mod tests {
         assert!(store.clear_directory_start("/tmp/test").await.unwrap());
         assert!(!store.clear_directory_start("/tmp/test").await.unwrap());
 
-        let result = store.get_directory_start("/tmp/test").await.unwrap();
+        let result = store
+            .get_directory_start("/tmp/test", "claude")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -258,11 +311,123 @@ mod tests {
             .unwrap();
 
         let record = store
-            .get_directory_start("/tmp/test")
+            .get_directory_start("/tmp/test", "codex")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(record.tool, "codex");
         assert_eq!(record.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn get_directory_start_returns_tool_specific_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "claude",
+                Some("sonnet"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "codex",
+                Some("gpt-4o"),
+            )
+            .await
+            .unwrap();
+
+        let claude_record = store
+            .get_directory_start("/tmp/test", "claude")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claude_record.model.as_deref(), Some("sonnet"));
+
+        let codex_record = store
+            .get_directory_start("/tmp/test", "codex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(codex_record.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn get_latest_directory_start_returns_most_recent() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "claude",
+                Some("sonnet"),
+            )
+            .await
+            .unwrap();
+
+        // Small delay so codex has a later timestamp
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "codex",
+                Some("gpt-4o"),
+            )
+            .await
+            .unwrap();
+
+        let latest = store
+            .get_latest_directory_start("/tmp/test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.tool, "codex");
+    }
+
+    #[tokio::test]
+    async fn get_all_directory_starts_returns_all_valid() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        write_config_with_key(&store, "key1", "http://localhost").await;
+
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "claude",
+                Some("sonnet"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_directory_start(
+                "/tmp/test",
+                "key1",
+                "http://localhost",
+                "codex",
+                Some("gpt-4o"),
+            )
+            .await
+            .unwrap();
+
+        let all = store.get_all_directory_starts("/tmp/test").await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 }
