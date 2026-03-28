@@ -342,6 +342,9 @@ async fn main() {
         },
     };
 
+    // Stop Ollama if aivo auto-started it during this session.
+    services::ollama::stop_if_we_started();
+
     process::exit(exit_code.code());
 }
 fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {

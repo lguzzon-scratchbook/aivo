@@ -4,11 +4,96 @@
 //! Ollama exposes an OpenAI-compatible API at `{host}/v1`.
 
 use std::io::Write;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+
+static OLLAMA_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn child_slot() -> &'static Mutex<Option<Child>> {
+    OLLAMA_CHILD.get_or_init(|| Mutex::new(None))
+}
+
+// ---------------------------------------------------------------------------
+// PID-file refcount: tracks how many aivo instances are using Ollama so we
+// only stop the server when the last one exits.
+// ---------------------------------------------------------------------------
+
+fn state_dir() -> &'static Path {
+    STATE_DIR.get_or_init(|| {
+        crate::services::system_env::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config/aivo/ollama-pids")
+    })
+}
+
+fn server_pid_path() -> PathBuf {
+    state_dir().join("server.pid")
+}
+
+fn register_pid() {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(std::process::id().to_string()), "");
+}
+
+/// Returns `true` if no other live aivo instances are still using Ollama.
+fn unregister_pid() -> bool {
+    let dir = state_dir();
+    let _ = std::fs::remove_file(dir.join(std::process::id().to_string()));
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return true,
+    };
+
+    let mut live_count = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // Only numeric filenames are aivo PID files; skip server.pid etc.
+        if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
+            if is_process_alive(pid) {
+                live_count += 1;
+            } else {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    live_count == 0
+}
+
+fn kill_server_by_pid_file() {
+    let path = server_pid_path();
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return;
+    };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
 
 /// Returns the Ollama host from `OLLAMA_HOST` or the default `http://localhost:11434`.
 pub fn ollama_host() -> String {
@@ -53,17 +138,25 @@ pub async fn is_running() -> bool {
     check_health(&health_client()).await
 }
 
-/// Spawns `ollama serve` as a detached process and polls for readiness (up to 5s).
+/// Spawns `ollama serve` and polls for readiness (up to 5s).
 pub async fn auto_start() -> Result<()> {
     eprintln!("  {} Starting Ollama...", crate::style::dim("⟳"));
 
-    Command::new("ollama")
+    let child = Command::new("ollama")
         .arg("serve")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to spawn 'ollama serve'")?;
+
+    let server_pid = child.id();
+    if let Ok(mut slot) = child_slot().lock() {
+        *slot = Some(child);
+    }
+    // register_pid() creates the directory; write server.pid after.
+    register_pid();
+    let _ = std::fs::write(server_pid_path(), server_pid.to_string());
 
     let client = health_client();
     for _ in 0..10 {
@@ -78,12 +171,41 @@ pub async fn auto_start() -> Result<()> {
     )
 }
 
-/// Ensures Ollama is installed and running: checks binary → checks running → auto-starts.
+/// Stops the Ollama server if aivo auto-started it **and** no other aivo
+/// instance is still using it. Safe to call multiple times; cheap no-op
+/// when Ollama was never used.
+pub fn stop_if_we_started() {
+    if !state_dir().exists() {
+        return;
+    }
+
+    if !unregister_pid() {
+        return;
+    }
+
+    // This instance spawned Ollama — use the child handle for clean shutdown.
+    if let Ok(mut slot) = child_slot().lock()
+        && let Some(mut child) = slot.take()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(server_pid_path());
+        return;
+    }
+
+    // Another instance spawned Ollama but exited earlier; kill via PID file.
+    kill_server_by_pid_file();
+}
+
+/// Ensures Ollama is installed and running, registering this process so
+/// concurrent aivo instances coordinate shutdown.
 pub async fn ensure_ready() -> Result<()> {
     if !detect_binary() {
         anyhow::bail!("Ollama is not installed. Install it from https://ollama.com and try again.");
     }
-    if !is_running().await {
+    if is_running().await {
+        register_pid();
+    } else {
         auto_start().await?;
     }
     Ok(())
