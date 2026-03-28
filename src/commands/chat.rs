@@ -653,7 +653,7 @@ fn build_pending_attachment(path: &str) -> Result<MessageAttachment> {
         name: attachment_name(file_path),
         mime_type,
         storage: AttachmentStorage::FileRef {
-            path: path.to_string(),
+            path: expanded.to_string_lossy().into_owned(),
         },
     })
 }
@@ -690,6 +690,7 @@ fn guess_attachment_mime_type(path: &Path) -> Result<String> {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "pdf" => "application/pdf",
         "json" => CONTENT_TYPE_JSON,
         "md" => "text/markdown",
         "html" => "text/html",
@@ -714,25 +715,37 @@ async fn materialize_attachments(
     Ok(resolved)
 }
 
+/// Whether this MIME type represents a binary document that should be base64 encoded.
+pub fn is_document_mime(mime: &str) -> bool {
+    mime == "application/pdf"
+}
+
 async fn materialize_attachment(attachment: &MessageAttachment) -> Result<MessageAttachment> {
     match &attachment.storage {
         AttachmentStorage::Inline { .. } => Ok(attachment.clone()),
         AttachmentStorage::FileRef { path } => {
-            let storage = if attachment.mime_type.starts_with("image/") {
+            let is_image = attachment.mime_type.starts_with("image/");
+            let is_document = is_document_mime(&attachment.mime_type);
+            let storage = if is_image || is_document {
                 let bytes = tokio::fs::read(path)
                     .await
-                    .map_err(|err| anyhow::anyhow!("Failed to read image '{}': {err}", path))?;
+                    .map_err(|err| anyhow::anyhow!("Failed to read '{}': {err}", path))?;
                 AttachmentStorage::Inline {
                     data: BASE64.encode(bytes),
                 }
             } else {
-                let text = tokio::fs::read_to_string(path).await.map_err(|err| {
-                    anyhow::anyhow!(
-                        "Failed to read text attachment '{}': {err}. Files must be UTF-8.",
-                        path
-                    )
-                })?;
-                AttachmentStorage::Inline { data: text }
+                match tokio::fs::read_to_string(path).await {
+                    Ok(text) => AttachmentStorage::Inline { data: text },
+                    Err(_) => {
+                        // Binary file that isn't valid UTF-8 — base64 encode it
+                        let bytes = tokio::fs::read(path)
+                            .await
+                            .map_err(|err| anyhow::anyhow!("Failed to read '{}': {err}", path))?;
+                        AttachmentStorage::Inline {
+                            data: BASE64.encode(bytes),
+                        }
+                    }
+                }
             };
             Ok(MessageAttachment {
                 name: attachment.name.clone(),

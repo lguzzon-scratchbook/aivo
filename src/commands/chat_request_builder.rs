@@ -4,6 +4,7 @@
  */
 use anyhow::Result;
 
+use crate::commands::chat::is_document_mime;
 use crate::services::anthropic_route_pipeline::inject_cache_control_on_last_block;
 use crate::services::session_store::{AttachmentStorage, MessageAttachment};
 
@@ -68,6 +69,14 @@ fn build_openai_message(message: &ChatMessage) -> Result<serde_json::Value> {
                 "type": "image_url",
                 "image_url": {
                     "url": format!("data:{};base64,{}", attachment.mime_type, data),
+                },
+            }));
+        } else if is_document_mime(&attachment.mime_type) {
+            parts.push(serde_json::json!({
+                "type": "file",
+                "file": {
+                    "filename": attachment.name,
+                    "file_data": format!("data:{};base64,{}", attachment.mime_type, data),
                 },
             }));
         } else {
@@ -138,6 +147,12 @@ fn build_responses_input_item(message: &ChatMessage) -> Result<serde_json::Value
             parts.push(serde_json::json!({
                 "type": "input_image",
                 "image_url": format!("data:{};base64,{}", attachment.mime_type, data),
+            }));
+        } else if is_document_mime(&attachment.mime_type) {
+            parts.push(serde_json::json!({
+                "type": "input_file",
+                "filename": attachment.name,
+                "file_data": format!("data:{};base64,{}", attachment.mime_type, data),
             }));
         } else {
             parts.push(serde_json::json!({
@@ -228,6 +243,15 @@ fn build_anthropic_content(message: &ChatMessage) -> Result<serde_json::Value> {
         if attachment.mime_type.starts_with("image/") {
             blocks.push(serde_json::json!({
                 "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": attachment.mime_type,
+                    "data": data,
+                },
+            }));
+        } else if is_document_mime(&attachment.mime_type) {
+            blocks.push(serde_json::json!({
+                "type": "document",
                 "source": {
                     "type": "base64",
                     "media_type": attachment.mime_type,
