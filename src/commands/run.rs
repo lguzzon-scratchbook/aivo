@@ -6,25 +6,31 @@ use std::collections::HashMap;
 use anyhow::Result;
 use reqwest::Client;
 
-use crate::commands::models::fetch_models_for_select;
+use crate::commands::models::{
+    fetch_models_for_select, prompt_model_picker, resolve_model_placeholder,
+};
 use crate::commands::print_launch_preview;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
-use crate::services::session_store::ApiKey;
+use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
-use crate::tui::FuzzySelect;
 
 /// RunCommand provides a unified interface to launch AI tools
 pub struct RunCommand {
+    session_store: SessionStore,
     ai_launcher: AILauncher,
     cache: ModelsCache,
 }
 
 impl RunCommand {
-    pub fn new(ai_launcher: AILauncher, cache: ModelsCache) -> Self {
-        Self { ai_launcher, cache }
+    pub fn new(session_store: SessionStore, ai_launcher: AILauncher, cache: ModelsCache) -> Self {
+        Self {
+            session_store,
+            ai_launcher,
+            cache,
+        }
     }
 
     /// Resolves the model to use when --model flag is provided.
@@ -47,7 +53,6 @@ impl RunCommand {
             Some(_) => {}
         }
 
-        // Show picker (--model with no value)
         let models_list = if refresh {
             crate::commands::models::fetch_models_cached(client, key, &self.cache, true)
                 .await
@@ -62,16 +67,7 @@ impl RunCommand {
             );
         }
 
-        let selected = FuzzySelect::new()
-            .with_prompt("Select model")
-            .items(&models_list)
-            .default(0)
-            .interact_opt()
-            .ok()
-            .flatten()
-            .map(|idx| models_list[idx].clone());
-
-        Ok(selected)
+        Ok(prompt_model_picker(models_list))
     }
 
     /// Executes the run command with the specified AI tool
@@ -159,12 +155,10 @@ impl RunCommand {
             }
         };
 
-        // Resolve model: only triggered when --model flag is present
         let picker_was_requested = model.as_ref().is_some_and(|m| m.is_empty());
         let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
             let result = self.resolve_model(&client, key, model, refresh).await?;
-            // If user explicitly opened the picker (--model with no value) and cancelled, exit
             if picker_was_requested && result.is_none() {
                 return Ok(ExitCode::Success);
             }
@@ -176,12 +170,23 @@ impl RunCommand {
             anyhow::bail!("Internal error: no active key available for model resolution");
         };
 
+        if let Some(ref key) = key_override
+            && let Some(cwd) = crate::services::system_env::current_dir_string()
+        {
+            let _ = self
+                .session_store
+                .set_last_selection(&cwd, key, tool, resolved_model.as_deref())
+                .await;
+        }
+
+        let launch_model = resolve_model_placeholder(resolved_model);
+
         // Launch the AI tool
         let options = LaunchOptions {
             tool: ai_tool,
             args,
             debug,
-            model: resolved_model,
+            model: launch_model,
             env,
             key_override,
         };

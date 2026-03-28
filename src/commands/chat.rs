@@ -12,7 +12,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::constants::CONTENT_TYPE_JSON;
-use crate::tui::FuzzySelect;
 use anyhow::Result;
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
@@ -95,12 +94,13 @@ impl ChatCommand {
         }
     }
 
-    /// Resolves the model to use: --model flag > persisted per-key > None
-    /// Returns None when the picker should be shown (no flag, no persisted, or --model with no value).
+    /// Resolves the model to use:
+    /// --model flag > persisted per-key > last_selection > None (show picker)
     async fn resolve_model(
         &self,
         key_id: &str,
         flag_model: Option<String>,
+        cwd: &str,
     ) -> Result<Option<String>> {
         match flag_model {
             // --model with no value → force picker (bypass persisted model)
@@ -113,7 +113,21 @@ impl ChatCommand {
                 }
                 Ok(Some(model))
             }
-            None => self.session_store.get_chat_model(key_id).await,
+            None => {
+                // Try per-key chat model first
+                if let Some(m) = self.session_store.get_chat_model(key_id).await? {
+                    return Ok(Some(m));
+                }
+                // Fall back to per-directory last selection if key matches
+                if let Ok(Some(sel)) = self.session_store.get_last_selection(cwd).await
+                    && sel.key_id == key_id
+                    && let Some(ref m) = sel.model
+                    && m != crate::constants::MODEL_DEFAULT_PLACEHOLDER
+                {
+                    return Ok(Some(m.clone()));
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -171,12 +185,13 @@ impl ChatCommand {
         };
 
         let client = crate::services::http_utils::router_http_client();
+        let cwd =
+            crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
 
-        let raw_model = match self.resolve_model(&key.id, model_flag).await? {
+        let raw_model = match self.resolve_model(&key.id, model_flag, &cwd).await? {
             Some(m) => m,
             None => {
                 ensure_picker_terminal("model", "--model <name>")?;
-                // No model set for this key — prompt user to select one
                 let models_list = if refresh {
                     crate::commands::models::fetch_models_cached(&client, &key, &self.cache, true)
                         .await
@@ -191,28 +206,48 @@ impl ChatCommand {
                     );
                 }
 
-                match FuzzySelect::new()
-                    .with_prompt("Select model")
-                    .items(&models_list)
-                    .default(0)
-                    .interact_opt()
-                    .ok()
-                    .flatten()
-                    .map(|idx| models_list[idx].clone())
-                {
+                // For chat, __default__ resolves to the first available model
+                // since chat needs a concrete model for API calls.
+                let first_model = models_list[0].clone();
+                match crate::commands::models::prompt_model_picker(models_list) {
                     Some(selected) => {
-                        self.session_store
-                            .set_chat_model(&key.id, &selected)
-                            .await?;
-                        selected
+                        if selected == crate::constants::MODEL_DEFAULT_PLACEHOLDER {
+                            self.session_store
+                                .set_chat_model(&key.id, &first_model)
+                                .await?;
+                            first_model
+                        } else {
+                            self.session_store
+                                .set_chat_model(&key.id, &selected)
+                                .await?;
+                            selected
+                        }
                     }
                     None => return Ok(ExitCode::Success),
                 }
             }
         };
+
+        // Preserve the existing tool in last_selection so `aivo run` (no tool)
+        // still recalls the last *launchable* tool, not "chat".
+        let existing_tool = self
+            .session_store
+            .get_last_selection(&cwd)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.tool);
+        let _ = self
+            .session_store
+            .set_last_selection(
+                &cwd,
+                &key,
+                existing_tool.as_deref().unwrap_or("chat"),
+                Some(&raw_model),
+            )
+            .await;
+
         let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
-        let cwd =
-            crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
         let pending_attachments = build_pending_attachments(&attachments)?;
 
         // Resolve the "ollama" sentinel to the actual local URL before any HTTP calls.

@@ -3,14 +3,15 @@ use console::{Key, Term};
 
 use crate::cli::parse_env_vars;
 use crate::commands::keys::prompt_pick_key_without_activation;
-use crate::commands::models::fetch_models_for_select;
+use crate::commands::models::{
+    fetch_models_for_select, model_display_label, prompt_model_picker, resolve_model_placeholder,
+};
 use crate::commands::print_launch_preview;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
-use crate::services::session_store::{ApiKey, DirectoryStartRecord, SessionStore};
-use crate::services::system_env;
+use crate::services::session_store::{ApiKey, LastSelection, SessionStore};
 use crate::style;
 use crate::tui::FuzzySelect;
 
@@ -57,37 +58,63 @@ impl StartCommand {
     }
 
     async fn execute_internal(&self, args: StartFlowArgs) -> Result<ExitCode> {
-        let cwd = system_env::current_dir_string()
+        let cwd = crate::services::system_env::current_dir_string()
             .ok_or_else(|| anyhow::anyhow!("Failed to determine the current directory"))?;
 
-        // Phase 1: Get the latest record (for tool default)
-        let latest = self.session_store.get_latest_directory_start(&cwd).await?;
+        // Use per-directory last selection for defaults
+        let last_sel = self.session_store.get_last_selection(&cwd).await?;
 
-        if latest.is_none() {
+        if last_sel.is_none() {
             eprintln!(
                 "{}",
-                style::dim("No saved start record for this directory yet. I’ll help you pick one.")
+                style::dim("No saved selection for this directory yet. I'll help you pick one.")
             );
         }
 
-        // Resolve tool first (uses latest record for default)
-        let tool = self.resolve_tool(args.tool.as_deref(), latest.as_ref())?;
+        let key_explicit = args.key.is_some();
 
-        // Phase 2: Get the tool-specific record (for key/model defaults)
-        let tool_record = self
-            .session_store
-            .get_directory_start(&cwd, tool.value.as_str())
-            .await?;
+        // Resolve tool first (uses last selection for default)
+        let tool = self.resolve_tool(args.tool.as_deref(), last_sel.as_ref())?;
 
         let key = self
-            .resolve_key(args.key.as_deref(), tool_record.as_ref())
+            .resolve_key(args.key.as_deref(), last_sel.as_ref())
             .await?;
+
+        // Determine model: if -k was explicit, force picker; otherwise use last selection
+        let model_arg = if args.model.is_some() {
+            args.model
+        } else if key_explicit {
+            // -k used without -m → force model picker
+            Some(String::new())
+        } else {
+            // No -k, no -m → check last selection
+            match last_sel.as_ref() {
+                Some(sel) if sel.key_id == key.value.id => {
+                    sel.model.clone().or(Some(String::new()))
+                }
+                _ => None, // will trigger picker below
+            }
+        };
+
         let model = self
-            .resolve_model(args.model, tool_record.as_ref(), &key, args.refresh)
+            .resolve_model(model_arg, last_sel.as_ref(), &key, args.refresh)
             .await?;
+
+        let _ = self
+            .session_store
+            .set_last_selection(
+                &cwd,
+                &key.value,
+                tool.value.as_str(),
+                model.value.as_deref(),
+            )
+            .await;
+
+        let launch_model = resolve_model_placeholder(model.value.clone());
+
         let env = parse_env_vars(&args.envs);
         let skip_confirm =
-            tool_record.is_some() || (key.interactive && tool.interactive && model.interactive);
+            last_sel.is_some() || (key.interactive && tool.interactive && model.interactive);
 
         if args.dry_run {
             let plan = self
@@ -96,7 +123,7 @@ impl StartCommand {
                     tool: tool.value,
                     args: Vec::new(),
                     debug: args.debug,
-                    model: model.value,
+                    model: launch_model,
                     env: (!env.is_empty()).then_some(env),
                     key_override: Some(key.value),
                 })
@@ -106,14 +133,14 @@ impl StartCommand {
         }
 
         if !args.yes {
-            let provider = normalize_provider_label(&key.value.base_url);
+            let provider = super::truncate_url_for_display(&key.value.base_url, 50);
             eprintln!(
                 "{}{}",
                 style::cyan(tool.value.as_str()),
                 style::dim(format!(
                     " · {} · {}",
                     provider,
-                    model.value.as_deref().unwrap_or("(tool default)")
+                    model_display_label(model.value.as_deref())
                 ))
             );
             if !skip_confirm && !confirm("Run?")? {
@@ -127,7 +154,7 @@ impl StartCommand {
                 tool: tool.value,
                 args: Vec::new(),
                 debug: args.debug,
-                model: model.value,
+                model: launch_model,
                 env: (!env.is_empty()).then_some(env),
                 key_override: Some(key.value),
             })
@@ -142,10 +169,10 @@ impl StartCommand {
     async fn resolve_key(
         &self,
         key_arg: Option<&str>,
-        remembered: Option<&DirectoryStartRecord>,
+        last_sel: Option<&LastSelection>,
     ) -> Result<Resolved<ApiKey>> {
         if matches!(key_arg, Some("")) {
-            return self.prompt_select_key(remembered).await;
+            return self.prompt_select_key(last_sel).await;
         }
 
         if let Some(key_id_or_name) = key_arg {
@@ -158,8 +185,9 @@ impl StartCommand {
             });
         }
 
-        if let Some(record) = remembered
-            && let Some(key) = self.session_store.get_key_by_id(&record.key_id).await?
+        // Try last selection
+        if let Some(sel) = last_sel
+            && let Some(key) = self.session_store.get_key_by_id(&sel.key_id).await?
         {
             return Ok(Resolved {
                 value: key,
@@ -167,6 +195,7 @@ impl StartCommand {
             });
         }
 
+        // Fallback to active key
         if let Some(key) = self.session_store.get_active_key().await? {
             return Ok(Resolved {
                 value: key,
@@ -197,7 +226,7 @@ impl StartCommand {
 
     async fn prompt_select_key(
         &self,
-        remembered: Option<&DirectoryStartRecord>,
+        last_sel: Option<&LastSelection>,
     ) -> Result<Resolved<ApiKey>> {
         let keys = self.session_store.get_keys().await?;
         match keys.len() {
@@ -216,8 +245,8 @@ impl StartCommand {
                     .get_active_key_info()
                     .await?
                     .map(|active_key| active_key.id);
-                let default_idx = remembered
-                    .and_then(|record| keys.iter().position(|key| key.id == record.key_id))
+                let default_idx = last_sel
+                    .and_then(|sel| keys.iter().position(|key| key.id == sel.key_id))
                     .or_else(|| {
                         active_key_id
                             .as_ref()
@@ -238,7 +267,7 @@ impl StartCommand {
     fn resolve_tool(
         &self,
         tool_arg: Option<&str>,
-        remembered: Option<&DirectoryStartRecord>,
+        last_sel: Option<&LastSelection>,
     ) -> Result<Resolved<AIToolType>> {
         if let Some(tool) = tool_arg {
             return Ok(Resolved {
@@ -248,8 +277,8 @@ impl StartCommand {
             });
         }
 
-        if let Some(record) = remembered
-            && let Some(tool) = AIToolType::parse(&record.tool)
+        if let Some(sel) = last_sel
+            && let Some(tool) = AIToolType::parse(&sel.tool)
         {
             return Ok(Resolved {
                 value: tool,
@@ -279,12 +308,14 @@ impl StartCommand {
     async fn resolve_model(
         &self,
         model_arg: Option<String>,
-        remembered: Option<&DirectoryStartRecord>,
+        last_sel: Option<&LastSelection>,
         key: &Resolved<ApiKey>,
         refresh: bool,
     ) -> Result<Resolved<Option<String>>> {
+        // Only use last_sel model when the key matches
+        let matching_sel = last_sel.filter(|sel| sel.key_id == key.value.id);
         let should_prompt = model_arg.as_ref().is_some_and(|value| value.is_empty())
-            || (model_arg.is_none() && remembered.is_none());
+            || (model_arg.is_none() && matching_sel.is_none());
 
         if should_prompt {
             return self.prompt_select_model(&key.value, refresh).await;
@@ -296,7 +327,7 @@ impl StartCommand {
                 interactive: false,
             }),
             None => Ok(Resolved {
-                value: remembered.and_then(|record| record.model.clone()),
+                value: matching_sel.and_then(|sel| sel.model.clone()),
                 interactive: false,
             }),
         }
@@ -320,18 +351,14 @@ impl StartCommand {
                 "No models found for this key. Use 'aivo models --refresh' or specify one with --model <name>."
             );
         }
-        let selected = FuzzySelect::new()
-            .with_prompt("Select model")
-            .items(&models)
-            .default(0)
-            .interact_opt()
-            .ok()
-            .flatten()
-            .ok_or_else(|| anyhow::anyhow!("Cancelled"))?;
-        Ok(Resolved {
-            value: Some(models[selected].clone()),
-            interactive: true,
-        })
+
+        match prompt_model_picker(models) {
+            Some(selected) => Ok(Resolved {
+                value: Some(selected),
+                interactive: true,
+            }),
+            None => Err(anyhow::anyhow!("Cancelled")),
+        }
     }
 }
 
@@ -353,63 +380,5 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
             }
             _ => {}
         }
-    }
-}
-
-fn normalize_provider_label(base_url: &str) -> String {
-    if base_url == "copilot" {
-        return "github.com/copilot".to_string();
-    }
-    if base_url == "ollama" {
-        return "localhost/ollama".to_string();
-    }
-
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(ToString::to_string))
-        .unwrap_or_else(|| base_url.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_provider_label;
-
-    #[test]
-    fn normalize_copilot_sentinel() {
-        assert_eq!(normalize_provider_label("copilot"), "github.com/copilot");
-    }
-
-    #[test]
-    fn normalize_ollama_sentinel() {
-        assert_eq!(normalize_provider_label("ollama"), "localhost/ollama");
-    }
-
-    #[test]
-    fn normalize_extracts_host_from_url() {
-        assert_eq!(
-            normalize_provider_label("https://api.openai.com/v1"),
-            "api.openai.com"
-        );
-    }
-
-    #[test]
-    fn normalize_returns_raw_string_for_unparseable_url() {
-        assert_eq!(normalize_provider_label("not-a-url"), "not-a-url");
-    }
-
-    #[test]
-    fn normalize_provider_label_url_with_port() {
-        assert_eq!(
-            normalize_provider_label("https://localhost:8080/v1"),
-            "localhost"
-        );
-    }
-
-    #[test]
-    fn normalize_provider_label_url_with_deep_path() {
-        assert_eq!(
-            normalize_provider_label("https://api.deepseek.com/v1/chat"),
-            "api.deepseek.com"
-        );
     }
 }

@@ -11,13 +11,11 @@ help: ## Show this help message
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-build: ## Build the real release binary
-	cargo build --release
-
-build-debug: ## Build debug binary for local development
+build: ## Build debug binary (~1s incremental)
 	cargo build
 
-build-release: build ## Build optimized release binary
+build-release: ## Build optimized release binary
+	cargo build --release
 
 test: ## Run all tests
 	cargo test --features test-fast-crypto
@@ -37,8 +35,8 @@ fmt: ## Format code
 clean: ## Clean build artifacts
 	cargo clean
 
-install: build ## Install binary to /usr/local/bin (re-signs for macOS arm64)
-	cp target/release/aivo /usr/local/bin/aivo
+install: build ## Install debug binary to /usr/local/bin (re-signs for macOS arm64)
+	cp target/debug/aivo /usr/local/bin/aivo
 	codesign --force -s - /usr/local/bin/aivo 2>/dev/null || true
 
 dev: check test clippy ## Run all checks (check, test, clippy)

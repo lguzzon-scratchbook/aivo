@@ -20,7 +20,6 @@ use cli::{Cli, Commands};
 use commands::{
     AliasCommand, ChatCommand, InfoCommand, KeysCommand, LogsCommand, ModelsCommand, RunCommand,
     ServeCommand, ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
-    truncate_url_for_display,
 };
 use errors::ExitCode;
 use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
@@ -38,6 +37,7 @@ async fn main() {
     // Initialize services early so we can show active key in help
     let session_store = SessionStore::new();
     let models_cache = services::ModelsCache::new();
+    let cwd = services::system_env::current_dir_string();
 
     // Handle help and version flags at the top level
     if args.help {
@@ -74,7 +74,6 @@ async fn main() {
             }
             None => {
                 print_help();
-                print_active_key(&session_store).await;
             }
         }
         process::exit(0);
@@ -90,7 +89,6 @@ async fn main() {
         Some(cmd) => cmd,
         None => {
             print_help();
-            print_active_key(&session_store).await;
             process::exit(0);
         }
     };
@@ -108,15 +106,24 @@ async fn main() {
         }
 
         Commands::Chat(chat_args) => {
+            let key_explicit = chat_args.key.is_some();
             let key_override = key_or_exit(
                 resolve_key_override(
                     &session_store,
                     chat_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
+                    cwd.as_deref(),
                 )
                 .await,
             );
-            let model = resolve_model_alias(&session_store, chat_args.model).await;
+            // When -k is used without -m, force model picker (same as run/start)
+            let model = if chat_args.model.is_some() {
+                resolve_model_alias(&session_store, chat_args.model).await
+            } else if key_explicit {
+                Some(String::new())
+            } else {
+                None
+            };
             let command = ChatCommand::new(session_store, models_cache.clone());
             command
                 .execute(
@@ -181,16 +188,43 @@ async fn main() {
                     })
                     .await
             } else {
-                let command = RunCommand::new(ai_launcher, models_cache);
+                let command = RunCommand::new(session_store.clone(), ai_launcher, models_cache);
 
+                let key_explicit = key_flag.is_some();
                 let key_override = key_or_exit(
                     resolve_key_override(
                         &session_store,
                         key_flag.as_deref(),
                         KeyLookupMode::RequireActiveOrPrompt,
+                        cwd.as_deref(),
                     )
                     .await,
                 );
+
+                // Resolve model using last selection when no explicit flags given.
+                // When -k is used without -m, always force the model picker.
+                let model = if model.is_some() {
+                    // -m was explicitly provided → use it
+                    model
+                } else if key_explicit {
+                    // -k used without -m → force model picker
+                    Some(String::new())
+                } else {
+                    // No -k, no -m → check last_selection for saved model
+                    let last_sel = match cwd.as_deref() {
+                        Some(dir) => session_store.get_last_selection(dir).await.ok().flatten(),
+                        None => None,
+                    };
+                    match last_sel {
+                        Some(ref sel)
+                            if key_override.as_ref().is_some_and(|k| k.id == sel.key_id) =>
+                        {
+                            // Same key as last time — reuse saved model (could be __default__)
+                            sel.model.clone().or(Some(String::new()))
+                        }
+                        _ => Some(String::new()), // no matching selection → trigger picker
+                    }
+                };
 
                 let env = if !env_strings.is_empty() {
                     let mut map = std::collections::HashMap::new();
@@ -231,6 +265,7 @@ async fn main() {
                     &session_store,
                     models_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
+                    cwd.as_deref(),
                 )
                 .await,
             );
@@ -245,6 +280,7 @@ async fn main() {
                 &session_store,
                 serve_args.key.as_deref(),
                 KeyLookupMode::PreferActiveAllowNone,
+                cwd.as_deref(),
             )
             .await
             {
@@ -285,7 +321,7 @@ async fn main() {
         }
 
         Commands::Info(info_args) => {
-            let command = InfoCommand::new(session_store, models_cache);
+            let command = InfoCommand::new(session_store);
             command.execute(info_args.ping).await
         }
 
@@ -344,25 +380,6 @@ fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
     }
 
     raw_args
-}
-/// Prints the active key info.
-/// Only prints if there is an active key configured.
-async fn print_active_key(session_store: &SessionStore) {
-    let active_key = match session_store.get_active_key_info().await.ok().flatten() {
-        Some(key) => key,
-        None => return,
-    };
-
-    println!();
-    println!("{}", style::bold("Active key:"));
-    let id_padded = format!("{:<3}", active_key.short_id());
-    println!(
-        "  {} {}  {}  {}",
-        style::bullet_symbol(),
-        style::cyan(&id_padded),
-        active_key.display_name(),
-        style::dim(truncate_url_for_display(&active_key.base_url, 50))
-    );
 }
 
 /// Prints help information

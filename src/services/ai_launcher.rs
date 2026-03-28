@@ -405,13 +405,14 @@ impl AILauncher {
 
     /// Outputs information about which key is being used
     fn output_key_info(&self, key: &ApiKey) {
+        use crate::commands::truncate_url_for_display;
         use crate::style;
 
         eprintln!(
             "  {} Using key: {} {}",
             style::success_symbol(),
             style::cyan(key.display_name()),
-            style::dim(format!("({})", key.base_url))
+            style::dim(format!("({})", truncate_url_for_display(&key.base_url, 50)))
         );
     }
 

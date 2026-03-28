@@ -7,12 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `aivo` is a Rust CLI tool that provides unified access to multiple AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi) with local API key management and secure storage. Supports OpenAI-compatible providers (Cloudflare Workers AI, Moonshot, DeepSeek), GitHub Copilot, OpenRouter, Ollama (local models), and native APIs.
 
 > [!IMPORTANT]
-> **Rebuild before testing**: After code changes, always run `cargo build --release && cargo install --path .` before testing the binary. Never test a stale build.
+> **Rebuild before testing**: After code changes, always run `cargo build && cargo install --path . --debug` before testing the binary. Never test a stale build. Only use `--release` for final testing before a release.
 
 ## Build & Test
 
 ```bash
-cargo build --release   # Compile optimized binary to target/release/aivo
+cargo build             # Compile debug binary to target/debug/aivo (~1s incremental)
 cargo test --features test-fast-crypto  # Run all tests (~1900 tests, fast crypto for CI/dev)
 cargo test -- test_name                 # Run a single test by name
 cargo clippy            # Lint (fix all warnings before committing)

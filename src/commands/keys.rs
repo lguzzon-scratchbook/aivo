@@ -352,6 +352,17 @@ impl KeysCommand {
         Self { session_store }
     }
 
+    /// Returns the key ID from the current directory's last_selection.
+    async fn selected_key_id(&self) -> Option<String> {
+        let cwd = crate::services::system_env::current_dir_string()?;
+        self.session_store
+            .get_last_selection(&cwd)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.key_id)
+    }
+
     /// Executes the keys command with the specified action
     pub async fn execute(&self, keys_args: KeysArgs) -> ExitCode {
         let action = keys_args.action.as_deref();
@@ -466,7 +477,8 @@ impl KeysCommand {
 
     /// Lists all API keys
     async fn list_keys(&self) -> Result<ExitCode> {
-        let (keys, active_key_id) = self.session_store.get_keys_and_active_id_info().await?;
+        let keys = self.session_store.get_keys().await?;
+        let selected_key_id = self.selected_key_id().await;
 
         if keys.is_empty() {
             println!("{}", style::dim("No API keys found."));
@@ -476,8 +488,8 @@ impl KeysCommand {
         let max_name_len = keys.iter().map(|k| k.name.len()).max().unwrap_or(0);
 
         for key in &keys {
-            let is_active = active_key_id.as_deref() == Some(key.id.as_str());
-            let active_indicator = if is_active {
+            let is_selected = selected_key_id.as_deref() == Some(key.id.as_str());
+            let active_indicator = if is_selected {
                 style::bullet_symbol()
             } else {
                 style::empty_bullet_symbol()
@@ -498,7 +510,8 @@ impl KeysCommand {
 
     /// Lists all API keys with live ping status, streaming results as they complete.
     async fn list_keys_with_ping(&self) -> Result<ExitCode> {
-        let (keys, active_key_id) = self.session_store.get_keys_and_active_id_info().await?;
+        let keys = self.session_store.get_keys().await?;
+        let selected_key_id = self.selected_key_id().await;
 
         if keys.is_empty() {
             println!("{}", style::dim("No API keys found."));
@@ -509,8 +522,8 @@ impl KeysCommand {
         let url_display_width = 42;
 
         for mut key in keys {
-            let is_active = active_key_id.as_deref() == Some(key.id.as_str());
-            let active_indicator = if is_active {
+            let is_selected = selected_key_id.as_deref() == Some(key.id.as_str());
+            let active_indicator = if is_selected {
                 style::bullet_symbol()
             } else {
                 style::empty_bullet_symbol()
@@ -577,6 +590,22 @@ impl KeysCommand {
     /// Activates a key and prints confirmation
     async fn activate_key(&self, key: &ApiKey) -> Result<()> {
         self.session_store.set_active_key(&key.id).await?;
+        // Update per-directory last-selection: keep existing tool, clear model since
+        // the new key may have a different provider/model set.
+        if let Some(cwd) = crate::services::system_env::current_dir_string()
+            && let Some(existing_tool) = self
+                .session_store
+                .get_last_selection(&cwd)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.tool)
+        {
+            let _ = self
+                .session_store
+                .set_last_selection(&cwd, key, &existing_tool, None)
+                .await;
+        }
         let preview = key_preview(&key.key);
         println!(
             "{} Activated key: {} {}",

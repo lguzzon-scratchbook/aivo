@@ -514,6 +514,49 @@ pub(crate) async fn fetch_models_cached(
     Ok(models)
 }
 
+/// Shows an interactive model picker with "(leave it to the tool)" as the first option.
+/// Prints the active key context before the picker so the user knows which provider
+/// they're selecting from. Returns `Some(MODEL_DEFAULT_PLACEHOLDER)` if the default
+/// is chosen, `Some(model_name)` for a real model, or `None` if cancelled.
+pub(crate) fn prompt_model_picker(models: Vec<String>) -> Option<String> {
+    use crate::constants;
+    use crate::tui::FuzzySelect;
+
+    let mut items = vec![constants::MODEL_DEFAULT_DISPLAY.to_string()];
+    items.extend(models);
+
+    FuzzySelect::new()
+        .with_prompt("Select model")
+        .items(&items)
+        .default(0)
+        .interact_opt()
+        .ok()
+        .flatten()
+        .map(|idx| {
+            if idx == 0 {
+                constants::MODEL_DEFAULT_PLACEHOLDER.to_string()
+            } else {
+                items[idx].clone()
+            }
+        })
+}
+
+/// Converts the `__default__` placeholder to `None` for passing to tools.
+pub(crate) fn resolve_model_placeholder(model: Option<String>) -> Option<String> {
+    match model.as_deref() {
+        Some(crate::constants::MODEL_DEFAULT_PLACEHOLDER) => None,
+        _ => model,
+    }
+}
+
+/// Returns a display-friendly model string, converting `__default__` and `None` to "(tool default)".
+pub(crate) fn model_display_label(model: Option<&str>) -> &str {
+    match model {
+        Some(crate::constants::MODEL_DEFAULT_PLACEHOLDER) | None => "(tool default)",
+        Some(m) => m,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

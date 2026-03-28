@@ -12,7 +12,7 @@ use crate::services::system_env;
 
 use crate::services::api_key_store::ApiKeyStore;
 use crate::services::chat_session_store::ChatSessionStore;
-use crate::services::directory_starts::DirectoryStartsStore;
+use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::usage_stats_store::UsageStatsStore;
 
@@ -142,6 +142,9 @@ impl ApiKey {
 
 /// Per-directory, per-tool start records. Outer key = cwd, inner key = tool name.
 pub type DirectoryStartsMap = HashMap<String, HashMap<String, DirectoryStartRecord>>;
+
+/// Per-directory last-used key/tool/model selection. Same shape as DirectoryStartRecord.
+pub type LastSelection = DirectoryStartRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryStartRecord {
@@ -431,10 +434,12 @@ pub struct StoredConfig {
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub chat_models: HashMap<String, String>,
+    /// Legacy field — read from old configs but never written back.
+    /// Replaced by `last_selection` (per-directory, single record).
     #[serde(
         rename = "directory_starts",
         default,
-        skip_serializing_if = "HashMap::is_empty",
+        skip_serializing,
         deserialize_with = "deserialize_directory_starts"
     )]
     pub directory_starts: DirectoryStartsMap,
@@ -447,6 +452,13 @@ pub struct StoredConfig {
     /// Model aliases (e.g. "fast" -> "claude-haiku-4-5")
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub aliases: HashMap<String, String>,
+    /// Per-directory last-used key/tool/model selection.
+    #[serde(
+        rename = "last_selection",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub last_selection: HashMap<String, LastSelection>,
     /// Legacy field — read from old configs but never written back.
     /// Sessions are now stored in individual files under sessions/.
     #[serde(rename = "chat_sessions", default, skip_serializing)]
@@ -507,6 +519,7 @@ impl StoredConfig {
             directory_starts: HashMap::new(),
             stats: UsageStats::default(),
             aliases: HashMap::new(),
+            last_selection: HashMap::new(),
             chat_sessions: HashMap::new(),
         }
     }
@@ -697,7 +710,7 @@ pub struct SessionStore {
     api_keys: ApiKeyStore,
     sessions: ChatSessionStore,
     stats: UsageStatsStore,
-    dirs: DirectoryStartsStore,
+    last_sel: LastSelectionStore,
     logs: LogStore,
 }
 
@@ -731,7 +744,7 @@ impl SessionStore {
             api_keys: ApiKeyStore { ctx: ctx.clone() },
             sessions: ChatSessionStore { ctx: ctx.clone() },
             stats: UsageStatsStore::new(ctx.clone()),
-            dirs: DirectoryStartsStore { ctx: ctx.clone() },
+            last_sel: LastSelectionStore { ctx: ctx.clone() },
             logs: LogStore::new(ctx.config_dir.clone()),
             ctx,
         }
@@ -894,43 +907,25 @@ impl SessionStore {
         self.api_keys.set_chat_model(key_id, model).await
     }
 
-    // ── Directory starts (delegated to DirectoryStartsStore) ──────────────
+    // ── Last selection (delegated to LastSelectionStore) ───────────────────
 
-    pub async fn get_directory_start(
-        &self,
-        cwd: &str,
-        tool: &str,
-    ) -> Result<Option<DirectoryStartRecord>> {
-        self.dirs.get_directory_start(cwd, tool).await
+    pub async fn get_last_selection(&self, cwd: &str) -> Result<Option<LastSelection>> {
+        self.last_sel.get(cwd).await
     }
 
-    pub async fn get_latest_directory_start(
+    pub async fn set_last_selection(
         &self,
         cwd: &str,
-    ) -> Result<Option<DirectoryStartRecord>> {
-        self.dirs.get_latest_directory_start(cwd).await
-    }
-
-    pub async fn get_all_directory_starts(&self, cwd: &str) -> Result<Vec<DirectoryStartRecord>> {
-        self.dirs.get_all_directory_starts(cwd).await
-    }
-
-    pub async fn set_directory_start(
-        &self,
-        cwd: &str,
-        key_id: &str,
-        base_url: &str,
+        key: &ApiKey,
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        self.dirs
-            .set_directory_start(cwd, key_id, base_url, tool, model)
-            .await
+        self.last_sel.set(cwd, key, tool, model).await
     }
 
     #[allow(dead_code)]
-    pub async fn clear_directory_start(&self, cwd: &str) -> Result<bool> {
-        self.dirs.clear_directory_start(cwd).await
+    pub async fn clear_last_selection(&self, cwd: &str) -> Result<()> {
+        self.last_sel.clear(cwd).await
     }
 
     // ── Usage stats (delegated to UsageStatsStore) ────────────────────────
@@ -1353,41 +1348,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_directory_start_removed_when_key_base_url_changes() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.json");
-        let store = SessionStore::with_path(config_path);
-
-        let id = store
-            .add_key_with_protocol("orig", "http://localhost", None, "sk-test")
-            .await
-            .unwrap();
-        store
-            .set_directory_start(
-                "/tmp/demo",
-                &id,
-                "http://localhost",
-                "claude",
-                Some("model-a"),
-            )
-            .await
-            .unwrap();
-
-        store
-            .update_key(&id, "orig", "https://new.example.com", None, "sk-test")
-            .await
-            .unwrap();
-
-        assert!(
-            store
-                .get_directory_start("/tmp/demo", "claude")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
     async fn test_record_stats_and_chat_session_roundtrip() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
@@ -1480,25 +1440,6 @@ mod tests {
         let session_path = store.session_file_path("legacy");
         let session_raw = tokio::fs::read_to_string(&session_path).await.unwrap();
         assert!(!session_raw.contains("\"hello\""));
-    }
-
-    #[tokio::test]
-    async fn test_clear_directory_start_returns_true_when_removed() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.json");
-        let store = SessionStore::with_path(config_path);
-
-        let id = store
-            .add_key_with_protocol("orig", "http://localhost", None, "sk-test")
-            .await
-            .unwrap();
-        store
-            .set_directory_start("/tmp/demo", &id, "http://localhost", "claude", None)
-            .await
-            .unwrap();
-
-        assert!(store.clear_directory_start("/tmp/demo").await.unwrap());
-        assert!(!store.clear_directory_start("/tmp/demo").await.unwrap());
     }
 
     #[tokio::test]

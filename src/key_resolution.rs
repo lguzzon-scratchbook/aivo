@@ -34,9 +34,10 @@ pub(crate) async fn resolve_key_override(
     session_store: &SessionStore,
     key_flag: Option<&str>,
     mode: KeyLookupMode,
+    cwd: Option<&str>,
 ) -> anyhow::Result<KeyResolution> {
     match key_flag {
-        Some("") => prompt_temporary_key_override(session_store).await,
+        Some("") => prompt_temporary_key_override(session_store, cwd).await,
         Some(key_id_or_name) => Ok(KeyResolution::Selected(
             session_store
                 .resolve_key_by_id_or_name(key_id_or_name)
@@ -44,21 +45,31 @@ pub(crate) async fn resolve_key_override(
         )),
         None => match mode {
             KeyLookupMode::RequireActiveOrPrompt => {
-                match resolve_active_key_or_prompt(session_store).await {
+                match resolve_active_key_or_prompt(session_store, cwd).await {
                     Some(key) => Ok(KeyResolution::Selected(key)),
                     None => Ok(KeyResolution::MissingAuth),
                 }
             }
-            KeyLookupMode::PreferActiveAllowNone => match session_store.get_active_key().await? {
-                Some(key) => Ok(KeyResolution::Selected(key)),
-                None => Ok(KeyResolution::MissingAuth),
-            },
+            KeyLookupMode::PreferActiveAllowNone => {
+                // Try last-used selection first
+                if let Some(dir) = cwd
+                    && let Ok(Some(last_sel)) = session_store.get_last_selection(dir).await
+                    && let Ok(Some(key)) = session_store.get_key_by_id(&last_sel.key_id).await
+                {
+                    return Ok(KeyResolution::Selected(key));
+                }
+                match session_store.get_active_key().await? {
+                    Some(key) => Ok(KeyResolution::Selected(key)),
+                    None => Ok(KeyResolution::MissingAuth),
+                }
+            }
         },
     }
 }
 
 async fn prompt_temporary_key_override(
     session_store: &SessionStore,
+    cwd: Option<&str>,
 ) -> anyhow::Result<KeyResolution> {
     let all_keys = session_store.get_keys().await?;
     if all_keys.is_empty() {
@@ -73,10 +84,30 @@ async fn prompt_temporary_key_override(
         );
     }
 
-    let default_idx = session_store
+    let last_sel_key_id = if let Some(dir) = cwd {
+        session_store
+            .get_last_selection(dir)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.key_id)
+    } else {
+        None
+    };
+    let active_key_id = session_store
         .get_active_key_info()
-        .await?
-        .and_then(|active_key| all_keys.iter().position(|key| key.id == active_key.id))
+        .await
+        .ok()
+        .flatten()
+        .map(|k| k.id);
+    let default_idx = last_sel_key_id
+        .as_ref()
+        .and_then(|id| all_keys.iter().position(|key| &key.id == id))
+        .or_else(|| {
+            active_key_id
+                .as_ref()
+                .and_then(|id| all_keys.iter().position(|key| &key.id == id))
+        })
         .unwrap_or(0);
 
     match commands::keys::prompt_pick_key_without_activation(
@@ -89,7 +120,18 @@ async fn prompt_temporary_key_override(
     }
 }
 
-async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<ApiKey> {
+async fn resolve_active_key_or_prompt(
+    session_store: &SessionStore,
+    cwd: Option<&str>,
+) -> Option<ApiKey> {
+    // Try last-used selection first
+    if let Some(dir) = cwd
+        && let Ok(Some(last_sel)) = session_store.get_last_selection(dir).await
+        && let Ok(Some(key)) = session_store.get_key_by_id(&last_sel.key_id).await
+    {
+        return Some(key);
+    }
+    // Then active key
     if let Ok(Some(key)) = session_store.get_active_key().await {
         return Some(key);
     }
@@ -166,7 +208,7 @@ mod tests {
         store.set_active_key(&id).await.unwrap();
 
         let resolved =
-            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone).await;
+            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone, None).await;
 
         match resolved.unwrap() {
             KeyResolution::Selected(key) => assert_eq!(key.id, id),
@@ -179,7 +221,7 @@ mod tests {
         let (_temp_dir, store) = temp_store();
 
         let resolved =
-            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone).await;
+            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone, None).await;
 
         assert!(matches!(resolved.unwrap(), KeyResolution::MissingAuth));
     }

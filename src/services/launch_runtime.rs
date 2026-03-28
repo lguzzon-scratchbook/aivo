@@ -101,11 +101,6 @@ pub(crate) async fn record_launch_state(
     let _ = session_store
         .record_selection(&key.id, tool.as_str(), model)
         .await;
-    if let Some(cwd) = crate::services::system_env::current_dir_string() {
-        let _ = session_store
-            .set_directory_start(&cwd, &key.id, &key.base_url, tool.as_str(), model)
-            .await;
-    }
 }
 
 pub(crate) async fn persist_runtime_discoveries(
