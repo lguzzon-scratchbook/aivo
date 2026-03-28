@@ -14,9 +14,9 @@ pub(crate) struct LastSelectionStore {
 }
 
 impl LastSelectionStore {
-    pub(crate) async fn get(&self, cwd: &str) -> Result<Option<LastSelection>> {
+    pub(crate) async fn get(&self) -> Result<Option<LastSelection>> {
         let config = self.ctx.load().await?;
-        let Some(record) = config.last_selection.get(cwd).cloned() else {
+        let Some(record) = config.last_selection.clone() else {
             return Ok(None);
         };
 
@@ -30,42 +30,34 @@ impl LastSelectionStore {
         let mut config = self.ctx.load().await?;
         if config
             .last_selection
-            .get(cwd)
+            .as_ref()
             .is_some_and(|r| !has_valid_key(r, &config.api_keys))
         {
-            config.last_selection.remove(cwd);
+            config.last_selection = None;
             self.ctx.save_raw(&config).await?;
         }
         Ok(None)
     }
 
-    pub(crate) async fn set(
-        &self,
-        cwd: &str,
-        key: &ApiKey,
-        tool: &str,
-        model: Option<&str>,
-    ) -> Result<()> {
+    pub(crate) async fn set(&self, key: &ApiKey, tool: &str, model: Option<&str>) -> Result<()> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
-        config.last_selection.insert(
-            cwd.to_string(),
-            DirectoryStartRecord {
-                key_id: key.id.clone(),
-                base_url: key.base_url.clone(),
-                tool: tool.to_string(),
-                model: model.map(ToString::to_string),
-                updated_at: Utc::now().to_rfc3339(),
-            },
-        );
+        config.last_selection = Some(DirectoryStartRecord {
+            key_id: key.id.clone(),
+            base_url: key.base_url.clone(),
+            tool: tool.to_string(),
+            model: model.map(ToString::to_string),
+            updated_at: Utc::now().to_rfc3339(),
+        });
         self.ctx.save_raw(&config).await
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn clear(&self, cwd: &str) -> Result<()> {
+    pub(crate) async fn clear(&self) -> Result<()> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
-        if config.last_selection.remove(cwd).is_some() {
+        if config.last_selection.is_some() {
+            config.last_selection = None;
             self.ctx.save_raw(&config).await?;
         }
         Ok(())
@@ -120,7 +112,7 @@ mod tests {
         let key = make_key("key1", "http://localhost");
         write_config_with_key(&store, &key).await;
 
-        let result = store.get("/tmp/test").await.unwrap();
+        let result = store.get().await.unwrap();
         assert!(result.is_none());
     }
 
@@ -131,41 +123,13 @@ mod tests {
         let key = make_key("key1", "http://localhost");
         write_config_with_key(&store, &key).await;
 
-        store
-            .set("/tmp/test", &key, "claude", Some("gpt-4o"))
-            .await
-            .unwrap();
+        store.set(&key, "claude", Some("gpt-4o")).await.unwrap();
 
-        let record = store.get("/tmp/test").await.unwrap().unwrap();
+        let record = store.get().await.unwrap().unwrap();
         assert_eq!(record.key_id, "key1");
         assert_eq!(record.base_url, "http://localhost");
         assert_eq!(record.tool, "claude");
         assert_eq!(record.model.as_deref(), Some("gpt-4o"));
-    }
-
-    #[tokio::test]
-    async fn different_directories_are_independent() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = make_store(&temp_dir);
-        let key = make_key("key1", "http://localhost");
-        write_config_with_key(&store, &key).await;
-
-        store
-            .set("/tmp/a", &key, "claude", Some("sonnet"))
-            .await
-            .unwrap();
-        store
-            .set("/tmp/b", &key, "codex", Some("gpt-4o"))
-            .await
-            .unwrap();
-
-        let a = store.get("/tmp/a").await.unwrap().unwrap();
-        assert_eq!(a.tool, "claude");
-        assert_eq!(a.model.as_deref(), Some("sonnet"));
-
-        let b = store.get("/tmp/b").await.unwrap().unwrap();
-        assert_eq!(b.tool, "codex");
-        assert_eq!(b.model.as_deref(), Some("gpt-4o"));
     }
 
     #[tokio::test]
@@ -175,9 +139,9 @@ mod tests {
         let key = make_key("key1", "http://localhost");
         write_config_with_key(&store, &key).await;
 
-        store.set("/tmp/test", &key, "codex", None).await.unwrap();
+        store.set(&key, "codex", None).await.unwrap();
 
-        let record = store.get("/tmp/test").await.unwrap().unwrap();
+        let record = store.get().await.unwrap().unwrap();
         assert_eq!(record.tool, "codex");
         assert!(record.model.is_none());
     }
@@ -191,7 +155,6 @@ mod tests {
 
         store
             .set(
-                "/tmp/test",
                 &key,
                 "claude",
                 Some(crate::constants::MODEL_DEFAULT_PLACEHOLDER),
@@ -199,7 +162,7 @@ mod tests {
             .await
             .unwrap();
 
-        let record = store.get("/tmp/test").await.unwrap().unwrap();
+        let record = store.get().await.unwrap().unwrap();
         assert_eq!(
             record.model.as_deref(),
             Some(crate::constants::MODEL_DEFAULT_PLACEHOLDER)
@@ -213,7 +176,7 @@ mod tests {
         let key = make_key("key1", "http://localhost");
         write_config_with_key(&store, &key).await;
 
-        store.set("/tmp/test", &key, "claude", None).await.unwrap();
+        store.set(&key, "claude", None).await.unwrap();
 
         // Remove the key from config
         let config = StoredConfig::new();
@@ -222,7 +185,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store.get("/tmp/test").await.unwrap();
+        let result = store.get().await.unwrap();
         assert!(result.is_none());
     }
 
@@ -233,17 +196,11 @@ mod tests {
         let key = make_key("key1", "http://localhost");
         write_config_with_key(&store, &key).await;
 
-        store
-            .set("/tmp/test", &key, "claude", Some("sonnet"))
-            .await
-            .unwrap();
+        store.set(&key, "claude", Some("sonnet")).await.unwrap();
 
-        store
-            .set("/tmp/test", &key, "codex", Some("gpt-4o"))
-            .await
-            .unwrap();
+        store.set(&key, "codex", Some("gpt-4o")).await.unwrap();
 
-        let record = store.get("/tmp/test").await.unwrap().unwrap();
+        let record = store.get().await.unwrap().unwrap();
         assert_eq!(record.tool, "codex");
         assert_eq!(record.model.as_deref(), Some("gpt-4o"));
     }
@@ -255,11 +212,11 @@ mod tests {
         let key = make_key("key1", "http://localhost");
         write_config_with_key(&store, &key).await;
 
-        store.set("/tmp/test", &key, "claude", None).await.unwrap();
+        store.set(&key, "claude", None).await.unwrap();
 
-        store.clear("/tmp/test").await.unwrap();
+        store.clear().await.unwrap();
 
-        let result = store.get("/tmp/test").await.unwrap();
+        let result = store.get().await.unwrap();
         assert!(result.is_none());
     }
 }

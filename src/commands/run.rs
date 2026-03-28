@@ -170,12 +170,10 @@ impl RunCommand {
             anyhow::bail!("Internal error: no active key available for model resolution");
         };
 
-        if let Some(ref key) = key_override
-            && let Some(cwd) = crate::services::system_env::current_dir_string()
-        {
+        if let Some(ref key) = key_override {
             let _ = self
                 .session_store
-                .set_last_selection(&cwd, key, tool, resolved_model.as_deref())
+                .set_last_selection(key, tool, resolved_model.as_deref())
                 .await;
         }
 

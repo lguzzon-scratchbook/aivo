@@ -45,7 +45,7 @@ impl InfoCommand {
 
         let keys = self.session_store.get_keys().await?;
         let cwd = system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
-        let last_sel = self.session_store.get_last_selection(&cwd).await?;
+        let last_sel = self.session_store.get_last_selection().await?;
         let selected_key_id = last_sel.as_ref().map(|s| s.key_id.as_str());
         let mut has_problems = false;
 
@@ -118,9 +118,9 @@ impl InfoCommand {
             }
         }
 
-        // 4. Current directory + last used selection
+        // 4. Status
         println!();
-        println!("{}", style::bold("Current directory:"));
+        println!("{}", style::bold("Status:"));
         println!("  {}", style::dim(&cwd));
         match last_sel {
             Some(ref sel) => {
@@ -140,7 +140,7 @@ impl InfoCommand {
                 );
             }
             None => {
-                println!("  {}", style::dim("No saved selection for this directory."));
+                println!("  {}", style::dim("No saved selection."));
             }
         }
 

@@ -58,16 +58,13 @@ impl StartCommand {
     }
 
     async fn execute_internal(&self, args: StartFlowArgs) -> Result<ExitCode> {
-        let cwd = crate::services::system_env::current_dir_string()
-            .ok_or_else(|| anyhow::anyhow!("Failed to determine the current directory"))?;
-
-        // Use per-directory last selection for defaults
-        let last_sel = self.session_store.get_last_selection(&cwd).await?;
+        // Use global last selection for defaults
+        let last_sel = self.session_store.get_last_selection().await?;
 
         if last_sel.is_none() {
             eprintln!(
                 "{}",
-                style::dim("No saved selection for this directory yet. I'll help you pick one.")
+                style::dim("No saved selection yet. I'll help you pick one.")
             );
         }
 
@@ -102,12 +99,7 @@ impl StartCommand {
 
         let _ = self
             .session_store
-            .set_last_selection(
-                &cwd,
-                &key.value,
-                tool.value.as_str(),
-                model.value.as_deref(),
-            )
+            .set_last_selection(&key.value, tool.value.as_str(), model.value.as_deref())
             .await;
 
         let launch_model = resolve_model_placeholder(model.value.clone());

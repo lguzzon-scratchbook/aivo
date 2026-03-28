@@ -100,7 +100,6 @@ impl ChatCommand {
         &self,
         key_id: &str,
         flag_model: Option<String>,
-        cwd: &str,
     ) -> Result<Option<String>> {
         match flag_model {
             // --model with no value → force picker (bypass persisted model)
@@ -118,8 +117,8 @@ impl ChatCommand {
                 if let Some(m) = self.session_store.get_chat_model(key_id).await? {
                     return Ok(Some(m));
                 }
-                // Fall back to per-directory last selection if key matches
-                if let Ok(Some(sel)) = self.session_store.get_last_selection(cwd).await
+                // Fall back to global last selection if key matches
+                if let Ok(Some(sel)) = self.session_store.get_last_selection().await
                     && sel.key_id == key_id
                     && let Some(ref m) = sel.model
                     && m != crate::constants::MODEL_DEFAULT_PLACEHOLDER
@@ -188,7 +187,7 @@ impl ChatCommand {
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
 
-        let raw_model = match self.resolve_model(&key.id, model_flag, &cwd).await? {
+        let raw_model = match self.resolve_model(&key.id, model_flag).await? {
             Some(m) => m,
             None => {
                 ensure_picker_terminal("model", "--model <name>")?;
@@ -232,7 +231,7 @@ impl ChatCommand {
         // still recalls the last *launchable* tool, not "chat".
         let existing_tool = self
             .session_store
-            .get_last_selection(&cwd)
+            .get_last_selection()
             .await
             .ok()
             .flatten()
@@ -240,7 +239,6 @@ impl ChatCommand {
         let _ = self
             .session_store
             .set_last_selection(
-                &cwd,
                 &key,
                 existing_tool.as_deref().unwrap_or("chat"),
                 Some(&raw_model),

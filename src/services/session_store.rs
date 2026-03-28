@@ -143,7 +143,7 @@ impl ApiKey {
 /// Per-directory, per-tool start records. Outer key = cwd, inner key = tool name.
 pub type DirectoryStartsMap = HashMap<String, HashMap<String, DirectoryStartRecord>>;
 
-/// Per-directory last-used key/tool/model selection. Same shape as DirectoryStartRecord.
+/// Global last-used key/tool/model selection. Same shape as DirectoryStartRecord.
 pub type LastSelection = DirectoryStartRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,7 +435,7 @@ pub struct StoredConfig {
     )]
     pub chat_models: HashMap<String, String>,
     /// Legacy field — read from old configs but never written back.
-    /// Replaced by `last_selection` (per-directory, single record).
+    /// Replaced by `last_selection` (global single record).
     #[serde(
         rename = "directory_starts",
         default,
@@ -452,13 +452,14 @@ pub struct StoredConfig {
     /// Model aliases (e.g. "fast" -> "claude-haiku-4-5")
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub aliases: HashMap<String, String>,
-    /// Per-directory last-used key/tool/model selection.
+    /// Global last-used key/tool/model selection.
     #[serde(
         rename = "last_selection",
         default,
-        skip_serializing_if = "HashMap::is_empty"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_last_selection"
     )]
-    pub last_selection: HashMap<String, LastSelection>,
+    pub last_selection: Option<LastSelection>,
     /// Legacy field — read from old configs but never written back.
     /// Sessions are now stored in individual files under sessions/.
     #[serde(rename = "chat_sessions", default, skip_serializing)]
@@ -504,6 +505,46 @@ where
     Ok(result)
 }
 
+/// Deserialize last_selection supporting both the new global format and legacy per-directory format.
+/// New:    `{ "keyId": ..., "tool": "claude", ... }` (single record)
+/// Legacy: `{ "/path": { "keyId": ..., ... }, "/other": { ... } }` (per-directory map → pick most recent)
+fn deserialize_last_selection<'de, D>(deserializer: D) -> Result<Option<LastSelection>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Object(ref map) if map.contains_key("keyId") => {
+            // New format: a single DirectoryStartRecord
+            let record: DirectoryStartRecord =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Some(record))
+        }
+        Value::Object(map) => {
+            // Legacy format: HashMap<String, LastSelection> — pick most recently updated
+            let mut best: Option<DirectoryStartRecord> = None;
+            for (_cwd, val) in map {
+                if let Ok(record) = serde_json::from_value::<DirectoryStartRecord>(val)
+                    && best
+                        .as_ref()
+                        .is_none_or(|b| record.updated_at > b.updated_at)
+                {
+                    best = Some(record);
+                }
+            }
+            Ok(best)
+        }
+        _ => Ok(None),
+    }
+}
+
 impl Default for StoredConfig {
     fn default() -> Self {
         Self::new()
@@ -519,7 +560,7 @@ impl StoredConfig {
             directory_starts: HashMap::new(),
             stats: UsageStats::default(),
             aliases: HashMap::new(),
-            last_selection: HashMap::new(),
+            last_selection: None,
             chat_sessions: HashMap::new(),
         }
     }
@@ -909,23 +950,22 @@ impl SessionStore {
 
     // ── Last selection (delegated to LastSelectionStore) ───────────────────
 
-    pub async fn get_last_selection(&self, cwd: &str) -> Result<Option<LastSelection>> {
-        self.last_sel.get(cwd).await
+    pub async fn get_last_selection(&self) -> Result<Option<LastSelection>> {
+        self.last_sel.get().await
     }
 
     pub async fn set_last_selection(
         &self,
-        cwd: &str,
         key: &ApiKey,
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        self.last_sel.set(cwd, key, tool, model).await
+        self.last_sel.set(key, tool, model).await
     }
 
     #[allow(dead_code)]
-    pub async fn clear_last_selection(&self, cwd: &str) -> Result<()> {
-        self.last_sel.clear(cwd).await
+    pub async fn clear_last_selection(&self) -> Result<()> {
+        self.last_sel.clear().await
     }
 
     // ── Usage stats (delegated to UsageStatsStore) ────────────────────────

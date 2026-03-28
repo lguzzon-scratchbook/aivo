@@ -37,7 +37,6 @@ async fn main() {
     // Initialize services early so we can show active key in help
     let session_store = SessionStore::new();
     let models_cache = services::ModelsCache::new();
-    let cwd = services::system_env::current_dir_string();
 
     // Handle help and version flags at the top level
     if args.help {
@@ -74,6 +73,7 @@ async fn main() {
             }
             None => {
                 print_help();
+                print_active_selection(&session_store).await;
             }
         }
         process::exit(0);
@@ -89,6 +89,7 @@ async fn main() {
         Some(cmd) => cmd,
         None => {
             print_help();
+            print_active_selection(&session_store).await;
             process::exit(0);
         }
     };
@@ -112,7 +113,6 @@ async fn main() {
                     &session_store,
                     chat_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
-                    cwd.as_deref(),
                 )
                 .await,
             );
@@ -196,7 +196,6 @@ async fn main() {
                         &session_store,
                         key_flag.as_deref(),
                         KeyLookupMode::RequireActiveOrPrompt,
-                        cwd.as_deref(),
                     )
                     .await,
                 );
@@ -211,10 +210,7 @@ async fn main() {
                     Some(String::new())
                 } else {
                     // No -k, no -m → check last_selection for saved model
-                    let last_sel = match cwd.as_deref() {
-                        Some(dir) => session_store.get_last_selection(dir).await.ok().flatten(),
-                        None => None,
-                    };
+                    let last_sel = session_store.get_last_selection().await.ok().flatten();
                     match last_sel {
                         Some(ref sel)
                             if key_override.as_ref().is_some_and(|k| k.id == sel.key_id) =>
@@ -265,7 +261,6 @@ async fn main() {
                     &session_store,
                     models_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
-                    cwd.as_deref(),
                 )
                 .await,
             );
@@ -280,7 +275,6 @@ async fn main() {
                 &session_store,
                 serve_args.key.as_deref(),
                 KeyLookupMode::PreferActiveAllowNone,
-                cwd.as_deref(),
             )
             .await
             {
@@ -439,6 +433,33 @@ fn print_help() {
     };
     print_opt("-h, --help", "Display help information");
     print_opt("-v, --version", "Display the current version");
+}
+
+/// Prints the active selection (key, tool, model) at the bottom of help output.
+async fn print_active_selection(session_store: &SessionStore) {
+    let sel = match session_store.get_last_selection().await.ok().flatten() {
+        Some(sel) => sel,
+        None => return,
+    };
+
+    let key_label = session_store
+        .get_key_by_id(&sel.key_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|k| k.display_name().to_string())
+        .unwrap_or(sel.key_id.clone());
+    let model_display = commands::models::model_display_label(sel.model.as_deref());
+
+    println!();
+    println!("{}", style::bold("Active key:"));
+    println!(
+        "  {} {}  {}  {}",
+        style::bullet_symbol(),
+        style::cyan(&sel.tool),
+        key_label,
+        style::dim(model_display),
+    );
 }
 
 /// Prints version information

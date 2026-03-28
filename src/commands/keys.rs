@@ -352,15 +352,24 @@ impl KeysCommand {
         Self { session_store }
     }
 
-    /// Returns the key ID from the current directory's last_selection.
+    /// Returns the active key ID from last_selection or active_key_id.
     async fn selected_key_id(&self) -> Option<String> {
-        let cwd = crate::services::system_env::current_dir_string()?;
-        self.session_store
-            .get_last_selection(&cwd)
+        if let Some(id) = self
+            .session_store
+            .get_last_selection()
             .await
             .ok()
             .flatten()
             .map(|s| s.key_id)
+        {
+            return Some(id);
+        }
+        self.session_store
+            .get_active_key_info()
+            .await
+            .ok()
+            .flatten()
+            .map(|k| k.id)
     }
 
     /// Executes the keys command with the specified action
@@ -590,20 +599,19 @@ impl KeysCommand {
     /// Activates a key and prints confirmation
     async fn activate_key(&self, key: &ApiKey) -> Result<()> {
         self.session_store.set_active_key(&key.id).await?;
-        // Update per-directory last-selection: keep existing tool, clear model since
+        // Update global last-selection: keep existing tool, clear model since
         // the new key may have a different provider/model set.
-        if let Some(cwd) = crate::services::system_env::current_dir_string()
-            && let Some(existing_tool) = self
-                .session_store
-                .get_last_selection(&cwd)
-                .await
-                .ok()
-                .flatten()
-                .map(|s| s.tool)
+        if let Some(existing_tool) = self
+            .session_store
+            .get_last_selection()
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.tool)
         {
             let _ = self
                 .session_store
-                .set_last_selection(&cwd, key, &existing_tool, None)
+                .set_last_selection(key, &existing_tool, None)
                 .await;
         }
         let preview = key_preview(&key.key);

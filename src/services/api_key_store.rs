@@ -24,7 +24,13 @@ fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
         tools.retain(|_, record| record.key_id != key_id);
     }
     config.directory_starts.retain(|_, tools| !tools.is_empty());
-    config.last_selection.retain(|_, sel| sel.key_id != key_id);
+    if config
+        .last_selection
+        .as_ref()
+        .is_some_and(|sel| sel.key_id == key_id)
+    {
+        config.last_selection = None;
+    }
     // chat_sessions are now stored in individual files; file cleanup is handled
     // asynchronously by remove_sessions_for_key().
     config
