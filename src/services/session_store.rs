@@ -794,7 +794,6 @@ impl SessionStore {
     // ── Config I/O ────────────────────────────────────────────────────────
 
     /// Loads config from the config file. Keys remain encrypted.
-    #[allow(dead_code)]
     pub async fn load(&self) -> Result<StoredConfig> {
         self.ctx.load().await
     }

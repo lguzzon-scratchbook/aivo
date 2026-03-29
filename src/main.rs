@@ -501,12 +501,17 @@ async fn print_active_selection(session_store: &SessionStore) {
         None => return,
     };
 
+    // Load config directly to get display name without triggering PBKDF2 decryption.
     let key_label = session_store
-        .get_key_by_id(&sel.key_id)
+        .load()
         .await
         .ok()
-        .flatten()
-        .map(|k| k.display_name().to_string())
+        .and_then(|c| {
+            c.api_keys
+                .into_iter()
+                .find(|k| k.id == sel.key_id)
+                .map(|k| k.display_name().to_string())
+        })
         .unwrap_or(sel.key_id.clone());
     let model_display = commands::models::model_display_label(sel.model.as_deref());
 
