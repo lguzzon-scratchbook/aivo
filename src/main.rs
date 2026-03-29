@@ -4,7 +4,7 @@
  */
 use std::process;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 mod cli;
 mod commands;
@@ -28,11 +28,29 @@ use services::{AILauncher, EnvironmentInjector, SessionStore};
 /// Known AI tool names that can be used as shortcut aliases for `run`.
 const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
+/// Collects all single-character short flags from the CLI definition,
+/// including global flags and all subcommands.
+fn collect_known_short_flags() -> Vec<char> {
+    let cmd = Cli::command();
+    let mut flags: Vec<char> = Vec::new();
+    let all_args = cmd
+        .get_arguments()
+        .chain(cmd.get_subcommands().flat_map(|s| s.get_arguments()));
+    for arg in all_args {
+        if let Some(c) = arg.get_short()
+            && !flags.contains(&c)
+        {
+            flags.push(c);
+        }
+    }
+    flags
+}
+
 /// Main entry point for the CLI
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
-    let args = Cli::parse_from(rewrite_cli_args(raw_args));
+    let args = Cli::parse_from(rewrite_cli_args(expand_combined_short_flags(raw_args)));
 
     // Initialize services early so we can show active key in help
     let session_store = SessionStore::new();
@@ -347,6 +365,44 @@ async fn main() {
 
     process::exit(exit_code.code());
 }
+
+/// Expands combined short flags (e.g. `-nar`) into individual flags (`-n`, `-a`, `-r`)
+/// when every character after the leading `-` is a known single-character flag.
+/// Tokens that don't match are left untouched (e.g. `-p8080`, `-mfoo`, `--model`).
+/// Stops processing after a bare `--` separator.
+fn expand_combined_short_flags(args: Vec<String>) -> Vec<String> {
+    let known = collect_known_short_flags();
+    let mut result = Vec::with_capacity(args.len());
+    let mut past_separator = false;
+
+    for arg in args {
+        if past_separator {
+            result.push(arg);
+            continue;
+        }
+
+        if arg == "--" {
+            past_separator = true;
+            result.push(arg);
+            continue;
+        }
+
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.len() > 2
+            && arg[1..].chars().all(|c| known.contains(&c))
+        {
+            for c in arg[1..].chars() {
+                result.push(format!("-{c}"));
+            }
+        } else {
+            result.push(arg);
+        }
+    }
+
+    result
+}
+
 fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
     if raw_args.len() <= 1 {
         return raw_args;
@@ -984,5 +1040,109 @@ mod tests {
             &args(&["fix", "the", "bug"]),
         );
         assert_eq!(r.remaining_args, args(&["fix", "the", "bug"]));
+    }
+
+    // --- expand_combined_short_flags tests ---
+
+    #[test]
+    fn expand_boolean_flags() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "stats", "-nar"])),
+            args(&["aivo", "stats", "-n", "-a", "-r"])
+        );
+    }
+
+    #[test]
+    fn expand_does_not_touch_single_flag() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "-m"])),
+            args(&["aivo", "-m"])
+        );
+    }
+
+    #[test]
+    fn expand_does_not_touch_long_flag() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "--model"])),
+            args(&["aivo", "--model"])
+        );
+    }
+
+    #[test]
+    fn expand_leaves_unknown_chars_intact() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "chat", "-mfoo"])),
+            args(&["aivo", "chat", "-mfoo"])
+        );
+    }
+
+    #[test]
+    fn expand_leaves_digit_value_intact() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "serve", "-p8080"])),
+            args(&["aivo", "serve", "-p8080"])
+        );
+    }
+
+    #[test]
+    fn expand_stops_after_separator() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "run", "claude", "--", "-nar"])),
+            args(&["aivo", "run", "claude", "--", "-nar"])
+        );
+    }
+
+    #[test]
+    fn expand_xr_full_pipeline() {
+        let expanded = expand_combined_short_flags(args(&["aivo", "-xr", "hello"]));
+        assert_eq!(expanded, args(&["aivo", "-x", "-r", "hello"]));
+        let rewritten = rewrite_cli_args(expanded);
+        assert_eq!(rewritten, args(&["aivo", "chat", "-x", "-r", "hello"]));
+    }
+
+    #[test]
+    fn expand_mr() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "run", "claude", "-mr"])),
+            args(&["aivo", "run", "claude", "-m", "-r"])
+        );
+    }
+
+    #[test]
+    fn expand_multiple_groups() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "stats", "-na", "-rs"])),
+            args(&["aivo", "stats", "-n", "-a", "-r", "-s"])
+        );
+    }
+
+    #[test]
+    fn expand_preserves_surrounding_args() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "stats", "--search", "gpt", "-na"])),
+            args(&["aivo", "stats", "--search", "gpt", "-n", "-a"])
+        );
+    }
+
+    #[test]
+    fn expand_global_hv() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "-hv"])),
+            args(&["aivo", "-h", "-v"])
+        );
+    }
+
+    #[test]
+    fn expand_no_args() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo"])),
+            args(&["aivo"])
+        );
+    }
+
+    #[test]
+    fn expand_empty() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(expand_combined_short_flags(empty.clone()), empty);
     }
 }
