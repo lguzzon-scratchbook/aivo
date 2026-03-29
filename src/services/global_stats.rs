@@ -27,7 +27,23 @@ pub struct ModelTokens {
     pub output_tokens: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeSessionSummary {
+    pub path: PathBuf,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub model: Option<String>,
+}
+
 impl GlobalToolStats {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+impl NativeSessionSummary {
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
@@ -74,6 +90,95 @@ pub async fn collect_all(refresh: bool) -> HashMap<String, GlobalToolStats> {
 
 pub async fn collect(tool: &str, refresh: bool) -> Result<Option<GlobalToolStats>> {
     collect_with_step(tool, refresh, None).await
+}
+
+pub async fn top_sessions(
+    tool: &str,
+    refresh: bool,
+    limit: usize,
+) -> Result<Vec<NativeSessionSummary>> {
+    if !matches!(tool, "claude" | "codex" | "gemini") {
+        return Ok(Vec::new());
+    }
+
+    let data_dir = match tool_data_dir(tool) {
+        Some(d) if d.exists() => d,
+        _ => return Ok(Vec::new()),
+    };
+
+    let filter = tool_file_filter(tool);
+    let cache_path = cache_path(tool);
+    let mut cache = if refresh {
+        StatsCache::default()
+    } else {
+        read_cache(&cache_path).await.unwrap_or_default()
+    };
+
+    let all_files = walk_files_with_size(&data_dir, filter).await;
+    if all_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let current_paths: HashSet<&str> = all_files
+        .iter()
+        .map(|(p, _)| p.to_str().unwrap_or(""))
+        .collect();
+
+    let mut stale: Vec<(&Path, u64)> = Vec::new();
+    for (path, size) in &all_files {
+        let key = path.to_string_lossy();
+        match cache.files.get(key.as_ref()) {
+            Some(cached) if cached.size == *size => {}
+            _ => stale.push((path, *size)),
+        }
+    }
+    cache
+        .files
+        .retain(|k, _| current_paths.contains(k.as_str()));
+
+    if !stale.is_empty() {
+        let parser = tool_file_parser(tool);
+        for (path, size) in stale {
+            if let Some(entry) = parser(path).await {
+                cache.files.insert(
+                    path.to_string_lossy().to_string(),
+                    FileEntry { size, ..entry },
+                );
+            }
+        }
+        let _ = write_cache(&cache_path, &cache).await;
+    }
+
+    let mut sessions: Vec<NativeSessionSummary> = cache
+        .files
+        .iter()
+        .filter_map(|(path, entry)| {
+            if !entry.has_session {
+                return None;
+            }
+            let model = entry
+                .models
+                .iter()
+                .max_by_key(|(_, (input, output))| input.saturating_add(*output))
+                .map(|(model, _)| model.clone());
+            Some(NativeSessionSummary {
+                path: PathBuf::from(path),
+                input_tokens: entry.input_tokens,
+                output_tokens: entry.output_tokens,
+                cache_read_tokens: entry.cache_read_tokens,
+                cache_write_tokens: entry.cache_write_tokens,
+                model,
+            })
+        })
+        .collect();
+
+    sessions.sort_by(|a, b| {
+        b.total_tokens()
+            .cmp(&a.total_tokens())
+            .then_with(|| b.input_tokens.cmp(&a.input_tokens))
+    });
+    sessions.truncate(limit);
+    Ok(sessions)
 }
 
 async fn collect_with_step(

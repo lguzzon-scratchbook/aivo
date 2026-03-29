@@ -4,7 +4,7 @@ use crate::cli::StatsArgs;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
 use crate::services::ai_launcher::AIToolType;
-use crate::services::global_stats::{self, normalize_model_for_display};
+use crate::services::global_stats::{self, NativeSessionSummary, normalize_model_for_display};
 use crate::services::session_store::{UsageCounter, UsageStats};
 use crate::style;
 
@@ -104,19 +104,8 @@ impl StatsCommand {
         let show_cache = total_cache > 0;
         let total_sessions: u64 = tool_tokens.values().map(|t| t.sessions).sum();
 
-        let mut model_tokens: HashMap<String, u64> = HashMap::new();
-        for gs in global.values() {
-            for (model, mt) in &gs.models {
-                let key = normalize_model_for_display(model);
-                *model_tokens.entry(key).or_default() +=
-                    mt.input_tokens.saturating_add(mt.output_tokens);
-            }
-        }
         let aivo_model_usage = aggregate_model_usage(&stats, &key_ids);
-        for (model, counter) in &aivo_model_usage {
-            let key = normalize_model_for_display(model);
-            *model_tokens.entry(key).or_default() += counter.total_tokens;
-        }
+        let model_tokens = combine_model_tokens(&global, &aivo_model_usage);
         let total_models = model_tokens.values().filter(|t| **t > 0).count() as u64;
 
         let mut parts = Vec::new();
@@ -254,6 +243,17 @@ impl StatsCommand {
                     .collect(),
             };
             print_tool_view(&view, fmt, args);
+            if args.top_sessions && matches!(tool.as_str(), "codex" | "claude" | "gemini") {
+                match global_stats::top_sessions(&tool, args.refresh, 10).await {
+                    Ok(sessions) => render_top_sessions(&sessions, fmt),
+                    Err(e) => eprintln!(
+                        "{} Failed to read {} sessions: {}",
+                        style::red("Error:"),
+                        global_stats::tool_display_name(&tool),
+                        e
+                    ),
+                }
+            }
         } else {
             let view = ToolView {
                 source: StatsSource::Aivo,
@@ -334,6 +334,7 @@ impl StatsCommand {
         print_opt("-r, --refresh", "Bypass cache and re-read all data files");
         print_opt("-s, --search <QUERY>", "Search by key, model, or tool name");
         print_opt("-a, --all", "Show all models (default: top 20)");
+        print_opt("--top-sessions", "Show the heaviest native session files");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo stats"));
@@ -532,6 +533,110 @@ fn render_model_table(models: &HashMap<String, u64>, fmt: fn(u64) -> String, arg
     hints.push("-r refresh".to_string());
     hints.push("-s filter".to_string());
     println!("{}", style::dim(hints.join(" · ")));
+}
+
+fn render_top_sessions(sessions: &[NativeSessionSummary], fmt: fn(u64) -> String) {
+    if sessions.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("{}", style::bold("Top sessions"));
+
+    let labels: Vec<String> = sessions.iter().map(session_label).collect();
+    let label_w = labels
+        .iter()
+        .map(|label| label.len())
+        .max()
+        .unwrap_or(0)
+        .max("session".len());
+    let tok_w = sessions
+        .iter()
+        .map(|s| fmt(s.total_tokens()).len())
+        .max()
+        .unwrap_or(0)
+        .max("tokens".len());
+    let cache_w = sessions
+        .iter()
+        .map(|s| fmt(s.cache_read_tokens.saturating_add(s.cache_write_tokens)).len())
+        .max()
+        .unwrap_or(0)
+        .max("cached".len());
+
+    println!(
+        "{} {} {} {}",
+        style::bold(format!("{:<label_w$}", "session")),
+        style::dim(format!("{:>tok_w$}", "tokens")),
+        style::dim(format!("{:>cache_w$}", "cached")),
+        style::dim("model"),
+    );
+
+    for (summary, label) in sessions.iter().zip(labels.iter()) {
+        let total = colorize_unit(&format!(
+            "{:>width$}",
+            fmt(summary.total_tokens()),
+            width = tok_w
+        ));
+        let cached = colorize_unit(&format!(
+            "{:>width$}",
+            fmt(summary
+                .cache_read_tokens
+                .saturating_add(summary.cache_write_tokens)),
+            width = cache_w
+        ));
+        let model = summary.model.as_deref().unwrap_or("-");
+        println!(
+            "{} {} {} {}",
+            style::cyan(format!("{:<width$}", label, width = label_w)),
+            total,
+            cached,
+            style::dim(model),
+        );
+    }
+}
+
+fn session_label(summary: &NativeSessionSummary) -> String {
+    let path = summary.path.to_string_lossy();
+    if let Some(pos) = path.find("/sessions/") {
+        let relative = &path[pos + "/sessions/".len()..];
+        return relative
+            .strip_suffix(".jsonl")
+            .unwrap_or(relative)
+            .to_string();
+    }
+    let label = summary
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    label.strip_suffix(".jsonl").unwrap_or(&label).to_string()
+}
+
+/// Native tool stats and aivo model stats overlap for launched tools, but the
+/// aivo store does not keep per-tool token attribution. To avoid inflated
+/// totals, prefer native tool models whenever any native data exists.
+fn combine_model_tokens(
+    global: &HashMap<String, global_stats::GlobalToolStats>,
+    aivo_model_usage: &HashMap<String, UsageCounter>,
+) -> HashMap<String, u64> {
+    let mut model_tokens: HashMap<String, u64> = HashMap::new();
+    for gs in global.values() {
+        for (model, mt) in &gs.models {
+            let key = normalize_model_for_display(model);
+            *model_tokens.entry(key).or_default() +=
+                mt.input_tokens.saturating_add(mt.output_tokens);
+        }
+    }
+
+    if model_tokens.is_empty() {
+        for (model, counter) in aivo_model_usage {
+            let key = normalize_model_for_display(model);
+            *model_tokens.entry(key).or_default() += counter.total_tokens;
+        }
+    }
+
+    model_tokens
 }
 
 /// Aggregates tool counts from per-key data of existing keys.
@@ -822,6 +927,51 @@ mod tests {
         let result = aggregate_model_usage(&stats, &keys);
         // Should fall back to global since legacy_key lacks per-model data
         assert_eq!(result.get("gpt-4o").unwrap().total_tokens, 500_000);
+    }
+
+    #[test]
+    fn combine_model_tokens_uses_aivo_only_without_global_data() {
+        let global = HashMap::new();
+        let mut aivo = HashMap::new();
+        aivo.insert(
+            "gpt-4o".to_string(),
+            UsageCounter {
+                total_tokens: 1234,
+                ..Default::default()
+            },
+        );
+
+        let result = combine_model_tokens(&global, &aivo);
+        assert_eq!(result.get("gpt-4o"), Some(&1234));
+    }
+
+    #[test]
+    fn combine_model_tokens_ignores_overlapping_aivo_data_when_global_exists() {
+        let mut global = HashMap::new();
+        global.insert(
+            "codex".to_string(),
+            global_stats::GlobalToolStats {
+                models: HashMap::from([(
+                    "gpt-5.4".to_string(),
+                    global_stats::ModelTokens {
+                        input_tokens: 100,
+                        output_tokens: 25,
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let mut aivo = HashMap::new();
+        aivo.insert(
+            "gpt-5.4".to_string(),
+            UsageCounter {
+                total_tokens: 500,
+                ..Default::default()
+            },
+        );
+
+        let result = combine_model_tokens(&global, &aivo);
+        assert_eq!(result.get("gpt-5.4"), Some(&125));
     }
 
     #[test]

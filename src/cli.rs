@@ -255,6 +255,10 @@ pub struct StatsArgs {
     /// Show all models (default: top 20, rest grouped as "others")
     #[arg(short = 'a', long)]
     pub all: bool,
+
+    /// Show the heaviest native session files for supported tools
+    #[arg(long)]
+    pub top_sessions: bool,
 }
 
 /// Arguments for the update command
