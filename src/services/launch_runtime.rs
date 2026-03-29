@@ -493,7 +493,7 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
     let router = GeminiRouter::new(GeminiRouterConfig {
         target_base_url: String::new(),
         api_key: String::new(),
-        upstream_protocol: ProviderProtocol::Openai,
+        upstream_protocol: ProviderProtocol::ResponsesApi,
         forced_model,
         copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
         requires_reasoning_content: false,

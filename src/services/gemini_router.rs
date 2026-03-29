@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -154,6 +154,11 @@ async fn forward_to_provider(
         );
         req_body["model"] = serde_json::json!(selected_model);
 
+        let initiator = config
+            .copilot_token_manager
+            .as_ref()
+            .map(|_| http_utils::copilot_initiator_from_openai(&req_body));
+
         let (status, body_text, parsed) = match protocol {
             ProviderProtocol::Anthropic => {
                 if req_body
@@ -226,13 +231,8 @@ async fn forward_to_provider(
                 };
                 (status, body_text, parsed)
             }
-            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
+            ProviderProtocol::Openai => {
                 let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
-                let initiator = if config.copilot_token_manager.is_some() {
-                    Some(http_utils::copilot_initiator_from_openai(&req_body))
-                } else {
-                    None
-                };
                 let response = http_utils::authorized_openai_post(
                     client.as_ref(),
                     &target_url,
@@ -253,9 +253,45 @@ async fn forward_to_provider(
                 };
                 (status, body_text, parsed)
             }
+            ProviderProtocol::ResponsesApi => {
+                let responses_body = chat_to_responses_request(&req_body)?;
+                let target_url =
+                    http_utils::build_target_url(&config.target_base_url, "/v1/responses");
+                let response = http_utils::authorized_openai_post(
+                    client.as_ref(),
+                    &target_url,
+                    &config.api_key,
+                    config.copilot_token_manager.as_deref(),
+                    initiator,
+                )
+                .await?
+                .json(&responses_body)
+                .send()
+                .await?;
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    Some(responses_to_chat_response(&body_text)?)
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
+            }
         };
 
-        match classify_attempt(status, body_text, parsed) {
+        let outcome = classify_attempt(status, body_text, parsed);
+        // A 400 "unsupported_api_for_model" means this model isn't available on
+        // the current endpoint — treat as mismatch so fallback tries the other.
+        // Must apply to both directions: ResponsesApi→Openai and Openai→ResponsesApi.
+        let outcome = match outcome {
+            AttemptOutcome::ProviderError { status: s, body: b }
+                if s == 400 && b.contains("unsupported_api_for_model") =>
+            {
+                AttemptOutcome::Mismatch { status: s, body: b }
+            }
+            other => other,
+        };
+        match outcome {
             AttemptOutcome::Success(result) => {
                 commit_protocol_switch(active_protocol, protocol, attempt);
                 return Ok(ForwardResult::Success(result));
@@ -865,6 +901,26 @@ fn message_to_gemini_parts(message: &Value) -> Vec<Value> {
     }
 
     parts
+}
+
+fn chat_to_responses_request(openai_req: &Value) -> Result<Value> {
+    use crate::services::openai_models::{
+        OpenAIChatRequest, convert_chat_to_responses_request as convert_typed,
+    };
+    let typed: OpenAIChatRequest = serde_json::from_value(openai_req.clone())?;
+    let mut resp = serde_json::to_value(convert_typed(&typed))
+        .context("failed to serialize responses request")?;
+    resp["stream"] = serde_json::json!(false);
+    Ok(resp)
+}
+
+fn responses_to_chat_response(body_text: &str) -> Result<Value> {
+    use crate::services::openai_models::{
+        ResponsesResponse, convert_responses_to_chat_response as convert_typed,
+    };
+    let typed: ResponsesResponse = serde_json::from_str(body_text)?;
+    serde_json::to_value(convert_typed(&typed))
+        .context("failed to convert responses to chat format")
 }
 
 #[cfg(test)]
