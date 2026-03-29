@@ -43,6 +43,7 @@ impl RunCommand {
         key: &ApiKey,
         flag_model: Option<String>,
         refresh: bool,
+        tool: AIToolType,
     ) -> Result<Option<String>> {
         match flag_model {
             // No --model flag → don't override, let the tool use its default
@@ -67,7 +68,7 @@ impl RunCommand {
             );
         }
 
-        Ok(prompt_model_picker(models_list))
+        Ok(prompt_model_picker(models_list, Some(tool)))
     }
 
     /// Executes the run command with the specified AI tool
@@ -158,7 +159,9 @@ impl RunCommand {
         let picker_was_requested = model.as_ref().is_some_and(|m| m.is_empty());
         let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
-            let result = self.resolve_model(&client, key, model, refresh).await?;
+            let result = self
+                .resolve_model(&client, key, model, refresh, ai_tool)
+                .await?;
             if picker_was_requested && result.is_none() {
                 return Ok(ExitCode::Success);
             }

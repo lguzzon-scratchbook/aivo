@@ -94,7 +94,7 @@ impl StartCommand {
         };
 
         let model = self
-            .resolve_model(model_arg, last_sel.as_ref(), &key, args.refresh)
+            .resolve_model(model_arg, last_sel.as_ref(), &key, args.refresh, tool.value)
             .await?;
 
         let _ = self
@@ -303,6 +303,7 @@ impl StartCommand {
         last_sel: Option<&LastSelection>,
         key: &Resolved<ApiKey>,
         refresh: bool,
+        tool: AIToolType,
     ) -> Result<Resolved<Option<String>>> {
         // Only use last_sel model when the key matches
         let matching_sel = last_sel.filter(|sel| sel.key_id == key.value.id);
@@ -310,7 +311,7 @@ impl StartCommand {
             || (model_arg.is_none() && matching_sel.is_none());
 
         if should_prompt {
-            return self.prompt_select_model(&key.value, refresh).await;
+            return self.prompt_select_model(&key.value, refresh, tool).await;
         }
 
         match model_arg {
@@ -329,6 +330,7 @@ impl StartCommand {
         &self,
         key: &ApiKey,
         refresh: bool,
+        tool: AIToolType,
     ) -> Result<Resolved<Option<String>>> {
         let client = http_utils::router_http_client();
         let models = if refresh {
@@ -344,7 +346,7 @@ impl StartCommand {
             );
         }
 
-        match prompt_model_picker(models) {
+        match prompt_model_picker(models, Some(tool)) {
             Some(selected) => Ok(Resolved {
                 value: Some(selected),
                 interactive: true,

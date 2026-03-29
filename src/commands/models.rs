@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
+use crate::services::ai_launcher::AIToolType;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, CopilotTokenManager,
 };
@@ -514,31 +515,60 @@ pub(crate) async fn fetch_models_cached(
     Ok(models)
 }
 
-/// Shows an interactive model picker with "(leave it to the tool)" as the first option.
-/// Prints the active key context before the picker so the user knows which provider
-/// they're selecting from. Returns `Some(MODEL_DEFAULT_PLACEHOLDER)` if the default
-/// is chosen, `Some(model_name)` for a real model, or `None` if cancelled.
-pub(crate) fn prompt_model_picker(models: Vec<String>) -> Option<String> {
+/// Determines whether the "(leave it to the tool)" default option should be
+/// shown in the model picker for the given tool type and model list.
+///
+/// - Pi, Opencode: never (these tools require explicit model selection)
+/// - Claude: only if the list contains Claude-family models
+/// - Codex: only if the list contains gpt- prefixed models
+/// - Gemini: only if the list contains Gemini-family models
+pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -> bool {
+    match tool {
+        AIToolType::Pi | AIToolType::Opencode => false,
+        AIToolType::Claude => models
+            .iter()
+            .any(|m| m.to_ascii_lowercase().contains("claude")),
+        AIToolType::Codex => models
+            .iter()
+            .any(|m| m.to_ascii_lowercase().starts_with("gpt-")),
+        AIToolType::Gemini => models
+            .iter()
+            .any(|m| m.to_ascii_lowercase().contains("gemini")),
+    }
+}
+
+/// Shows an interactive model picker. The "(leave it to the tool)" default option
+/// is conditionally shown based on whether the provider has models compatible with
+/// the selected tool. When `tool` is `None`, the default option is always shown.
+/// Returns `Some(MODEL_DEFAULT_PLACEHOLDER)` if the default is chosen,
+/// `Some(model_name)` for a real model, or `None` if cancelled.
+pub(crate) fn prompt_model_picker(models: Vec<String>, tool: Option<AIToolType>) -> Option<String> {
     use crate::constants;
     use crate::tui::FuzzySelect;
 
-    let mut items = vec![constants::MODEL_DEFAULT_DISPLAY.to_string()];
+    let show_default = tool
+        .map(|t| tool_supports_default_model(t, &models))
+        .unwrap_or(true);
+
+    let mut items = Vec::with_capacity(models.len() + show_default as usize);
+    if show_default {
+        items.push(constants::MODEL_DEFAULT_DISPLAY.to_string());
+    }
     items.extend(models);
 
-    FuzzySelect::new()
+    let selected = FuzzySelect::new()
         .with_prompt("Select model")
         .items(&items)
         .default(0)
         .interact_opt()
         .ok()
-        .flatten()
-        .map(|idx| {
-            if idx == 0 {
-                constants::MODEL_DEFAULT_PLACEHOLDER.to_string()
-            } else {
-                items[idx].clone()
-            }
-        })
+        .flatten()?;
+
+    if show_default && selected == 0 {
+        Some(constants::MODEL_DEFAULT_PLACEHOLDER.to_string())
+    } else {
+        Some(items[selected].clone())
+    }
 }
 
 /// Converts the `__default__` placeholder to `None` for passing to tools.
@@ -712,5 +742,69 @@ mod tests {
             result.is_err(),
             "Expected network error, not cached stale data"
         );
+    }
+
+    #[test]
+    fn test_tool_supports_default_pi_always_false() {
+        let models = vec!["claude-sonnet-4-6".into(), "gpt-4o".into()];
+        assert!(!tool_supports_default_model(AIToolType::Pi, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_opencode_always_false() {
+        let models = vec!["claude-sonnet-4-6".into(), "gpt-4o".into()];
+        assert!(!tool_supports_default_model(AIToolType::Opencode, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_claude_with_claude_models() {
+        let models = vec!["claude-sonnet-4-6".into(), "gpt-4o".into()];
+        assert!(tool_supports_default_model(AIToolType::Claude, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_claude_without_claude_models() {
+        let models = vec!["gpt-4o".into(), "gemini-2.5-pro".into()];
+        assert!(!tool_supports_default_model(AIToolType::Claude, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_codex_with_gpt_models() {
+        let models = vec!["gpt-4o".into(), "claude-sonnet-4-6".into()];
+        assert!(tool_supports_default_model(AIToolType::Codex, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_codex_only_matches_gpt_prefix() {
+        // o-series and chatgpt should NOT match for Codex
+        let models = vec!["o3-mini".into(), "o4-preview".into(), "chatgpt-4o".into()];
+        assert!(!tool_supports_default_model(AIToolType::Codex, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_codex_without_gpt_models() {
+        let models = vec!["claude-sonnet-4-6".into(), "gemini-2.5-pro".into()];
+        assert!(!tool_supports_default_model(AIToolType::Codex, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_gemini_with_gemini_models() {
+        let models = vec!["gemini-2.5-pro".into(), "gpt-4o".into()];
+        assert!(tool_supports_default_model(AIToolType::Gemini, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_gemini_without_gemini_models() {
+        let models = vec!["gpt-4o".into(), "claude-sonnet-4-6".into()];
+        assert!(!tool_supports_default_model(AIToolType::Gemini, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_empty_model_list() {
+        assert!(!tool_supports_default_model(AIToolType::Claude, &[]));
+        assert!(!tool_supports_default_model(AIToolType::Codex, &[]));
+        assert!(!tool_supports_default_model(AIToolType::Gemini, &[]));
+        assert!(!tool_supports_default_model(AIToolType::Pi, &[]));
+        assert!(!tool_supports_default_model(AIToolType::Opencode, &[]));
     }
 }
