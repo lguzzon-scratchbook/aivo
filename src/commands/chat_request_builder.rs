@@ -18,6 +18,7 @@ pub(crate) fn build_openai_chat_request(
     model: &str,
     messages: &[ChatMessage],
     stream: bool,
+    max_tokens: Option<u64>,
 ) -> Result<serde_json::Value> {
     let mut encoded_messages = Vec::with_capacity(messages.len());
     for message in messages {
@@ -29,6 +30,9 @@ pub(crate) fn build_openai_chat_request(
         "messages": encoded_messages,
         "stream": stream,
     });
+    if let Some(mt) = max_tokens {
+        body["max_tokens"] = serde_json::json!(mt);
+    }
     if stream {
         body["stream_options"] = serde_json::json!({"include_usage": true});
     }
@@ -300,6 +304,7 @@ mod tests {
                 ],
             }],
             true,
+            None,
         )
         .unwrap();
 
@@ -308,6 +313,37 @@ mod tests {
         assert!(parts[1]["text"].as_str().unwrap().contains("notes.md"));
         assert_eq!(parts[2]["type"], "image_url");
         assert_eq!(parts[2]["image_url"]["url"], "data:image/png;base64,YWJj");
+    }
+
+    #[test]
+    fn test_build_openai_chat_request_includes_max_tokens() {
+        let with_cap = build_openai_chat_request(
+            "deepseek-chat",
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                reasoning_content: None,
+                attachments: vec![],
+            }],
+            true,
+            Some(8192),
+        )
+        .unwrap();
+        assert_eq!(with_cap["max_tokens"], 8192);
+
+        let without_cap = build_openai_chat_request(
+            "gpt-4o",
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                reasoning_content: None,
+                attachments: vec![],
+            }],
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(without_cap.get("max_tokens").is_none());
     }
 
     #[test]

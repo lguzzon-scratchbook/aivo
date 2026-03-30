@@ -49,7 +49,10 @@ impl ProviderQuirks {
         let requires_reasoning_content = base_url.contains("moonshot.cn")
             || base_url.contains("moonshot.ai")
             || base_url.contains("deepseek.com");
-        let max_tokens_cap = if base_url.contains("deepseek.com") {
+        let max_tokens_cap = if base_url.contains("deepseek.com")
+            || base_url.contains("getaivo.dev")
+            || base_url == "aivo-starter"
+        {
             Some(8192)
         } else {
             None
@@ -409,6 +412,12 @@ mod tests {
         let deepseek = provider_profile_for_base_url("https://api.deepseek.com/v1");
         assert!(deepseek.quirks.requires_reasoning_content);
         assert_eq!(deepseek.quirks.max_tokens_cap, Some(8192));
+
+        let starter_url = provider_profile_for_base_url("https://api.getaivo.dev");
+        assert_eq!(starter_url.quirks.max_tokens_cap, Some(8192));
+
+        let starter_sentinel = provider_profile_for_base_url("aivo-starter");
+        assert_eq!(starter_sentinel.quirks.max_tokens_cap, Some(8192));
     }
 
     #[test]

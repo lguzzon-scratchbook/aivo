@@ -951,7 +951,9 @@ where
     let url = format!("{}/v1/chat/completions", base);
 
     // Try streaming first; fall back to non-streaming on server errors
-    let request = build_openai_chat_request(model, messages, true)?;
+    let max_tokens = crate::services::provider_profile::ProviderQuirks::for_base_url(&key.base_url)
+        .max_tokens_cap;
+    let request = build_openai_chat_request(model, messages, true, max_tokens)?;
 
     let mut response = send_with_retry(|| {
         with_auth(client.post(&url), key)
@@ -964,7 +966,10 @@ where
     // Note: 404 is NOT included here — it means wrong endpoint, not streaming unsupported.
     // The caller detects 404 and switches to a different API format instead.
     if response.status().is_server_error() {
-        return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
+        return send_non_streaming(
+            client, &url, key, model, messages, max_tokens, spinning, on_chunk,
+        )
+        .await;
     }
 
     if !response.status().is_success() {
@@ -1056,7 +1061,10 @@ where
     }
 
     if full_content.is_empty() && full_reasoning.is_empty() {
-        return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
+        return send_non_streaming(
+            client, &url, key, model, messages, max_tokens, spinning, on_chunk,
+        )
+        .await;
     }
 
     Ok(ChatTurnResult {
@@ -1067,19 +1075,21 @@ where
 }
 
 /// Non-streaming fallback for gateways that don't support SSE streaming.
+#[allow(clippy::too_many_arguments)]
 async fn send_non_streaming<F>(
     client: &Client,
     url: &str,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
+    max_tokens: Option<u64>,
     spinning: &Arc<AtomicBool>,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = build_openai_chat_request(model, messages, false)?;
+    let request = build_openai_chat_request(model, messages, false, max_tokens)?;
 
     let response = send_with_retry(|| {
         with_auth(client.post(url), key)
@@ -1134,7 +1144,7 @@ where
     let (copilot_token, api_endpoint) = tm.get_token().await?;
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
 
-    let request = build_openai_chat_request(model, messages, true)?;
+    let request = build_openai_chat_request(model, messages, true, None)?;
     let initiator = copilot_initiator_from_openai(&request);
 
     let mut response = send_with_retry(|| {
@@ -1283,7 +1293,7 @@ async fn send_copilot_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = build_openai_chat_request(model, messages, false)?;
+    let request = build_openai_chat_request(model, messages, false, None)?;
     let initiator = copilot_initiator_from_openai(&request);
 
     let response = send_with_retry(|| {
