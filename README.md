@@ -34,6 +34,15 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 
 ## Quick Start
 
+aivo ships with a free built-in provider (`aivo/starter`) that is activated automatically on first run — no API key needed:
+
+```bash
+aivo chat
+aivo claude
+```
+
+Add your own provider key for access to more models:
+
 ```bash
 # 1) Add a provider key (OpenRouter, Vercel AI Gateway, etc.)
 aivo keys add
@@ -92,6 +101,7 @@ The `run` keyword is optional — tool names work directly as shortcuts, so `aiv
 
 ```bash
 aivo run claude
+aivo claude "fix the login bug"
 aivo claude --dangerously-skip-permissions
 aivo claude --resume 16354407-050e-4447-a068-4db222ff841
 ```
@@ -114,6 +124,14 @@ Use a different saved key without changing the active one:
 aivo claude --key openrouter
 aivo claude --key copilot
 aivo claude --key                        # opens key picker
+```
+
+#### `--refresh, -r`
+
+Bypass cache and fetch a fresh model list for the picker:
+
+```bash
+aivo claude -r
 ```
 
 #### `--dry-run`
@@ -188,6 +206,32 @@ Attach text files or images to the next message (repeatable):
 ```bash
 aivo chat --attach README.md --attach screenshot.png
 ```
+
+#### `--refresh, -r`
+
+Bypass the model cache when opening the model picker:
+
+```bash
+aivo chat -r
+```
+
+#### Slash commands
+
+Inside the chat TUI:
+
+| Command | Description |
+| ------- | ----------- |
+| `/new` | Start a fresh chat with the current key and model |
+| `/resume [query]` | Resume a saved chat from this directory |
+| `/model [name]` | Switch the current chat model |
+| `/key [id\|name]` | Switch to another saved key for this chat |
+| `/attach <path>` | Attach a text file or image to the next message |
+| `/detach <n>` | Remove one queued attachment by number |
+| `/clear` | Clear queued attachments from the composer |
+| `/help` | Open command help |
+| `/exit` | Leave chat |
+| `//message` | Send a literal leading slash |
+
 
 ## serve
 
@@ -286,14 +330,16 @@ aivo keys add --name deepseek --base-url https://api.deepseek.com/v1 --key sk-xx
 
 Any endpoint that speaks a supported protocol can be saved — you are not limited to the providers above.
 
-Two special names skip the base-url/key prompts:
+Three special names skip the base-url/key prompts:
 
 - **`copilot`** — uses your GitHub Copilot subscription via OAuth device flow
 - **`ollama`** — connects to a local Ollama instance (auto-starts if needed)
+- **`aivo-starter`** — free built-in provider (auto-created on first run, re-add if removed)
 
 ```bash
 aivo keys add copilot
 aivo keys add ollama
+aivo keys add aivo-starter
 ```
 
 #### `keys use`
@@ -467,6 +513,10 @@ aivo logs "rate limit"
 aivo logs --source chat -n 5
 aivo logs --tool claude --errors
 aivo logs -s "rate limit"
+aivo logs --model sonnet
+aivo logs --key openrouter
+aivo logs --cwd /path/to/project
+aivo logs --since "2025-01-01" --until "2025-02-01"
 aivo logs --json
 aivo logs --latest-first
 ```
@@ -530,6 +580,14 @@ Show all models (default: top 20, rest grouped as "others"):
 aivo stats -a
 ```
 
+#### `--top-sessions`
+
+Show the heaviest native session files:
+
+```bash
+aivo stats --top-sessions
+```
+
 ## update
 
 Update to the latest version. Delegates to Homebrew or npm when installed by those package managers.
@@ -544,6 +602,14 @@ Force update even if installed via a package manager:
 
 ```bash
 aivo update --force
+```
+
+#### `--rollback`
+
+Restore the previous version from the last update backup:
+
+```bash
+aivo update --rollback
 ```
 
 ## Development
