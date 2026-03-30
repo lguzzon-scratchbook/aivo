@@ -227,8 +227,7 @@ impl StatsCommand {
             return ExitCode::Success;
         }
 
-        if has_global {
-            let gs = global.as_ref().unwrap();
+        if let Some(gs) = global.as_ref().filter(|gs| gs.total_tokens() > 0) {
             let view = ToolView {
                 source: StatsSource::Global,
                 count: gs.sessions,

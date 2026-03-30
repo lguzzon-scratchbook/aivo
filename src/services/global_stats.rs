@@ -502,7 +502,7 @@ async fn parse_codex_file(path: &Path) -> Option<FileEntry> {
             continue;
         }
         let info = match payload.get("info") {
-            Some(Value::Object(_)) => payload.get("info").unwrap(),
+            Some(info @ Value::Object(_)) => info,
             _ => continue,
         };
         let usage = match info.get("total_token_usage") {
