@@ -20,7 +20,7 @@ brew install yuanchuan/tap/aivo
 Install script:
 
 ```bash
-curl -fsSL https://yuanchuan.dev/aivo/install.sh | sh
+curl -fsSL https://getaivo.dev/install.sh | bash
 ```
 
 Via npm (only recommended for windows users):
