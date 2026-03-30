@@ -77,10 +77,15 @@ impl UpdateCommand {
             "-f, --force",
             "Force update even if installed via a package manager",
         );
+        print_opt(
+            "--rollback",
+            "Restore the previous version from the last update backup",
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo update"));
         println!("  {}", style::dim("aivo update --force"));
+        println!("  {}", style::dim("aivo update --rollback"));
     }
 
     /// Creates a new UpdateCommand instance
@@ -411,13 +416,69 @@ impl UpdateCommand {
             }
         }
 
-        // Atomically replace the old binary
+        // Back up current binary before replacing (rename is O(1) on same filesystem)
+        let backup_path = backup_path_for(&exec_path);
+        let has_backup =
+            exec_path.exists() && tokio::fs::rename(&exec_path, &backup_path).await.is_ok();
+        if exec_path.exists() && !has_backup {
+            eprintln!(
+                "  {} Could not back up current binary",
+                style::yellow("Warning:")
+            );
+        }
+
+        // Replace with the new binary
         if let Err(e) = tokio::fs::rename(&tmp_path, &exec_path).await {
+            // Restore backup if the replace failed
+            if has_backup {
+                tokio::fs::rename(&backup_path, &exec_path).await.ok();
+            }
             tokio::fs::remove_file(&tmp_path).await.ok();
             return Err(e).with_context(|| format!("Failed to replace binary at {:?}", exec_path));
         }
 
+        // Smoke test: verify the new binary can run
+        if run_version_check(&exec_path).is_none() {
+            eprintln!(
+                "  {} New binary failed smoke test, rolling back...",
+                style::red("Error:")
+            );
+            if has_backup {
+                match tokio::fs::rename(&backup_path, &exec_path).await {
+                    Ok(()) => {
+                        return Err(anyhow::anyhow!(
+                            "Updated binary failed to run. Previous version has been restored."
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Updated binary failed to run and rollback failed: {}. \
+                             Manual restore: cp {} {}",
+                            e,
+                            backup_path.display(),
+                            exec_path.display()
+                        ));
+                    }
+                }
+            }
+            return Err(anyhow::anyhow!(
+                "Updated binary failed to run and no backup was available."
+            ));
+        }
+
         println!("  {} {}", style::dim("Installed to:"), exec_path.display());
+        if has_backup {
+            println!(
+                "  {} {}",
+                style::dim("Backup saved:"),
+                backup_path.display()
+            );
+            println!(
+                "  {} {}",
+                style::dim("Rollback with:"),
+                style::green("aivo update --rollback")
+            );
+        }
 
         Ok(())
     }
@@ -672,6 +733,73 @@ fn get_binary_name() -> Result<String> {
     };
 
     Ok(name.to_string())
+}
+
+/// Restores the previous binary from the backup created during the last update.
+/// Free function — no HTTP client needed for a local-only operation.
+pub async fn execute_rollback() -> ExitCode {
+    let exec_path = match get_install_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            return ExitCode::UserError;
+        }
+    };
+    let backup_path = backup_path_for(&exec_path);
+
+    match tokio::fs::rename(&backup_path, &exec_path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "{} No backup found at {}",
+                style::red("Error:"),
+                backup_path.display()
+            );
+            eprintln!(
+                "  {}",
+                style::dim("A backup is created automatically during `aivo update`.")
+            );
+            return ExitCode::UserError;
+        }
+        Err(e) => {
+            eprintln!("{} Failed to restore backup: {}", style::red("Error:"), e);
+            eprintln!(
+                "  {} cp {} {}",
+                style::dim("You can restore manually:"),
+                backup_path.display(),
+                exec_path.display()
+            );
+            return ExitCode::UserError;
+        }
+    }
+
+    let version = run_version_check(&exec_path).unwrap_or_default();
+    println!(
+        "{} Rolled back to previous version{}",
+        style::success_symbol(),
+        if version.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", version)
+        }
+    );
+
+    ExitCode::Success
+}
+
+fn run_version_check(exec_path: &Path) -> Option<String> {
+    Command::new(exec_path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn backup_path_for(exec_path: &Path) -> PathBuf {
+    exec_path.with_extension("previous")
 }
 
 fn get_install_path() -> Result<PathBuf> {
@@ -966,6 +1094,24 @@ mod tests {
         assert_eq!(
             normalize_install_path(path),
             "c:/users/user/appdata/roaming/npm/node_modules/@yuanchuan/aivo/aivo.exe"
+        );
+    }
+
+    #[test]
+    fn test_backup_path_unix() {
+        let exec = Path::new("/usr/local/bin/aivo");
+        assert_eq!(
+            backup_path_for(exec),
+            PathBuf::from("/usr/local/bin/aivo.previous")
+        );
+    }
+
+    #[test]
+    fn test_backup_path_windows() {
+        let exec = Path::new(r"C:\Users\user\bin\aivo.exe");
+        assert_eq!(
+            backup_path_for(exec),
+            PathBuf::from(r"C:\Users\user\bin\aivo.previous")
         );
     }
 }

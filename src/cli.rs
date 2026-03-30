@@ -267,6 +267,9 @@ pub struct UpdateArgs {
     /// Force update even if installed via a package manager
     #[arg(short, long)]
     pub force: bool,
+    /// Restore the previous version from the last update backup
+    #[arg(long)]
+    pub rollback: bool,
 }
 
 /// Arguments for the info command

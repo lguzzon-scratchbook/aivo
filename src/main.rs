@@ -355,6 +355,10 @@ async fn main() {
             command.execute(stats_args).await
         }
 
+        Commands::Update(update_args) if update_args.rollback => {
+            commands::update::execute_rollback().await
+        }
+
         Commands::Update(update_args) => match UpdateCommand::new() {
             Ok(command) => command.execute(update_args.force).await,
             Err(e) => {

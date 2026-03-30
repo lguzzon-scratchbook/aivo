@@ -1812,6 +1812,218 @@ mod tests {
         assert!(!stats.model_usage.contains_key("gpt-4o"));
     }
 
+    /// Full config snapshot from v0.12 era: all legacy fields present, optional ApiKey
+    /// fields absent, legacy flat directory_starts, legacy per-directory last_selection,
+    /// legacy inline chat_sessions with plaintext messages. If this test ever breaks after
+    /// a schema change, real users' configs will too.
+    #[test]
+    fn load_v012_full_config_snapshot() {
+        let json = r#"{
+            "api_keys": [
+                {
+                    "id": "a1b2c3",
+                    "name": "work-key",
+                    "baseUrl": "https://api.anthropic.com",
+                    "key": "sk-ant-test-key",
+                    "createdAt": "2025-06-01T10:00:00Z"
+                },
+                {
+                    "id": "d4e5f6",
+                    "name": "openrouter",
+                    "baseUrl": "https://openrouter.ai/api/v1",
+                    "key": "sk-or-test-key",
+                    "createdAt": "2025-07-15T12:00:00Z"
+                }
+            ],
+            "active_key_id": "a1b2c3",
+            "chat_models": {
+                "a1b2c3": "claude-sonnet-4-6",
+                "d4e5f6": "gpt-4o"
+            },
+            "directory_starts": {
+                "/home/user/project": {
+                    "keyId": "a1b2c3",
+                    "baseUrl": "https://api.anthropic.com",
+                    "tool": "claude",
+                    "model": "claude-sonnet-4-6",
+                    "updatedAt": "2025-08-01T00:00:00Z"
+                }
+            },
+            "last_selection": {
+                "/home/user/project": {
+                    "keyId": "a1b2c3",
+                    "baseUrl": "https://api.anthropic.com",
+                    "tool": "claude",
+                    "model": "claude-sonnet-4-6",
+                    "updatedAt": "2025-08-01T00:00:00Z"
+                },
+                "/home/user/other": {
+                    "keyId": "d4e5f6",
+                    "baseUrl": "https://openrouter.ai/api/v1",
+                    "tool": "codex",
+                    "model": "gpt-4o",
+                    "updatedAt": "2025-09-01T00:00:00Z"
+                }
+            },
+            "stats": {
+                "toolCounts": { "claude": 42, "codex": 10 },
+                "modelUsage": {
+                    "claude-sonnet-4-6": { "total_tokens": 150000 }
+                }
+            },
+            "chat_sessions": {
+                "sess-legacy": {
+                    "sessionId": "sess-legacy",
+                    "keyId": "a1b2c3",
+                    "baseUrl": "https://api.anthropic.com",
+                    "cwd": "/home/user/project",
+                    "model": "claude-sonnet-4-6",
+                    "messages": [
+                        { "role": "user", "content": "hello" },
+                        { "role": "assistant", "content": "hi there" }
+                    ],
+                    "updatedAt": "2025-08-10T00:00:00Z"
+                }
+            }
+        }"#;
+
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+
+        // API keys loaded with missing optional fields defaulting to None
+        assert_eq!(config.api_keys.len(), 2);
+        assert_eq!(config.api_keys[0].id, "a1b2c3");
+        assert_eq!(config.api_keys[0].name, "work-key");
+        assert!(config.api_keys[0].claude_protocol.is_none());
+        assert!(config.api_keys[0].gemini_protocol.is_none());
+        assert!(config.api_keys[0].responses_api_supported.is_none());
+        assert!(config.api_keys[0].codex_mode.is_none());
+        assert!(config.api_keys[0].opencode_mode.is_none());
+        assert!(config.api_keys[0].pi_mode.is_none());
+
+        // Active key preserved
+        assert_eq!(config.active_key_id.as_deref(), Some("a1b2c3"));
+
+        // Chat models preserved
+        assert_eq!(
+            config.chat_models.get("a1b2c3").unwrap(),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(config.chat_models.get("d4e5f6").unwrap(), "gpt-4o");
+
+        // Legacy flat directory_starts migrated to nested format
+        let tools = config.directory_starts.get("/home/user/project").unwrap();
+        assert_eq!(tools.get("claude").unwrap().key_id, "a1b2c3");
+
+        // Legacy per-directory last_selection picked most recent entry
+        let sel = config.last_selection.unwrap();
+        assert_eq!(sel.key_id, "d4e5f6");
+        assert_eq!(sel.tool, "codex");
+
+        // Stats preserved
+        assert_eq!(*config.stats.tool_counts.get("claude").unwrap(), 42);
+
+        // Legacy inline chat_sessions loaded (messages auto-encrypted)
+        let session = config.chat_sessions.get("sess-legacy").unwrap();
+        assert_eq!(session.key_id, "a1b2c3");
+        let msgs = session.decrypt_messages().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "hello");
+
+        // New fields default correctly
+        assert!(!config.starter_key_dismissed);
+        assert!(config.aliases.is_empty());
+    }
+
+    /// Current config format: all new fields present, optional ApiKey fields populated.
+    /// Guards against regressions in the latest schema.
+    #[test]
+    fn load_current_config_with_all_fields() {
+        let json = r#"{
+            "api_keys": [
+                {
+                    "id": "x1y2z3",
+                    "name": "full-key",
+                    "baseUrl": "https://api.anthropic.com",
+                    "claudeProtocol": "anthropic",
+                    "geminiProtocol": "openai",
+                    "codexResponsesApi": true,
+                    "codexMode": "router",
+                    "opencodeMode": "direct",
+                    "piMode": "direct",
+                    "key": "sk-full-test",
+                    "createdAt": "2026-01-01T00:00:00Z"
+                }
+            ],
+            "active_key_id": "x1y2z3",
+            "aliases": {
+                "fast": "claude-haiku-4-5",
+                "smart": "claude-sonnet-4-6"
+            },
+            "last_selection": {
+                "keyId": "x1y2z3",
+                "baseUrl": "https://api.anthropic.com",
+                "tool": "claude",
+                "model": "claude-sonnet-4-6",
+                "updatedAt": "2026-01-15T00:00:00Z"
+            },
+            "starter_key_dismissed": true
+        }"#;
+
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+
+        let key = &config.api_keys[0];
+        assert_eq!(key.claude_protocol, Some(ClaudeProviderProtocol::Anthropic));
+        assert_eq!(key.gemini_protocol, Some(GeminiProviderProtocol::Openai));
+        assert_eq!(key.responses_api_supported, Some(true));
+        assert_eq!(key.codex_mode, Some(OpenAICompatibilityMode::Router));
+        assert_eq!(key.opencode_mode, Some(OpenAICompatibilityMode::Direct));
+        assert_eq!(key.pi_mode, Some(OpenAICompatibilityMode::Direct));
+
+        assert_eq!(config.aliases.get("fast").unwrap(), "claude-haiku-4-5");
+
+        // Global last_selection (new format) loaded directly
+        let sel = config.last_selection.unwrap();
+        assert_eq!(sel.tool, "claude");
+
+        assert!(config.starter_key_dismissed);
+    }
+
+    /// The legacy field name "responsesApiSupported" must still deserialize into
+    /// responses_api_supported via the serde alias.
+    #[test]
+    fn load_legacy_responses_api_field_alias() {
+        let json = r#"{
+            "api_keys": [
+                {
+                    "id": "abc",
+                    "name": "old-key",
+                    "baseUrl": "https://api.openai.com/v1",
+                    "responsesApiSupported": true,
+                    "key": "sk-old",
+                    "createdAt": "2025-05-01T00:00:00Z"
+                }
+            ]
+        }"#;
+
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.api_keys[0].responses_api_supported, Some(true));
+    }
+
+    /// A minimal config with only api_keys (all other fields absent) must load
+    /// without errors — this is what a first-run config looks like.
+    #[test]
+    fn load_minimal_config() {
+        let json = r#"{ "api_keys": [] }"#;
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+        assert!(config.api_keys.is_empty());
+        assert!(config.active_key_id.is_none());
+        assert!(config.chat_models.is_empty());
+        assert!(config.aliases.is_empty());
+        assert!(config.last_selection.is_none());
+        assert!(!config.starter_key_dismissed);
+    }
+
     #[test]
     fn deserialize_legacy_flat_directory_starts() {
         let json = r#"{
