@@ -82,6 +82,11 @@ pub(crate) async fn prepare_runtime_env(
         write_pi_agent_dir(&mut env, Some(port)).await?;
     }
 
+    if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_STARTER_ROUTER") {
+        let (port, _active, _responses_api) = start_responses_to_chat_router(&env).await?;
+        write_pi_agent_dir(&mut env, Some(port)).await?;
+    }
+
     let pi_agent_dir = env.get("PI_CODING_AGENT_DIR").cloned();
 
     Ok(LaunchRuntimeState {
@@ -305,6 +310,10 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
     let config = AnthropicRouterConfig {
         upstream_base_url: base_url,
         upstream_api_key: api_key,
+        is_starter: env
+            .get("AIVO_IS_STARTER")
+            .map(|v| v == "1")
+            .unwrap_or(false),
     };
 
     let router = AnthropicRouter::new(config);
@@ -354,6 +363,10 @@ async fn start_anthropic_to_openai_router(
         model_prefix,
         requires_reasoning_content,
         max_tokens_cap,
+        is_starter: env
+            .get("AIVO_IS_STARTER")
+            .map(|v| v == "1")
+            .unwrap_or(false),
     };
 
     let router = AnthropicToOpenAIRouter::new(config);
@@ -418,6 +431,10 @@ async fn start_responses_to_chat_router(
         actual_model,
         max_tokens_cap,
         responses_api_supported,
+        is_starter: env
+            .get("AIVO_IS_STARTER")
+            .map(|v| v == "1")
+            .unwrap_or(false),
     });
     let (port, active_protocol, responses_api, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -461,6 +478,10 @@ async fn start_gemini_router(env: &HashMap<String, String>) -> Result<(u16, Arc<
         copilot_token_manager: None,
         requires_reasoning_content,
         max_tokens_cap,
+        is_starter: env
+            .get("AIVO_IS_STARTER")
+            .map(|v| v == "1")
+            .unwrap_or(false),
     });
     let (port, active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -498,6 +519,7 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
         requires_reasoning_content: false,
         max_tokens_cap: None,
+        is_starter: false,
     });
     let (port, _active_protocol, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -545,6 +567,7 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
         actual_model: None,
         max_tokens_cap: None,
         responses_api_supported: None,
+        is_starter: false,
     });
     let (port, _active_protocol, _responses_api, handle) = router.start_background().await?;
     tokio::spawn(async move {

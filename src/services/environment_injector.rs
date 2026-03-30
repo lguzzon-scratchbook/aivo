@@ -184,6 +184,9 @@ impl EnvironmentInjector {
                 profile.quirks.inject(&mut env, cfg.router_prefix);
             }
         }
+        if profile.serve_flags.is_starter {
+            env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
+        }
         env
     }
 
@@ -393,7 +396,7 @@ impl EnvironmentInjector {
             );
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
             (PLACEHOLDER_LOOPBACK_URL.to_string(), "copilot".to_string())
-        } else if Self::use_router_for_opencode(key) {
+        } else if Self::use_router_for_opencode(key) || profile.serve_flags.is_starter {
             env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
@@ -416,6 +419,15 @@ impl EnvironmentInjector {
             profile
                 .quirks
                 .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
+            if profile.serve_flags.is_starter {
+                env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
+                // OpenCode's SDK strips the provider prefix (aivo/starter → starter),
+                // but the API expects the full model name. Override via actual_model.
+                env.insert(
+                    "AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL".to_string(),
+                    "aivo/starter".to_string(),
+                );
+            }
             (PLACEHOLDER_LOOPBACK_URL.to_string(), auth)
         } else {
             (resolved_url, auth)
@@ -516,6 +528,26 @@ impl EnvironmentInjector {
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_COPILOT_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+        } else if profile.serve_flags.is_starter {
+            // Starter provider: route through a local router so device fingerprint
+            // headers are attached (Pi's native HTTP client can't add them).
+            let models_json = build_pi_models_json(
+                PLACEHOLDER_LOOPBACK_URL,
+                AIVO_STARTER_SENTINEL,
+                "openai-completions",
+                model,
+            );
+            env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
+            env.insert("AIVO_USE_PI_STARTER_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
+                AIVO_STARTER_SENTINEL.to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
+                AIVO_STARTER_REAL_URL.to_string(),
+            );
         } else {
             // Direct connection — pi talks to the upstream natively.
             // Map aivo's ProviderProtocol to pi's API type string.

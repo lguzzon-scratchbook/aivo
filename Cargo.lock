@@ -61,6 +61,7 @@ dependencies = [
  "clap",
  "console",
  "crossterm",
+ "hmac",
  "http",
  "libc",
  "pbkdf2",

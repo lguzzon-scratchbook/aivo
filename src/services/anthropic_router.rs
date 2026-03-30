@@ -12,12 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
+use crate::services::device_fingerprint;
 use crate::services::http_utils::{self, router_http_client};
 
 #[derive(Clone)]
 pub struct AnthropicRouterConfig {
     pub upstream_base_url: String,
     pub upstream_api_key: String,
+    pub is_starter: bool,
 }
 
 pub struct AnthropicRouter {
@@ -233,12 +235,13 @@ async fn forward_request(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
     pipeline.patch_headers(route.patch_route(), &mut headers, &ctx)?;
 
-    let response = client
-        .post(&url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await?;
+    let is_starter = config.is_starter;
+    let response = device_fingerprint::maybe_with_starter_headers(
+        client.post(&url).headers(headers).json(&body),
+        is_starter,
+    )
+    .send()
+    .await?;
 
     // Detect beta header rejection: on 400, check if the provider rejected
     // anthropic-beta headers, learn to strip them, and retry immediately.
@@ -257,12 +260,12 @@ async fn forward_request(
             retry_headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
             pipeline.patch_headers(route.patch_route(), &mut retry_headers, &ctx)?;
 
-            let retry_response = client
-                .post(&url)
-                .headers(retry_headers)
-                .json(&body)
-                .send()
-                .await?;
+            let retry_response = device_fingerprint::maybe_with_starter_headers(
+                client.post(&url).headers(retry_headers).json(&body),
+                is_starter,
+            )
+            .send()
+            .await?;
 
             return classify_upstream_response(retry_response).await;
         }

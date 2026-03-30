@@ -651,6 +651,7 @@ fn responses_router_config(state: &ServeState) -> ResponsesToChatRouterConfig {
         actual_model: None,
         max_tokens_cap: None,
         responses_api_supported: None,
+        is_starter: state.config.is_starter,
     }
 }
 

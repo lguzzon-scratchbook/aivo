@@ -3,6 +3,7 @@
 //! Provides a privacy-preserving device identifier (SHA-256 of hardware UUID)
 //! and per-request signatures that prevent trivial URL redistribution.
 
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
@@ -10,6 +11,8 @@ use crate::constants::AIVO_STARTER_SIGNING_KEY;
 use crate::services::http_utils::current_unix_ts;
 use crate::services::system_env;
 use crate::version::VERSION;
+
+type HmacSha256 = Hmac<Sha256>;
 
 static DEVICE_ID: OnceLock<String> = OnceLock::new();
 
@@ -21,10 +24,26 @@ pub fn device_id() -> &'static str {
     })
 }
 
-/// `SHA256(device_id:timestamp:signing_key)` as lowercase hex.
+/// `HMAC-SHA256(signing_key, device_id:timestamp)` as lowercase hex.
 pub fn sign_request(device_id: &str, timestamp: u64) -> String {
-    let input = format!("{}:{}:{}", device_id, timestamp, AIVO_STARTER_SIGNING_KEY);
-    hex_sha256(input.as_bytes())
+    let message = format!("{}:{}", device_id, timestamp);
+    let mut mac =
+        HmacSha256::new_from_slice(AIVO_STARTER_SIGNING_KEY.as_bytes()).expect("valid key length");
+    mac.update(message.as_bytes());
+    let result = mac.finalize().into_bytes();
+    result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Conditionally attaches device fingerprint headers when `is_starter` is true.
+pub fn maybe_with_starter_headers(
+    builder: reqwest::RequestBuilder,
+    is_starter: bool,
+) -> reqwest::RequestBuilder {
+    if is_starter {
+        with_starter_headers(builder)
+    } else {
+        builder
+    }
 }
 
 /// Attaches device fingerprint headers to a request builder.

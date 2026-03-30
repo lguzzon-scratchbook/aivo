@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicU8;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
+use crate::services::device_fingerprint;
 use crate::services::http_utils;
 use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
@@ -37,6 +38,8 @@ pub struct GeminiRouterConfig {
     pub requires_reasoning_content: bool,
     /// Cap applied to `max_tokens` before forwarding to the provider
     pub max_tokens_cap: Option<u64>,
+    /// Whether this is the aivo starter provider (requires device fingerprint headers).
+    pub is_starter: bool,
 }
 
 pub struct GeminiRouter {
@@ -177,15 +180,18 @@ async fn forward_to_provider(
                 anthropic_req["stream"] = serde_json::json!(false);
                 let target_url =
                     http_utils::build_target_url(&config.target_base_url, "/v1/messages");
-                let response = client
-                    .post(&target_url)
-                    .header("Authorization", format!("Bearer {}", config.api_key))
-                    .header("x-api-key", config.api_key.as_str())
-                    .header("anthropic-version", "2023-06-01")
-                    .header("Content-Type", CONTENT_TYPE_JSON)
-                    .json(&anthropic_req)
-                    .send()
-                    .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    client
+                        .post(&target_url)
+                        .header("Authorization", format!("Bearer {}", config.api_key))
+                        .header("x-api-key", config.api_key.as_str())
+                        .header("anthropic-version", "2023-06-01")
+                        .header("Content-Type", CONTENT_TYPE_JSON)
+                        .json(&anthropic_req),
+                    config.is_starter,
+                )
+                .send()
+                .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
@@ -211,13 +217,16 @@ async fn forward_to_provider(
                 );
                 let model = openai_chat_model(&req_body, "gemini-2.5-pro");
                 let target_url = build_google_generate_content_url(&config.target_base_url, &model);
-                let response = client
-                    .post(&target_url)
-                    .header("x-goog-api-key", config.api_key.as_str())
-                    .header("Content-Type", CONTENT_TYPE_JSON)
-                    .json(&google_body)
-                    .send()
-                    .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    client
+                        .post(&target_url)
+                        .header("x-goog-api-key", config.api_key.as_str())
+                        .header("Content-Type", CONTENT_TYPE_JSON)
+                        .json(&google_body),
+                    config.is_starter,
+                )
+                .send()
+                .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
@@ -233,15 +242,18 @@ async fn forward_to_provider(
             }
             ProviderProtocol::Openai => {
                 let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
-                let response = http_utils::authorized_openai_post(
+                let req = http_utils::authorized_openai_post(
                     client.as_ref(),
                     &target_url,
                     &config.api_key,
                     config.copilot_token_manager.as_deref(),
                     initiator,
                 )
-                .await?
-                .json(&req_body)
+                .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    req.json(&req_body),
+                    config.is_starter,
+                )
                 .send()
                 .await?;
                 let status = response.status().as_u16();
@@ -257,15 +269,18 @@ async fn forward_to_provider(
                 let responses_body = chat_to_responses_request(&req_body)?;
                 let target_url =
                     http_utils::build_target_url(&config.target_base_url, "/v1/responses");
-                let response = http_utils::authorized_openai_post(
+                let req = http_utils::authorized_openai_post(
                     client.as_ref(),
                     &target_url,
                     &config.api_key,
                     config.copilot_token_manager.as_deref(),
                     initiator,
                 )
-                .await?
-                .json(&responses_body)
+                .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    req.json(&responses_body),
+                    config.is_starter,
+                )
                 .send()
                 .await?;
                 let status = response.status().as_u16();
@@ -1226,6 +1241,7 @@ mod tests {
             copilot_token_manager: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
+            is_starter: false,
         };
         assert_eq!(config.forced_model, Some("gpt-4o".to_string()));
         assert!(config.copilot_token_manager.is_none());
@@ -1241,6 +1257,7 @@ mod tests {
             copilot_token_manager: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
+            is_starter: false,
         };
         assert!(config.copilot_token_manager.is_none());
         assert!(config.forced_model.is_none());

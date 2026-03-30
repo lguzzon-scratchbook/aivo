@@ -932,6 +932,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
 
@@ -962,6 +963,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -992,6 +994,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1025,6 +1028,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1055,6 +1059,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         let tools = chat["tools"].as_array().unwrap();
@@ -1077,6 +1082,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
@@ -1101,6 +1107,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: Some(8192),
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -1125,6 +1132,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: Some(8192),
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -1368,6 +1376,7 @@ mod tests {
             actual_model: None,
             max_tokens_cap: None,
             responses_api_supported: None,
+            is_starter: false,
         };
         let chat = convert_responses_to_chat_request(&body, &config);
         assert_eq!(chat["model"], "gpt-4o");
@@ -1404,6 +1413,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         assert!(chat.get("model").is_some());
@@ -1424,6 +1434,7 @@ mod tests {
                 actual_model: None,
                 max_tokens_cap: None,
                 responses_api_supported: None,
+                is_starter: false,
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1552,6 +1563,7 @@ mod tests {
             actual_model: Some("kimi-k2.5".to_string()),
             max_tokens_cap: None,
             responses_api_supported: None,
+            is_starter: false,
         };
         let chat = convert_responses_to_chat_request(&body, &config);
         assert_eq!(chat["model"], "kimi-k2.5");

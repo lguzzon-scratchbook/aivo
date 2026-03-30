@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
+use crate::services::device_fingerprint;
 
 use crate::services::anthropic_chat_request::{
     AnthropicToOpenAIConfig, convert_anthropic_to_openai_request,
@@ -62,6 +63,8 @@ pub struct AnthropicToOpenAIRouterConfig {
     /// Cap applied to `max_tokens` before forwarding to the provider.
     /// Use for providers with hard limits (e.g., DeepSeek: 8192).
     pub max_tokens_cap: Option<u64>,
+    /// Whether this is the aivo starter provider (requires device fingerprint headers).
+    pub is_starter: bool,
 }
 
 pub struct AnthropicToOpenAIRouter {
@@ -230,12 +233,13 @@ async fn try_native_anthropic(
     let url = http_utils::build_target_url(&config.target_base_url, "/v1/messages");
     let headers = build_native_anthropic_headers(passthrough_headers, &config.target_api_key)?;
 
-    let response = client
-        .post(&url)
-        .headers(headers)
-        .json(&native_body)
-        .send()
-        .await?;
+    let is_starter = config.is_starter;
+    let response = device_fingerprint::maybe_with_starter_headers(
+        client.post(&url).headers(headers).json(&native_body),
+        is_starter,
+    )
+    .send()
+    .await?;
 
     let status_code = response.status().as_u16();
     if is_protocol_mismatch(status_code) {
@@ -258,12 +262,12 @@ async fn try_native_anthropic(
                 build_native_anthropic_headers(passthrough_headers, &config.target_api_key)?;
             http_utils::strip_beta_headers(&mut retry_headers);
 
-            let retry_response = client
-                .post(&url)
-                .headers(retry_headers)
-                .json(&native_body)
-                .send()
-                .await?;
+            let retry_response = device_fingerprint::maybe_with_starter_headers(
+                client.post(&url).headers(retry_headers).json(&native_body),
+                is_starter,
+            )
+            .send()
+            .await?;
 
             let retry_status = retry_response.status().as_u16();
             if is_protocol_mismatch(retry_status) {
@@ -382,14 +386,17 @@ async fn handle_anthropic_to_upstream(
                     },
                 );
                 let url = build_google_generate_content_url(&config.target_base_url, &model);
-                let response = client
-                    .post(&url)
-                    .headers(attempt_headers)
-                    .header("x-goog-api-key", config.target_api_key.as_str())
-                    .header("Content-Type", CONTENT_TYPE_JSON)
-                    .json(&google_body)
-                    .send()
-                    .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    client
+                        .post(&url)
+                        .headers(attempt_headers)
+                        .header("x-goog-api-key", config.target_api_key.as_str())
+                        .header("Content-Type", CONTENT_TYPE_JSON)
+                        .json(&google_body),
+                    config.is_starter,
+                )
+                .send()
+                .await?;
 
                 let status_code = response.status().as_u16();
                 let response_body = response.text().await?;
@@ -431,14 +438,17 @@ async fn handle_anthropic_to_upstream(
                 let mut responses_body = convert_chat_to_responses_request(&req_body)?;
                 responses_body["stream"] = json!(false);
                 let url = build_responses_url(&config.target_base_url);
-                let response = client
-                    .post(&url)
-                    .headers(attempt_headers)
-                    .header("Authorization", format!("Bearer {}", config.target_api_key))
-                    .header("Content-Type", CONTENT_TYPE_JSON)
-                    .json(&responses_body)
-                    .send()
-                    .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    client
+                        .post(&url)
+                        .headers(attempt_headers)
+                        .header("Authorization", format!("Bearer {}", config.target_api_key))
+                        .header("Content-Type", CONTENT_TYPE_JSON)
+                        .json(&responses_body),
+                    config.is_starter,
+                )
+                .send()
+                .await?;
 
                 let status_code = response.status().as_u16();
                 let response_body = response.text().await?;
@@ -478,14 +488,17 @@ async fn handle_anthropic_to_upstream(
             _ => {
                 // OpenAI or Anthropic — use chat completions endpoint
                 let url = http_utils::build_chat_completions_url(&config.target_base_url);
-                let mut response = client
-                    .post(&url)
-                    .headers(attempt_headers)
-                    .header("Authorization", format!("Bearer {}", config.target_api_key))
-                    .header("Content-Type", CONTENT_TYPE_JSON)
-                    .json(&req_body)
-                    .send()
-                    .await?;
+                let mut response = device_fingerprint::maybe_with_starter_headers(
+                    client
+                        .post(&url)
+                        .headers(attempt_headers)
+                        .header("Authorization", format!("Bearer {}", config.target_api_key))
+                        .header("Content-Type", CONTENT_TYPE_JSON)
+                        .json(&req_body),
+                    config.is_starter,
+                )
+                .send()
+                .await?;
 
                 let status_code = response.status().as_u16();
                 if is_protocol_mismatch(status_code) {
@@ -1460,6 +1473,7 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
+            is_starter: false,
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();
@@ -1482,6 +1496,7 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
+            is_starter: false,
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();

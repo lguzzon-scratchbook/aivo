@@ -20,7 +20,7 @@ use crate::services::copilot_auth::{
 };
 
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
-const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum RequestReadError {
