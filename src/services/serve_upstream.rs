@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
+use crate::services::device_fingerprint;
 use crate::services::http_utils;
 use crate::services::model_names::{copilot_model_name, transform_model_for_openrouter};
 use crate::services::openai_anthropic_bridge::{
@@ -28,7 +29,18 @@ pub(crate) struct UpstreamRequestContext {
     pub(crate) upstream_api_key: String,
     pub(crate) is_copilot: bool,
     pub(crate) is_openrouter: bool,
+    pub(crate) is_starter: bool,
     pub(crate) copilot_tokens: Option<Arc<CopilotTokenManager>>,
+}
+
+impl UpstreamRequestContext {
+    /// Conditionally attaches device fingerprint headers for starter endpoint requests.
+    fn with_device_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if !self.is_starter {
+            return builder;
+        }
+        device_fingerprint::with_starter_headers(builder)
+    }
 }
 
 pub(crate) enum RouterResponse {
@@ -79,11 +91,14 @@ pub(crate) async fn send_anthropic_chat(
 
     let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/messages");
     let response = context
-        .client
-        .post(&url)
-        .header("x-api-key", context.upstream_api_key.as_str())
-        .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", CONTENT_TYPE_JSON)
+        .with_device_headers(
+            context
+                .client
+                .post(&url)
+                .header("x-api-key", context.upstream_api_key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", CONTENT_TYPE_JSON),
+        )
         .json(&anthropic_req)
         .send()
         .await?;
@@ -115,10 +130,13 @@ pub(crate) async fn send_gemini_chat(
         build_google_generate_content_url(&context.upstream_base_url, &model)
     };
     let response = context
-        .client
-        .post(&url)
-        .header("x-goog-api-key", context.upstream_api_key.as_str())
-        .header("Content-Type", CONTENT_TYPE_JSON)
+        .with_device_headers(
+            context
+                .client
+                .post(&url)
+                .header("x-goog-api-key", context.upstream_api_key.as_str())
+                .header("Content-Type", CONTENT_TYPE_JSON),
+        )
         .json(&gemini_req)
         .send()
         .await?;
@@ -148,7 +166,7 @@ pub(crate) async fn send_openai_chat(
     )
     .await?;
 
-    let response = req.json(&*body).send().await?;
+    let response = context.with_device_headers(req).json(&*body).send().await?;
     finalize_openai_response(response, client_wants_stream).await
 }
 
@@ -166,7 +184,7 @@ pub(crate) async fn send_openai_embeddings(
     )
     .await?;
 
-    let response = req.json(body).send().await?;
+    let response = context.with_device_headers(req).json(body).send().await?;
     let status = response.status().as_u16();
     let content_type = http_utils::response_content_type(&response);
     let body_bytes = response.bytes().await?.to_vec();

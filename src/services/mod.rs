@@ -12,6 +12,7 @@ pub mod chat_session_store;
 pub mod codex_model_map;
 pub mod copilot_auth;
 pub mod copilot_router;
+pub mod device_fingerprint;
 pub mod environment_injector;
 pub mod gemini_router;
 pub mod global_stats;

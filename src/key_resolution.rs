@@ -206,12 +206,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefer_active_allow_none_returns_missing_auth_without_active_key() {
+    async fn prefer_active_allow_none_returns_missing_auth_without_keys() {
         let (_temp_dir, store) = temp_store();
 
+        // resolve_key_override alone doesn't create the starter key;
+        // that's handled by main.rs before dispatching commands.
         let resolved =
             resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone).await;
 
         assert!(matches!(resolved.unwrap(), KeyResolution::MissingAuth));
+    }
+
+    #[tokio::test]
+    async fn prefer_active_allow_none_returns_starter_after_ensure() {
+        let (_temp_dir, store) = temp_store();
+
+        // Simulate main.rs: ensure + activate for new users
+        let (starter, _) = store.ensure_starter_key().await.unwrap();
+        store.set_active_key(&starter.id).await.unwrap();
+
+        let resolved =
+            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone).await;
+
+        match resolved.unwrap() {
+            KeyResolution::Selected(key) => {
+                assert_eq!(key.name, crate::constants::AIVO_STARTER_KEY_NAME);
+                assert_eq!(key.base_url, crate::constants::AIVO_STARTER_SENTINEL);
+            }
+            _ => panic!("expected starter key"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_starter_key_creates_and_is_idempotent() {
+        let (_temp_dir, store) = temp_store();
+
+        let (key, is_new) = store
+            .ensure_starter_key()
+            .await
+            .expect("should create starter key");
+        assert_eq!(key.name, crate::constants::AIVO_STARTER_KEY_NAME);
+        assert_eq!(key.base_url, crate::constants::AIVO_STARTER_SENTINEL);
+        assert!(is_new);
+
+        // Verify chat model was pre-set
+        let model = store.get_chat_model(&key.id).await.unwrap();
+        assert_eq!(
+            model,
+            Some(crate::constants::AIVO_STARTER_MODEL.to_string())
+        );
+
+        // Calling again returns the same key (idempotent)
+        let (key2, is_new2) = store
+            .ensure_starter_key()
+            .await
+            .expect("should return existing starter key");
+        assert_eq!(key.id, key2.id);
+        assert!(!is_new2);
+
+        // Only one key exists
+        let all_keys = store.get_keys().await.unwrap();
+        assert_eq!(all_keys.len(), 1);
     }
 }

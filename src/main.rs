@@ -56,6 +56,14 @@ async fn main() {
     let session_store = SessionStore::new();
     let models_cache = services::ModelsCache::new();
 
+    // Ensure the free starter key exists for all users.
+    // For new users (no keys), also activate it.
+    if let Some((starter, is_new_user)) = session_store.ensure_starter_key().await
+        && is_new_user
+    {
+        let _ = session_store.set_active_key(&starter.id).await;
+    }
+
     // Handle help and version flags at the top level
     if args.help {
         match &args.command {

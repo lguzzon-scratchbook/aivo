@@ -464,6 +464,10 @@ pub struct StoredConfig {
     /// Sessions are now stored in individual files under sessions/.
     #[serde(rename = "chat_sessions", default, skip_serializing)]
     pub chat_sessions: HashMap<String, ChatSessionState>,
+    /// Set to true when the user manually removes the aivo-starter key.
+    /// Prevents auto-recreation until the user explicitly re-adds it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starter_key_dismissed: bool,
 }
 
 /// Deserialize directory_starts supporting both legacy flat format and new nested format.
@@ -562,6 +566,7 @@ impl StoredConfig {
             aliases: HashMap::new(),
             last_selection: None,
             chat_sessions: HashMap::new(),
+            starter_key_dismissed: false,
         }
     }
 }
@@ -925,6 +930,51 @@ impl SessionStore {
     /// Gets the currently active API key with its secret decrypted.
     pub async fn get_active_key(&self) -> Result<Option<ApiKey>> {
         self.api_keys.get_active_key().await
+    }
+
+    /// Ensures the aivo starter key exists in the config.
+    /// Creates it if missing, does NOT change the active key.
+    /// Respects the dismissed flag — returns None if the user previously removed it.
+    /// Returns `(key, is_new_user)` where `is_new_user` is true when no keys existed before.
+    pub async fn ensure_starter_key(&self) -> Option<(ApiKey, bool)> {
+        use crate::constants::{
+            AIVO_STARTER_EMPTY_SECRET, AIVO_STARTER_KEY_NAME, AIVO_STARTER_MODEL,
+            AIVO_STARTER_SENTINEL,
+        };
+        let config = self.api_keys.ctx.load().await.ok()?;
+        if config.starter_key_dismissed {
+            return None;
+        }
+        let is_new_user = config.api_keys.is_empty();
+        // Check if starter key already exists
+        if let Some(existing) = config
+            .api_keys
+            .iter()
+            .find(|k| k.base_url == AIVO_STARTER_SENTINEL)
+        {
+            let key = self.get_key_by_id(&existing.id).await.ok().flatten()?;
+            return Some((key, is_new_user));
+        }
+        let id = self
+            .add_key_with_protocol(
+                AIVO_STARTER_KEY_NAME,
+                AIVO_STARTER_SENTINEL,
+                None,
+                AIVO_STARTER_EMPTY_SECRET,
+            )
+            .await
+            .ok()?;
+        let _ = self.set_chat_model(&id, AIVO_STARTER_MODEL).await;
+        let key = self.get_key_by_id(&id).await.ok().flatten()?;
+        Some((key, is_new_user))
+    }
+
+    /// Sets the starter_key_dismissed flag in the config.
+    pub async fn set_starter_key_dismissed(&self, dismissed: bool) -> Result<()> {
+        let _lock = self.api_keys.ctx.acquire_config_lock()?;
+        let mut config = self.api_keys.ctx.load().await?;
+        config.starter_key_dismissed = dismissed;
+        self.api_keys.ctx.save_raw(&config).await
     }
 
     /// Gets all keys and the active key ID without decrypting secrets.

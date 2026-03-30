@@ -248,11 +248,13 @@ impl ChatCommand {
         let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
         let pending_attachments = build_pending_attachments(&attachments)?;
 
-        // Resolve the "ollama" sentinel to the actual local URL before any HTTP calls.
+        // Resolve sentinel base URLs to actual URLs before any HTTP calls.
         if key.base_url == "ollama" {
             crate::services::ollama::ensure_ready().await?;
             crate::services::ollama::ensure_model(&raw_model).await?;
             key.base_url = crate::services::ollama::ollama_openai_base_url();
+        } else if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
+            key.base_url = crate::constants::AIVO_STARTER_REAL_URL.to_string();
         }
 
         // Create once so its token cache is reused across messages in the session.
@@ -887,6 +889,26 @@ fn attachment_storage_label(storage: &AttachmentStorage) -> &'static str {
     }
 }
 
+/// Conditionally adds auth headers to a request. Skips when the key is empty
+/// (e.g. the free aivo starter provider needs no authentication).
+fn with_auth(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::RequestBuilder {
+    if key.key.is_empty() {
+        crate::services::device_fingerprint::with_starter_headers(builder)
+    } else {
+        builder.header("Authorization", format!("Bearer {}", key.key.as_str()))
+    }
+}
+
+/// Like `with_auth` but also adds the `x-api-key` header for Anthropic gateways.
+fn with_auth_anthropic(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::RequestBuilder {
+    let b = with_auth(builder, key);
+    if key.key.is_empty() {
+        b
+    } else {
+        b.header("x-api-key", key.key.as_str())
+    }
+}
+
 async fn send_with_retry<F>(mut build_request: F) -> Result<reqwest::Response>
 where
     F: FnMut() -> reqwest::RequestBuilder,
@@ -942,9 +964,7 @@ where
     let request = build_openai_chat_request(model, messages, true)?;
 
     let mut response = send_with_retry(|| {
-        client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+        with_auth(client.post(&url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
             .json(&request)
     })
@@ -1072,9 +1092,7 @@ where
     let request = build_openai_chat_request(model, messages, false)?;
 
     let response = send_with_retry(|| {
-        client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+        with_auth(client.post(url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
             .json(&request)
     })
@@ -1553,9 +1571,7 @@ where
     let request = build_responses_request(model, messages, true)?;
 
     let mut response = send_with_retry(|| {
-        client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+        with_auth(client.post(&url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
             .json(&request)
     })
@@ -1648,9 +1664,7 @@ where
     let request = build_responses_request(model, messages, false)?;
 
     let response = send_with_retry(|| {
-        client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", key.key.as_str()))
+        with_auth(client.post(url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
             .json(&request)
     })
@@ -1701,11 +1715,7 @@ where
     let request = build_anthropic_request(model, messages, true)?;
 
     let mut response = send_with_retry(|| {
-        client
-            .post(&url)
-            // Send both auth headers: gateways vary on which they accept
-            .header("Authorization", format!("Bearer {}", key.key.as_str()))
-            .header("x-api-key", key.key.as_str())
+        with_auth_anthropic(client.post(&url), key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", CONTENT_TYPE_JSON)
             .json(&request)
@@ -1805,11 +1815,7 @@ where
     let request = build_anthropic_request(model, messages, false)?;
 
     let response = send_with_retry(|| {
-        client
-            .post(url)
-            // Send both auth headers: gateways vary on which they accept
-            .header("Authorization", format!("Bearer {}", key.key.as_str()))
-            .header("x-api-key", key.key.as_str())
+        with_auth_anthropic(client.post(url), key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", CONTENT_TYPE_JSON)
             .json(&request)

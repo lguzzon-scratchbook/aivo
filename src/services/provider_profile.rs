@@ -29,6 +29,7 @@ pub enum ModelListingStrategy {
 pub struct ServeFlags {
     pub is_copilot: bool,
     pub is_openrouter: bool,
+    pub is_starter: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +89,8 @@ pub struct ProviderProfile {
     pub serve_flags: ServeFlags,
 }
 
+pub static AIVO_STARTER_MODELS: &[&str] = &["aivo/starter"];
+
 pub static MINIMAX_MODELS: &[&str] = &[
     "minimax-m2.7",
     "minimax-m2.7-highspeed",
@@ -106,6 +109,10 @@ pub fn is_copilot_base(base_url: &str) -> bool {
 
 pub fn is_ollama_base(base_url: &str) -> bool {
     base_url == "ollama"
+}
+
+pub fn is_aivo_starter_base(base_url: &str) -> bool {
+    base_url == "aivo-starter"
 }
 
 pub fn is_openrouter_base(base_url: &str) -> bool {
@@ -157,6 +164,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: true,
                 is_openrouter: false,
+                is_starter: false,
             },
         };
     }
@@ -170,6 +178,21 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
+                is_starter: false,
+            },
+        };
+    }
+
+    if is_aivo_starter_base(base_url) {
+        return ProviderProfile {
+            kind: ProviderKind::OpenAiCompatible,
+            default_protocol: ProviderProtocol::Openai,
+            quirks,
+            model_listing_strategy: ModelListingStrategy::Static(AIVO_STARTER_MODELS),
+            serve_flags: ServeFlags {
+                is_copilot: false,
+                is_openrouter: false,
+                is_starter: true,
             },
         };
     }
@@ -183,6 +206,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: true,
+                is_starter: false,
             },
         };
     }
@@ -196,6 +220,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
+                is_starter: false,
             },
         };
     }
@@ -209,6 +234,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
+                is_starter: false,
             },
         };
     }
@@ -222,6 +248,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
+                is_starter: false,
             },
         },
         ProviderProtocol::Google => ProviderProfile {
@@ -232,6 +259,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
+                is_starter: false,
             },
         },
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => ProviderProfile {
@@ -242,6 +270,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
+                is_starter: false,
             },
         },
     }
@@ -279,6 +308,17 @@ mod tests {
         assert_eq!(profile.model_listing_strategy, ModelListingStrategy::Ollama);
         assert!(!profile.serve_flags.is_copilot);
         assert!(!profile.serve_flags.is_openrouter);
+    }
+
+    #[test]
+    fn classifies_aivo_starter() {
+        let profile = provider_profile_for_base_url("aivo-starter");
+        assert_eq!(profile.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(profile.default_protocol, ProviderProtocol::Openai);
+        assert!(matches!(
+            profile.model_listing_strategy,
+            ModelListingStrategy::Static(models) if models == &["aivo/starter"]
+        ));
     }
 
     #[test]

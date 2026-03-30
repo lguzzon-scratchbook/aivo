@@ -652,7 +652,11 @@ impl KeysCommand {
     fn display_key_details(&self, key: &ApiKey) {
         println!("Name:     {}", style::cyan(key.display_name()));
         println!("Base URL: {}", style::blue(&key.base_url));
-        println!("API Key:  {}", style::yellow(&*key.key));
+        if key.key.is_empty() {
+            println!("API Key:  {}", style::dim("(none)"));
+        } else {
+            println!("API Key:  {}", style::yellow(&*key.key));
+        }
     }
 
     /// Interactively edits an API key
@@ -709,6 +713,8 @@ impl KeysCommand {
             };
             if value == "copilot"
                 || value == "ollama"
+                || value == "aivo-starter"
+                || value == "aivo starter"
                 || value.starts_with("http://")
                 || value.starts_with("https://")
             {
@@ -837,6 +843,8 @@ impl KeysCommand {
                     return Ok(ExitCode::UserError);
                 }
             }
+        } else if name == "aivo-starter" || name == "aivo starter" {
+            crate::constants::AIVO_STARTER_SENTINEL.to_string()
         } else {
             let detected_url = detect_base_url(&name);
             let mut provided_base_url = add_options.base_url.map(str::to_string);
@@ -868,6 +876,16 @@ impl KeysCommand {
                 if value == "ollama" {
                     eprintln!(
                         "{} Ollama setup requires the explicit shortcut 'aivo keys add ollama'.",
+                        style::red("Error:")
+                    );
+                    if add_options.base_url.is_some() {
+                        return Ok(ExitCode::UserError);
+                    }
+                    continue;
+                }
+                if value == "aivo-starter" || value == "aivo starter" {
+                    eprintln!(
+                        "{} Use 'aivo keys add aivo-starter' instead.",
                         style::red("Error:")
                     );
                     if add_options.base_url.is_some() {
@@ -1008,6 +1026,29 @@ impl KeysCommand {
             return Ok(ExitCode::Success);
         }
 
+        // Aivo starter: free provider, no API key needed
+        if base_url == crate::constants::AIVO_STARTER_SENTINEL {
+            // Clear the dismissed flag so ensure_starter_key works again
+            let _ = self.session_store.set_starter_key_dismissed(false).await;
+
+            let (starter, _) = self
+                .session_store
+                .ensure_starter_key()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Failed to create aivo starter key"))?;
+            self.session_store.set_active_key(&starter.id).await?;
+
+            println!(
+                "{} Added and activated key: {}",
+                style::success_symbol(),
+                style::cyan(&name)
+            );
+            println!("  {}", style::dim(format!("ID: {}", starter.id)));
+            println!("  {}", style::dim("Provider: aivo starter (free)"));
+
+            return Ok(ExitCode::Success);
+        }
+
         let key = if let Some(key) = add_options.key {
             key.to_string()
         } else {
@@ -1082,6 +1123,10 @@ impl KeysCommand {
 
         if self.session_store.delete_key(&key_to_remove.id).await? {
             let _ = self.session_store.remove_key_stats(&key_to_remove.id).await;
+            // Remember if the user dismissed the aivo-starter key
+            if key_to_remove.base_url == crate::constants::AIVO_STARTER_SENTINEL {
+                let _ = self.session_store.set_starter_key_dismissed(true).await;
+            }
             println!(
                 "{} Removed key: {}",
                 style::success_symbol(),

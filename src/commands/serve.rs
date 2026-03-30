@@ -116,6 +116,7 @@ impl ServeCommand {
             upstream_protocol,
             is_copilot,
             is_openrouter,
+            is_starter: profile.serve_flags.is_starter,
             cors,
             timeout,
             auth_token,

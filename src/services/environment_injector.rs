@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::constants::PLACEHOLDER_LOOPBACK_URL;
+use crate::constants::{AIVO_STARTER_REAL_URL, AIVO_STARTER_SENTINEL, PLACEHOLDER_LOOPBACK_URL};
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::model_names::{anthropic_native_model_name, google_native_model_name};
 use crate::services::ollama::ollama_openai_base_url;
@@ -104,6 +104,20 @@ impl EnvironmentInjector {
         mode: &ConnectionMode,
         profile: &ProviderProfile,
     ) -> HashMap<String, String> {
+        // Resolve sentinel base URLs to real URLs for env injection.
+        let resolved_base_url = if key.base_url == AIVO_STARTER_SENTINEL {
+            AIVO_STARTER_REAL_URL.to_string()
+        } else {
+            key.base_url.to_string()
+        };
+        // Tools require a non-empty API key env var. Use a placeholder for
+        // the aivo starter provider which needs no real authentication.
+        let auth_value = if key.key.is_empty() {
+            AIVO_STARTER_SENTINEL.to_string()
+        } else {
+            key.key.to_string()
+        };
+
         let mut env = HashMap::new();
         match mode {
             ConnectionMode::Ollama => {
@@ -140,30 +154,29 @@ impl EnvironmentInjector {
                     cfg.base_url_env.to_string(),
                     PLACEHOLDER_LOOPBACK_URL.to_string(),
                 );
-                env.insert(cfg.auth_env.to_string(), key.key.to_string());
+                env.insert(cfg.auth_env.to_string(), auth_value.clone());
                 env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
-                env.insert("AIVO_ROUTER_API_KEY".to_string(), key.key.to_string());
-                env.insert("AIVO_ROUTER_BASE_URL".to_string(), key.base_url.to_string());
+                env.insert("AIVO_ROUTER_API_KEY".to_string(), auth_value);
+                env.insert("AIVO_ROUTER_BASE_URL".to_string(), resolved_base_url);
             }
             ConnectionMode::Direct { base_url } => {
-                env.insert(cfg.base_url_env.to_string(), base_url.clone());
-                env.insert(cfg.auth_env.to_string(), key.key.to_string());
+                let url = if base_url == AIVO_STARTER_SENTINEL {
+                    AIVO_STARTER_REAL_URL.to_string()
+                } else {
+                    base_url.clone()
+                };
+                env.insert(cfg.base_url_env.to_string(), url);
+                env.insert(cfg.auth_env.to_string(), auth_value);
             }
             ConnectionMode::Routed { protocol } => {
                 env.insert(
                     cfg.base_url_env.to_string(),
                     PLACEHOLDER_LOOPBACK_URL.to_string(),
                 );
-                env.insert(cfg.auth_env.to_string(), key.key.to_string());
+                env.insert(cfg.auth_env.to_string(), auth_value.clone());
                 env.insert(cfg.router_flag.to_string(), "1".to_string());
-                env.insert(
-                    format!("{}_API_KEY", cfg.router_prefix),
-                    key.key.to_string(),
-                );
-                env.insert(
-                    format!("{}_BASE_URL", cfg.router_prefix),
-                    key.base_url.to_string(),
-                );
+                env.insert(format!("{}_API_KEY", cfg.router_prefix), auth_value);
+                env.insert(format!("{}_BASE_URL", cfg.router_prefix), resolved_base_url);
                 env.insert(
                     format!("{}_UPSTREAM_PROTOCOL", cfg.router_prefix),
                     protocol.as_str().to_string(),
@@ -357,6 +370,16 @@ impl EnvironmentInjector {
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
+        let resolved_url = if key.base_url == AIVO_STARTER_SENTINEL {
+            AIVO_STARTER_REAL_URL.to_string()
+        } else {
+            key.base_url.clone()
+        };
+        let auth = if key.key.is_empty() {
+            AIVO_STARTER_SENTINEL.to_string()
+        } else {
+            key.key.to_string()
+        };
 
         // For Ollama, connect directly — OpenCode speaks OpenAI-compatible natively.
         // For GitHub Copilot, the base_url is the magic string "copilot" — not a real URL.
@@ -374,11 +397,11 @@ impl EnvironmentInjector {
             env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
-                key.key.to_string(),
+                auth.clone(),
             );
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
-                key.base_url.clone(),
+                resolved_url.clone(),
             );
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
@@ -393,9 +416,9 @@ impl EnvironmentInjector {
             profile
                 .quirks
                 .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
-            (PLACEHOLDER_LOOPBACK_URL.to_string(), key.key.to_string())
+            (PLACEHOLDER_LOOPBACK_URL.to_string(), auth)
         } else {
-            (key.base_url.clone(), key.key.to_string())
+            (resolved_url, auth)
         };
 
         let mut provider = Map::new();
@@ -501,7 +524,17 @@ impl EnvironmentInjector {
                 ProviderProtocol::Google => "google-generative-ai",
                 ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => "openai-completions",
             };
-            let models_json = build_pi_models_json(&key.base_url, &key.key, pi_api, model);
+            let resolved_url = if key.base_url == AIVO_STARTER_SENTINEL {
+                AIVO_STARTER_REAL_URL
+            } else {
+                &key.base_url
+            };
+            let auth: &str = if key.key.is_empty() {
+                AIVO_STARTER_SENTINEL
+            } else {
+                &key.key
+            };
+            let models_json = build_pi_models_json(resolved_url, auth, pi_api, model);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         }
