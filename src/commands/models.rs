@@ -539,7 +539,8 @@ pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -
 
 /// Shows an interactive model picker. The "(leave it to the tool)" default option
 /// is conditionally shown based on whether the provider has models compatible with
-/// the selected tool. When `tool` is `None`, the default option is always shown.
+/// the selected tool. When `tool` is `None` (e.g. chat mode), the default option
+/// is hidden since a concrete model is required.
 /// Returns `Some(MODEL_DEFAULT_PLACEHOLDER)` if the default is chosen,
 /// `Some(model_name)` for a real model, or `None` if cancelled.
 pub(crate) fn prompt_model_picker(models: Vec<String>, tool: Option<AIToolType>) -> Option<String> {
@@ -548,7 +549,7 @@ pub(crate) fn prompt_model_picker(models: Vec<String>, tool: Option<AIToolType>)
 
     let show_default = tool
         .map(|t| tool_supports_default_model(t, &models))
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let mut items = Vec::with_capacity(models.len() + show_default as usize);
     if show_default {

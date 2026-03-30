@@ -205,22 +205,12 @@ impl ChatCommand {
                     );
                 }
 
-                // For chat, __default__ resolves to the first available model
-                // since chat needs a concrete model for API calls.
-                let first_model = models_list[0].clone();
                 match crate::commands::models::prompt_model_picker(models_list, None) {
                     Some(selected) => {
-                        if selected == crate::constants::MODEL_DEFAULT_PLACEHOLDER {
-                            self.session_store
-                                .set_chat_model(&key.id, &first_model)
-                                .await?;
-                            first_model
-                        } else {
-                            self.session_store
-                                .set_chat_model(&key.id, &selected)
-                                .await?;
-                            selected
-                        }
+                        self.session_store
+                            .set_chat_model(&key.id, &selected)
+                            .await?;
+                        selected
                     }
                     None => return Ok(ExitCode::Success),
                 }
