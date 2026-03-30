@@ -526,9 +526,8 @@ async fn print_active_selection(session_store: &SessionStore) {
     println!();
     println!("{}", style::bold("Active key:"));
     println!(
-        "  {} {}  {}  {}",
+        "  {} {}  {}",
         style::bullet_symbol(),
-        style::cyan(&sel.tool),
         key_label,
         style::dim(model_display),
     );

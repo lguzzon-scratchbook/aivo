@@ -132,9 +132,8 @@ impl InfoCommand {
                 let model_display =
                     crate::commands::models::model_display_label(sel.model.as_deref());
                 println!(
-                    "  {} {} · {} · {}",
+                    "  {} {} · {}",
                     style::bullet_symbol(),
-                    style::cyan(&sel.tool),
                     key_label,
                     model_display,
                 );
