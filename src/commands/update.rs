@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::errors::ExitCode;
+#[cfg(not(windows))]
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::style;
 
@@ -592,7 +593,7 @@ impl UpdateCommand {
                 style::dim("Or repair with:"),
                 style::green(manager.upgrade_command)
             );
-            return Ok(ExitCode::UserError);
+            Ok(ExitCode::UserError)
         }
 
         #[cfg(not(windows))]

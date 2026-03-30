@@ -81,6 +81,8 @@ fn kill_server_by_pid_file() {
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 fn is_process_alive(pid: u32) -> bool {
