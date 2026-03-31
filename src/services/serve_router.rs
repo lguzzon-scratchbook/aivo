@@ -140,7 +140,10 @@ impl ServeRouter {
                 };
                 FailoverEntry {
                     config: Arc::new(ServeRouterConfig {
-                        upstream_base_url: fk.base_url.clone(),
+                        upstream_base_url:
+                            crate::services::provider_profile::resolve_starter_base_url(
+                                &fk.base_url,
+                            ),
                         upstream_api_key: fk.key.as_str().to_string(),
                         upstream_protocol: protocol,
                         is_copilot,

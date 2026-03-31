@@ -111,7 +111,9 @@ impl ServeCommand {
         };
 
         let config = ServeRouterConfig {
-            upstream_base_url: key.base_url.clone(),
+            upstream_base_url: crate::services::provider_profile::resolve_starter_base_url(
+                &key.base_url,
+            ),
             upstream_api_key: key.key.as_str().to_string(),
             upstream_protocol,
             is_copilot,

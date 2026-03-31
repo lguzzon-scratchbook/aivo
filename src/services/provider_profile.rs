@@ -114,7 +114,18 @@ pub fn is_ollama_base(base_url: &str) -> bool {
 }
 
 pub fn is_aivo_starter_base(base_url: &str) -> bool {
-    base_url == "aivo-starter"
+    base_url == crate::constants::AIVO_STARTER_SENTINEL
+        || base_url == crate::constants::AIVO_STARTER_REAL_URL
+}
+
+/// Resolves the aivo-starter sentinel to the real API URL.
+/// Returns the base_url unchanged for all other providers.
+pub fn resolve_starter_base_url(base_url: &str) -> String {
+    if base_url == crate::constants::AIVO_STARTER_SENTINEL {
+        crate::constants::AIVO_STARTER_REAL_URL.to_string()
+    } else {
+        base_url.to_string()
+    }
 }
 
 pub fn is_openrouter_base(base_url: &str) -> bool {
