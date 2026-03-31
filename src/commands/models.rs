@@ -18,7 +18,7 @@ use crate::services::copilot_auth::{
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::provider_profile::{
-    ModelListingStrategy, cloudflare_ai_base, provider_profile_for_base_url,
+    ModelListingStrategy, cloudflare_ai_base, is_aivo_starter_base, provider_profile_for_base_url,
     provider_profile_for_key,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
@@ -284,7 +284,21 @@ impl ModelsCommand {
             self.cache.set(&key.base_url, ids).await;
         }
 
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        let is_starter = is_aivo_starter_base(&key.base_url);
+        models.sort_by(|a, b| {
+            if is_starter {
+                let a_s = a.id.ends_with("/starter");
+                let b_s = b.id.ends_with("/starter");
+                if a_s != b_s {
+                    return if a_s {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    };
+                }
+            }
+            a.id.cmp(&b.id)
+        });
 
         let searching = if let Some(ref query) = search {
             let q = query.trim().to_lowercase();

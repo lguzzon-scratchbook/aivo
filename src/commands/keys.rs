@@ -10,6 +10,7 @@ use crate::commands::truncate_url_for_display;
 use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
+use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
@@ -520,11 +521,17 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
+            let is_starter = is_aivo_starter_base(&key.base_url);
+            let name_col = if is_starter {
+                style::yellow(&name_padded)
+            } else {
+                name_padded
+            };
             println!(
                 "{} {}  {}  {}",
                 active_indicator,
                 style::cyan(&id_padded),
-                name_padded,
+                name_col,
                 style::dim(truncate_url_for_display(&key.base_url, 50))
             );
         }
@@ -554,6 +561,12 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
+            let is_starter = is_aivo_starter_base(&key.base_url);
+            let name_col = if is_starter {
+                style::yellow(&name_padded)
+            } else {
+                name_padded
+            };
 
             let ping_status = if SessionStore::decrypt_key_secret(&mut key).is_ok() {
                 let start = Instant::now();
@@ -578,7 +591,7 @@ impl KeysCommand {
                 "{} {}  {}  {}  {}",
                 active_indicator,
                 style::cyan(&id_padded),
-                name_padded,
+                name_col,
                 style::dim(&url_padded),
                 ping_status
             );
