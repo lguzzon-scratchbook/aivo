@@ -214,7 +214,9 @@ impl StatsCommand {
             }
         };
         let aivo = self.get_aivo_tool_stats(&tool).await;
-        let has_global = global.as_ref().is_some_and(|gs| gs.total_tokens() > 0);
+        let has_global = global
+            .as_ref()
+            .is_some_and(|gs| gs.total_tokens() > 0 || gs.sessions > 0);
 
         if !has_global && aivo.launches == 0 {
             println!(
@@ -227,7 +229,10 @@ impl StatsCommand {
             return ExitCode::Success;
         }
 
-        if let Some(gs) = global.as_ref().filter(|gs| gs.total_tokens() > 0) {
+        if let Some(gs) = global
+            .as_ref()
+            .filter(|gs| gs.total_tokens() > 0 || gs.sessions > 0)
+        {
             let view = ToolView {
                 source: StatsSource::Global,
                 count: gs.sessions,

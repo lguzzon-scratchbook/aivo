@@ -726,7 +726,9 @@ async fn collect_pi() -> Result<Option<GlobalToolStats>> {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
 
-            stats.input_tokens += input;
+            // Pi's "input" excludes cached tokens, unlike Claude/Codex where
+            // input_tokens includes cache_read. Add cache_read to normalize.
+            stats.input_tokens += input + cache_read;
             stats.output_tokens += output;
             stats.cache_read_tokens += cache_read;
             stats.cache_write_tokens += cache_write;
@@ -738,7 +740,7 @@ async fn collect_pi() -> Result<Option<GlobalToolStats>> {
             {
                 let key = normalize_model_for_display(model);
                 let entry = stats.models.entry(key).or_default();
-                entry.input_tokens += input;
+                entry.input_tokens += input + cache_read;
                 entry.output_tokens += output;
             }
         }

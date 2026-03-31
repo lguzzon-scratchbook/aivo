@@ -37,7 +37,7 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 aivo ships with a free built-in provider (`aivo/starter`) that is activated automatically on first run — no API key needed:
 
 ```bash
-aivo chat
+aivo -x hello
 aivo claude
 ```
 
