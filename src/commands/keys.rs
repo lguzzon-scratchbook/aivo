@@ -624,6 +624,39 @@ impl KeysCommand {
         Ok(())
     }
 
+    /// Activates a newly added key and prints the post-add status.
+    async fn finalize_add(
+        &self,
+        id: &str,
+        name: &str,
+        detail: &str,
+        next_hint: Option<(&str, &str)>,
+    ) -> Result<()> {
+        self.session_store.set_active_key(id).await?;
+        // Clear last_selection so key resolution picks the new active key
+        // instead of a stale last_selection (e.g. aivo-starter).
+        let _ = self.session_store.clear_last_selection().await;
+
+        let display_name = style::cyan(if name.is_empty() { id } else { name });
+        println!(
+            "{} Added and activated key: {}",
+            style::success_symbol(),
+            display_name
+        );
+        println!("  {}", style::dim(format!("ID: {}", id)));
+        println!("  {}", style::dim(detail));
+        println!();
+        if let Some((cmd, desc)) = next_hint {
+            println!(
+                "{} {} {}",
+                style::yellow("Next:"),
+                style::bold(cmd),
+                style::dim(desc)
+            );
+        }
+        Ok(())
+    }
+
     /// Displays details for a specific API key
     async fn cat_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
         match self
@@ -946,22 +979,13 @@ impl KeysCommand {
                 .session_store
                 .add_key_with_protocol(&name, "copilot", None, &token)
                 .await?;
-            self.session_store.set_active_key(&id).await?;
-
-            println!(
-                "{} Added and activated key: {}",
-                style::success_symbol(),
-                style::cyan(&name)
-            );
-            println!("  {}", style::dim(format!("ID: {}", id)));
-            println!("  {}", style::dim("Provider: GitHub Copilot"));
-            println!();
-            println!(
-                "{} {} {}",
-                style::yellow("Next:"),
-                style::bold("aivo run claude"),
-                style::dim("(uses Copilot subscription)")
-            );
+            self.finalize_add(
+                &id,
+                &name,
+                "Provider: GitHub Copilot",
+                Some(("aivo run claude", "(uses Copilot subscription)")),
+            )
+            .await?;
 
             sync_models_in_background(&id, &base_url);
             return Ok(ExitCode::Success);
@@ -1006,22 +1030,13 @@ impl KeysCommand {
                 .session_store
                 .add_key_with_protocol(&name, "ollama", None, "ollama-local")
                 .await?;
-            self.session_store.set_active_key(&id).await?;
-
-            println!(
-                "{} Added and activated key: {}",
-                style::success_symbol(),
-                style::cyan(&name)
-            );
-            println!("  {}", style::dim(format!("ID: {}", id)));
-            println!("  {}", style::dim("Provider: Ollama (local)"));
-            println!();
-            println!(
-                "{} {} {}",
-                style::yellow("Next:"),
-                style::bold("aivo models"),
-                style::dim("(list local models)")
-            );
+            self.finalize_add(
+                &id,
+                &name,
+                "Provider: Ollama (local)",
+                Some(("aivo models", "(list local models)")),
+            )
+            .await?;
 
             return Ok(ExitCode::Success);
         }
@@ -1036,15 +1051,13 @@ impl KeysCommand {
                 .ensure_starter_key()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("Failed to create aivo starter key"))?;
-            self.session_store.set_active_key(&starter.id).await?;
-
-            println!(
-                "{} Added and activated key: {}",
-                style::success_symbol(),
-                style::cyan(&name)
-            );
-            println!("  {}", style::dim(format!("ID: {}", starter.id)));
-            println!("  {}", style::dim("Provider: aivo starter (free)"));
+            self.finalize_add(
+                &starter.id,
+                &name,
+                "Provider: aivo starter (free)",
+                Some(("aivo chat", "(start chatting)")),
+            )
+            .await?;
 
             return Ok(ExitCode::Success);
         }
@@ -1069,22 +1082,13 @@ impl KeysCommand {
             .session_store
             .add_key_with_protocol(&name, &base_url, None, &key)
             .await?;
-        self.session_store.set_active_key(&id).await?;
-
-        println!(
-            "{} Added and activated key: {}",
-            style::success_symbol(),
-            style::cyan(if name.is_empty() { &id } else { &name })
-        );
-        println!("  {}", style::dim(format!("ID: {}", id)));
-        println!("  {}", style::dim(format!("Base URL: {}", base_url)));
-        println!();
-        println!(
-            "{} {} {}",
-            style::yellow("Next:"),
-            style::bold("aivo run <tool>"),
-            style::dim("(uses this key)")
-        );
+        self.finalize_add(
+            &id,
+            &name,
+            &format!("Base URL: {}", base_url),
+            Some(("aivo run <tool>", "(uses this key)")),
+        )
+        .await?;
 
         sync_models_in_background(&id, &base_url);
         Ok(ExitCode::Success)
