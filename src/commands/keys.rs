@@ -309,6 +309,21 @@ async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
                 Err(_) => Ok(PingStatus::Unreachable),
             }
         }
+        ModelListingStrategy::AivoStarter => {
+            let url = format!(
+                "{}/v1/models",
+                crate::constants::AIVO_STARTER_REAL_URL.trim_end_matches('/')
+            );
+            let req = crate::services::device_fingerprint::with_starter_headers(
+                client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", key.key.as_str())),
+            );
+            match req.send().await {
+                Ok(r) => Ok(PingStatus::from_http_status(r.status().as_u16())),
+                Err(_) => Ok(PingStatus::Unreachable),
+            }
+        }
         ModelListingStrategy::CloudflareSearch | ModelListingStrategy::OpenAiCompatible => {
             let base = key.base_url.trim_end_matches('/');
             let url = if base.ends_with("/v1") {

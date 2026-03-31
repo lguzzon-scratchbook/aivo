@@ -22,6 +22,7 @@ pub enum ModelListingStrategy {
     Anthropic,
     CloudflareSearch,
     OpenAiCompatible,
+    AivoStarter,
     Static(&'static [&'static str]),
 }
 
@@ -91,8 +92,6 @@ pub struct ProviderProfile {
     pub model_listing_strategy: ModelListingStrategy,
     pub serve_flags: ServeFlags,
 }
-
-pub static AIVO_STARTER_MODELS: &[&str] = &["aivo/starter"];
 
 pub static MINIMAX_MODELS: &[&str] = &[
     "minimax-m2.7",
@@ -191,7 +190,7 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             kind: ProviderKind::OpenAiCompatible,
             default_protocol: ProviderProtocol::Openai,
             quirks,
-            model_listing_strategy: ModelListingStrategy::Static(AIVO_STARTER_MODELS),
+            model_listing_strategy: ModelListingStrategy::AivoStarter,
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
@@ -318,10 +317,10 @@ mod tests {
         let profile = provider_profile_for_base_url("aivo-starter");
         assert_eq!(profile.kind, ProviderKind::OpenAiCompatible);
         assert_eq!(profile.default_protocol, ProviderProtocol::Openai);
-        assert!(matches!(
+        assert_eq!(
             profile.model_listing_strategy,
-            ModelListingStrategy::Static(models) if models == &["aivo/starter"]
-        ));
+            ModelListingStrategy::AivoStarter
+        );
     }
 
     #[test]

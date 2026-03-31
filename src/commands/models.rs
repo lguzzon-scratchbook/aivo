@@ -264,6 +264,26 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
 
     match profile.model_listing_strategy {
         ModelListingStrategy::Static(models) => Ok(models.iter().map(|s| s.to_string()).collect()),
+        ModelListingStrategy::AivoStarter => {
+            let starter_base = crate::constants::AIVO_STARTER_REAL_URL;
+            let url = format!("{}/v1/models", starter_base.trim_end_matches('/'));
+            let response = crate::services::device_fingerprint::with_starter_headers(
+                client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", key.key.as_str())),
+            )
+            .send()
+            .await?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("API returned {} — {}", status, body);
+            }
+
+            let resp: OpenAIModelsResponse = response.json().await?;
+            Ok(resp.data.into_iter().map(|m| m.id).collect())
+        }
         ModelListingStrategy::Ollama => {
             crate::services::ollama::ensure_ready().await?;
             crate::services::ollama::list_models().await
