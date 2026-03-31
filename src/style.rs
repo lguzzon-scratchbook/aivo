@@ -79,6 +79,11 @@ pub fn blue(text: impl AsRef<str>) -> String {
     style_text(StyleName::Blue, text)
 }
 
+/// Convenience function to style text as magenta/purple.
+pub fn magenta(text: impl AsRef<str>) -> String {
+    style_text(StyleName::Magenta, text)
+}
+
 /// Convenience function for the "✓" success symbol.
 pub fn success_symbol() -> String {
     green("✓")

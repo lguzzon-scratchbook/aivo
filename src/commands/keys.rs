@@ -523,7 +523,7 @@ impl KeysCommand {
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
             let is_starter = is_aivo_starter_base(&key.base_url);
             let name_col = if is_starter {
-                style::yellow(&name_padded)
+                style::magenta(&name_padded)
             } else {
                 name_padded
             };
@@ -563,7 +563,7 @@ impl KeysCommand {
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
             let is_starter = is_aivo_starter_base(&key.base_url);
             let name_col = if is_starter {
-                style::yellow(&name_padded)
+                style::magenta(&name_padded)
             } else {
                 name_padded
             };

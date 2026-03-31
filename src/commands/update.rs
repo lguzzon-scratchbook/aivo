@@ -19,6 +19,7 @@ const GITHUB_API: &str = "https://api.github.com/repos/yuanchuan/aivo/releases/l
 const GITHUB_RELEASES_LATEST: &str = "https://github.com/yuanchuan/aivo/releases/latest";
 const GITHUB_LATEST_DOWNLOAD_BASE: &str =
     "https://github.com/yuanchuan/aivo/releases/latest/download";
+const MIRROR_DOWNLOAD_BASE: &str = "https://getaivo.dev/dl/latest";
 const NPM_UPDATE_COMMAND: &str = "npm install -g @yuanchuan/aivo@latest";
 #[cfg(not(windows))]
 const NPM_UPDATE_ARGS: [&str; 3] = ["install", "-g", "@yuanchuan/aivo@latest"];
@@ -178,7 +179,7 @@ impl UpdateCommand {
         println!("  Latest:  {}", style::green(latest_version));
         println!("{} Downloading update...", style::arrow_symbol());
 
-        self.install_update(&asset.browser_download_url, &expected_sha256)
+        self.install_update(&asset.browser_download_url, &expected_sha256, &binary_name)
             .await?;
 
         println!(
@@ -289,7 +290,9 @@ impl UpdateCommand {
 
         let sha256_name = format!("{}.sha256", binary_name);
         if let Some(asset) = release.assets.iter().find(|a| a.name == sha256_name) {
-            let checksum_text = self.fetch_text(&asset.browser_download_url).await?;
+            let checksum_text = self
+                .fetch_text_with_mirror(&asset.browser_download_url, &sha256_name)
+                .await?;
             if let Some(sha256) = parse_checksum_text(&checksum_text, binary_name) {
                 return Ok(sha256);
             }
@@ -300,7 +303,9 @@ impl UpdateCommand {
         }
 
         if let Some(asset) = release.assets.iter().find(|a| a.name == "checksums.txt") {
-            let checksum_text = self.fetch_text(&asset.browser_download_url).await?;
+            let checksum_text = self
+                .fetch_text_with_mirror(&asset.browser_download_url, "checksums.txt")
+                .await?;
             if let Some(sha256) = parse_checksum_text(&checksum_text, binary_name) {
                 return Ok(sha256);
             }
@@ -334,19 +339,67 @@ impl UpdateCommand {
             .context("Failed to read checksum asset response")
     }
 
-    /// Downloads and installs the update
-    async fn install_update(&self, download_url: &str, expected_sha256: &str) -> Result<()> {
-        let mut response = self
-            .github_request(download_url)
-            .timeout(std::time::Duration::from_secs(600)) // 10 minutes
-            .send()
-            .await
-            .context("Failed to download update")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!("Download failed: HTTP {}", status));
+    /// Fetch text with mirror fallback when primary download fails.
+    async fn fetch_text_with_mirror(&self, url: &str, asset_name: &str) -> Result<String> {
+        match self.fetch_text(url).await {
+            Ok(text) => Ok(text),
+            Err(_) => {
+                let mirror_url = format!("{}/{}", MIRROR_DOWNLOAD_BASE, asset_name);
+                eprintln!("  Falling back to mirror...");
+                let response = self
+                    .client
+                    .get(&mirror_url)
+                    .header("User-Agent", "aivo-cli")
+                    .send()
+                    .await
+                    .context("Failed to fetch from mirror")?;
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(anyhow::anyhow!("Mirror download failed: HTTP {}", status));
+                }
+                response
+                    .text()
+                    .await
+                    .context("Failed to read mirror response")
+            }
         }
+    }
+
+    /// Downloads and installs the update
+    async fn install_update(
+        &self,
+        download_url: &str,
+        expected_sha256: &str,
+        binary_name: &str,
+    ) -> Result<()> {
+        let mut response = {
+            let primary = self
+                .github_request(download_url)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .ok()
+                .filter(|r| r.status().is_success());
+            match primary {
+                Some(resp) => resp,
+                None => {
+                    let mirror_url = format!("{}/{}", MIRROR_DOWNLOAD_BASE, binary_name);
+                    eprintln!("  Falling back to mirror...");
+                    let resp = self
+                        .client
+                        .get(&mirror_url)
+                        .header("User-Agent", "aivo-cli")
+                        .timeout(std::time::Duration::from_secs(600))
+                        .send()
+                        .await
+                        .context("Failed to download update")?;
+                    if !resp.status().is_success() {
+                        return Err(anyhow::anyhow!("Download failed: HTTP {}", resp.status()));
+                    }
+                    resp
+                }
+            }
+        };
 
         let total_size = response.content_length().unwrap_or(0);
 
