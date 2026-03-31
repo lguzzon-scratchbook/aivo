@@ -60,3 +60,13 @@ test("formatInstallError includes repair guidance and Windows note", () => {
   assert.match(message, /Repair with: npm install -g @yuanchuan\/aivo@latest/);
   assert.match(message, /open a new terminal/i);
 });
+
+test("getMirrorBaseUrl returns correct mirror URL", () => {
+  const { getMirrorBaseUrl } = require("../scripts/postinstall");
+  assert.equal(getMirrorBaseUrl("1.2.3"), "https://getaivo.dev/dl/v1.2.3");
+});
+
+test("getReleaseBaseUrl returns correct GitHub URL", () => {
+  const { getReleaseBaseUrl } = require("../scripts/postinstall");
+  assert.equal(getReleaseBaseUrl("1.2.3"), "https://github.com/yuanchuan/aivo/releases/download/v1.2.3");
+});

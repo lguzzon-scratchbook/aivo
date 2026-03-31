@@ -168,6 +168,33 @@ jobs:
           name: release-artifacts
           path: artifacts/*
 
+  upload-r2:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Upload to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+
+          for f in artifacts/aivo-*; do
+            KEY="${VERSION}/$(basename "$f")"
+            echo "Uploading ${KEY}..."
+            wrangler r2 object put "aivo-releases/${KEY}" --file "$f" --remote
+          done
+
+          echo -n "${VERSION#v}" | wrangler r2 object put "aivo-releases/latest" --pipe --remote
+
   update-npm:
     needs: release
     runs-on: ubuntu-latest

@@ -26,14 +26,29 @@ async function main(options = {}) {
 
   const { assetName } = resolvePlatformAsset(platform, arch);
   const version = pkg.version;
-  const baseUrl = env.AIVO_INSTALL_BASE_URL || getReleaseBaseUrl(version);
-  const checksumUrl = `${baseUrl}/${assetName}.sha256`;
-  const binaryUrl = `${baseUrl}/${assetName}`;
+  const overrideBaseUrl = env.AIVO_INSTALL_BASE_URL;
 
-  const [checksumText, binary] = await Promise.all([
-    downloadText(checksumUrl),
-    downloadBuffer(binaryUrl)
-  ]);
+  let checksumText, binary;
+
+  if (overrideBaseUrl) {
+    [checksumText, binary] = await Promise.all([
+      downloadText(`${overrideBaseUrl}/${assetName}.sha256`),
+      downloadBuffer(`${overrideBaseUrl}/${assetName}`)
+    ]);
+  } else {
+    const githubBaseUrl = getReleaseBaseUrl(version);
+    const mirrorBaseUrl = getMirrorBaseUrl(version);
+    [checksumText, binary] = await Promise.all([
+      downloadTextWithFallback(
+        `${githubBaseUrl}/${assetName}.sha256`,
+        `${mirrorBaseUrl}/${assetName}.sha256`
+      ),
+      downloadBufferWithFallback(
+        `${githubBaseUrl}/${assetName}`,
+        `${mirrorBaseUrl}/${assetName}`
+      )
+    ]);
+  }
 
   const expectedSha = parseChecksumText(checksumText, assetName);
   if (!expectedSha) {
@@ -65,8 +80,22 @@ function downloadText(url) {
   return downloadBuffer(url).then((buffer) => buffer.toString("utf8"));
 }
 
+function downloadBufferWithFallback(primaryUrl, fallbackUrl) {
+  return downloadBuffer(primaryUrl, 0, 10_000).catch(() => {
+    return downloadBuffer(fallbackUrl);
+  });
+}
+
+function downloadTextWithFallback(primaryUrl, fallbackUrl) {
+  return downloadBufferWithFallback(primaryUrl, fallbackUrl).then((buffer) => buffer.toString("utf8"));
+}
+
 function getReleaseBaseUrl(version) {
   return `https://github.com/yuanchuan/aivo/releases/download/v${version}`;
+}
+
+function getMirrorBaseUrl(version) {
+  return `https://getaivo.dev/dl/v${version}`;
 }
 
 function installBinary({ binary, binaryPath, nativeDir, platform, fsImpl = fs }) {
@@ -110,7 +139,7 @@ function formatInstallError(error, platform = process.platform) {
   return lines.join("\n");
 }
 
-function downloadBuffer(url, redirectCount = 0) {
+function downloadBuffer(url, redirectCount = 0, timeout = 30_000) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith("https://") ? https : require("node:http");
     const request = proto.get(
@@ -119,7 +148,7 @@ function downloadBuffer(url, redirectCount = 0) {
         headers: {
           "User-Agent": "@yuanchuan/aivo-installer"
         },
-        timeout: 30_000
+        timeout
       },
       (response) => {
         const status = response.statusCode || 0;
@@ -136,7 +165,7 @@ function downloadBuffer(url, redirectCount = 0) {
             reject(new Error(`Invalid redirect URL: ${location}`));
             return;
           }
-          resolve(downloadBuffer(location, redirectCount + 1));
+          resolve(downloadBuffer(location, redirectCount + 1, timeout));
           return;
         }
 
@@ -170,8 +199,11 @@ if (require.main === module) {
 module.exports = {
   REPAIR_COMMAND,
   downloadBuffer,
+  downloadBufferWithFallback,
   downloadText,
+  downloadTextWithFallback,
   formatInstallError,
+  getMirrorBaseUrl,
   getReleaseBaseUrl,
   installBinary,
   main

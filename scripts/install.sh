@@ -29,10 +29,39 @@ esac
 
 ARTIFACT="${BINARY}-${PLATFORM}-${ARCH}"
 
-# Get latest release download URL
-echo "Fetching latest release..."
-DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ARTIFACT}"
-CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+GITHUB_BASE="https://github.com/${REPO}/releases/latest/download"
+MIRROR_BASE="https://getaivo.dev/dl/latest"
+
+download_file() {
+  url="$1"
+  output="$2"
+  fallback="$3"
+
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fSL --connect-timeout 8 --max-time 120 --progress-bar "$url" -o "$output" 2>/dev/null; then
+      return 0
+    fi
+    if [ -n "$fallback" ]; then
+      echo "  Falling back to mirror..."
+      curl -fSL --progress-bar "$fallback" -o "$output"
+      return $?
+    fi
+    return 1
+  elif command -v wget >/dev/null 2>&1; then
+    if wget --connect-timeout=8 --timeout=120 -q --show-progress "$url" -O "$output" 2>/dev/null; then
+      return 0
+    fi
+    if [ -n "$fallback" ]; then
+      echo "  Falling back to mirror..."
+      wget -q --show-progress "$fallback" -O "$output"
+      return $?
+    fi
+    return 1
+  else
+    echo "Error: curl or wget is required"
+    exit 1
+  fi
+}
 
 # Create temp directory
 TMP_DIR="$(mktemp -d)"
@@ -40,20 +69,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Download
 echo "Downloading ${ARTIFACT}..."
-if command -v curl >/dev/null 2>&1; then
-  curl -fSL --progress-bar "$DOWNLOAD_URL" -o "${TMP_DIR}/${BINARY}"
-  curl -fSL "$CHECKSUM_URL" -o "${TMP_DIR}/${ARTIFACT}.sha256"
-elif command -v wget >/dev/null 2>&1; then
-  wget -q --show-progress "$DOWNLOAD_URL" -O "${TMP_DIR}/${BINARY}"
-  wget -q "$CHECKSUM_URL" -O "${TMP_DIR}/${ARTIFACT}.sha256"
-else
-  echo "Error: curl or wget is required"
-  exit 1
-fi
+download_file "${GITHUB_BASE}/${ARTIFACT}" "${TMP_DIR}/${BINARY}" "${MIRROR_BASE}/${ARTIFACT}"
+download_file "${GITHUB_BASE}/${ARTIFACT}.sha256" "${TMP_DIR}/${ARTIFACT}.sha256" "${MIRROR_BASE}/${ARTIFACT}.sha256"
 
 EXPECTED_SHA="$(awk '{print $1}' "${TMP_DIR}/${ARTIFACT}.sha256" | tr -d '\r\n')"
 if ! printf '%s' "$EXPECTED_SHA" | grep -Eq '^[A-Fa-f0-9]{64}$'; then
-  echo "Error: Invalid checksum format from ${CHECKSUM_URL}"
+  echo "Error: Invalid checksum format"
   exit 1
 fi
 

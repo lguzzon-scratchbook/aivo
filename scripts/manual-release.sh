@@ -82,6 +82,18 @@ gh release create "$VERSION" \
 
 rm -rf "$TMPDIR"
 
+# Upload to R2
+echo ""
+echo "→ Uploading to Cloudflare R2..."
+for f in "$DIST"/aivo-*; do
+  KEY="${VERSION}/$(basename "$f")"
+  echo "  ${KEY}"
+  wrangler r2 object put "aivo-releases/${KEY}" --file "$f" --remote
+done
+V="${VERSION#v}"
+echo -n "$V" | wrangler r2 object put "aivo-releases/latest" --pipe --remote
+echo "R2 upload complete."
+
 # Update Homebrew tap
 echo ""
 echo "→ Updating Homebrew formula..."
