@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io::{IsTerminal, Write};
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command;
@@ -74,13 +75,22 @@ impl AIToolType {
         ]
     }
 
-    /// Returns installation instructions for the tool.
+    /// Returns installation instructions for the tool (platform-appropriate).
     pub fn install_hint(&self) -> &'static str {
+        #[cfg(unix)]
         match self {
             Self::Claude => "curl -fsSL https://claude.ai/install.sh | bash",
             Self::Codex => "npm install -g @openai/codex",
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "curl -fsSL https://opencode.ai/install | bash",
+            Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
+        }
+        #[cfg(not(unix))]
+        match self {
+            Self::Claude => "npm install -g @anthropic-ai/claude-code",
+            Self::Codex => "npm install -g @openai/codex",
+            Self::Gemini => "npm install -g @google/gemini-cli",
+            Self::Opencode => "npm install -g opencode-ai",
             Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
         }
     }
@@ -179,17 +189,98 @@ impl AILauncher {
         let path_dirs = collect_path_dirs();
         if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
             let tool = options.tool;
-            eprintln!(
-                "{} '{}' is not installed or not found on PATH.",
-                crate::style::red("Error:"),
+
+            let not_installed = || -> Result<()> {
+                eprintln!(
+                    "{} '{}' is not installed or not found on PATH.",
+                    crate::style::red("Error:"),
+                    tool.as_str()
+                );
+                eprintln!();
+                eprintln!(
+                    "  {}",
+                    crate::style::dim(format!("Install: {}", tool.install_hint()))
+                );
+                anyhow::bail!("tool '{}' not found", tool.as_str());
+            };
+
+            if !std::io::stdin().is_terminal() {
+                not_installed()?;
+            }
+
+            eprint!(
+                "  {} '{}' is not installed. Install it? [Y/n] ",
+                crate::style::yellow("?"),
                 tool.as_str()
             );
-            eprintln!();
+            let _ = std::io::stderr().flush();
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim();
+
+            if !(trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("y")
+                || trimmed.eq_ignore_ascii_case("yes"))
+            {
+                not_installed()?;
+            }
+
             eprintln!(
-                "  {}",
-                crate::style::dim(format!("Install: {}", tool.install_hint()))
+                "  {} Installing {}...",
+                crate::style::arrow_symbol(),
+                tool.as_str()
             );
-            anyhow::bail!("tool '{}' not found", tool.as_str());
+
+            #[cfg(unix)]
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(tool.install_hint())
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .await;
+
+            #[cfg(not(unix))]
+            let status = Command::new("cmd")
+                .arg("/C")
+                .arg(tool.install_hint())
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .await;
+
+            let status = status.context(format!(
+                "Failed to run install command for '{}'",
+                tool.as_str()
+            ))?;
+
+            if !status.success() {
+                anyhow::bail!(
+                    "Installation of '{}' failed (exit code: {})",
+                    tool.as_str(),
+                    status.code().unwrap_or(-1)
+                );
+            }
+
+            // Re-scan PATH: the child process can't modify our env, but the
+            // binary may now exist in a directory already on PATH.
+            let path_dirs = collect_path_dirs();
+            if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
+                eprintln!(
+                    "  {} '{}' was installed but not found on PATH. You may need to restart your shell.",
+                    crate::style::yellow("!"),
+                    tool.as_str()
+                );
+                anyhow::bail!("tool '{}' not found on PATH after install", tool.as_str());
+            }
+
+            eprintln!(
+                "  {} Installed successfully.\n",
+                crate::style::success_symbol()
+            );
         }
 
         let base_event = || LogEvent {
