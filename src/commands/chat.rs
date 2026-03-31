@@ -34,12 +34,14 @@ use crate::services::session_store::{
 use crate::style;
 
 use super::chat_request_builder::{
-    build_anthropic_request, build_openai_chat_request, build_responses_request,
+    build_anthropic_request, build_google_request, build_openai_chat_request,
+    build_responses_request,
 };
 use super::chat_response_parser::{
-    ChatResponseChunk, ChatTurnResult, extract_anthropic_usage, extract_openai_message,
-    extract_openai_usage, extract_responses_message, extract_responses_usage, merge_token_usage,
-    normalize_reasoning_content, parse_anthropic_chunk, parse_anthropic_usage_chunk,
+    ChatResponseChunk, ChatTurnResult, extract_anthropic_usage, extract_google_message,
+    extract_google_usage, extract_openai_message, extract_openai_usage, extract_responses_message,
+    extract_responses_usage, merge_token_usage, normalize_reasoning_content, parse_anthropic_chunk,
+    parse_anthropic_usage_chunk, parse_google_chunk, parse_google_usage_chunk,
     parse_openai_usage_chunk, parse_responses_chunk, parse_responses_usage_chunk, parse_sse_chunk,
 };
 
@@ -78,6 +80,17 @@ enum ChatFormat {
     Anthropic,
     /// OpenAI Responses API: POST /v1/responses
     Responses,
+    /// Google Gemini native: POST /models/{model}:streamGenerateContent
+    Google,
+}
+
+fn detect_initial_chat_format(base_url: &str) -> ChatFormat {
+    use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
+    match detect_provider_protocol(base_url) {
+        ProviderProtocol::Google => ChatFormat::Google,
+        ProviderProtocol::Anthropic => ChatFormat::Anthropic,
+        _ => ChatFormat::OpenAI,
+    }
 }
 
 /// ChatCommand provides an interactive REPL for chatting with AI models
@@ -272,7 +285,7 @@ impl ChatCommand {
                 reasoning_content: None,
                 attachments: one_shot_attachments,
             }];
-            let mut format = ChatFormat::OpenAI;
+            let mut format = detect_initial_chat_format(&key.base_url);
             self.session_store
                 .record_selection(&key.id, "chat", Some(&raw_model))
                 .await?;
@@ -562,6 +575,22 @@ where
         }
         ChatFormat::Responses => {
             send_responses_request(client, key, model, history, spinning, on_chunk).await
+        }
+        ChatFormat::Google => {
+            match send_google_request(client, key, model, history, spinning, on_chunk).await {
+                ok @ Ok(_) => ok,
+                Err(e) if is_format_mismatch(&e) => {
+                    // Fall back to OpenAI for gateways serving Google models via /v1/chat/completions
+                    match send_chat_request(client, key, model, history, spinning, on_chunk).await {
+                        Ok(content) => {
+                            *format = ChatFormat::OpenAI;
+                            Ok(content)
+                        }
+                        Err(_) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 }
@@ -896,6 +925,15 @@ fn with_auth_anthropic(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwes
         b
     } else {
         b.header("x-api-key", key.key.as_str())
+    }
+}
+
+/// Adds the `x-goog-api-key` header for Google Gemini native API.
+fn with_auth_google(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::RequestBuilder {
+    if key.key.is_empty() {
+        crate::services::device_fingerprint::with_starter_headers(builder)
+    } else {
+        builder.header("x-goog-api-key", key.key.as_str())
     }
 }
 
@@ -1873,6 +1911,154 @@ where
     Ok(ChatTurnResult {
         content,
         reasoning_content,
+        usage,
+    })
+}
+
+/// Sends a request using Google Gemini's native API with streaming.
+/// Falls back to non-streaming on server errors.
+async fn send_google_request<F>(
+    client: &Client,
+    key: &ApiKey,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    use crate::services::model_names::google_native_model_name;
+    use crate::services::openai_gemini_bridge::build_google_stream_generate_content_url;
+
+    let native_model = google_native_model_name(model);
+    let url = build_google_stream_generate_content_url(&key.base_url, native_model);
+
+    let request = build_google_request(messages)?;
+
+    let mut response = send_with_retry(|| {
+        with_auth_google(client.post(&url), key)
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .json(&request)
+    })
+    .await?;
+
+    if response.status().is_server_error() {
+        return send_google_non_streaming(client, key, model, messages, spinning, on_chunk).await;
+    }
+
+    if !response.status().is_success() {
+        style::stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let mut full_content = String::new();
+    let mut usage = None;
+    let mut line_buf = String::new();
+
+    while let Some(chunk) = response.chunk().await? {
+        let text = String::from_utf8_lossy(&chunk);
+        line_buf.push_str(&text);
+
+        while let Some(pos) = line_buf.find('\n') {
+            let line = line_buf[..pos].trim_end_matches('\r').to_string();
+            line_buf = line_buf[pos + 1..].to_string();
+
+            if let Some(data) = sse_data_payload(&line) {
+                if let Some(tokens) = parse_google_usage_chunk(data) {
+                    merge_token_usage(&mut usage, tokens);
+                }
+                if let Some(chunk) = parse_google_chunk(data) {
+                    style::stop_spinner(spinning);
+                    if let ChatResponseChunk::Content(ref content) = chunk {
+                        full_content.push_str(content);
+                    }
+                    on_chunk(chunk)?;
+                }
+            }
+        }
+    }
+
+    // Process any remaining data in the buffer
+    let tail = line_buf.trim();
+    if !tail.is_empty()
+        && let Some(data) = sse_data_payload(tail)
+    {
+        if let Some(tokens) = parse_google_usage_chunk(data) {
+            merge_token_usage(&mut usage, tokens);
+        }
+        if let Some(chunk) = parse_google_chunk(data) {
+            style::stop_spinner(spinning);
+            if let ChatResponseChunk::Content(ref content) = chunk {
+                full_content.push_str(content);
+            }
+            on_chunk(chunk)?;
+        }
+    }
+
+    // If streaming produced no content, fall back to non-streaming
+    if full_content.is_empty() {
+        return send_google_non_streaming(client, key, model, messages, spinning, on_chunk).await;
+    }
+
+    Ok(ChatTurnResult {
+        content: full_content,
+        reasoning_content: None,
+        usage,
+    })
+}
+
+/// Non-streaming fallback for Google Gemini native API.
+async fn send_google_non_streaming<F>(
+    client: &Client,
+    key: &ApiKey,
+    model: &str,
+    messages: &[ChatMessage],
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    use crate::services::model_names::google_native_model_name;
+    use crate::services::openai_gemini_bridge::build_google_generate_content_url;
+
+    let native_model = google_native_model_name(model);
+    let url = build_google_generate_content_url(&key.base_url, native_model);
+
+    let request = build_google_request(messages)?;
+
+    let response = send_with_retry(|| {
+        with_auth_google(client.post(&url), key)
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .json(&request)
+    })
+    .await?;
+
+    if !response.status().is_success() {
+        style::stop_spinner(spinning);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let body: serde_json::Value = response.json().await?;
+    let google_response = extract_google_message(&body);
+    let usage = extract_google_usage(&body);
+
+    if google_response.content.is_empty() {
+        style::stop_spinner(spinning);
+        anyhow::bail!("Provider returned an empty response");
+    }
+
+    style::stop_spinner(spinning);
+    on_chunk(ChatResponseChunk::Content(google_response.content.clone()))?;
+
+    Ok(ChatTurnResult {
+        content: google_response.content,
+        reasoning_content: None,
         usage,
     })
 }

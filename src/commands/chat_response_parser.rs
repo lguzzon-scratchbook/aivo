@@ -373,6 +373,88 @@ pub(crate) fn extract_responses_usage(body: &serde_json::Value) -> Option<TokenU
     }
 }
 
+/// Parses a Google Gemini SSE data line and extracts text content.
+pub(crate) fn parse_google_chunk(data: &str) -> Option<ChatResponseChunk> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let candidate = value.get("candidates")?.as_array()?.first()?;
+    let parts = candidate.get("content")?.get("parts")?.as_array()?;
+    let mut text = String::new();
+    for part in parts {
+        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+            text.push_str(t);
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(ChatResponseChunk::Content(text))
+    }
+}
+
+/// Extracts usage from a Google Gemini SSE chunk (usageMetadata may appear in any chunk).
+pub(crate) fn parse_google_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let usage = value.get("usageMetadata")?;
+    let update = TokenUsageUpdate {
+        prompt_tokens: usage.get("promptTokenCount").and_then(parse_token_u64),
+        completion_tokens: usage.get("candidatesTokenCount").and_then(parse_token_u64),
+        cache_read_input_tokens: usage
+            .get("cachedContentTokenCount")
+            .and_then(parse_token_u64),
+        cache_creation_input_tokens: None,
+    };
+    if update.is_empty() {
+        None
+    } else {
+        Some(update)
+    }
+}
+
+/// Extracts the assistant message from a non-streaming Google Gemini response.
+pub(crate) fn extract_google_message(body: &serde_json::Value) -> AssistantResponse {
+    let mut text_parts = Vec::new();
+    if let Some(candidates) = body.get("candidates").and_then(|v| v.as_array())
+        && let Some(candidate) = candidates.first()
+        && let Some(parts) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+    {
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                text_parts.push(text.to_string());
+            }
+        }
+    }
+    AssistantResponse {
+        content: text_parts.concat(),
+        reasoning_content: None,
+    }
+}
+
+/// Extracts usage from a non-streaming Google Gemini response.
+pub(crate) fn extract_google_usage(body: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = body.get("usageMetadata")?;
+    let prompt = usage
+        .get("promptTokenCount")
+        .and_then(parse_token_u64)
+        .unwrap_or(0);
+    let completion = usage
+        .get("candidatesTokenCount")
+        .and_then(parse_token_u64)
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cachedContentTokenCount")
+        .and_then(parse_token_u64)
+        .unwrap_or(0);
+    Some(TokenUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: 0,
+    })
+}
+
 /// Parses an Anthropic SSE data line and returns either a text or thinking delta.
 pub(crate) fn parse_anthropic_chunk(data: &str) -> Option<ChatResponseChunk> {
     let event: AnthropicStreamEvent = serde_json::from_str(data).ok()?;
@@ -791,6 +873,105 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 cache_read_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_google_chunk_with_text() {
+        let data = r#"{"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}]}"#;
+        assert_eq!(
+            parse_google_chunk(data),
+            Some(ChatResponseChunk::Content("Hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_google_chunk_empty_parts() {
+        let data = r#"{"candidates":[{"content":{"parts":[],"role":"model"}}]}"#;
+        assert_eq!(parse_google_chunk(data), None);
+    }
+
+    #[test]
+    fn test_parse_google_chunk_no_candidates() {
+        let data = r#"{"candidates":[]}"#;
+        assert_eq!(parse_google_chunk(data), None);
+    }
+
+    #[test]
+    fn test_parse_google_chunk_invalid_json() {
+        assert_eq!(parse_google_chunk("not json"), None);
+    }
+
+    #[test]
+    fn test_parse_google_usage_chunk() {
+        let data = r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#;
+        let update = parse_google_usage_chunk(data).unwrap();
+        assert_eq!(update.prompt_tokens, Some(10));
+        assert_eq!(update.completion_tokens, Some(5));
+    }
+
+    #[test]
+    fn test_parse_google_usage_chunk_with_cache() {
+        let data = r#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"cachedContentTokenCount":90}}"#;
+        let update = parse_google_usage_chunk(data).unwrap();
+        assert_eq!(update.cache_read_input_tokens, Some(90));
+    }
+
+    #[test]
+    fn test_parse_google_usage_chunk_no_metadata() {
+        let data = r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#;
+        assert_eq!(parse_google_usage_chunk(data), None);
+    }
+
+    #[test]
+    fn test_extract_google_message() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello "}, {"text": "world"}],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        assert_eq!(
+            extract_google_message(&body),
+            AssistantResponse {
+                content: "Hello world".to_string(),
+                reasoning_content: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_extract_google_message_empty() {
+        let body = serde_json::json!({"candidates": []});
+        assert_eq!(
+            extract_google_message(&body),
+            AssistantResponse {
+                content: String::new(),
+                reasoning_content: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_extract_google_usage() {
+        let body = serde_json::json!({
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+        assert_eq!(
+            extract_google_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
         );

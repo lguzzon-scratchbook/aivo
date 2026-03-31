@@ -17,7 +17,7 @@ use crate::services::openai_anthropic_bridge::{
 use crate::services::openai_gemini_bridge::{
     OpenAIToGeminiConfig, build_google_generate_content_url,
     convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
-    openai_chat_model,
+    openai_chat_model, sanitize_schema_for_gemini,
 };
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
@@ -546,6 +546,10 @@ fn repair_single_tool_call(tc: &mut Value, schema: &Value) {
     let existing_keys: Vec<String> = args.keys().cloned().collect();
 
     for req in &required {
+        // Treat null values the same as missing — remove so default logic applies
+        if args.get(req).is_some_and(|v| v.is_null()) {
+            args.remove(req);
+        }
         if args.contains_key(req) {
             continue;
         }
@@ -632,17 +636,24 @@ fn schema_param_accepts_string(schema: &Value, name: &str) -> bool {
 }
 
 fn normalize_parameters(params: &Value) -> Value {
-    if let Some(obj) = params.as_object()
-        && obj.get("type").and_then(|v| v.as_str()) != Some("object")
-    {
-        let mut normalized = obj.clone();
-        normalized.insert("type".to_string(), serde_json::json!("object"));
-        if !normalized.contains_key("properties") {
-            normalized.insert("properties".to_string(), serde_json::json!({}));
+    sanitize_schema_for_gemini(params)
+}
+
+/// Remove top-level null-valued keys from a JSON object.
+/// Some models return explicit nulls for optional parameters which can
+/// crash consumers that don't expect null (e.g. Claude Code's diff renderer).
+fn strip_null_args(args: &Value) -> Value {
+    if let Some(obj) = args.as_object() {
+        let mut cleaned = serde_json::Map::new();
+        for (k, v) in obj {
+            if !v.is_null() {
+                cleaned.insert(k.clone(), v.clone());
+            }
         }
-        return Value::Object(normalized);
+        Value::Object(cleaned)
+    } else {
+        args.clone()
     }
-    params.clone()
 }
 
 fn convert_parts_to_messages(
@@ -903,6 +914,10 @@ fn message_to_gemini_parts(message: &Value) -> Vec<Value> {
                 obj @ Value::Object(_) => obj.clone(),
                 _ => serde_json::json!({}),
             };
+            // Strip null-valued keys from args. Some models return explicit nulls for
+            // optional parameters which can crash consumers (e.g. Claude Code's diff
+            // renderer when old_string is null instead of absent).
+            let args = strip_null_args(&args);
             parts.push(serde_json::json!({"functionCall": {"name": name, "args": args}}));
         }
     }

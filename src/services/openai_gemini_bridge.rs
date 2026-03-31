@@ -4,6 +4,73 @@ use std::collections::HashMap;
 use crate::services::http_utils::current_unix_ts;
 use crate::services::model_names::google_native_model_name;
 
+/// Gemini's `functionDeclarations` only accepts a subset of JSON Schema fields.
+/// Recursively strip unsupported fields like `$schema`, `additionalProperties`,
+/// `propertyNames`, etc. that OpenAI-compatible tool definitions commonly include.
+pub fn sanitize_schema_for_gemini(schema: &Value) -> Value {
+    let Some(obj) = schema.as_object() else {
+        return schema.clone();
+    };
+
+    static ALLOWED: &[&str] = &[
+        "type",
+        "description",
+        "properties",
+        "required",
+        "items",
+        "enum",
+        "format",
+        "nullable",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+        "anyOf",
+    ];
+
+    let mut cleaned = serde_json::Map::new();
+    for key in ALLOWED {
+        if let Some(value) = obj.get(*key) {
+            let sanitized = match *key {
+                "properties" => {
+                    if let Some(props) = value.as_object() {
+                        let mut new_props = serde_json::Map::new();
+                        for (k, v) in props {
+                            new_props.insert(k.clone(), sanitize_schema_for_gemini(v));
+                        }
+                        Value::Object(new_props)
+                    } else {
+                        value.clone()
+                    }
+                }
+                "items" => sanitize_schema_for_gemini(value),
+                "anyOf" => {
+                    if let Some(arr) = value.as_array() {
+                        Value::Array(arr.iter().map(sanitize_schema_for_gemini).collect())
+                    } else {
+                        value.clone()
+                    }
+                }
+                _ => value.clone(),
+            };
+            cleaned.insert(key.to_string(), sanitized);
+        }
+    }
+
+    // Ensure type and properties exist for object schemas
+    // Treat null type the same as missing
+    if !cleaned.contains_key("type") || cleaned.get("type").is_some_and(|v| v.is_null()) {
+        cleaned.insert("type".to_string(), json!("object"));
+    }
+    if cleaned.get("type").and_then(|v| v.as_str()) == Some("object")
+        && !cleaned.contains_key("properties")
+    {
+        cleaned.insert("properties".to_string(), json!({}));
+    }
+
+    Value::Object(cleaned)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToGeminiConfig {
     pub default_model: &'static str,
@@ -34,8 +101,10 @@ fn build_google_content_url(base_url: &str, model: &str, stream: bool) -> String
     };
     if base.ends_with("/models") {
         format!("{}/{}{}", base, model, suffix)
-    } else {
+    } else if base.ends_with("/v1beta") || base.ends_with("/v1") {
         format!("{}/models/{}{}", base, model, suffix)
+    } else {
+        format!("{}/v1beta/models/{}{}", base, model, suffix)
     }
 }
 
@@ -149,7 +218,9 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                 json!({
                     "name": tool.get("function").and_then(|f| f.get("name")).cloned().unwrap_or_default(),
                     "description": tool.get("function").and_then(|f| f.get("description")).cloned().unwrap_or(json!("")),
-                    "parameters": tool.get("function").and_then(|f| f.get("parameters")).cloned().unwrap_or(json!({"type": "object", "properties": {}}))
+                    "parameters": sanitize_schema_for_gemini(
+                        tool.get("function").and_then(|f| f.get("parameters")).unwrap_or(&json!({"type": "object", "properties": {}}))
+                    )
                 })
             })
             .collect();
@@ -424,6 +495,14 @@ mod tests {
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
+        // Bare hostname without /v1beta — should auto-add /v1beta
+        assert_eq!(
+            build_google_stream_generate_content_url(
+                "https://generativelanguage.googleapis.com",
+                "gemini-2.5-flash"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
     }
 
     #[test]
@@ -667,5 +746,142 @@ mod tests {
         let fc_config = &converted["toolConfig"]["functionCallingConfig"];
         assert_eq!(fc_config["mode"], "ANY");
         assert_eq!(fc_config["allowedFunctionNames"][0], "X");
+    }
+
+    #[test]
+    fn sanitize_schema_strips_unsupported_fields() {
+        let schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "file path",
+                    "additionalProperties": false,
+                    "default": "/tmp"
+                },
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "recursive": {"type": "boolean", "$ref": "#/defs/x"}
+                    },
+                    "additionalProperties": false,
+                    "propertyNames": {"pattern": "^[a-z]+$"}
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false,
+            "propertyNames": {"pattern": ".*"}
+        });
+
+        let sanitized = sanitize_schema_for_gemini(&schema);
+        let obj = sanitized.as_object().unwrap();
+
+        // Allowed fields kept
+        assert_eq!(obj["type"], "object");
+        assert!(obj.contains_key("properties"));
+        assert!(obj.contains_key("required"));
+
+        // Unsupported fields stripped at top level
+        assert!(!obj.contains_key("$schema"));
+        assert!(!obj.contains_key("additionalProperties"));
+        assert!(!obj.contains_key("propertyNames"));
+
+        // Unsupported fields stripped in nested properties
+        let path_prop = &obj["properties"]["path"];
+        assert!(
+            !path_prop
+                .as_object()
+                .unwrap()
+                .contains_key("additionalProperties")
+        );
+        assert!(!path_prop.as_object().unwrap().contains_key("default"));
+
+        let options_prop = &obj["properties"]["options"];
+        assert!(
+            !options_prop
+                .as_object()
+                .unwrap()
+                .contains_key("additionalProperties")
+        );
+        assert!(
+            !options_prop
+                .as_object()
+                .unwrap()
+                .contains_key("propertyNames")
+        );
+
+        // Nested nested property also cleaned
+        let recursive = &options_prop["properties"]["recursive"];
+        assert!(!recursive.as_object().unwrap().contains_key("$ref"));
+    }
+
+    #[test]
+    fn sanitize_schema_preserves_valid_fields() {
+        let schema = json!({
+            "type": "object",
+            "description": "parameters",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "description": "item count",
+                    "minimum": 0,
+                    "maximum": 100
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["a", "b"]},
+                    "minItems": 1,
+                    "maxItems": 10
+                }
+            },
+            "required": ["count"]
+        });
+
+        let sanitized = sanitize_schema_for_gemini(&schema);
+        assert_eq!(sanitized["properties"]["count"]["minimum"], 0);
+        assert_eq!(sanitized["properties"]["count"]["maximum"], 100);
+        assert_eq!(sanitized["properties"]["tags"]["items"]["enum"][0], "a");
+        assert_eq!(sanitized["properties"]["tags"]["minItems"], 1);
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_sanitizes_tool_parameters() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "additionalProperties": false}
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false,
+                        "propertyNames": {"pattern": ".*"}
+                    }
+                }
+            }]
+        });
+
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+
+        let params = &converted["tools"][0]["functionDeclarations"][0]["parameters"];
+        let obj = params.as_object().unwrap();
+        assert!(!obj.contains_key("$schema"));
+        assert!(!obj.contains_key("additionalProperties"));
+        assert!(!obj.contains_key("propertyNames"));
+        assert_eq!(obj["type"], "object");
+        assert!(obj.contains_key("properties"));
     }
 }

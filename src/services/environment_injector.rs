@@ -40,6 +40,29 @@ enum ConnectionMode {
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentInjector;
 
+/// Strips the API version suffix (`/v1beta`, `/v1`) and trailing slashes from
+/// a Google base URL.  Tools whose SDKs append their own `apiVersion` path
+/// (Gemini CLI) would produce a double path like `/v1beta/v1beta/models/…`
+/// if the suffix were left in place.
+fn strip_google_version_suffix(base_url: &str) -> &str {
+    let base = base_url.trim_end_matches('/');
+    base.strip_suffix("/v1beta")
+        .or_else(|| base.strip_suffix("/v1"))
+        .unwrap_or(base)
+}
+
+/// Ensures the Google base URL ends with `/v1beta`.  Tools that set
+/// `apiVersion = ""` when a custom base URL is provided (Pi) expect the
+/// version to already be part of the URL.
+fn ensure_google_version_suffix(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1beta") || base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{}/v1beta", base)
+    }
+}
+
 impl EnvironmentInjector {
     /// Returns true when the URL points to a native Anthropic endpoint that speaks
     /// the Anthropic Messages API directly (no format conversion needed).
@@ -321,7 +344,7 @@ impl EnvironmentInjector {
             ConnectionMode::Copilot
         } else if Self::use_google_native_for_gemini(key) {
             ConnectionMode::Direct {
-                base_url: key.base_url.clone(),
+                base_url: strip_google_version_suffix(&key.base_url).to_string(),
             }
         } else {
             ConnectionMode::Routed {
@@ -557,16 +580,20 @@ impl EnvironmentInjector {
                 ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => "openai-completions",
             };
             let resolved_url = if key.base_url == AIVO_STARTER_SENTINEL {
-                AIVO_STARTER_REAL_URL
+                AIVO_STARTER_REAL_URL.to_string()
+            } else if pi_api == "google-generative-ai" {
+                // Pi sets apiVersion="" when a custom baseUrl is provided,
+                // expecting the version to be part of the URL already.
+                ensure_google_version_suffix(&key.base_url)
             } else {
-                &key.base_url
+                key.base_url.clone()
             };
             let auth: &str = if key.key.is_empty() {
                 AIVO_STARTER_SENTINEL
             } else {
                 &key.key
             };
-            let models_json = build_pi_models_json(resolved_url, auth, pi_api, model);
+            let models_json = build_pi_models_json(&resolved_url, auth, pi_api, model);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         }
@@ -1184,9 +1211,24 @@ mod tests {
         key.base_url = "https://generativelanguage.googleapis.com/".to_string();
         let env = injector.for_gemini(&key, None);
         assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
+        // Trailing slash stripped; SDK adds /v1beta itself
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
-            Some(&"https://generativelanguage.googleapis.com/".to_string())
+            Some(&"https://generativelanguage.googleapis.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_gemini_native_google_strips_v1beta_suffix() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
+        let env = injector.for_gemini(&key, None);
+        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
+        // /v1beta stripped; the Gemini CLI's @google/genai SDK adds it
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&"https://generativelanguage.googleapis.com".to_string())
         );
     }
 
@@ -1640,6 +1682,40 @@ mod tests {
         // No router needed for OpenCode
         assert!(!env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER"));
         assert!(!env.contains_key("AIVO_USE_OPENCODE_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_pi_google_preserves_v1beta_suffix() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
+        let env = injector.for_pi(&key, Some("gemini-2.5-flash"));
+
+        let models_json = env.get("AIVO_PI_MODELS_JSON").unwrap();
+        let parsed: Value = serde_json::from_str(models_json).unwrap();
+        // Pi sets apiVersion="" and expects version in the URL
+        assert_eq!(
+            parsed["providers"]["aivo"]["baseUrl"],
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(parsed["providers"]["aivo"]["api"], "google-generative-ai");
+    }
+
+    #[test]
+    fn test_for_pi_google_adds_v1beta_when_missing() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://generativelanguage.googleapis.com".to_string();
+        let env = injector.for_pi(&key, Some("gemini-2.5-flash"));
+
+        let models_json = env.get("AIVO_PI_MODELS_JSON").unwrap();
+        let parsed: Value = serde_json::from_str(models_json).unwrap();
+        // Pi needs /v1beta in the URL since it sets apiVersion=""
+        assert_eq!(
+            parsed["providers"]["aivo"]["baseUrl"],
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(parsed["providers"]["aivo"]["api"], "google-generative-ai");
     }
 
     #[test]

@@ -341,7 +341,7 @@ impl ChatTuiApp {
         self.draft_history_stash = None;
         self.pending_response.clear();
         self.pending_submit = None;
-        self.format = ChatFormat::OpenAI;
+        self.format = detect_initial_chat_format(&self.key.base_url);
         self.last_usage = None;
         self.context_tokens = estimate_context_tokens(&self.history);
         self.follow_output = true;

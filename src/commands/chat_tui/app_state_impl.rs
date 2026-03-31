@@ -74,7 +74,7 @@ impl ChatTuiApp {
         self.pending_response.clear();
         self.pending_reasoning.clear();
         self.pending_submit = None;
-        self.format = ChatFormat::OpenAI;
+        self.format = detect_initial_chat_format(&self.key.base_url);
         self.last_usage = None;
         self.context_tokens = 0;
         self.follow_output = true;

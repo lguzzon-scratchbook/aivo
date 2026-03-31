@@ -84,6 +84,7 @@ impl ChatTuiApp {
             .map(|message| (MUTED, message))
             .or(Some((MUTED, "Ready".to_string())));
 
+        let initial_format = detect_initial_chat_format(&params.key.base_url);
         Ok(Self {
             session_store: params.session_store,
             cache: params.cache,
@@ -93,7 +94,7 @@ impl ChatTuiApp {
             cwd: params.cwd,
             raw_model: params.raw_model,
             model: params.model,
-            format: ChatFormat::OpenAI,
+            format: initial_format,
             history: params.initial_history,
             draft: String::new(),
             draft_attachments: params.initial_draft_attachments,
