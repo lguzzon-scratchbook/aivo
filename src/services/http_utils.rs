@@ -640,9 +640,10 @@ pub fn current_unix_ts() -> u64 {
         .as_secs()
 }
 
-/// Parses a JSON value as a `u64`, accepting both JSON numbers and numeric strings.
+/// Parses a JSON value as a `u64`, accepting JSON integers, floats, and numeric strings.
 pub fn parse_token_u64(v: &Value) -> Option<u64> {
     v.as_u64()
+        .or_else(|| v.as_f64().map(|f| f as u64))
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 

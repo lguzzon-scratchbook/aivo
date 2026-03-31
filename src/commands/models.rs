@@ -5,6 +5,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -28,14 +29,147 @@ pub struct ModelsCommand {
     cache: ModelsCache,
 }
 
+/// Rich model information for display. Fields are populated from API metadata
+/// when the provider returns them.
+#[derive(Debug, Clone)]
+pub(crate) struct ModelInfo {
+    pub id: String,
+    pub context: Option<String>,
+    pub max_output: Option<String>,
+    pub input_price: Option<String>,
+    pub output_price: Option<String>,
+}
+
+impl ModelInfo {
+    fn id_only(id: String) -> Self {
+        Self {
+            id,
+            context: None,
+            max_output: None,
+            input_price: None,
+            output_price: None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct OpenAIModelsResponse {
     data: Vec<OpenAIModel>,
 }
 
+/// Loosely-parsed model entry. Only `id` is required; everything else is
+/// extracted by searching field names for known patterns so we adapt to
+/// any provider's response shape (OpenRouter, Vercel, OpenAI, etc.).
 #[derive(Deserialize)]
 struct OpenAIModel {
     id: String,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+}
+
+impl OpenAIModel {
+    fn into_model_info(self) -> ModelInfo {
+        let context = self.find_context().map(format_token_count);
+        let max_output = self.find_max_output().map(format_token_count);
+        let (input_price, output_price) = self.find_pricing();
+        ModelInfo {
+            id: self.id,
+            context,
+            max_output,
+            input_price,
+            output_price,
+        }
+    }
+
+    /// Search for a context-window field: context_length, context_window,
+    /// context_size, max_context_length, max_input_tokens, etc.
+    fn find_context(&self) -> Option<u64> {
+        for (key, val) in &self.extra {
+            let k = key.to_ascii_lowercase();
+            if k.contains("context")
+                && !k.contains("price")
+                && !k.contains("cost")
+                && let Some(n) = http_utils::parse_token_u64(val)
+            {
+                return Some(n);
+            }
+        }
+        // Fallback: direct lookup
+        self.extra
+            .get("max_input_tokens")
+            .and_then(http_utils::parse_token_u64)
+    }
+
+    /// Search for a max-output field: max_tokens, max_output_tokens,
+    /// max_completion_tokens (top-level or nested in sub-objects).
+    fn find_max_output(&self) -> Option<u64> {
+        // Top-level fields
+        for (key, val) in &self.extra {
+            let k = key.to_ascii_lowercase();
+            if (k == "max_tokens"
+                || k == "max_output_tokens"
+                || k == "max_completion_tokens"
+                || k == "max_output")
+                && !k.contains("price")
+                && let Some(n) = http_utils::parse_token_u64(val)
+            {
+                return Some(n);
+            }
+        }
+        // Nested in sub-objects (e.g. top_provider.max_completion_tokens)
+        for (_key, val) in &self.extra {
+            if let Some(obj) = val.as_object() {
+                for (k2, v2) in obj {
+                    let k = k2.to_ascii_lowercase();
+                    if k.contains("max")
+                        && (k.contains("output") || k.contains("completion") || k.contains("token"))
+                        && let Some(n) = http_utils::parse_token_u64(v2)
+                    {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Search for pricing info in a nested "pricing"/"price" object,
+    /// looking for input/prompt and output/completion fields.
+    fn find_pricing(&self) -> (Option<String>, Option<String>) {
+        for (key, val) in &self.extra {
+            let k = key.to_ascii_lowercase();
+            if (k == "pricing" || k == "price" || k == "prices")
+                && let Some(obj) = val.as_object()
+            {
+                let input =
+                    find_price_value(obj, &["input", "prompt", "input_cost", "input_price"]);
+                let output = find_price_value(
+                    obj,
+                    &["output", "completion", "output_cost", "output_price"],
+                );
+                return (
+                    input.and_then(|s| format_price_per_million(&s)),
+                    output.and_then(|s| format_price_per_million(&s)),
+                );
+            }
+        }
+        (None, None)
+    }
+}
+
+/// Search a pricing object for a field matching one of the candidate names.
+fn find_price_value(obj: &serde_json::Map<String, Value>, candidates: &[&str]) -> Option<String> {
+    for candidate in candidates {
+        if let Some(val) = obj.get(*candidate) {
+            if let Some(s) = val.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(n) = val.as_f64() {
+                return Some(n.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -49,6 +183,10 @@ struct GeminiModel {
     name: String,
     #[serde(default)]
     supported_generation_methods: Vec<String>,
+    #[serde(default)]
+    input_token_limit: Option<u64>,
+    #[serde(default)]
+    output_token_limit: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -121,49 +259,56 @@ impl ModelsCommand {
         );
 
         let client = http_utils::router_http_client();
-        let mut models = fetch_models_with_spinner(
-            &client,
-            &key,
-            &self.cache,
-            refresh,
-            Some(" Fetching models..."),
-        )
-        .await?;
-        models.sort();
+        let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
+        let cache_warm = !refresh && self.cache.get(&key.base_url).await.is_some();
 
-        match search {
-            Some(search) => {
-                let query = search.trim().to_lowercase();
-                if query.is_empty() {
-                    anyhow::bail!("Search query cannot be empty");
-                }
-
-                let filtered: Vec<_> = models
-                    .into_iter()
-                    .filter(|model| model.to_lowercase().contains(&query))
-                    .collect();
-
-                eprintln!(
-                    "{} {} matches via {}",
-                    style::success_symbol(),
-                    filtered.len(),
-                    style::dim(&key.base_url)
-                );
-                for model in &filtered {
-                    println!("{}", model);
-                }
+        let mut models = if cache_warm {
+            // Spinner-free: fetch in the background but don't block UX
+            fetch_models_detailed(&client, &key).await?
+        } else {
+            let started_at = Instant::now();
+            let (spinning, spinner_handle) = style::start_spinner(Some(" Fetching models..."));
+            let result = fetch_models_detailed(&client, &key).await;
+            let min_visible = Duration::from_millis(350);
+            if let Some(remaining) = min_visible.checked_sub(started_at.elapsed()) {
+                tokio::time::sleep(remaining).await;
             }
-            None => {
-                eprintln!(
-                    "{} {} models via {}",
-                    style::success_symbol(),
-                    models.len(),
-                    style::dim(&key.base_url)
-                );
-                for model in &models {
-                    println!("{}", model);
-                }
+            style::stop_spinner(&spinning);
+            let _ = spinner_handle.await;
+            result?
+        };
+
+        // Cache the IDs for other commands
+        if !is_ollama {
+            let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+            self.cache.set(&key.base_url, ids).await;
+        }
+
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let searching = if let Some(ref query) = search {
+            let q = query.trim().to_lowercase();
+            if q.is_empty() {
+                anyhow::bail!("Search query cannot be empty");
             }
+            models.retain(|m| m.id.to_lowercase().contains(&q));
+            true
+        } else {
+            false
+        };
+
+        let label = if searching { "matches" } else { "models" };
+        eprintln!(
+            "{} {} {} via {}",
+            style::success_symbol(),
+            models.len(),
+            label,
+            style::dim(&key.base_url)
+        );
+
+        let name_w = models.iter().map(|m| m.id.len()).max().unwrap_or(0);
+        for model in &models {
+            println!("{}", format_model_line(model, name_w));
         }
 
         if is_static {
@@ -258,12 +403,92 @@ fn cloudflare_model_name(model: CloudflareModel) -> String {
         .unwrap_or(model.id)
 }
 
+/// Format a token count as a compact display string: 1M, 200K, 128K, etc.
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        let m = n / 1_000_000;
+        let remainder = (n % 1_000_000) / 100_000;
+        if remainder > 0 {
+            format!("{}.{}M", m, remainder)
+        } else {
+            format!("{}M", m)
+        }
+    } else if n >= 1_000 {
+        format!("{}K", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Convert a per-token price string (e.g. "0.000003") to per-1M display (e.g. "$3").
+fn format_price_per_million(per_token: &str) -> Option<String> {
+    let price: f64 = per_token.parse().ok()?;
+    if price <= 0.0 {
+        return None;
+    }
+    let per_m = price * 1_000_000.0;
+    if per_m >= 1.0 {
+        let rounded = (per_m * 100.0).round() / 100.0;
+        if rounded == rounded.floor() {
+            Some(format!("${}", rounded as u64))
+        } else {
+            let s = format!("{:.2}", rounded);
+            Some(format!(
+                "${}",
+                s.trim_end_matches('0').trim_end_matches('.')
+            ))
+        }
+    } else {
+        let s = format!("{:.4}", per_m);
+        Some(format!(
+            "${}",
+            s.trim_end_matches('0').trim_end_matches('.')
+        ))
+    }
+}
+
+fn format_model_line(model: &ModelInfo, name_width: usize) -> String {
+    let has_info = model.context.is_some() || model.max_output.is_some();
+    if !has_info {
+        return model.id.clone();
+    }
+
+    let ctx = model.context.as_deref().unwrap_or("?");
+    let out = model.max_output.as_deref().unwrap_or("?");
+    let mut line = format!(
+        "{:<width$}  {}",
+        model.id,
+        style::dim(format!("{} ctx \u{00b7} {} out", ctx, out)),
+        width = name_width,
+    );
+    if let (Some(input), Some(output)) = (&model.input_price, &model.output_price) {
+        line.push_str(&format!(
+            "  {}",
+            style::dim(format!("{}/{}", input, output))
+        ));
+    }
+    line
+}
+
 pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<String>> {
+    fetch_models_detailed(client, key)
+        .await
+        .map(|v| v.into_iter().map(|m| m.id).collect())
+}
+
+/// Fetch models with full metadata from the API where available.
+/// Providers like OpenRouter/Vercel return context window, pricing, and max output.
+/// Google returns inputTokenLimit and outputTokenLimit.
+/// Other providers return just IDs.
+async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>> {
     let base = normalize_base_url(&key.base_url);
     let profile = provider_profile_for_key(key);
 
     match profile.model_listing_strategy {
-        ModelListingStrategy::Static(models) => Ok(models.iter().map(|s| s.to_string()).collect()),
+        ModelListingStrategy::Static(models) => Ok(models
+            .iter()
+            .map(|s| ModelInfo::id_only(s.to_string()))
+            .collect()),
         ModelListingStrategy::AivoStarter => {
             let starter_base = crate::constants::AIVO_STARTER_REAL_URL;
             let url = format!("{}/v1/models", starter_base.trim_end_matches('/'));
@@ -282,11 +507,12 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
-            Ok(resp.data.into_iter().map(|m| m.id).collect())
+            Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
         }
         ModelListingStrategy::Ollama => {
             crate::services::ollama::ensure_ready().await?;
-            crate::services::ollama::list_models().await
+            let ids = crate::services::ollama::list_models().await?;
+            Ok(ids.into_iter().map(ModelInfo::id_only).collect())
         }
         ModelListingStrategy::Copilot => {
             let tm = CopilotTokenManager::new(key.key.as_str().to_string());
@@ -310,8 +536,8 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             Ok(resp
                 .data
                 .into_iter()
-                .map(|m| m.id)
-                .filter(|id| is_copilot_chat_model(id))
+                .filter(|m| is_copilot_chat_model(&m.id))
+                .map(|m| m.into_model_info())
                 .collect())
         }
         ModelListingStrategy::Google => {
@@ -338,10 +564,18 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                         .any(|method| method == "generateContent")
                 })
                 .map(|m| {
-                    m.name
+                    let id = m
+                        .name
                         .strip_prefix("models/")
                         .unwrap_or(&m.name)
-                        .to_string()
+                        .to_string();
+                    ModelInfo {
+                        context: m.input_token_limit.map(format_token_count),
+                        max_output: m.output_token_limit.map(format_token_count),
+                        input_price: None,
+                        output_price: None,
+                        id,
+                    }
                 })
                 .collect())
         }
@@ -364,8 +598,8 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
             Ok(resp
                 .data
                 .into_iter()
-                .map(|m| m.id)
-                .filter(|id| is_text_chat_model(id))
+                .filter(|m| is_text_chat_model(&m.id))
+                .map(|m| m.into_model_info())
                 .collect())
         }
         ModelListingStrategy::CloudflareSearch => {
@@ -396,7 +630,7 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                 let resp: CloudflareModelsResponse = response.json().await?;
                 for model in resp.result.into_iter().map(cloudflare_model_name) {
                     if seen.insert(model.clone()) && is_text_chat_model(&model) {
-                        models.push(model);
+                        models.push(ModelInfo::id_only(model));
                     }
                 }
 
@@ -438,8 +672,8 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
                             return Ok(resp
                                 .data
                                 .into_iter()
-                                .map(|m| m.id)
-                                .filter(|id| is_text_chat_model(id))
+                                .filter(|m| is_text_chat_model(&m.id))
+                                .map(|m| m.into_model_info())
                                 .collect());
                         }
                         Err(e) => {
@@ -485,30 +719,6 @@ pub(crate) async fn fetch_models_for_select(
     fetch_models_cached(client, key, cache, false)
         .await
         .unwrap_or_default()
-}
-
-pub(crate) async fn fetch_models_with_spinner(
-    client: &Client,
-    key: &ApiKey,
-    cache: &ModelsCache,
-    bypass_cache: bool,
-    label: Option<&str>,
-) -> Result<Vec<String>> {
-    let should_spin = bypass_cache || cache.get(&key.base_url).await.is_none();
-    if !should_spin {
-        return fetch_models_cached(client, key, cache, bypass_cache).await;
-    }
-
-    let started_at = Instant::now();
-    let (spinning, spinner_handle) = style::start_spinner(label);
-    let result = fetch_models_cached(client, key, cache, bypass_cache).await;
-    let min_visible = Duration::from_millis(350);
-    if let Some(remaining) = min_visible.checked_sub(started_at.elapsed()) {
-        tokio::time::sleep(remaining).await;
-    }
-    style::stop_spinner(&spinning);
-    let _ = spinner_handle.await;
-    result
 }
 
 /// Cache-aware wrapper around `fetch_models`.
