@@ -493,11 +493,12 @@ impl UpdateCommand {
         }
 
         // Smoke test: verify the new binary can run
-        if run_version_check(&exec_path).is_none() {
+        if let Err(reason) = run_version_check(&exec_path) {
             eprintln!(
                 "  {} New binary failed smoke test, rolling back...",
                 style::red("Error:")
             );
+            eprintln!("  {}", style::dim(format!("{}", reason)));
             if has_backup {
                 match tokio::fs::rename(&backup_path, &exec_path).await {
                     Ok(()) => {
@@ -828,7 +829,7 @@ pub async fn execute_rollback() -> ExitCode {
         }
     }
 
-    let version = run_version_check(&exec_path).unwrap_or_default();
+    let version = run_version_check(&exec_path).ok().unwrap_or_default();
     println!(
         "{} Rolled back to previous version{}",
         style::success_symbol(),
@@ -842,15 +843,23 @@ pub async fn execute_rollback() -> ExitCode {
     ExitCode::Success
 }
 
-fn run_version_check(exec_path: &Path) -> Option<String> {
-    Command::new(exec_path)
+fn run_version_check(exec_path: &Path) -> Result<String> {
+    let output = Command::new(exec_path)
         .arg("--version")
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .context("Failed to execute binary")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.trim().is_empty() {
+            anyhow::bail!("Exit code: {}", output.status);
+        }
+        anyhow::bail!("Exit code: {}, stderr: {}", output.status, stderr.trim());
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    anyhow::ensure!(!version.is_empty(), "Binary produced no version output");
+    Ok(version)
 }
 
 fn backup_path_for(exec_path: &Path) -> PathBuf {

@@ -52,7 +52,31 @@ async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let args = Cli::parse_from(rewrite_cli_args(expand_combined_short_flags(raw_args)));
 
-    // Initialize services early so we can show active key in help
+    // Handle --version and subcommand --help early, before any service initialization.
+    if args.version {
+        print_version();
+        process::exit(0);
+    }
+
+    if args.help
+        && let Some(cmd) = &args.command
+    {
+        match cmd {
+            Commands::Run(_) => RunCommand::print_help(),
+            Commands::Keys(_) => KeysCommand::print_help(),
+            Commands::Chat(_) => ChatCommand::print_help(),
+            Commands::Models(_) => ModelsCommand::print_help(),
+            Commands::Serve(_) => ServeCommand::print_help(),
+            Commands::Alias(_) => AliasCommand::print_help(),
+            Commands::Info(_) => InfoCommand::print_help(),
+            Commands::Logs(_) => LogsCommand::print_help(),
+            Commands::Stats(_) => StatsCommand::print_help(),
+            Commands::Update(_) => UpdateCommand::print_help(),
+        }
+        process::exit(0);
+    }
+
+    // Initialize services
     let session_store = SessionStore::new();
     let models_cache = services::ModelsCache::new();
 
@@ -64,49 +88,9 @@ async fn main() {
         let _ = session_store.set_active_key(&starter.id).await;
     }
 
-    // Handle help and version flags at the top level
     if args.help {
-        match &args.command {
-            Some(Commands::Run(_)) => {
-                RunCommand::print_help();
-            }
-            Some(Commands::Keys(_)) => {
-                KeysCommand::print_help();
-            }
-            Some(Commands::Chat(_)) => {
-                ChatCommand::print_help();
-            }
-            Some(Commands::Models(_)) => {
-                ModelsCommand::print_help();
-            }
-            Some(Commands::Serve(_)) => {
-                ServeCommand::print_help();
-            }
-            Some(Commands::Alias(_)) => {
-                AliasCommand::print_help();
-            }
-            Some(Commands::Info(_)) => {
-                InfoCommand::print_help();
-            }
-            Some(Commands::Logs(_)) => {
-                LogsCommand::print_help();
-            }
-            Some(Commands::Stats(_)) => {
-                StatsCommand::print_help();
-            }
-            Some(Commands::Update(_)) => {
-                UpdateCommand::print_help();
-            }
-            None => {
-                print_help();
-                print_active_selection(&session_store).await;
-            }
-        }
-        process::exit(0);
-    }
-
-    if args.version {
-        print_version();
+        print_help();
+        print_active_selection(&session_store).await;
         process::exit(0);
     }
 
