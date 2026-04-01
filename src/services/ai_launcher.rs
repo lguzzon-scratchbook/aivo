@@ -265,8 +265,10 @@ impl AILauncher {
                 );
             }
 
-            // Re-scan PATH: the child process can't modify our env, but the
-            // binary may now exist in a directory already on PATH.
+            // The installer may have added a new directory to PATH via shell
+            // profile. Re-read PATH from a login shell so we pick it up.
+            refresh_path_from_shell().await;
+
             let path_dirs = collect_path_dirs();
             if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
                 eprintln!(
@@ -730,6 +732,33 @@ struct ResolvedLaunchContext {
     key: ApiKey,
     model: Option<String>,
     tool_config: ToolConfig,
+}
+
+/// Re-read PATH from a login shell and update this process's PATH env var.
+/// Unix installers often append to shell profiles (~/.zshrc, ~/.bashrc);
+/// this picks up those changes without requiring a terminal restart.
+/// On Windows, installers use npm global bin which is already on PATH,
+/// so this is a no-op.
+async fn refresh_path_from_shell() {
+    #[cfg(not(unix))]
+    return;
+
+    #[cfg(unix)]
+    if let Ok(output) = Command::new("sh")
+        .arg("-lc")
+        .arg("echo $PATH")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+    {
+        let fresh = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !fresh.is_empty() {
+            // SAFETY: no other threads or tasks read PATH concurrently here —
+            // we are in the interactive install flow, blocked on user I/O.
+            unsafe { std::env::set_var("PATH", &fresh) };
+        }
+    }
 }
 
 fn preferred_claude_protocol(base_url: &str) -> ClaudeProviderProtocol {
