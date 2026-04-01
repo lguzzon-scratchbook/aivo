@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.16.0
+
+### Features
+
+- **Google Gemini native API**: Direct support for `generativelanguage.googleapis.com` as a provider across all tools
+- **Open aivo-starter model list**: aivo-starter users can now access the full model catalog
+- **Enriched `aivo models`**: Show context window, max output tokens, and pricing from the provider API
+- **Prompt to install missing tools**: Interactively offer to install tool binaries when not found on PATH, with cross-platform support
+- **R2 download mirror**: GitHub-first binary downloads with Cloudflare R2 fallback for faster installs and updates
+
+### Bug Fixes
+
+- Clear `last_selection` on key add so the newly added key is actually used
+- Resolve aivo-starter sentinel URL in serve router and model picker
+- Normalize Pi stats token counting to include cached input tokens
+- Reduce GitHub download timeout and deduplicate mirror fallback messages
+- Fix mirror fallback for self-update flow
+
 ## v0.15.0
 
 ### Features
