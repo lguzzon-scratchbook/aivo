@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.16.1
+
+### Bug Fixes
+
+- Fix `ETXTBSY` on Linux during self-update: close write file descriptor before smoke test
+
 ## v0.16.0
 
 ### Features

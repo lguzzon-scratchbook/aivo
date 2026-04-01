@@ -442,6 +442,7 @@ impl UpdateCommand {
             tokio::fs::remove_file(&tmp_path).await.ok();
             return Err(e.into());
         }
+        drop(file); // Close write FD before rename/exec to avoid ETXTBSY on Linux
         if total_size > 0 {
             eprintln!(); // newline after progress
         }
