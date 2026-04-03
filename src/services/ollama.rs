@@ -267,11 +267,13 @@ pub async fn pull_model(name: &str) -> Result<()> {
         .context("Failed to connect to Ollama for model pull")?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Ollama pull failed: {}", body);
+        anyhow::bail!("Ollama pull failed (HTTP {}): {}", status, body);
     }
 
     let mut last_status = String::new();
+    let mut saw_success = false;
     while let Some(chunk) = resp
         .chunk()
         .await
@@ -283,7 +285,15 @@ pub async fn pull_model(name: &str) -> Result<()> {
                 continue;
             }
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+                // Check for error responses in the stream
+                if let Some(error) = v["error"].as_str() {
+                    eprintln!("\r\x1b[2K");
+                    anyhow::bail!("Ollama pull failed: {}", error);
+                }
                 let status = v["status"].as_str().unwrap_or("");
+                if status == "success" {
+                    saw_success = true;
+                }
                 if !status.is_empty() && status != last_status {
                     eprint!("\r\x1b[2K  {} {}", crate::style::dim("⟳"), status);
                     let _ = std::io::stderr().flush();
@@ -306,6 +316,15 @@ pub async fn pull_model(name: &str) -> Result<()> {
             }
         }
     }
+
+    if !saw_success {
+        eprintln!("\r\x1b[2K");
+        anyhow::bail!(
+            "Ollama pull for '{}' ended without success confirmation. The model may not have been downloaded.",
+            name
+        );
+    }
+
     eprintln!(
         "\r\x1b[2K  {} Pull complete: {}",
         crate::style::success_symbol(),
@@ -331,6 +350,14 @@ pub async fn ensure_model(name: &str) -> Result<()> {
     std::io::stdin().read_line(&mut input)?;
     if matches!(input.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
         pull_model(name).await?;
+        // Verify the model is actually available after pull
+        if !is_model_available(name).await? {
+            anyhow::bail!(
+                "Model '{}' was not found after pull completed. Try 'ollama pull {}' manually.",
+                name,
+                name
+            );
+        }
     } else {
         anyhow::bail!(
             "Model '{}' is not available. Pull it with 'ollama pull {}'.",
