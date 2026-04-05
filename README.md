@@ -118,7 +118,7 @@ aivo claude -m                           # short form
 
 #### `--key, -k`
 
-Use a different saved key without changing the active one:
+Select a saved key by ID or name:
 
 ```bash
 aivo claude --key openrouter
