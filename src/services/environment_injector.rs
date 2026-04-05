@@ -248,7 +248,13 @@ impl EnvironmentInjector {
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
             "1".to_string(),
         );
-
+        env.insert("BASH_DEFAULT_TIMEOUT_MS".to_string(), "2400000".to_string());
+        env.insert("BASH_MAX_TIMEOUT_MS".to_string(), "2500000".to_string());
+        env.insert(
+            "CLAUDE_CODE_ATTRIBUTION_HEADER".to_string(),
+            "0".to_string(),
+        );
+        env.insert("API_TIMEOUT_MS".to_string(), "30000000".to_string());
         if let Some(model) = model {
             let anthropic_model = if matches!(mode, ConnectionMode::Direct { .. }) {
                 anthropic_native_model_name(model)
@@ -272,7 +278,14 @@ impl EnvironmentInjector {
                 "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
                 anthropic_model.clone(),
             );
-            env.insert("ANTHROPIC_REASONING_MODEL".to_string(), anthropic_model);
+            env.insert(
+                "ANTHROPIC_REASONING_MODEL".to_string(),
+                anthropic_model.clone(),
+            );
+            env.insert(
+                "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
+                anthropic_model.clone(),
+            );
         }
 
         env
