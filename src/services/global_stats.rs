@@ -445,7 +445,18 @@ async fn parse_claude_file(path: &Path) -> Option<FileEntry> {
         entry.cache_read_tokens += cache_read;
         entry.cache_write_tokens += cache_write;
 
-        if !seen_session && v.get("sessionId").and_then(|s| s.as_str()).is_some() {
+        // Skip sidechain (subagent) assistant lines when deciding whether
+        // this file represents a real user-facing session. Claude Code
+        // stores each Task subagent conversation in its own `agent-*.jsonl`
+        // file under `<session>/subagents/`, tagged `isSidechain: true`.
+        // Counting those inflates the session count by the number of
+        // subagent invocations. Tokens above are still accumulated because
+        // subagent calls are real API spend.
+        let is_sidechain = v
+            .get("isSidechain")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+        if !seen_session && !is_sidechain && v.get("sessionId").and_then(|s| s.as_str()).is_some() {
             seen_session = true;
             entry.has_session = true;
         }
@@ -840,6 +851,53 @@ mod tests {
         let (i, o, cr, cw, model) = parse_claude_line(line);
         assert_eq!((i, o, cr, cw), (0, 0, 0, 0));
         assert!(model.is_none());
+    }
+
+    async fn write_jsonl(dir: &tempfile::TempDir, name: &str, lines: &[&str]) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, lines.join("\n")).await.unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn parse_claude_file_counts_main_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}},"sessionId":"abc"}"#;
+        let path = write_jsonl(&dir, "main.jsonl", &[line]).await;
+        let entry = parse_claude_file(&path).await.unwrap();
+        assert!(
+            entry.has_session,
+            "main assistant line should register a session"
+        );
+        assert_eq!(entry.input_tokens, 10);
+        assert_eq!(entry.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn parse_claude_file_ignores_sidechain_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}},"sessionId":"abc"}"#;
+        let path = write_jsonl(&dir, "agent-xxx.jsonl", &[line]).await;
+        let entry = parse_claude_file(&path).await.unwrap();
+        assert!(
+            !entry.has_session,
+            "a file containing only sidechain assistant lines must not count as a session"
+        );
+        // Tokens are still real API spend and should be preserved.
+        assert_eq!(entry.input_tokens, 10);
+        assert_eq!(entry.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn parse_claude_file_mixed_main_and_sidechain_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidechain = r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":2}},"sessionId":"abc"}"#;
+        let main = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":3,"output_tokens":4}},"sessionId":"abc"}"#;
+        let path = write_jsonl(&dir, "mixed.jsonl", &[sidechain, main]).await;
+        let entry = parse_claude_file(&path).await.unwrap();
+        assert!(entry.has_session);
+        assert_eq!(entry.input_tokens, 4);
+        assert_eq!(entry.output_tokens, 6);
     }
 
     #[test]
