@@ -536,9 +536,14 @@ async fn parse_codex_file(path: &Path) -> Option<FileEntry> {
         has_tokens = true;
     }
 
+    // Codex's `input_tokens` in `total_token_usage` is the total input
+    // including cached tokens. Normalize to Claude's convention where
+    // `input_tokens` represents only fresh (non-cached) input so the
+    // aggregated "tokens" column doesn't overlap with "cached".
+    let fresh_input = last_input.saturating_sub(last_cached);
     let mut entry = FileEntry {
         has_session: has_tokens,
-        input_tokens: last_input,
+        input_tokens: fresh_input,
         output_tokens: last_output,
         cache_read_tokens: last_cached,
         ..Default::default()
@@ -546,7 +551,7 @@ async fn parse_codex_file(path: &Path) -> Option<FileEntry> {
 
     if has_tokens && let Some(ref m) = model {
         let key = normalize_model_for_display(m);
-        entry.models.insert(key, (last_input, last_output));
+        entry.models.insert(key, (fresh_input, last_output));
     }
 
     Some(entry)
@@ -576,14 +581,18 @@ async fn parse_gemini_file(path: &Path) -> Option<FileEntry> {
         let output = tokens.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
         let cached = tokens.get("cached").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        entry.input_tokens += input;
+        // Gemini's `tokens.input` is the total turn input INCLUDING the
+        // `tokens.cached` portion. Normalize to fresh-only so the
+        // aggregated "tokens" column doesn't overlap with "cached".
+        let fresh_input = input.saturating_sub(cached);
+        entry.input_tokens += fresh_input;
         entry.output_tokens += output;
         entry.cache_read_tokens += cached;
 
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
             let key = normalize_model_for_display(model);
             let e = entry.models.entry(key).or_default();
-            e.0 += input;
+            e.0 += fresh_input;
             e.1 += output;
         }
     }
@@ -698,67 +707,95 @@ async fn collect_pi() -> Result<Option<GlobalToolStats>> {
     }
 
     let mut stats = GlobalToolStats::default();
-    let mut session_ids = HashSet::new();
+    let mut session_ids: HashSet<String> = HashSet::new();
 
     for (path, _) in &files {
-        let file = match fs::File::open(path).await {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-
-        while let Ok(Some(line)) = lines.next_line().await {
-            let v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if v.get("type").and_then(|t| t.as_str()) == Some("session")
-                && let Some(sid) = v.get("id").and_then(|s| s.as_str())
-            {
-                session_ids.insert(sid.to_string());
+        if let Some((entry, ids)) = parse_pi_file(path).await {
+            stats.input_tokens += entry.input_tokens;
+            stats.output_tokens += entry.output_tokens;
+            stats.cache_read_tokens += entry.cache_read_tokens;
+            stats.cache_write_tokens += entry.cache_write_tokens;
+            for (model, (inp, out)) in entry.models {
+                let m = stats.models.entry(model).or_default();
+                m.input_tokens += inp;
+                m.output_tokens += out;
             }
-
-            if v.get("type").and_then(|t| t.as_str()) != Some("message") {
-                continue;
-            }
-
-            let usage = match v.get("message").and_then(|m| m.get("usage")) {
-                Some(u) => u,
-                None => continue,
-            };
-
-            let input = usage.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
-            let output = usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
-            let cache_read = usage.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0);
-            let cache_write = usage
-                .get("cacheWrite")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-
-            // Pi's "input" excludes cached tokens, unlike Claude/Codex where
-            // input_tokens includes cache_read. Add cache_read to normalize.
-            stats.input_tokens += input + cache_read;
-            stats.output_tokens += output;
-            stats.cache_read_tokens += cache_read;
-            stats.cache_write_tokens += cache_write;
-
-            if let Some(model) = v
-                .get("message")
-                .and_then(|m| m.get("model"))
-                .and_then(|m| m.as_str())
-            {
-                let key = normalize_model_for_display(model);
-                let entry = stats.models.entry(key).or_default();
-                entry.input_tokens += input + cache_read;
-                entry.output_tokens += output;
+            for id in ids {
+                session_ids.insert(id);
             }
         }
     }
 
     stats.sessions = session_ids.len() as u64;
     Ok(Some(stats))
+}
+
+/// Parse a single Pi JSONL file.
+///
+/// Returns the per-file token totals plus any session ids found in
+/// `type:session` records (Pi's session ids are file-scoped but tracked
+/// globally to dedupe across files).
+async fn parse_pi_file(path: &Path) -> Option<(FileEntry, Vec<String>)> {
+    let file = fs::File::open(path).await.ok()?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let mut entry = FileEntry::default();
+    let mut session_ids: Vec<String> = Vec::new();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if v.get("type").and_then(|t| t.as_str()) == Some("session")
+            && let Some(sid) = v.get("id").and_then(|s| s.as_str())
+        {
+            session_ids.push(sid.to_string());
+        }
+
+        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+
+        let usage = match v.get("message").and_then(|m| m.get("usage")) {
+            Some(u) => u,
+            None => continue,
+        };
+
+        let input = usage.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
+        let output = usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_read = usage.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_write = usage
+            .get("cacheWrite")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        // Pi's `usage.input` already excludes `cacheRead`, so it matches
+        // Claude's fresh-only convention as-is. Don't add cache to it.
+        entry.input_tokens += input;
+        entry.output_tokens += output;
+        entry.cache_read_tokens += cache_read;
+        entry.cache_write_tokens += cache_write;
+
+        if let Some(model) = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str())
+        {
+            let key = normalize_model_for_display(model);
+            let e = entry.models.entry(key).or_default();
+            e.0 += input;
+            e.1 += output;
+        }
+    }
+
+    entry.has_session = !session_ids.is_empty()
+        || entry.input_tokens > 0
+        || entry.output_tokens > 0
+        || entry.cache_read_tokens > 0;
+    Some((entry, session_ids))
 }
 
 // ---------------------------------------------------------------------------
@@ -886,6 +923,101 @@ mod tests {
         // Tokens are still real API spend and should be preserved.
         assert_eq!(entry.input_tokens, 10);
         assert_eq!(entry.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn parse_gemini_file_subtracts_cached_from_input() {
+        // Gemini's `tokens.input` is the total turn input INCLUDING the
+        // `tokens.cached` portion. Normalize to fresh-only.
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"sessionId":"s1","messages":[
+            {"type":"user","content":"hi"},
+            {"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":7613,"output":11,"cached":7036,"thoughts":29,"tool":0,"total":7653}}
+        ]}"#;
+        let path = dir.path().join("session-x.json");
+        fs::write(&path, body).await.unwrap();
+        let entry = parse_gemini_file(&path).await.unwrap();
+        assert_eq!(
+            entry.input_tokens,
+            7613 - 7036,
+            "input should exclude cached portion"
+        );
+        assert_eq!(entry.output_tokens, 11);
+        assert_eq!(entry.cache_read_tokens, 7036);
+        let (m_in, m_out) = entry.models.get("gemini-2.5-flash").copied().unwrap();
+        assert_eq!(m_in, 7613 - 7036);
+        assert_eq!(m_out, 11);
+    }
+
+    #[tokio::test]
+    async fn parse_gemini_file_sums_multiple_messages_with_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"messages":[
+            {"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":1000,"output":50,"cached":800}},
+            {"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":2000,"output":100,"cached":1500}}
+        ]}"#;
+        let path = dir.path().join("session-y.json");
+        fs::write(&path, body).await.unwrap();
+        let entry = parse_gemini_file(&path).await.unwrap();
+        assert_eq!(entry.input_tokens, (1000 - 800) + (2000 - 1500));
+        assert_eq!(entry.output_tokens, 150);
+        assert_eq!(entry.cache_read_tokens, 800 + 1500);
+    }
+
+    #[tokio::test]
+    async fn parse_pi_file_keeps_input_fresh_only() {
+        // Pi's `usage.input` already excludes `cacheRead`. The previous
+        // implementation added `cacheRead` to it, double-counting cache.
+        let dir = tempfile::tempdir().unwrap();
+        let session_record = r#"{"type":"session","id":"sess-abc"}"#;
+        let message_record = r#"{"type":"message","message":{"model":"pi-coder","usage":{"input":38,"output":23,"cacheRead":5376,"cacheWrite":0,"totalTokens":5437}}}"#;
+        let path = write_jsonl(&dir, "sess.jsonl", &[session_record, message_record]).await;
+        let (entry, ids) = parse_pi_file(&path).await.unwrap();
+        assert_eq!(entry.input_tokens, 38, "input must be the fresh-only value");
+        assert_eq!(entry.output_tokens, 23);
+        assert_eq!(entry.cache_read_tokens, 5376);
+        assert_eq!(entry.cache_write_tokens, 0);
+        let (m_in, m_out) = entry.models.get("pi-coder").copied().unwrap();
+        assert_eq!(m_in, 38);
+        assert_eq!(m_out, 23);
+        assert_eq!(ids, vec!["sess-abc".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn parse_codex_file_subtracts_cached_from_input() {
+        // Codex's `input_tokens` in `total_token_usage` is the total input
+        // for the session INCLUDING cached tokens. aivo's display treats
+        // `input_tokens` as "fresh only" (Claude's convention), so the
+        // parser must subtract `cached_input_tokens` before storing.
+        let dir = tempfile::tempdir().unwrap();
+        let turn_context = r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#;
+        let token_event = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":13482,"cached_input_tokens":3968,"output_tokens":202,"total_tokens":13684},"model_context_window":258400}}}"#;
+        let path = write_jsonl(&dir, "rollout.jsonl", &[turn_context, token_event]).await;
+        let entry = parse_codex_file(&path).await.unwrap();
+        assert!(entry.has_session);
+        assert_eq!(
+            entry.input_tokens,
+            13482 - 3968,
+            "input should exclude cached portion"
+        );
+        assert_eq!(entry.output_tokens, 202);
+        assert_eq!(entry.cache_read_tokens, 3968);
+        // Per-model tuple should also store fresh-only input.
+        let (m_in, m_out) = entry.models.get("gpt-5.4").copied().unwrap();
+        assert_eq!(m_in, 13482 - 3968);
+        assert_eq!(m_out, 202);
+    }
+
+    #[tokio::test]
+    async fn parse_codex_file_handles_cached_equal_to_input() {
+        // Degenerate case: cached >= input. Use saturating_sub to avoid underflow.
+        let dir = tempfile::tempdir().unwrap();
+        let token_event = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":500,"output_tokens":10,"total_tokens":510}}}}"#;
+        let path = write_jsonl(&dir, "rollout.jsonl", &[token_event]).await;
+        let entry = parse_codex_file(&path).await.unwrap();
+        assert_eq!(entry.input_tokens, 0);
+        assert_eq!(entry.output_tokens, 10);
+        assert_eq!(entry.cache_read_tokens, 500);
     }
 
     #[tokio::test]
