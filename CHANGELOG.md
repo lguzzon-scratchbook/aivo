@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.16.2
+
+### Bug Fixes
+
+- Normalize `input_tokens` to fresh-only across all stats parsers for consistent accounting
+- Exclude subagent sidechain files from Claude session count
+- Add Claude Code env vars for timeouts, attribution, and subagent model
+- Handle Ollama pull errors instead of silently succeeding
+- Refresh PATH from login shell after tool install
+- Move `--version` and `--help` before service init and improve smoke test diagnostics
+
 ## v0.16.1
 
 ### Bug Fixes
