@@ -22,6 +22,26 @@ enum KeySelection {
     NotFound,
 }
 
+// Force cooked (canonical + echo) mode on stdin. The `console` crate's FuzzySelect
+// can leave termios flags off on macOS, and a previously-crashed `aivo` invocation
+// may have left the terminal corrupted. `crossterm::disable_raw_mode` is a no-op
+// when crossterm didn't enable raw mode itself, so we shell out to `stty sane`.
+// Call this at entry of an interactive flow and after any FuzzySelect exits.
+#[cfg(unix)]
+fn restore_cooked_mode() {
+    let _ = std::process::Command::new("stty")
+        .arg("sane")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn restore_cooked_mode() {
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
 // Reads a line from stdin, flushing the prompt first so it appears before blocking.
 fn term_read_line(prompt: &str) -> std::io::Result<String> {
     use std::io::{BufRead, Write};
@@ -114,6 +134,13 @@ struct AddKeyOptions<'a> {
     key: Option<&'a str>,
 }
 
+/// Outcome of prompting the user about a conflicting existing key.
+enum ReplaceDecision {
+    NoExisting,
+    Replace(String),
+    Abort,
+}
+
 fn print_ping_result(result: &PingResult, max_name_len: usize) {
     let icon = match &result.status {
         PingStatus::Ok => style::green(result.status.icon()),
@@ -140,6 +167,56 @@ fn print_ping_result(result: &PingResult, max_name_len: usize) {
 
 fn detect_base_url(name: &str) -> Option<&str> {
     crate::services::known_providers::find_by_name_substring(name).map(|p| p.base_url.as_str())
+}
+
+/// Placeholder used in `providers.json` for Cloudflare Workers AI account ID.
+const CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER: &str = "${CLOUDFLARE_ACCOUNT_ID}";
+
+/// Validates a user-supplied base URL. Returns `Err` with a user-facing message
+/// if the URL is malformed. Accepts `http(s)://host[/path]` with no whitespace.
+fn validate_base_url(url: &str) -> Result<(), &'static str> {
+    let rest = if let Some(r) = url.strip_prefix("https://") {
+        r
+    } else if let Some(r) = url.strip_prefix("http://") {
+        r
+    } else {
+        return Err("URL must start with http:// or https://");
+    };
+    if url.chars().any(char::is_whitespace) {
+        return Err("URL must not contain whitespace");
+    }
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return Err("URL must include a host");
+    }
+    Ok(())
+}
+const CLOUDFLARE_PROVIDER_ID: &str = "cloudflare-workers-ai";
+const PICKER_LABEL_WIDTH: usize = 36;
+const PICKER_URL_MAX_LEN: usize = 50;
+
+fn format_picker_choice(label: &str, hint: &str) -> String {
+    format!(
+        "{:<width$} {}",
+        label,
+        style::dim(hint),
+        width = PICKER_LABEL_WIDTH
+    )
+}
+
+/// Prompts for a secret. If the user enters nothing, asks whether to save
+/// without one; loops until a value is provided or confirmation is given.
+fn prompt_secret(prompt: &str, secret_noun: &str) -> std::io::Result<String> {
+    loop {
+        let input = term_read_secret(&style::dim(prompt))?;
+        if !input.is_empty() {
+            return Ok(input);
+        }
+        let confirm_prompt = style::yellow(format!("Save without {}?", secret_noun));
+        if confirm(&confirm_prompt)? {
+            return Ok(String::new());
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -853,6 +930,273 @@ impl KeysCommand {
         Ok(ExitCode::Success)
     }
 
+    /// Shows the provider picker, then routes to the appropriate add flow.
+    /// `name` is the pre-collected key name (may be empty — each arm supplies
+    /// its own default when empty).
+    async fn interactive_add(&self, name: &str) -> Result<ExitCode> {
+        enum ProviderChoice {
+            Known(usize),
+            Copilot,
+            Ollama,
+            Starter,
+            Custom,
+        }
+
+        let providers = crate::services::known_providers::all();
+        let existing_keys = self.session_store.get_keys().await?;
+        let has_starter = existing_keys
+            .iter()
+            .any(|k| is_aivo_starter_base(&k.base_url));
+
+        let mut choices: Vec<ProviderChoice> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+
+        labels.push(format_picker_choice("Custom URL", "enter manually"));
+        choices.push(ProviderChoice::Custom);
+
+        for (i, p) in providers.iter().enumerate() {
+            let url = truncate_url_for_display(&p.base_url, PICKER_URL_MAX_LEN);
+            labels.push(format_picker_choice(&p.name, &url));
+            choices.push(ProviderChoice::Known(i));
+        }
+
+        // Ollama is pickable like a regular provider, but retains its own flow
+        // (installation check, no API key). The `aivo keys add ollama` shortcut
+        // also continues to work via the non-interactive path.
+        labels.push(format_picker_choice(
+            "Ollama",
+            &crate::services::ollama::ollama_openai_base_url(),
+        ));
+        choices.push(ProviderChoice::Ollama);
+
+        labels.push(format_picker_choice("GitHub Copilot", "device login"));
+        choices.push(ProviderChoice::Copilot);
+
+        // Starter is a singleton — hide the picker entry once one is already set up.
+        if !has_starter {
+            labels.push(format_picker_choice("aivo starter", "free"));
+            choices.push(ProviderChoice::Starter);
+        }
+
+        let selection = FuzzySelect::new()
+            .with_prompt("Provider")
+            .items(&labels)
+            .default(0)
+            .interact_opt()?;
+
+        let Some(idx) = selection else {
+            return Ok(ExitCode::Success);
+        };
+
+        // FuzzySelect's `console` crate can leave termios flags off.
+        restore_cooked_mode();
+
+        let picked_label = match &choices[idx] {
+            ProviderChoice::Known(i) => providers[*i].name.as_str(),
+            ProviderChoice::Copilot => "GitHub Copilot",
+            ProviderChoice::Ollama => "Ollama",
+            ProviderChoice::Starter => "aivo starter",
+            ProviderChoice::Custom => "Custom URL",
+        };
+        println!("{} {}", style::dim("Provider:"), style::cyan(picked_label));
+
+        match &choices[idx] {
+            ProviderChoice::Known(i) => self.add_known_provider(name, &providers[*i]).await,
+            ProviderChoice::Copilot => self.add_copilot_interactive(name).await,
+            ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
+            ProviderChoice::Starter => self.add_starter_interactive(name).await,
+            ProviderChoice::Custom => self.add_custom_interactive(name).await,
+        }
+    }
+
+    async fn add_known_provider(
+        &self,
+        name: &str,
+        provider: &crate::services::known_providers::KnownProvider,
+    ) -> Result<ExitCode> {
+        let name = if name.is_empty() {
+            provider.id.clone()
+        } else {
+            name.to_string()
+        };
+        let is_cloudflare = provider.id == CLOUDFLARE_PROVIDER_ID;
+
+        let base_url = if provider
+            .base_url
+            .contains(CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER)
+        {
+            let account_id = loop {
+                let input = term_read_line(&style::dim("Cloudflare Account ID: "))?;
+                if !input.is_empty() {
+                    break input;
+                }
+                eprintln!("{} Account ID is required", style::red("Error:"));
+            };
+            provider
+                .base_url
+                .replace(CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER, &account_id)
+        } else {
+            provider.base_url.clone()
+        };
+
+        let (key_prompt, secret_noun) = if is_cloudflare {
+            ("Auth Token: ", "an auth token")
+        } else {
+            ("API Key: ", "an API key")
+        };
+        let key = prompt_secret(key_prompt, secret_noun)?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(&name, &base_url, None, &key)
+            .await?;
+        self.finalize_add(
+            &id,
+            &name,
+            &format!("Base URL: {}", base_url),
+            Some(("aivo run <tool>", "(uses this key)")),
+        )
+        .await?;
+        sync_models_in_background(&id, &base_url);
+        Ok(ExitCode::Success)
+    }
+
+    async fn add_copilot_interactive(&self, name: &str) -> Result<ExitCode> {
+        let decision = self.confirm_replace_existing("copilot", "Copilot").await?;
+        if matches!(decision, ReplaceDecision::Abort) {
+            return Ok(ExitCode::Success);
+        }
+
+        let token = crate::services::copilot_auth::device_flow_login().await?;
+        if let ReplaceDecision::Replace(old_id) = decision {
+            self.session_store.delete_key(&old_id).await?;
+        }
+
+        let name = if name.is_empty() { "copilot" } else { name };
+        let id = self
+            .session_store
+            .add_key_with_protocol(name, "copilot", None, &token)
+            .await?;
+        self.finalize_add(
+            &id,
+            name,
+            "Provider: GitHub Copilot",
+            Some(("aivo run claude", "(uses Copilot subscription)")),
+        )
+        .await?;
+        sync_models_in_background(&id, "copilot");
+        Ok(ExitCode::Success)
+    }
+
+    async fn add_ollama_interactive(&self, name: &str) -> Result<ExitCode> {
+        let decision = self.confirm_replace_existing("ollama", "Ollama").await?;
+        if matches!(decision, ReplaceDecision::Abort) {
+            return Ok(ExitCode::Success);
+        }
+
+        crate::services::ollama::ensure_ready().await?;
+        if let ReplaceDecision::Replace(old_id) = decision {
+            self.session_store.delete_key(&old_id).await?;
+        }
+
+        let name = if name.is_empty() { "ollama" } else { name };
+        let id = self
+            .session_store
+            .add_key_with_protocol(name, "ollama", None, "ollama-local")
+            .await?;
+        self.finalize_add(
+            &id,
+            name,
+            "Provider: Ollama (local)",
+            Some(("aivo models", "(list local models)")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
+    }
+
+    async fn add_starter_interactive(&self, name: &str) -> Result<ExitCode> {
+        let _ = self.session_store.set_starter_key_dismissed(false).await;
+
+        let (starter, _) = self
+            .session_store
+            .ensure_starter_key()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Failed to create aivo starter key"))?;
+        let display_name = if name.is_empty() {
+            "aivo-starter"
+        } else {
+            name
+        };
+        self.finalize_add(
+            &starter.id,
+            display_name,
+            "Provider: aivo starter (free)",
+            Some(("aivo chat", "(start chatting)")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
+    }
+
+    async fn add_custom_interactive(&self, name: &str) -> Result<ExitCode> {
+        let base_url = loop {
+            let input =
+                term_read_line(&style::dim("Base URL (e.g., https://api.openai.com/v1): "))?;
+            if input.is_empty() {
+                continue;
+            }
+            match validate_base_url(&input) {
+                Ok(()) => break input,
+                Err(msg) => {
+                    eprintln!("{} {}", style::red("Error:"), msg);
+                }
+            }
+        };
+
+        let key = prompt_secret("API Key: ", "an API key")?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(name, &base_url, None, &key)
+            .await?;
+        self.finalize_add(
+            &id,
+            name,
+            &format!("Base URL: {}", base_url),
+            Some(("aivo run <tool>", "(uses this key)")),
+        )
+        .await?;
+        sync_models_in_background(&id, &base_url);
+        Ok(ExitCode::Success)
+    }
+
+    /// Prompts to replace any existing key with the given `base_url`.
+    /// - Returns `Ok(Some(id))` — caller must delete `id` before adding the new key.
+    /// - Returns `Ok(None)` when there was no existing key (caller proceeds).
+    /// - Returns `Err` on IO error; aborts on user decline by returning early via this type.
+    async fn confirm_replace_existing(
+        &self,
+        base_url: &str,
+        label: &str,
+    ) -> Result<ReplaceDecision> {
+        let existing_keys = self.session_store.get_keys().await?;
+        let Some(existing) = existing_keys.iter().find(|k| k.base_url == base_url) else {
+            return Ok(ReplaceDecision::NoExisting);
+        };
+        let answer = term_read_line(&style::dim(format!(
+            "{} {} key '{}' (ID: {}) already exists. Replace it? [y/N] ",
+            style::yellow("Warning:"),
+            label,
+            existing.name,
+            existing.id
+        )))?;
+        if matches!(answer.to_lowercase().as_str(), "y" | "yes") {
+            Ok(ReplaceDecision::Replace(existing.id.clone()))
+        } else {
+            println!("Aborted.");
+            Ok(ReplaceDecision::Abort)
+        }
+    }
+
     /// Interactively adds an API key
     async fn add_key(
         &self,
@@ -873,6 +1217,9 @@ impl KeysCommand {
             return Ok(ExitCode::UserError);
         }
 
+        // Defensive: a previously-crashed invocation may have left the terminal
+        // in raw mode, which breaks backspace in the first prompt.
+        restore_cooked_mode();
         let name = if let Some(n) = add_options.name.or(provided_name) {
             n.to_string()
         } else if add_options.base_url.is_some() && add_options.key.is_some() {
@@ -880,6 +1227,17 @@ impl KeysCommand {
         } else {
             read_line("Name (optional): ")?
         };
+
+        let is_name_shortcut = matches!(
+            name.as_str(),
+            "copilot" | "ollama" | "aivo-starter" | "aivo starter"
+        );
+        let interactive =
+            add_options.base_url.is_none() && add_options.key.is_none() && !is_name_shortcut;
+
+        if interactive {
+            return self.interactive_add(&name).await;
+        }
 
         // Shortcut: `aivo keys add copilot` skips all prompts unless flags conflict.
         let base_url = if name == "copilot" {
@@ -1577,16 +1935,16 @@ mod tests {
         );
         assert_eq!(detect_base_url("xai"), Some("https://api.x.ai/v1"));
         assert_eq!(
-            detect_base_url("fireworks"),
-            Some("https://api.fireworks.ai/inference/v1")
+            detect_base_url("fireworks-ai"),
+            Some("https://api.fireworks.ai/inference/v1/")
         );
         assert_eq!(
-            detect_base_url("moonshot"),
+            detect_base_url("moonshotai"),
             Some("https://api.moonshot.ai/v1")
         );
         assert_eq!(
             detect_base_url("minimax"),
-            Some("https://api.minimax.io/anthropic")
+            Some("https://api.minimax.io/anthropic/v1")
         );
         assert_eq!(
             detect_base_url("vercel"),
@@ -1626,6 +1984,19 @@ mod tests {
     fn test_detect_base_url_no_match() {
         assert_eq!(detect_base_url("random"), None);
         assert_eq!(detect_base_url(""), None);
+    }
+
+    #[test]
+    fn test_validate_base_url() {
+        assert!(validate_base_url("https://api.example.com").is_ok());
+        assert!(validate_base_url("http://localhost:8080").is_ok());
+        assert!(validate_base_url("https://api.example.com/v1/path").is_ok());
+
+        assert!(validate_base_url("ftp://example.com").is_err());
+        assert!(validate_base_url("example.com").is_err());
+        assert!(validate_base_url("https://").is_err());
+        assert!(validate_base_url("https:// example.com").is_err());
+        assert!(validate_base_url("https://example.com/path with space").is_err());
     }
 
     #[test]
