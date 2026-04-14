@@ -46,12 +46,18 @@ impl FuzzySelect {
         let page_size = 10;
 
         loop {
-            let filtered: Vec<(usize, &String)> = self
+            let mut filtered: Vec<(usize, &String)> = self
                 .items
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| matches_fuzzy(&query, item))
                 .collect();
+
+            if !query.is_empty() {
+                // `sort_by_cached_key` scores each item once and is stable, so
+                // equal-score items keep their original insertion order.
+                filtered.sort_by_cached_key(|(_, item)| score_match(&query, item));
+            }
 
             let count = filtered.len();
 
@@ -222,6 +228,43 @@ fn truncate_to_width(s: &str, width: usize) -> String {
     result
 }
 
+/// Ranks a matching target against a query. Lower is better.
+///
+/// Assumes `matches_fuzzy(query, target)` is true (i.e. already passed filter).
+/// Tuple components, in priority order:
+///   0. rank: 0 = case-insensitive prefix, 1 = case-insensitive substring,
+///            2 = subsequence-only.
+///   1. position: byte index of the match start (earlier wins). For
+///      subsequence matches, the byte index of the first query char in target.
+///   2. target length: shorter target wins for otherwise-equal matches, so
+///      exact-length hits float above longer strings with the query embedded.
+pub(crate) fn score_match(query: &str, target: &str) -> (u8, usize, usize) {
+    // ASCII case-folding to stay consistent with `matches_fuzzy`, which uses
+    // `eq_ignore_ascii_case`. Picker content (provider names, URLs, model IDs)
+    // is ASCII-dominant, and `target.len()` byte length is a fine tiebreak.
+    let q_lower = query.to_ascii_lowercase();
+    let t_lower = target.to_ascii_lowercase();
+
+    if t_lower.starts_with(&q_lower) {
+        return (0, 0, target.len());
+    }
+    if let Some(pos) = t_lower.find(&q_lower) {
+        return (1, pos, target.len());
+    }
+    // Invariant: `matches_fuzzy(query, target)` was true, so the first query
+    // char must appear somewhere in target.
+    let first_q = q_lower
+        .chars()
+        .next()
+        .expect("score_match called with empty query; guarded by !query.is_empty()");
+    let pos = t_lower
+        .char_indices()
+        .find(|(_, c)| *c == first_q)
+        .map(|(i, _)| i)
+        .expect("matches_fuzzy guarantees the first query char is present");
+    (2, pos, target.len())
+}
+
 pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
     let mut q_chars = query.chars();
     let mut current_q_char = match q_chars.next() {
@@ -243,7 +286,7 @@ pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_next_key, is_previous_key};
+    use super::{is_next_key, is_previous_key, score_match};
     use console::Key;
 
     #[test]
@@ -258,5 +301,62 @@ mod tests {
         assert!(is_previous_key(&Key::Char('\x10')));
         assert!(is_next_key(&Key::ArrowDown));
         assert!(is_next_key(&Key::Char('\x0e')));
+    }
+
+    #[test]
+    fn score_prefers_prefix_over_substring_over_subsequence() {
+        // "openai" prefix-matches the literal "openai" provider label, contains-matches
+        // "groq …/openai/v1", and only subsequence-matches "OpenRouter …openrouter.ai".
+        let prefix = score_match("openai", "openai   https://api.openai.com");
+        let substr = score_match("openai", "groq     https://api.groq.com/openai/v1");
+        let subseq = score_match("openai", "OpenRouter https://openrouter.ai/api/v1");
+        assert_eq!(prefix.0, 0);
+        assert_eq!(substr.0, 1);
+        assert_eq!(subseq.0, 2);
+        assert!(prefix < substr);
+        assert!(substr < subseq);
+    }
+
+    #[test]
+    fn score_prefers_earlier_substring_match() {
+        let early = score_match("api", "api-server  https://example.com");
+        let late = score_match("api", "Zhipu AI    https://open.bigmodel.cn/api/v4");
+        // Both are substring matches (rank 1), earlier position wins.
+        assert_eq!(early.0, 0); // actually starts_with → rank 0, even better
+        assert!(early < late);
+
+        // Two substring matches, neither prefix.
+        let a = score_match("foo", "bar foo baz");
+        let b = score_match("foo", "bar baz foo");
+        assert_eq!(a.0, 1);
+        assert_eq!(b.0, 1);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn score_is_case_insensitive() {
+        let upper = score_match("OPENAI", "openai   https://api.openai.com");
+        let lower = score_match("openai", "OPENAI   https://api.openai.com");
+        assert_eq!(upper.0, 0);
+        assert_eq!(lower.0, 0);
+    }
+
+    #[test]
+    fn score_tiebreaks_by_length_for_equal_rank_and_position() {
+        let short = score_match("foo", "foo");
+        let long = score_match("foo", "foobar baz qux");
+        assert_eq!(short.0, 0);
+        assert_eq!(long.0, 0);
+        assert!(short < long);
+    }
+
+    #[test]
+    fn stable_sort_preserves_original_order_within_ties() {
+        // Two items with identical scores: sort_by_cached_key is stable.
+        let items = vec!["openai one".to_string(), "openai two".to_string()];
+        let mut filtered: Vec<(usize, &String)> = items.iter().enumerate().collect();
+        filtered.sort_by_cached_key(|(_, item)| score_match("openai", item));
+        assert_eq!(filtered[0].0, 0);
+        assert_eq!(filtered[1].0, 1);
     }
 }
