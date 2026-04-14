@@ -20,16 +20,20 @@ static KNOWN_PROVIDERS: LazyLock<Vec<KnownProvider>> = LazyLock::new(|| {
         .expect("embedded providers.json must be valid")
 });
 
-/// Find a provider whose id appears as a substring in the input
-/// (case-insensitive). Used by `keys add` for auto-detecting base URLs from
-/// key names like "my-openrouter-key".
+/// Find a provider whose id or display name matches the input as a substring
+/// in either direction (case-insensitive). Matches both "my-openrouter-key"
+/// (id contained in input) and "google" (input contained in id or name).
 pub fn find_by_name_substring(input: &str) -> Option<&KnownProvider> {
+    if input.is_empty() {
+        return None;
+    }
+    let input_lower = input.to_ascii_lowercase();
     KNOWN_PROVIDERS.iter().find(|p| {
-        input.len() >= p.id.len()
-            && input
-                .as_bytes()
-                .windows(p.id.len())
-                .any(|w| w.eq_ignore_ascii_case(p.id.as_bytes()))
+        let id_lower = p.id.to_ascii_lowercase();
+        let name_lower = p.name.to_ascii_lowercase();
+        id_lower.contains(&input_lower)
+            || name_lower.contains(&input_lower)
+            || input_lower.contains(&id_lower)
     })
 }
 

@@ -950,14 +950,19 @@ impl KeysCommand {
 
         let mut choices: Vec<ProviderChoice> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
+        let mut preselected: Option<usize> = None;
 
         labels.push(format_picker_choice("Custom URL", "enter manually"));
         choices.push(ProviderChoice::Custom);
 
+        let detected_url = (!name.is_empty()).then(|| detect_base_url(name)).flatten();
         for (i, p) in providers.iter().enumerate() {
             let url = truncate_url_for_display(&p.base_url, PICKER_URL_MAX_LEN);
             labels.push(format_picker_choice(&p.name, &url));
             choices.push(ProviderChoice::Known(i));
+            if preselected.is_none() && detected_url == Some(p.base_url.as_str()) {
+                preselected = Some(labels.len() - 1);
+            }
         }
 
         // Ollama is pickable like a regular provider, but retains its own flow
@@ -981,7 +986,7 @@ impl KeysCommand {
         let selection = FuzzySelect::new()
             .with_prompt("Provider")
             .items(&labels)
-            .default(0)
+            .default(preselected.unwrap_or(0))
             .interact_opt()?;
 
         let Some(idx) = selection else {

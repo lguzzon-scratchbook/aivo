@@ -1,6 +1,9 @@
 [
   {"id":"openrouter","name":"OpenRouter","base_url":"https://openrouter.ai/api/v1"},
   {"id":"vercel", "name": "Vercel AI Gateway", "base_url": "https://ai-gateway.vercel.sh/v1"},
+  {"id":"anthropic","name": "anthropic", "base_url": "https://api.anthropic.com"},
+  {"id":"openai","name": "openai", "base_url": "https://api.openai.com"},
+  {"id":"google-ai-studio","name": "Google AI Studio", "base_url":"https://generativelanguage.googleapis.com"},
   {"id":"fireworks-ai","name":"Fireworks AI","base_url":"https://api.fireworks.ai/inference/v1/"},
   {"id":"deepseek","name":"DeepSeek","base_url":"https://api.deepseek.com/v1"},
   {"id":"xai","name": "xai", "base_url": "https://api.x.ai/v1"},
@@ -16,8 +19,6 @@
   {"id":"zhipuai-coding-plan","name":"Zhipu AI Coding Plan","base_url":"https://open.bigmodel.cn/api/coding/paas/v4"},
   {"id":"minimax","name":"MiniMax","base_url":"https://api.minimax.io/anthropic/v1"},
   {"id":"minimax-cn","name":"MiniMax (China)","base_url":"https://api.minimaxi.com/anthropic/v1"},
-  {"id":"anthropic","name": "anthropic", "base_url": "https://api.anthropic.com"},
-  {"id":"openai","name": "openai", "base_url": "https://api.openai.com"},
   {"id":"alibaba","name":"Alibaba","base_url":"https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
   {"id":"alibaba-cn","name":"Alibaba (China)","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1"},
   {"id":"alibaba-coding-plan","name":"Alibaba Coding Plan","base_url":"https://coding-intl.dashscope.aliyuncs.com/v1"},
