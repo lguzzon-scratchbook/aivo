@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::cli::KeysArgs;
+use crate::commands::keys_ui;
 use crate::commands::truncate_url_for_display;
 use crate::tui::FuzzySelect;
 
@@ -196,6 +197,12 @@ fn validate_base_url(url: &str) -> Result<(), &'static str> {
 const CLOUDFLARE_PROVIDER_ID: &str = "cloudflare-workers-ai";
 const PICKER_LABEL_WIDTH: usize = 36;
 const PICKER_URL_MAX_LEN: usize = 50;
+
+/// Provider info lines shown after picker selection / during shortcut flows.
+/// Defined once so the interactive and shortcut paths stay in sync.
+const COPILOT_INFO: (&str, &str) = ("GitHub Copilot", "device login: github.com/login/device");
+const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
+const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
 fn format_picker_choice(label: &str, hint: &str) -> String {
     format!(
@@ -814,6 +821,7 @@ impl KeysCommand {
         let _ = self.session_store.clear_last_selection().await;
 
         let display_name = style::cyan(if name.is_empty() { id } else { name });
+        println!();
         println!(
             "{} Added and activated key: {}",
             style::success_symbol(),
@@ -823,12 +831,16 @@ impl KeysCommand {
         println!("  {}", style::dim(detail));
         println!();
         if let Some((cmd, desc)) = next_hint {
-            println!(
-                "{} {} {}",
-                style::yellow("Next:"),
-                style::bold(cmd),
-                style::dim(desc)
-            );
+            if desc.is_empty() {
+                println!("{} {}", style::yellow("Next:"), style::bold(cmd));
+            } else {
+                println!(
+                    "{} {} {}",
+                    style::yellow("Next:"),
+                    style::bold(cmd),
+                    style::dim(desc)
+                );
+            }
         }
         Ok(())
     }
@@ -1053,10 +1065,8 @@ impl KeysCommand {
         // Ollama is pickable like a regular provider, but retains its own flow
         // (installation check, no API key). The `aivo keys add ollama` shortcut
         // also continues to work via the non-interactive path.
-        labels.push(format_picker_choice(
-            "Ollama",
-            &crate::services::ollama::ollama_openai_base_url(),
-        ));
+        let ollama_base_url = crate::services::ollama::ollama_openai_base_url();
+        labels.push(format_picker_choice("Ollama", &ollama_base_url));
         choices.push(ProviderChoice::Ollama);
 
         labels.push(format_picker_choice("GitHub Copilot", "device login"));
@@ -1067,6 +1077,8 @@ impl KeysCommand {
             labels.push(format_picker_choice("aivo starter", "free"));
             choices.push(ProviderChoice::Starter);
         }
+
+        keys_ui::step_header(2, 3, "Provider", "preset or custom URL");
 
         let selection = FuzzySelect::new()
             .with_prompt("Provider")
@@ -1081,14 +1093,25 @@ impl KeysCommand {
         // FuzzySelect's `console` crate can leave termios flags off.
         restore_cooked_mode();
 
-        let picked_label = match &choices[idx] {
-            ProviderChoice::Known(i) => providers[*i].name.as_str(),
-            ProviderChoice::Copilot => "GitHub Copilot",
-            ProviderChoice::Ollama => "Ollama",
-            ProviderChoice::Starter => "aivo starter",
-            ProviderChoice::Custom => "Custom URL",
+        let (picked_label, picked_url): (&str, Option<String>) = match &choices[idx] {
+            ProviderChoice::Known(i) => (
+                providers[*i].name.as_str(),
+                Some(providers[*i].base_url.clone()),
+            ),
+            ProviderChoice::Copilot => ("GitHub Copilot", None),
+            ProviderChoice::Ollama => ("Ollama", Some(ollama_base_url.clone())),
+            ProviderChoice::Starter => ("aivo starter", None),
+            ProviderChoice::Custom => ("Custom URL", None),
         };
-        println!("{} {}", style::dim("Provider:"), style::cyan(picked_label));
+        match picked_url {
+            Some(url) => println!(
+                "{} {}  {}",
+                style::dim("Provider:"),
+                style::cyan(picked_label),
+                style::dim(url),
+            ),
+            None => println!("{} {}", style::dim("Provider:"), style::cyan(picked_label)),
+        }
 
         match &choices[idx] {
             ProviderChoice::Known(i) => self.add_known_provider(name, &providers[*i]).await,
@@ -1115,6 +1138,12 @@ impl KeysCommand {
             .base_url
             .contains(CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER)
         {
+            keys_ui::step_header(
+                3,
+                3,
+                "Credentials",
+                "Cloudflare Account ID, then auth token",
+            );
             let account_id = loop {
                 let input = term_read_line(&style::dim("Cloudflare Account ID: "))?;
                 if !input.is_empty() {
@@ -1126,6 +1155,7 @@ impl KeysCommand {
                 .base_url
                 .replace(CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER, &account_id)
         } else {
+            keys_ui::step_header(3, 3, "API Key", "input is hidden");
             provider.base_url.clone()
         };
 
@@ -1144,7 +1174,7 @@ impl KeysCommand {
             &id,
             &name,
             &format!("Base URL: {}", base_url),
-            Some(("aivo run <tool>", "(uses this key)")),
+            Some(("aivo claude", "")),
         )
         .await?;
         sync_models_in_background(&id, &base_url);
@@ -1152,11 +1182,14 @@ impl KeysCommand {
     }
 
     async fn add_copilot_interactive(&self, name: &str) -> Result<ExitCode> {
+        keys_ui::provider_info(COPILOT_INFO.0, COPILOT_INFO.1);
+
         let decision = self.confirm_replace_existing("copilot", "Copilot").await?;
         if matches!(decision, ReplaceDecision::Abort) {
             return Ok(ExitCode::Success);
         }
 
+        keys_ui::step_header(3, 3, "Device login", "follow the code shown below");
         let token = crate::services::copilot_auth::device_flow_login().await?;
         if let ReplaceDecision::Replace(old_id) = decision {
             self.session_store.delete_key(&old_id).await?;
@@ -1179,11 +1212,14 @@ impl KeysCommand {
     }
 
     async fn add_ollama_interactive(&self, name: &str) -> Result<ExitCode> {
+        keys_ui::provider_info(OLLAMA_INFO.0, OLLAMA_INFO.1);
+
         let decision = self.confirm_replace_existing("ollama", "Ollama").await?;
         if matches!(decision, ReplaceDecision::Abort) {
             return Ok(ExitCode::Success);
         }
 
+        keys_ui::step_header(3, 3, "Verify local install", "checking ollama is reachable");
         crate::services::ollama::ensure_ready().await?;
         if let ReplaceDecision::Replace(old_id) = decision {
             self.session_store.delete_key(&old_id).await?;
@@ -1205,6 +1241,8 @@ impl KeysCommand {
     }
 
     async fn add_starter_interactive(&self, name: &str) -> Result<ExitCode> {
+        keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
+
         let _ = self.session_store.set_starter_key_dismissed(false).await;
 
         let (starter, _) = self
@@ -1228,6 +1266,7 @@ impl KeysCommand {
     }
 
     async fn add_custom_interactive(&self, name: &str) -> Result<ExitCode> {
+        keys_ui::step_header(3, 3, "Credentials", "base URL, then API key");
         let base_url = loop {
             let input = term_read_line(&style::dim("Base URL: "))?;
             if input.is_empty() {
@@ -1251,7 +1290,7 @@ impl KeysCommand {
             &id,
             name,
             &format!("Base URL: {}", base_url),
-            Some(("aivo run <tool>", "(uses this key)")),
+            Some(("aivo claude", "")),
         )
         .await?;
         sync_models_in_background(&id, &base_url);
@@ -1316,6 +1355,7 @@ impl KeysCommand {
             String::new()
         } else {
             name_was_prompted = true;
+            keys_ui::step_header(1, 3, "Name", "a short label for this key");
             read_line("Name (optional): ")?
         };
 
@@ -1431,6 +1471,8 @@ impl KeysCommand {
                 return Ok(ExitCode::UserError);
             }
 
+            keys_ui::provider_info(COPILOT_INFO.0, COPILOT_INFO.1);
+
             // Check for an existing Copilot key and prompt to replace
             let existing_keys = self.session_store.get_keys().await?;
             let existing_copilot_id =
@@ -1483,6 +1525,8 @@ impl KeysCommand {
                 return Ok(ExitCode::UserError);
             }
 
+            keys_ui::provider_info(OLLAMA_INFO.0, OLLAMA_INFO.1);
+
             crate::services::ollama::ensure_ready().await?;
 
             // Check for an existing Ollama key and prompt to replace
@@ -1525,6 +1569,8 @@ impl KeysCommand {
 
         // Aivo starter: free provider, no API key needed
         if base_url == crate::constants::AIVO_STARTER_SENTINEL {
+            keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
+
             // Clear the dismissed flag so ensure_starter_key works again
             let _ = self.session_store.set_starter_key_dismissed(false).await;
 
@@ -1568,7 +1614,7 @@ impl KeysCommand {
             &id,
             &name,
             &format!("Base URL: {}", base_url),
-            Some(("aivo run <tool>", "(uses this key)")),
+            Some(("aivo claude", "")),
         )
         .await?;
 

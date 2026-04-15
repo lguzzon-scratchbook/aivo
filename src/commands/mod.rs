@@ -30,6 +30,7 @@ pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
 pub mod info;
 pub mod keys;
+pub(crate) mod keys_ui;
 pub mod logs;
 pub mod models;
 pub mod run;
