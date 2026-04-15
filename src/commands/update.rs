@@ -27,6 +27,10 @@ const NPM_UPDATE_ARGS: [&str; 3] = ["install", "-g", "@yuanchuan/aivo@latest"];
 /// UpdateCommand handles CLI self-update via GitHub Releases
 pub struct UpdateCommand {
     client: Client,
+    /// Separate client for binary downloads: no total deadline, but a per-read
+    /// timeout so genuine stalls fail fast while slow-but-progressing
+    /// connections (common in regions with poor GitHub connectivity) survive.
+    download_client: Client,
 }
 
 /// GitHub Release asset from the API
@@ -97,7 +101,16 @@ impl UpdateCommand {
             .build()
             .context("Failed to create HTTP client")?;
 
-        Ok(Self { client })
+        let download_client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(60))
+            .build()
+            .context("Failed to create download HTTP client")?;
+
+        Ok(Self {
+            client,
+            download_client,
+        })
     }
 
     /// Executes the update command
@@ -372,82 +385,29 @@ impl UpdateCommand {
         expected_sha256: &str,
         binary_name: &str,
     ) -> Result<()> {
-        let mut response = {
-            let primary = self
-                .github_request(download_url)
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-                .ok()
-                .filter(|r| r.status().is_success());
-            match primary {
-                Some(resp) => resp,
-                None => {
-                    let mirror_url = format!("{}/{}", MIRROR_DOWNLOAD_BASE, binary_name);
-                    eprintln!("  Falling back to mirror...");
-                    let resp = self
-                        .client
-                        .get(&mirror_url)
-                        .header("User-Agent", "aivo-cli")
-                        .timeout(std::time::Duration::from_secs(600))
-                        .send()
-                        .await
-                        .context("Failed to download update")?;
-                    if !resp.status().is_success() {
-                        return Err(anyhow::anyhow!("Download failed: HTTP {}", resp.status()));
-                    }
-                    resp
-                }
-            }
-        };
-
-        let total_size = response.content_length().unwrap_or(0);
-
         // Determine install path
         let exec_path = get_install_path()?;
         let tmp_path = exec_path.with_extension("tmp");
 
-        // Stream the download directly to file with incremental hashing
-        let mut hasher = Sha256::new();
-        let mut downloaded: u64 = 0;
-        let mut file = tokio::fs::File::create(&tmp_path)
-            .await
-            .with_context(|| format!("Failed to create temporary file at {:?}", tmp_path))?;
-
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("Error reading download stream")?
-        {
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .with_context(|| format!("Failed to write to temporary file at {:?}", tmp_path))?;
-            downloaded += chunk.len() as u64;
-
-            if total_size > 0 {
-                let mb = downloaded as f64 / 1024.0 / 1024.0;
-                let total_mb = total_size as f64 / 1024.0 / 1024.0;
-                let percent = (downloaded as f64 / total_size as f64) * 100.0;
-                eprint!(
-                    "\r  {} {:.1}/{:.1} MB ({:.0}%)",
-                    style::dim("Downloading:"),
-                    mb,
-                    total_mb,
-                    percent
+        // Try GitHub first; if anything fails (initial connect OR mid-stream),
+        // wipe the partial file and retry the full download from the mirror.
+        let actual_sha256 = match self.download_to_file(download_url, &tmp_path).await {
+            Ok(sha) => sha,
+            Err(primary_err) => {
+                tokio::fs::remove_file(&tmp_path).await.ok();
+                eprintln!(
+                    "  {} {}",
+                    style::yellow("Primary download failed:"),
+                    style::dim(format!("{:#}", primary_err))
                 );
+                eprintln!("  Falling back to mirror...");
+                let mirror_url = format!("{}/{}", MIRROR_DOWNLOAD_BASE, binary_name);
+                self.download_to_file(&mirror_url, &tmp_path)
+                    .await
+                    .context("Failed to download update")?
             }
-        }
-        if let Err(e) = file.flush().await {
-            tokio::fs::remove_file(&tmp_path).await.ok();
-            return Err(e.into());
-        }
-        drop(file); // Close write FD before rename/exec to avoid ETXTBSY on Linux
-        if total_size > 0 {
-            eprintln!(); // newline after progress
-        }
+        };
 
-        let actual_sha256 = format!("{:x}", hasher.finalize());
         if actual_sha256 != expected_sha256 {
             tokio::fs::remove_file(&tmp_path).await.ok();
             return Err(anyhow::anyhow!(
@@ -537,6 +497,67 @@ impl UpdateCommand {
         }
 
         Ok(())
+    }
+
+    /// Streams a binary download into `tmp_path`, computes its SHA-256 on the
+    /// fly, and renders progress. Uses `download_client` (no total deadline,
+    /// only a per-read stall timeout) so slow connections that keep delivering
+    /// bytes finish instead of being killed mid-stream.
+    async fn download_to_file(&self, url: &str, tmp_path: &Path) -> Result<String> {
+        let mut req = self
+            .download_client
+            .get(url)
+            .header("User-Agent", "aivo-cli");
+        if let Some(token) = github_token_from_env() {
+            req = req.bearer_auth(token);
+        }
+        let mut response = req.send().await.context("Failed to start download")?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Download failed: HTTP {}",
+                response.status()
+            ));
+        }
+
+        let total_size = response.content_length().unwrap_or(0);
+
+        let mut hasher = Sha256::new();
+        let mut downloaded: u64 = 0;
+        let mut file = tokio::fs::File::create(tmp_path)
+            .await
+            .with_context(|| format!("Failed to create temporary file at {:?}", tmp_path))?;
+
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Error reading download stream")?
+        {
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed to write to temporary file at {:?}", tmp_path))?;
+            downloaded += chunk.len() as u64;
+
+            if total_size > 0 {
+                let mb = downloaded as f64 / 1024.0 / 1024.0;
+                let total_mb = total_size as f64 / 1024.0 / 1024.0;
+                let percent = (downloaded as f64 / total_size as f64) * 100.0;
+                eprint!(
+                    "\r  {} {:.1}/{:.1} MB ({:.0}%)",
+                    style::dim("Downloading:"),
+                    mb,
+                    total_mb,
+                    percent
+                );
+            }
+        }
+        file.flush().await?;
+        drop(file); // Close write FD before rename/exec to avoid ETXTBSY on Linux
+        if total_size > 0 {
+            eprintln!(); // newline after progress
+        }
+
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     /// Compares two semantic version strings.
