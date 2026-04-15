@@ -2,7 +2,7 @@
  * Response parsing for chat: SSE chunk parsing, usage extraction, think-tag
  * handling, and content/delta extraction for OpenAI and Anthropic formats.
  */
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::services::http_utils::parse_token_u64;
 
@@ -36,7 +36,7 @@ pub(crate) struct AssistantResponse {
     pub reasoning_content: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,

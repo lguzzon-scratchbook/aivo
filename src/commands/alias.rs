@@ -34,20 +34,38 @@ impl AliasCommand {
     async fn execute_internal(&self, args: AliasArgs) -> Result<ExitCode> {
         // `aivo alias rm <name>`
         if args.rm {
+            if args.json {
+                anyhow::bail!("--json only applies to listing aliases");
+            }
             return self.remove_alias(&args).await;
         }
 
         // `aivo alias name=model` or `aivo alias name model`
         if let Some(ref assignment) = args.assignment {
+            if args.json {
+                anyhow::bail!("--json only applies to listing aliases");
+            }
             return self.set_alias(assignment, args.value.as_deref()).await;
         }
 
         // `aivo alias` — list all
-        self.list_aliases().await
+        self.list_aliases(args.json).await
     }
 
-    async fn list_aliases(&self) -> Result<ExitCode> {
+    async fn list_aliases(&self, json: bool) -> Result<ExitCode> {
         let aliases = self.session_store.get_aliases().await?;
+
+        if json {
+            let mut entries: Vec<_> = aliases.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let payload: serde_json::Map<String, serde_json::Value> = entries
+                .into_iter()
+                .map(|(name, model)| (name, serde_json::Value::String(model)))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            return Ok(ExitCode::Success);
+        }
+
         if aliases.is_empty() {
             println!("{}", style::dim("No aliases defined."));
             println!();
@@ -182,11 +200,22 @@ impl AliasCommand {
         print_row("name model", "Create or update an alias");
         print_row("rm <name>", "Remove an alias");
         println!();
+        println!("{}", style::bold("Options:"));
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<14}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt("--json", "Output alias list as JSON (listing only)");
+        println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo alias fast=claude-haiku-4-5"));
         println!("  {}", style::dim("aivo alias best claude-sonnet-4-6"));
         println!("  {}", style::dim("aivo alias rm fast"));
         println!("  {}", style::dim("aivo alias"));
+        println!("  {}", style::dim("aivo alias --json"));
     }
 }
 

@@ -119,6 +119,7 @@ impl ChatTuiApp {
                     &history,
                     &mut format,
                     &spinning,
+                    false, // TUI always streams for live rendering
                     &mut on_chunk,
                 )
                 .await

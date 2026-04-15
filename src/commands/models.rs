@@ -4,7 +4,7 @@
  */
 use anyhow::Result;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -31,12 +31,16 @@ pub struct ModelsCommand {
 
 /// Rich model information for display. Fields are populated from API metadata
 /// when the provider returns them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelInfo {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<String>,
 }
 
@@ -222,8 +226,12 @@ impl ModelsCommand {
         key_override: Option<ApiKey>,
         refresh: bool,
         search: Option<String>,
+        json: bool,
     ) -> ExitCode {
-        match self.execute_internal(key_override, refresh, search).await {
+        match self
+            .execute_internal(key_override, refresh, search, json)
+            .await
+        {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -237,6 +245,7 @@ impl ModelsCommand {
         key_override: Option<ApiKey>,
         refresh: bool,
         search: Option<String>,
+        json: bool,
     ) -> Result<ExitCode> {
         let key = match key_override {
             Some(k) => k,
@@ -320,18 +329,27 @@ impl ModelsCommand {
             style::dim(&key.base_url)
         );
 
-        let name_w = models.iter().map(|m| m.id.len()).max().unwrap_or(0);
-        for model in &models {
-            println!("{}", format_model_line(model, name_w));
-        }
+        if json {
+            let payload = serde_json::json!({
+                "provider": key.base_url,
+                "is_static": is_static,
+                "models": models,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            let name_w = models.iter().map(|m| m.id.len()).max().unwrap_or(0);
+            for model in &models {
+                println!("{}", format_model_line(model, name_w));
+            }
 
-        if is_static {
-            eprintln!(
-                "{}",
-                style::dim(
-                    "Note: This provider does not have a model listing API. Showing a built-in list."
-                )
-            );
+            if is_static {
+                eprintln!(
+                    "{}",
+                    style::dim(
+                        "Note: This provider does not have a model listing API. Showing a built-in list."
+                    )
+                );
+            }
         }
 
         Ok(ExitCode::Success)
@@ -365,12 +383,14 @@ impl ModelsCommand {
         );
         print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
         print_opt("-s, --search <query>", "Filter models by substring match");
+        print_opt("--json", "Output model list as JSON instead of a table");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo models"));
         println!("  {}", style::dim("aivo models -s sonnet"));
         println!("  {}", style::dim("aivo models --key openrouter"));
         println!("  {}", style::dim("aivo models --refresh"));
+        println!("  {}", style::dim("aivo models --json | jq '.models[].id'"));
     }
 }
 

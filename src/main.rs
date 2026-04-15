@@ -142,6 +142,7 @@ async fn main() {
                     chat_args.attachments,
                     chat_args.refresh,
                     key_override,
+                    chat_args.json,
                 )
                 .await
         }
@@ -276,7 +277,12 @@ async fn main() {
             );
             let command = ModelsCommand::new(session_store, models_cache);
             command
-                .execute(key_override, models_args.refresh, models_args.search)
+                .execute(
+                    key_override,
+                    models_args.refresh,
+                    models_args.search,
+                    models_args.json,
+                )
                 .await
         }
 
@@ -326,7 +332,7 @@ async fn main() {
 
         Commands::Info(info_args) => {
             let command = InfoCommand::new(session_store);
-            command.execute(info_args.ping).await
+            command.execute(info_args.ping, info_args.json).await
         }
 
         Commands::Logs(logs_args) => {

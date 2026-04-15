@@ -6,7 +6,13 @@
  */
 use anyhow::Result;
 
-use crate::commands::keys::{PingResult, PingStatus, ping_keys_streaming};
+use serde_json::{Value, json};
+
+use std::collections::HashMap;
+
+use crate::commands::keys::{
+    PingResult, PingStatus, key_metadata_json, ping_keys_streaming, ping_result_json,
+};
 use crate::commands::truncate_url_for_display;
 use crate::errors::ExitCode;
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
@@ -14,6 +20,8 @@ use crate::services::session_store::SessionStore;
 use crate::services::system_env;
 use crate::style;
 use crate::version;
+
+const TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
 pub struct InfoCommand {
     session_store: SessionStore,
@@ -24,8 +32,8 @@ impl InfoCommand {
         Self { session_store }
     }
 
-    pub async fn execute(&self, check: bool) -> ExitCode {
-        match self.execute_internal(check).await {
+    pub async fn execute(&self, check: bool, json: bool) -> ExitCode {
+        match self.execute_internal(check, json).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -34,7 +42,11 @@ impl InfoCommand {
         }
     }
 
-    async fn execute_internal(&self, check: bool) -> Result<ExitCode> {
+    async fn execute_internal(&self, check: bool, json: bool) -> Result<ExitCode> {
+        if json {
+            return self.execute_json(check).await;
+        }
+
         // Header
         println!(
             "{} {}",
@@ -101,7 +113,7 @@ impl InfoCommand {
         println!();
         println!("{}", style::bold("Tools:"));
         let path_dirs = collect_path_dirs();
-        for tool in ["claude", "codex", "gemini", "opencode", "pi"] {
+        for tool in TOOLS {
             match find_in_dirs(tool, &path_dirs) {
                 Some(path) => println!(
                     "  {} {:8} {}",
@@ -160,6 +172,101 @@ impl InfoCommand {
         Ok(ExitCode::Success)
     }
 
+    /// Builds a structured JSON payload describing keys, tools, selection,
+    /// and (when `check` is true) ping results per key.
+    async fn execute_json(&self, check: bool) -> Result<ExitCode> {
+        let keys = self.session_store.get_keys().await?;
+        let cwd = system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
+        let last_sel = self.session_store.get_last_selection().await?;
+        let selected_key_id = last_sel.as_ref().map(|s| s.key_id.clone());
+
+        let config_path = self.session_store.get_config_path();
+        let config_exists = config_path.exists();
+
+        let (has_problems, mut ping_by_id) = if check && !keys.is_empty() {
+            let mut map: HashMap<String, Value> = HashMap::new();
+            let mut any_failed = false;
+            let (spinning, spinner_handle) = style::start_spinner(Some(" Pinging keys..."));
+            ping_keys_streaming(keys.clone(), |id, result| {
+                if !matches!(result.status, PingStatus::Ok) {
+                    any_failed = true;
+                }
+                map.insert(id.to_string(), ping_result_json(result));
+            })
+            .await;
+            style::stop_spinner(&spinning);
+            let _ = spinner_handle.await;
+            (any_failed, map)
+        } else {
+            (false, HashMap::new())
+        };
+
+        let keys_json: Vec<Value> = keys
+            .iter()
+            .map(|k| {
+                let mut obj = key_metadata_json(k, selected_key_id.as_deref());
+                if let Some(ping) = ping_by_id.remove(&k.id) {
+                    obj["ping"] = ping;
+                }
+                obj
+            })
+            .collect();
+
+        let path_dirs = collect_path_dirs();
+        let tools_json: Vec<Value> = TOOLS
+            .iter()
+            .map(|tool| match find_in_dirs(tool, &path_dirs) {
+                Some(path) => json!({
+                    "name": tool,
+                    "found": true,
+                    "path": path.display().to_string(),
+                }),
+                None => json!({
+                    "name": tool,
+                    "found": false,
+                    "path": Value::Null,
+                }),
+            })
+            .collect();
+
+        let selection_json = last_sel.as_ref().map(|sel| {
+            let key_name = keys
+                .iter()
+                .find(|k| k.id == sel.key_id)
+                .map(|k| k.display_name().to_string());
+            json!({
+                "key_id": sel.key_id,
+                "key_name": key_name,
+                "tool": sel.tool,
+                "model": sel.model,
+            })
+        });
+
+        let mut payload = json!({
+            "version": version::VERSION,
+            "cwd": cwd,
+            "config": {
+                "path": config_path.display().to_string(),
+                "exists": config_exists,
+            },
+            "keys": keys_json,
+            "tools": tools_json,
+            "selection": selection_json,
+        });
+        // Match the human path's pass/fail criteria: missing config or any failed
+        // ping is a problem; an empty key list alone is not.
+        if check {
+            payload["checks_passed"] = Value::Bool(config_exists && !has_problems);
+        }
+
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+
+        if check && (!config_exists || has_problems) {
+            return Ok(ExitCode::UserError);
+        }
+        Ok(ExitCode::Success)
+    }
+
     fn check_config(&self) -> bool {
         println!("{}", style::bold("Config:"));
 
@@ -186,7 +293,7 @@ impl InfoCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo info [--ping]", style::bold("Usage:"));
+        println!("{} aivo info [--ping] [--json]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
@@ -206,10 +313,16 @@ impl InfoCommand {
             );
         };
         print_opt("--ping", "Ping all keys and show pass/fail summary");
+        print_opt("--json", "Output info as JSON (combines with --ping)");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo info"));
         println!("  {}", style::dim("aivo info --ping"));
+        println!("  {}", style::dim("aivo info --json"));
+        println!(
+            "  {}",
+            style::dim("aivo info --ping --json | jq '.keys[] | select(.ping.ok==false)'")
+        );
     }
 }
 

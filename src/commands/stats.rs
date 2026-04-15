@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use serde_json::{Value, json};
+
 use crate::cli::StatsArgs;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
@@ -36,6 +38,9 @@ impl StatsCommand {
         let global = global_stats::collect_all(args.refresh).await;
 
         if stats.is_empty() && global.is_empty() {
+            if args.json {
+                return print_json(&empty_overview_json());
+            }
             println!("{}", style::dim("No usage stats recorded yet."));
             return ExitCode::Success;
         }
@@ -107,6 +112,18 @@ impl StatsCommand {
         let aivo_model_usage = aggregate_model_usage(&stats, &key_ids);
         let model_tokens = combine_model_tokens(&global, &aivo_model_usage);
         let total_models = model_tokens.values().filter(|t| **t > 0).count() as u64;
+
+        if args.json {
+            return print_json(&build_overview_json(
+                &tool_tokens,
+                &model_tokens,
+                (total_input, total_output),
+                (total_cache_read, total_cache_write),
+                total_sessions,
+                total_models,
+                args.search.as_deref(),
+            ));
+        }
 
         let mut parts = Vec::new();
         if total_tokens > 0 {
@@ -219,6 +236,9 @@ impl StatsCommand {
             .is_some_and(|gs| gs.total_tokens() > 0 || gs.sessions > 0);
 
         if !has_global && aivo.launches == 0 {
+            if args.json {
+                return print_json(&empty_tool_view_json(&tool));
+            }
             println!(
                 "{}",
                 style::dim(format!(
@@ -229,7 +249,7 @@ impl StatsCommand {
             return ExitCode::Success;
         }
 
-        if let Some(gs) = global
+        let (view, top_sessions) = if let Some(gs) = global
             .as_ref()
             .filter(|gs| gs.total_tokens() > 0 || gs.sessions > 0)
         {
@@ -246,18 +266,24 @@ impl StatsCommand {
                     .map(|(name, m)| (name.clone(), m.input_tokens + m.output_tokens))
                     .collect(),
             };
-            print_tool_view(&view, fmt, args);
-            if args.top_sessions && matches!(tool.as_str(), "codex" | "claude" | "gemini") {
+            let top = if args.top_sessions && matches!(tool.as_str(), "codex" | "claude" | "gemini")
+            {
                 match global_stats::top_sessions(&tool, args.refresh, 10).await {
-                    Ok(sessions) => render_top_sessions(&sessions, fmt),
-                    Err(e) => eprintln!(
-                        "{} Failed to read {} sessions: {}",
-                        style::red("Error:"),
-                        global_stats::tool_display_name(&tool),
-                        e
-                    ),
+                    Ok(sessions) => Some(sessions),
+                    Err(e) => {
+                        eprintln!(
+                            "{} Failed to read {} sessions: {}",
+                            style::red("Error:"),
+                            global_stats::tool_display_name(&tool),
+                            e
+                        );
+                        None
+                    }
                 }
-            }
+            } else {
+                None
+            };
+            (view, top)
         } else {
             let view = ToolView {
                 source: StatsSource::Aivo,
@@ -268,7 +294,21 @@ impl StatsCommand {
                 cache_write: aivo.cache_write,
                 models: aivo.models,
             };
-            print_tool_view(&view, fmt, args);
+            (view, None)
+        };
+
+        if args.json {
+            return print_json(&build_tool_view_json(
+                &tool,
+                &view,
+                top_sessions.as_deref(),
+                args,
+            ));
+        }
+
+        print_tool_view(&view, fmt, args);
+        if let Some(sessions) = top_sessions {
+            render_top_sessions(&sessions, fmt);
         }
 
         ExitCode::Success
@@ -339,6 +379,7 @@ impl StatsCommand {
         print_opt("-s, --search <QUERY>", "Search by key, model, or tool name");
         print_opt("-a, --all", "Show all models (default: top 20)");
         print_opt("--top-sessions", "Show the heaviest native session files");
+        print_opt("--json", "Output stats as JSON (all models, exact numbers)");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo stats"));
@@ -346,7 +387,180 @@ impl StatsCommand {
         println!("  {}", style::dim("aivo stats claude -n"));
         println!("  {}", style::dim("aivo stats -n"));
         println!("  {}", style::dim("aivo stats -s openrouter"));
+        println!(
+            "  {}",
+            style::dim("aivo stats --json | jq '.totals.tokens'")
+        );
     }
+}
+
+fn filter_models<'a>(
+    models: impl IntoIterator<Item = (&'a String, &'a u64)>,
+    search: Option<&str>,
+) -> Vec<(String, u64)> {
+    let needle = search.map(|s| s.to_lowercase());
+    let mut rows: Vec<(String, u64)> = models
+        .into_iter()
+        .filter(|(_, tok)| **tok > 0)
+        .filter(|(name, _)| {
+            needle
+                .as_ref()
+                .is_none_or(|q| name.to_lowercase().contains(q))
+        })
+        .map(|(name, tok)| (name.clone(), *tok))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows
+}
+
+fn print_json(payload: &Value) -> ExitCode {
+    match serde_json::to_string_pretty(payload) {
+        Ok(s) => {
+            println!("{}", s);
+            ExitCode::Success
+        }
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            ExitCode::UserError
+        }
+    }
+}
+
+fn build_overview_json(
+    tool_tokens: &HashMap<String, ToolTokenSummary>,
+    model_tokens: &HashMap<String, u64>,
+    (total_input, total_output): (u64, u64),
+    (total_cache_read, total_cache_write): (u64, u64),
+    total_sessions: u64,
+    total_models: u64,
+    search: Option<&str>,
+) -> Value {
+    let mut tool_rows: Vec<(&String, &ToolTokenSummary)> = tool_tokens.iter().collect();
+    tool_rows.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+    let by_tool: Vec<Value> = tool_rows
+        .into_iter()
+        .map(|(name, t)| {
+            json!({
+                "name": name,
+                "sessions": t.sessions,
+                "tokens": t.total_tokens(),
+                "input_tokens": t.input,
+                "output_tokens": t.output,
+                "cache_read_tokens": t.cache_read,
+                "cache_write_tokens": t.cache_write,
+            })
+        })
+        .collect();
+
+    let by_model: Vec<Value> = filter_models(model_tokens, search)
+        .into_iter()
+        .map(|(name, tok)| json!({ "name": name, "tokens": tok }))
+        .collect();
+
+    json!({
+        "totals": {
+            "tokens": total_input.saturating_add(total_output),
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "cache_tokens": total_cache_read.saturating_add(total_cache_write),
+            "cache_read_tokens": total_cache_read,
+            "cache_write_tokens": total_cache_write,
+            "sessions": total_sessions,
+            "models": total_models,
+        },
+        "by_tool": by_tool,
+        "by_model": by_model,
+    })
+}
+
+fn build_tool_view_json(
+    tool: &str,
+    view: &ToolView,
+    top_sessions: Option<&[NativeSessionSummary]>,
+    args: &StatsArgs,
+) -> Value {
+    let source = match view.source {
+        StatsSource::Global => "global",
+        StatsSource::Aivo => "aivo",
+    };
+    let by_model: Vec<Value> = filter_models(&view.models, args.search.as_deref())
+        .into_iter()
+        .map(|(name, tok)| json!({ "name": name, "tokens": tok }))
+        .collect();
+    // Match the human view's count: total models with any tokens, ignoring search filter.
+    let total_models = view.models.values().filter(|t| **t > 0).count() as u64;
+    let mut payload = json!({
+        "tool": tool,
+        "source": source,
+        "totals": {
+            "tokens": view.input_tokens.saturating_add(view.output_tokens),
+            "input_tokens": view.input_tokens,
+            "output_tokens": view.output_tokens,
+            "cache_tokens": view.cache_read.saturating_add(view.cache_write),
+            "cache_read_tokens": view.cache_read,
+            "cache_write_tokens": view.cache_write,
+            "count": view.count,
+            "models": total_models,
+        },
+        "by_model": by_model,
+    });
+    // Always emit `top_sessions` when --top-sessions was requested, so consumers
+    // see a stable schema (empty array means "tool doesn't expose native sessions").
+    if args.top_sessions {
+        let sessions_json: Vec<Value> = top_sessions
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| {
+                json!({
+                    "path": s.path.display().to_string(),
+                    "label": session_label(s),
+                    "model": s.model,
+                    "tokens": s.total_tokens(),
+                    "input_tokens": s.input_tokens,
+                    "output_tokens": s.output_tokens,
+                    "cache_read_tokens": s.cache_read_tokens,
+                    "cache_write_tokens": s.cache_write_tokens,
+                })
+            })
+            .collect();
+        payload["top_sessions"] = Value::Array(sessions_json);
+    }
+    payload
+}
+
+fn empty_overview_json() -> Value {
+    json!({
+        "totals": {
+            "tokens": 0u64,
+            "input_tokens": 0u64,
+            "output_tokens": 0u64,
+            "cache_tokens": 0u64,
+            "cache_read_tokens": 0u64,
+            "cache_write_tokens": 0u64,
+            "sessions": 0u64,
+            "models": 0u64,
+        },
+        "by_tool": Vec::<Value>::new(),
+        "by_model": Vec::<Value>::new(),
+    })
+}
+
+fn empty_tool_view_json(tool: &str) -> Value {
+    json!({
+        "tool": tool,
+        "source": Value::Null,
+        "totals": {
+            "tokens": 0u64,
+            "input_tokens": 0u64,
+            "output_tokens": 0u64,
+            "cache_tokens": 0u64,
+            "cache_read_tokens": 0u64,
+            "cache_write_tokens": 0u64,
+            "count": 0u64,
+            "models": 0u64,
+        },
+        "by_model": Vec::<Value>::new(),
+    })
 }
 
 struct ToolTokenSummary {
@@ -451,20 +665,8 @@ fn print_tool_view(view: &ToolView, fmt: fn(u64) -> String, args: &StatsArgs) {
 }
 
 fn render_model_table(models: &HashMap<String, u64>, fmt: fn(u64) -> String, args: &StatsArgs) {
-    let search = args.search.as_deref().map(|s| s.to_lowercase());
-    let searching = search.is_some();
-
-    let mut model_rows: Vec<(&str, u64)> = models
-        .iter()
-        .filter(|(_, tok)| **tok > 0)
-        .filter(|(name, _)| {
-            search
-                .as_ref()
-                .is_none_or(|q| name.to_lowercase().contains(q))
-        })
-        .map(|(name, tok)| (name.as_str(), *tok))
-        .collect();
-    model_rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let searching = args.search.is_some();
+    let model_rows = filter_models(models, args.search.as_deref());
 
     if model_rows.is_empty() {
         return;
@@ -479,17 +681,11 @@ fn render_model_table(models: &HashMap<String, u64>, fmt: fn(u64) -> String, arg
     let display_rows: Vec<(String, u64)> = if truncated {
         let others_count = total_model_count - max_display;
         let others_tokens: u64 = model_rows[max_display..].iter().map(|(_, t)| *t).sum();
-        let mut rows: Vec<(String, u64)> = model_rows[..max_display]
-            .iter()
-            .map(|(n, t)| (n.to_string(), *t))
-            .collect();
+        let mut rows: Vec<(String, u64)> = model_rows[..max_display].to_vec();
         rows.push((format!("others ({} models)", others_count), others_tokens));
         rows
     } else {
         model_rows
-            .iter()
-            .map(|(n, t)| (n.to_string(), *t))
-            .collect()
     };
 
     let name_w = display_rows

@@ -82,6 +82,10 @@ pub struct AliasArgs {
     /// Remove an alias
     #[arg(long, short)]
     pub rm: bool,
+
+    /// Output alias list as JSON (only affects listing)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the keys command
@@ -117,6 +121,10 @@ pub struct KeysArgs {
     /// List keys with ping status
     #[arg(long)]
     pub ping: bool,
+
+    /// Output key list as JSON (listing only; secret is never included)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the run command
@@ -189,6 +197,10 @@ pub struct ModelsArgs {
     /// Search models by substring
     #[arg(short = 's', long, value_name = "QUERY", value_parser = non_empty())]
     pub search: Option<String>,
+
+    /// Output { provider, is_static, models[] } as JSON (pipe to `jq` to filter)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the serve command
@@ -259,6 +271,10 @@ pub struct StatsArgs {
     /// Show the heaviest native session files for supported tools
     #[arg(long)]
     pub top_sessions: bool,
+
+    /// Output stats as JSON (always uses exact numbers; includes all models)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the update command
@@ -278,6 +294,10 @@ pub struct InfoArgs {
     /// Ping all keys and show pass/fail summary
     #[arg(long)]
     pub ping: bool,
+
+    /// Output info as JSON (useful for scripting)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the logs command
@@ -382,6 +402,10 @@ pub struct ChatArgs {
         default_missing_value = ""
     )]
     pub execute: Option<String>,
+
+    /// Print result as JSON (requires -x; useful for scripting)
+    #[arg(long)]
+    pub json: bool,
 
     /// Attach a file or image to the next chat message (repeatable)
     #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]

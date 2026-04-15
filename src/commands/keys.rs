@@ -2,7 +2,9 @@
  * KeysCommand handler for managing API keys.
  */
 use anyhow::Result;
+use serde_json::{Value, json};
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::cli::KeysArgs;
@@ -249,6 +251,17 @@ impl PingStatus {
         }
     }
 
+    /// Machine-readable identifier used in structured output.
+    pub fn json_key(&self) -> &'static str {
+        match self {
+            PingStatus::Ok => "ok",
+            PingStatus::AuthError => "auth_error",
+            PingStatus::Unreachable => "unreachable",
+            PingStatus::Timeout => "timeout",
+            PingStatus::Error(_) => "error",
+        }
+    }
+
     pub fn from_http_status(status: u16) -> Self {
         match status {
             200..=299 => PingStatus::Ok,
@@ -266,6 +279,27 @@ pub struct PingResult {
     pub url: String,
     pub status: PingStatus,
     pub latency: Option<Duration>,
+}
+
+/// Builds a JSON metadata object for a key. Never includes the secret.
+pub(crate) fn key_metadata_json(key: &ApiKey, selected_id: Option<&str>) -> Value {
+    json!({
+        "id": key.id,
+        "name": key.name,
+        "base_url": key.base_url,
+        "active": selected_id == Some(key.id.as_str()),
+        "created_at": key.created_at,
+    })
+}
+
+/// Converts a PingResult into a JSON object for structured output.
+pub(crate) fn ping_result_json(result: &PingResult) -> Value {
+    json!({
+        "ok": matches!(result.status, PingStatus::Ok),
+        "status": result.status.json_key(),
+        "message": result.status.message(),
+        "latency_ms": result.latency.map(|d| d.as_millis() as u64),
+    })
 }
 
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -476,9 +510,10 @@ impl KeysCommand {
         };
         let ping_all = keys_args.all;
         let list_ping = keys_args.ping;
+        let json = keys_args.json;
 
         match self
-            .execute_internal(action, Some(&args), add_options, ping_all, list_ping)
+            .execute_internal(action, Some(&args), add_options, ping_all, list_ping, json)
             .await
         {
             Ok(code) => code,
@@ -496,10 +531,11 @@ impl KeysCommand {
         add_options: AddKeyOptions<'_>,
         ping_all: bool,
         list_ping: bool,
+        json: bool,
     ) -> Result<ExitCode> {
         match action {
-            None if list_ping => self.list_keys_with_ping().await,
-            None => self.list_keys().await,
+            None if list_ping => self.list_keys_with_ping(json).await,
+            None => self.list_keys(json).await,
             Some("add") => {
                 self.add_key(args.and_then(|a| a.first().copied()), add_options)
                     .await
@@ -578,9 +614,18 @@ impl KeysCommand {
     }
 
     /// Lists all API keys
-    async fn list_keys(&self) -> Result<ExitCode> {
+    async fn list_keys(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
+
+        if json {
+            let payload: Vec<Value> = keys
+                .iter()
+                .map(|k| key_metadata_json(k, selected_key_id.as_deref()))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            return Ok(ExitCode::Success);
+        }
 
         if keys.is_empty() {
             println!("{}", style::dim("No API keys found."));
@@ -617,9 +662,35 @@ impl KeysCommand {
     }
 
     /// Lists all API keys with live ping status, streaming results as they complete.
-    async fn list_keys_with_ping(&self) -> Result<ExitCode> {
+    async fn list_keys_with_ping(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
+
+        if json {
+            let mut ping_by_id: HashMap<String, Value> = HashMap::new();
+            let spinner =
+                (!keys.is_empty()).then(|| style::start_spinner(Some(" Pinging keys...")));
+            ping_keys_streaming(keys.clone(), |id, result| {
+                ping_by_id.insert(id.to_string(), ping_result_json(result));
+            })
+            .await;
+            if let Some((spinning, handle)) = spinner {
+                style::stop_spinner(&spinning);
+                let _ = handle.await;
+            }
+            let payload: Vec<Value> = keys
+                .iter()
+                .map(|k| {
+                    let mut obj = key_metadata_json(k, selected_key_id.as_deref());
+                    if let Some(p) = ping_by_id.remove(&k.id) {
+                        obj["ping"] = p;
+                    }
+                    obj
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            return Ok(ExitCode::Success);
+        }
 
         if keys.is_empty() {
             println!("{}", style::dim("No API keys found."));
@@ -1627,12 +1698,21 @@ impl KeysCommand {
         print_row("--base-url <url>", "Set provider base URL");
         print_row("--key <api-key>", "Set provider API key");
         println!();
+        println!("{}", style::bold("List Flags:"));
+        print_row("--ping", "List keys with live ping status");
+        print_row("--json", "Output list as JSON (secret is never included)");
+        println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo keys"));
         println!("  {}", style::dim("aivo keys use openrouter"));
         println!(
             "  {}",
             style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
+        );
+        println!("  {}", style::dim("aivo keys --json"));
+        println!(
+            "  {}",
+            style::dim("aivo keys --ping --json | jq '.[] | select(.ping.ok==false)'")
         );
     }
 }
@@ -1713,6 +1793,7 @@ mod tests {
             key: None,
             all: false,
             ping: false,
+            json: false,
         }
     }
 
@@ -1808,6 +1889,7 @@ mod tests {
                 key: Some("sk-minimax-test".to_string()),
                 all: false,
                 ping: false,
+                json: false,
             })
             .await;
 
@@ -1840,6 +1922,7 @@ mod tests {
                 key: Some("sk-or-v1-test".to_string()),
                 all: false,
                 ping: false,
+                json: false,
             })
             .await;
 
@@ -1862,6 +1945,7 @@ mod tests {
                 key: Some("sk-or-v1-test".to_string()),
                 all: false,
                 ping: false,
+                json: false,
             })
             .await;
 
@@ -1892,6 +1976,7 @@ mod tests {
                 key: None,
                 all: false,
                 ping: false,
+                json: false,
             })
             .await;
 
@@ -1914,6 +1999,7 @@ mod tests {
                 key: None,
                 all: false,
                 ping: false,
+                json: false,
             })
             .await;
 

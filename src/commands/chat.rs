@@ -16,6 +16,7 @@ use anyhow::Result;
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
@@ -161,9 +162,10 @@ impl ChatCommand {
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
+        json: bool,
     ) -> ExitCode {
         match self
-            .execute_internal(model, one_shot, attachments, refresh, key_override)
+            .execute_internal(model, one_shot, attachments, refresh, key_override, json)
             .await
         {
             Ok(code) => code,
@@ -181,7 +183,14 @@ impl ChatCommand {
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
+        json: bool,
     ) -> Result<ExitCode> {
+        if json && one_shot.is_none() {
+            anyhow::bail!(
+                "--json requires -x/--execute (JSON output is only produced in one-shot mode)"
+            );
+        }
+
         let mut key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
@@ -251,6 +260,10 @@ impl ChatCommand {
         let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
         let pending_attachments = build_pending_attachments(&attachments)?;
 
+        // Snapshot before sentinel URLs are resolved, so JSON output shows
+        // "ollama"/"copilot"/etc. rather than the resolved endpoint URL.
+        let provider_label = key.base_url.clone();
+
         // Resolve sentinel base URLs to actual URLs before any HTTP calls.
         if key.base_url == "ollama" {
             crate::services::ollama::ensure_ready().await?;
@@ -299,7 +312,11 @@ impl ChatCommand {
                 &history,
                 &mut format,
                 &spinning,
+                json,
                 &mut |chunk| {
+                    if json {
+                        return Ok(());
+                    }
                     match chunk {
                         ChatResponseChunk::Reasoning(text) => {
                             if current_section != Some("thinking") {
@@ -353,7 +370,19 @@ impl ChatCommand {
                         &usage,
                     )
                     .await;
-                    println!();
+                    if json {
+                        let payload = json!({
+                            "provider": provider_label,
+                            "model": raw_model,
+                            "prompt": history[0].content,
+                            "reasoning": turn.reasoning_content,
+                            "response": turn.content,
+                            "usage": usage,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    } else {
+                        println!();
+                    }
                     return Ok(ExitCode::Success);
                 }
                 Err(e) => return Err(e),
@@ -444,6 +473,10 @@ impl ChatCommand {
             "--attach <path>",
             "Queue a text file or image for the next message",
         );
+        print_opt(
+            "--json",
+            "Print result as JSON (requires -x; useful for scripting)",
+        );
         println!();
         println!("{}", style::bold("Slash Commands:"));
         let print_cmd = |label: &str, desc: &str| {
@@ -516,17 +549,36 @@ async fn send_message_turn<F>(
     history: &[ChatMessage],
     format: &mut ChatFormat,
     spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
     if let Some(tm) = copilot_tm {
-        match send_copilot_request(client, tm, model, history, spinning, on_chunk).await {
+        match send_copilot_request(
+            client,
+            tm,
+            model,
+            history,
+            spinning,
+            non_streaming,
+            on_chunk,
+        )
+        .await
+        {
             ok @ Ok(_) => return ok,
             Err(e) if is_responses_api_required(&e) => {
-                match send_copilot_responses_request(client, tm, model, history, spinning, on_chunk)
-                    .await
+                match send_copilot_responses_request(
+                    client,
+                    tm,
+                    model,
+                    history,
+                    spinning,
+                    non_streaming,
+                    on_chunk,
+                )
+                .await
                 {
                     Ok(content) => {
                         *format = ChatFormat::Responses;
@@ -541,12 +593,30 @@ where
 
     match format {
         ChatFormat::OpenAI => {
-            match send_chat_request(client, key, model, history, spinning, on_chunk).await {
+            match send_chat_request(
+                client,
+                key,
+                model,
+                history,
+                spinning,
+                non_streaming,
+                on_chunk,
+            )
+            .await
+            {
                 ok @ Ok(_) => ok,
                 Err(e) if is_responses_api_required(&e) => {
                     // Model requires the Responses API instead of Chat Completions
-                    match send_responses_request(client, key, model, history, spinning, on_chunk)
-                        .await
+                    match send_responses_request(
+                        client,
+                        key,
+                        model,
+                        history,
+                        spinning,
+                        non_streaming,
+                        on_chunk,
+                    )
+                    .await
                     {
                         Ok(content) => {
                             *format = ChatFormat::Responses;
@@ -557,8 +627,16 @@ where
                 }
                 Err(e) if is_format_mismatch(&e) => {
                     // Provider doesn't speak OpenAI format; try Anthropic
-                    match send_anthropic_request(client, key, model, history, spinning, on_chunk)
-                        .await
+                    match send_anthropic_request(
+                        client,
+                        key,
+                        model,
+                        history,
+                        spinning,
+                        non_streaming,
+                        on_chunk,
+                    )
+                    .await
                     {
                         Ok(content) => {
                             *format = ChatFormat::Anthropic;
@@ -571,17 +649,55 @@ where
             }
         }
         ChatFormat::Anthropic => {
-            send_anthropic_request(client, key, model, history, spinning, on_chunk).await
+            send_anthropic_request(
+                client,
+                key,
+                model,
+                history,
+                spinning,
+                non_streaming,
+                on_chunk,
+            )
+            .await
         }
         ChatFormat::Responses => {
-            send_responses_request(client, key, model, history, spinning, on_chunk).await
+            send_responses_request(
+                client,
+                key,
+                model,
+                history,
+                spinning,
+                non_streaming,
+                on_chunk,
+            )
+            .await
         }
         ChatFormat::Google => {
-            match send_google_request(client, key, model, history, spinning, on_chunk).await {
+            match send_google_request(
+                client,
+                key,
+                model,
+                history,
+                spinning,
+                non_streaming,
+                on_chunk,
+            )
+            .await
+            {
                 ok @ Ok(_) => ok,
                 Err(e) if is_format_mismatch(&e) => {
                     // Fall back to OpenAI for gateways serving Google models via /v1/chat/completions
-                    match send_chat_request(client, key, model, history, spinning, on_chunk).await {
+                    match send_chat_request(
+                        client,
+                        key,
+                        model,
+                        history,
+                        spinning,
+                        non_streaming,
+                        on_chunk,
+                    )
+                    .await
+                    {
                         Ok(content) => {
                             *format = ChatFormat::OpenAI;
                             Ok(content)
@@ -974,12 +1090,14 @@ where
 /// Sends a chat completion request and prints the response.
 /// Tries streaming first; falls back to non-streaming if the server returns a 5xx error.
 /// Returns the full assistant message content.
+#[allow(clippy::too_many_arguments)]
 async fn send_chat_request<F>(
     client: &Client,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
@@ -987,10 +1105,17 @@ where
 {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/chat/completions", base);
-
-    // Try streaming first; fall back to non-streaming on server errors
     let max_tokens = crate::services::provider_profile::ProviderQuirks::for_base_url(&key.base_url)
         .max_tokens_cap;
+
+    if non_streaming {
+        return send_non_streaming(
+            client, &url, key, model, messages, max_tokens, spinning, on_chunk,
+        )
+        .await;
+    }
+
+    // Try streaming first; fall back to non-streaming on server errors
     let request = build_openai_chat_request(model, messages, true, max_tokens)?;
 
     let mut response = send_with_retry(|| {
@@ -1168,12 +1293,14 @@ where
 }
 
 /// Sends a chat request via GitHub Copilot (token exchange + Copilot API).
+#[allow(clippy::too_many_arguments)]
 async fn send_copilot_request<F>(
     client: &Client,
     tm: &CopilotTokenManager,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
@@ -1181,6 +1308,19 @@ where
 {
     let (copilot_token, api_endpoint) = tm.get_token().await?;
     let url = format!("{}/chat/completions", api_endpoint.trim_end_matches('/'));
+
+    if non_streaming {
+        return send_copilot_non_streaming(
+            client,
+            &url,
+            &copilot_token,
+            model,
+            messages,
+            spinning,
+            on_chunk,
+        )
+        .await;
+    }
 
     let request = build_openai_chat_request(model, messages, true, None)?;
     let initiator = copilot_initiator_from_openai(&request);
@@ -1379,12 +1519,14 @@ where
 }
 
 /// Sends a chat request via GitHub Copilot using the Responses API.
+#[allow(clippy::too_many_arguments)]
 async fn send_copilot_responses_request<F>(
     client: &Client,
     tm: &CopilotTokenManager,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
@@ -1392,6 +1534,19 @@ where
 {
     let (copilot_token, api_endpoint) = tm.get_token().await?;
     let url = format!("{}/responses", api_endpoint.trim_end_matches('/'));
+
+    if non_streaming {
+        return send_copilot_responses_non_streaming(
+            client,
+            &url,
+            &copilot_token,
+            model,
+            messages,
+            spinning,
+            on_chunk,
+        )
+        .await;
+    }
 
     let request = build_responses_request(model, messages, true)?;
 
@@ -1592,12 +1747,14 @@ fn is_responses_api_required(e: &anyhow::Error) -> bool {
 
 /// Sends a chat request via the OpenAI Responses API (/v1/responses).
 /// Tries streaming first; falls back to non-streaming on server errors.
+#[allow(clippy::too_many_arguments)]
 async fn send_responses_request<F>(
     client: &Client,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
@@ -1605,6 +1762,13 @@ where
 {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/responses", base);
+
+    if non_streaming {
+        return send_responses_non_streaming(
+            client, &url, key, model, messages, spinning, on_chunk,
+        )
+        .await;
+    }
 
     let request = build_responses_request(model, messages, true)?;
 
@@ -1736,12 +1900,14 @@ where
 
 /// Sends a request using Anthropic's native /v1/messages API.
 /// Tries streaming first; falls back to non-streaming on server errors.
+#[allow(clippy::too_many_arguments)]
 async fn send_anthropic_request<F>(
     client: &Client,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
@@ -1749,6 +1915,13 @@ where
 {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/messages", base);
+
+    if non_streaming {
+        return send_anthropic_non_streaming(
+            client, &url, key, model, messages, spinning, on_chunk,
+        )
+        .await;
+    }
 
     let request = build_anthropic_request(model, messages, true)?;
 
@@ -1917,12 +2090,14 @@ where
 
 /// Sends a request using Google Gemini's native API with streaming.
 /// Falls back to non-streaming on server errors.
+#[allow(clippy::too_many_arguments)]
 async fn send_google_request<F>(
     client: &Client,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
     spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
@@ -1930,6 +2105,10 @@ where
 {
     use crate::services::model_names::google_native_model_name;
     use crate::services::openai_gemini_bridge::build_google_stream_generate_content_url;
+
+    if non_streaming {
+        return send_google_non_streaming(client, key, model, messages, spinning, on_chunk).await;
+    }
 
     let native_model = google_native_model_name(model);
     let url = build_google_stream_generate_content_url(&key.base_url, native_model);
