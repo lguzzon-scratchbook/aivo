@@ -323,29 +323,17 @@ pub struct LogsArgs {
     #[arg(long)]
     pub watch: bool,
 
-    /// Refresh interval in seconds for --watch
-    #[arg(long, default_value_t = 1.0)]
-    pub interval: f32,
-
     /// Emit newly seen entries as JSONL while watching
     #[arg(long)]
     pub jsonl: bool,
-
-    /// Show newest entries first instead of chronological order
-    #[arg(long)]
-    pub latest_first: bool,
 
     /// Search title/body text
     #[arg(short = 's', long, value_name = "QUERY", value_parser = non_empty())]
     pub search: Option<String>,
 
-    /// Filter by source (chat, run, serve)
-    #[arg(long, value_name = "SOURCE", value_parser = non_empty())]
-    pub source: Option<String>,
-
-    /// Filter by tool
-    #[arg(long, value_name = "TOOL", value_parser = non_empty())]
-    pub tool: Option<String>,
+    /// Filter by activity: aivo subcommand (chat, run, serve) or launched tool (claude, codex, ...)
+    #[arg(long, value_name = "NAME", value_parser = non_empty())]
+    pub by: Option<String>,
 
     /// Filter by model substring
     #[arg(long, value_name = "MODEL", value_parser = non_empty())]

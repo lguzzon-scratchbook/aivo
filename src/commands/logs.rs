@@ -1,5 +1,4 @@
 use anyhow::Result;
-use serde_json::json;
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -9,7 +8,10 @@ use crate::commands::chat::format_time_ago_short;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
 use crate::services::log_store::{LogEntry, LogQuery};
+use crate::services::system_env;
 use crate::style;
+
+const SEPARATOR: &str = "\u{00b7}";
 
 pub struct LogsCommand {
     session_store: SessionStore,
@@ -30,35 +32,16 @@ impl LogsCommand {
         }
     }
 
-    async fn execute_internal(&self, mut args: LogsArgs) -> Result<ExitCode> {
+    async fn execute_internal(&self, args: LogsArgs) -> Result<ExitCode> {
         validate_args(&args)?;
         match args.action.as_deref() {
-            Some("path") => self.show_path(&args).await,
             Some("status") => self.show_status(&args).await,
             Some("show") => self.show_entry(&args).await,
-            Some(query) => {
-                // Treat unknown action as a search query: `aivo logs claude`
-                if args.search.is_none() {
-                    args.search = Some(query.to_string());
-                }
-                self.list_entries(&args).await
-            }
+            Some(other) => anyhow::bail!(
+                "Unknown subcommand '{other}'. Valid: show <id>, status. Use -s <query> to search."
+            ),
             None => self.list_entries(&args).await,
         }
-    }
-
-    async fn show_path(&self, args: &LogsArgs) -> Result<ExitCode> {
-        ensure_no_target(args, "path")?;
-        let path = self.session_store.logs().path().display().to_string();
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({ "path": path }))?
-            );
-        } else {
-            println!("{}", path);
-        }
-        Ok(ExitCode::Success)
     }
 
     async fn show_status(&self, args: &LogsArgs) -> Result<ExitCode> {
@@ -69,29 +52,55 @@ impl LogsCommand {
             return Ok(ExitCode::Success);
         }
 
-        println!("{} {}", style::bold("Path:"), style::dim(&status.path));
         println!(
-            "{} {}",
-            style::bold("Entries:"),
-            style::cyan(status.total_entries.to_string())
+            "{} {} {} {} {} {}",
+            style::bold(status.total_entries.to_string()),
+            style::dim("events"),
+            style::dim(SEPARATOR),
+            style::dim(format_bytes(status.file_size_bytes)),
+            style::dim(SEPARATOR),
+            style::dim(system_env::collapse_tilde(&status.path)),
         );
-        println!(
-            "{} {} bytes",
-            style::bold("Size:"),
-            style::cyan(status.file_size_bytes.to_string())
-        );
+
         if status.counts_by_source.is_empty() {
-            println!("{}", style::dim("No log entries recorded yet."));
-        } else {
             println!();
-            println!("{}", style::bold("By Source:"));
-            for row in status.counts_by_source {
-                println!(
-                    "  {} {}",
-                    style::cyan(format!("{:<8}", row.source)),
-                    style::cyan(row.count.to_string())
-                );
+            println!("{}", style::dim("No log entries recorded yet."));
+            return Ok(ExitCode::Success);
+        }
+
+        // Flatten sources + tools into a single list sorted by count desc.
+        // A source with 2+ tools is replaced by its individual tool rows so
+        // the breakdown reads as one flat ranking rather than a hierarchy.
+        let mut rows: Vec<(String, u64)> = Vec::new();
+        for source in status.counts_by_source {
+            if source.tools.len() >= 2 {
+                for tool in source.tools {
+                    rows.push((tool.tool, tool.count));
+                }
+            } else {
+                rows.push((source.source, source.count));
             }
+        }
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let name_width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        let max_count = rows.iter().map(|(_, c)| *c).max().unwrap_or(0);
+        let count_width = max_count.to_string().len();
+        // `total` guards `count / total` in print_activity_row against zero.
+        let total = status.total_entries.max(1);
+        const BAR_WIDTH: usize = 32;
+
+        println!();
+        for (name, count) in rows {
+            print_activity_row(
+                &name,
+                count,
+                total,
+                max_count,
+                name_width,
+                count_width,
+                BAR_WIDTH,
+            );
         }
         Ok(ExitCode::Success)
     }
@@ -127,19 +136,16 @@ impl LogsCommand {
         let entries = self.fetch_entries(args).await?;
 
         if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&order_entries(entries, args.latest_first))?
-            );
+            println!("{}", serde_json::to_string_pretty(&entries)?);
             return Ok(ExitCode::Success);
         }
 
-        render_text_entries(entries, args.limit, args.latest_first);
+        render_text_entries(entries, args.limit);
         Ok(ExitCode::Success)
     }
 
     async fn watch_entries(&self, args: &LogsArgs) -> Result<ExitCode> {
-        let interval = Duration::from_secs_f32(args.interval.max(0.1));
+        const WATCH_INTERVAL: Duration = Duration::from_secs(1);
         let mut seen_ids = HashSet::new();
 
         loop {
@@ -159,17 +165,14 @@ impl LogsCommand {
                 println!(
                     "{} {}",
                     style::bold("Watching logs"),
-                    style::dim(format!(
-                        "(refresh {}s, Ctrl+C to stop)",
-                        args.interval.max(0.1)
-                    ))
+                    style::dim("(Ctrl+C to stop)")
                 );
                 println!();
-                render_text_entries(entries, args.limit, args.latest_first);
+                render_text_entries(entries, args.limit);
                 io::stdout().flush()?;
             }
 
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(WATCH_INTERVAL).await;
         }
     }
 
@@ -188,8 +191,7 @@ impl LogsCommand {
             .list(LogQuery {
                 limit: query_limit,
                 search: args.search.clone(),
-                source: args.source.clone(),
-                tool: args.tool.clone(),
+                by: args.by.clone(),
                 model: args.model.clone(),
                 key_query: args.key.clone(),
                 cwd: args.cwd.clone(),
@@ -202,17 +204,13 @@ impl LogsCommand {
     }
 
     pub fn print_help() {
-        println!(
-            "{} aivo logs [show <id>|path|status]",
-            style::bold("Usage:")
-        );
+        println!("{} aivo logs [COMMAND] [OPTIONS]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
             style::dim("Query local SQLite logs for chat, run, and serve activity.")
         );
         println!();
-        println!("{}", style::bold("Filters:"));
         let print_opt = |flag: &str, desc: &str| {
             println!(
                 "  {}{}",
@@ -220,21 +218,24 @@ impl LogsCommand {
                 style::dim(desc)
             );
         };
+        println!("{}", style::bold("Commands:"));
+        print_opt("(default)", "List recent log entries (newest first)");
+        print_opt("show <id>", "Show one entry in detail");
+        print_opt("status", "Show entry counts, size, and database path");
+        println!();
+        println!("{}", style::bold("Filters:"));
         print_opt(
             "-n, --limit <N>",
             "Maximum number of rows to show (default: 20)",
         );
         print_opt("--json", "Output JSON");
         print_opt("--watch", "Continuously refresh matching logs");
-        print_opt(
-            "--interval <secs>",
-            "Refresh interval for --watch (default: 1)",
-        );
         print_opt("--jsonl", "Emit newly seen entries as JSONL while watching");
-        print_opt("--latest-first", "Show newest entries first");
         print_opt("-s, --search <query>", "Search title/body text");
-        print_opt("--source <source>", "Filter by source: chat, run, serve");
-        print_opt("--tool <tool>", "Filter by tool name");
+        print_opt(
+            "--by <name>",
+            "Filter by chat, run, serve, or tool (claude, codex, gemini, opencode, pi)",
+        );
         print_opt("--model <model>", "Filter by model substring");
         print_opt("-k, --key <id|name>", "Filter by saved key ID or name");
         print_opt("--cwd <path>", "Filter by working directory substring");
@@ -244,13 +245,12 @@ impl LogsCommand {
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo logs"));
-        println!("  {}", style::dim("aivo logs --source chat -n 5"));
-        println!("  {}", style::dim("aivo logs --tool claude --errors"));
-        println!("  {}", style::dim("aivo logs --source run --watch"));
+        println!("  {}", style::dim("aivo logs --by chat -n 5"));
+        println!("  {}", style::dim("aivo logs --by claude --errors"));
+        println!("  {}", style::dim("aivo logs --by run --watch"));
         println!("  {}", style::dim("aivo logs --watch --jsonl"));
         println!("  {}", style::dim("aivo logs show 7m2q8k4v9cpr"));
         println!("  {}", style::dim("aivo logs status"));
-        println!("  {}", style::dim("aivo logs path"));
     }
 }
 
@@ -262,9 +262,6 @@ fn ensure_no_target(args: &LogsArgs, action: &str) -> Result<()> {
 }
 
 fn validate_args(args: &LogsArgs) -> Result<()> {
-    if args.interval <= 0.0 {
-        anyhow::bail!("--interval must be greater than 0");
-    }
     if args.jsonl && !args.watch {
         anyhow::bail!("--jsonl requires --watch");
     }
@@ -280,23 +277,15 @@ fn validate_args(args: &LogsArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_text_entries(entries: Vec<LogEntry>, limit: usize, latest_first: bool) {
+fn render_text_entries(entries: Vec<LogEntry>, limit: usize) {
     if entries.is_empty() {
         println!("{}", style::dim("No log entries found."));
         return;
     }
 
-    let entries = order_entries(collapse_run_events(entries, limit), latest_first);
-    for entry in entries {
+    for entry in collapse_run_events(entries, limit) {
         print_summary(&entry);
     }
-}
-
-fn order_entries(mut entries: Vec<LogEntry>, latest_first: bool) -> Vec<LogEntry> {
-    if !latest_first {
-        entries.reverse();
-    }
-    entries
 }
 
 fn print_summary(entry: &LogEntry) {
@@ -360,6 +349,51 @@ fn format_token_summary(entry: &LogEntry) -> String {
             style::dim(format!("({input}\u{2192}{output} tokens)"))
         }
         _ => String::new(),
+    }
+}
+
+fn print_activity_row(
+    name: &str,
+    count: u64,
+    total: u64,
+    max_count: u64,
+    name_width: usize,
+    count_width: usize,
+    bar_width: usize,
+) {
+    let pct = ((count as f64 / total as f64) * 100.0).round() as u64;
+    let row = format!(
+        "  {:<name_w$}  {:>count_w$}  {:>2}%  {}",
+        name,
+        count,
+        pct,
+        style::bar(count, max_count, bar_width),
+        name_w = name_width,
+        count_w = count_width,
+    );
+    println!("{}", style::cyan(row));
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut idx = 0;
+    while value >= 1024.0 && idx + 1 < UNITS.len() {
+        value /= 1024.0;
+        idx += 1;
+    }
+    // Guard against rounding to "1024 X" when a larger unit exists.
+    if value >= 1023.95 && idx + 1 < UNITS.len() {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if (value - value.round()).abs() < 0.05 {
+        format!("{:.0} {}", value, UNITS[idx])
+    } else {
+        format!("{:.1} {}", value, UNITS[idx])
     }
 }
 
@@ -498,12 +532,9 @@ mod tests {
             limit: 20,
             json: false,
             watch: false,
-            interval: 1.0,
             jsonl: false,
-            latest_first: false,
             search: None,
-            source: None,
-            tool: None,
+            by: None,
             model: None,
             key: None,
             cwd: None,
@@ -559,18 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn order_entries_defaults_to_chronological() {
-        let entries = vec![
-            test_entry("2", "2026-03-27T12:00:01Z", "run"),
-            test_entry("1", "2026-03-27T12:00:00Z", "run"),
-        ];
-
-        let ordered = order_entries(entries, false);
-        assert_eq!(ordered[0].id, "1");
-        assert_eq!(ordered[1].id, "2");
-    }
-
-    #[test]
     fn display_id_prefers_run_group_id() {
         let entry = LogEntry {
             event_group_id: Some("group123".to_string()),
@@ -580,6 +599,19 @@ mod tests {
         };
 
         assert_eq!(display_id(&entry), "group123");
+    }
+
+    #[test]
+    fn format_bytes_ranges() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(688_128), "672 KB");
+        assert_eq!(format_bytes(1500), "1.5 KB");
+        assert_eq!(format_bytes(1_572_864), "1.5 MB");
+        assert_eq!(format_bytes(2_147_483_648), "2 GB");
+        // Boundary: would round to "1024 KB" under naive formatting — promote to MB.
+        assert_eq!(format_bytes(1_048_575), "1 MB");
     }
 
     #[test]

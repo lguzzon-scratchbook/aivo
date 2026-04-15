@@ -896,22 +896,7 @@ fn is_valid_tool(tool: &str) -> bool {
 const BAR_MAX: usize = 20;
 
 fn bar(value: u64, max_value: u64) -> String {
-    if max_value == 0 || value == 0 {
-        return String::new();
-    }
-    let eighths = ((value as f64 / max_value as f64) * (BAR_MAX * 8) as f64).round() as usize;
-    let full = eighths / 8;
-    let frac = eighths % 8;
-    let mut s = "█".repeat(full);
-    if frac > 0
-        && let Some(ch) = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][frac].chars().next()
-    {
-        s.push(ch);
-    }
-    if s.is_empty() {
-        s.push('▏');
-    }
-    s
+    style::bar(value, max_value, BAR_MAX)
 }
 
 fn format_number(n: u64) -> String {

@@ -468,7 +468,7 @@ aivo info --ping
 
 Query the local SQLite log database used by aivo chat, run, and serve. Chat logs include turn content and token usage. `run` logs record launch metadata only. `serve` logs record request metadata only.
 
-By default, `aivo logs` prints entries in chronological order like traditional system logs. Use `--latest-first` to show newest entries first.
+`aivo logs` prints entries newest-first.
 
 ```bash
 aivo logs
@@ -482,43 +482,25 @@ Show one entry in detail:
 aivo logs show 7m2q8k4v9cpr
 ```
 
-#### `path`
-
-Print the SQLite database path:
-
-```bash
-aivo logs path
-```
-
 #### `status`
 
-Show entry counts and database size:
+Show entry counts, database size, and path:
 
 ```bash
 aivo logs status
 ```
 
-#### Quick search
-
-A bare word is treated as a search query:
-
-```bash
-aivo logs claude
-aivo logs "rate limit"
-```
-
 #### Filters
 
 ```bash
-aivo logs --source chat -n 5
-aivo logs --tool claude --errors
+aivo logs --by chat -n 5
+aivo logs --by claude --errors
 aivo logs -s "rate limit"
 aivo logs --model sonnet
 aivo logs --key openrouter
 aivo logs --cwd /path/to/project
 aivo logs --since "2025-01-01" --until "2025-02-01"
 aivo logs --json
-aivo logs --latest-first
 ```
 
 #### Live watch
@@ -526,8 +508,7 @@ aivo logs --latest-first
 Poll and refresh matching logs continuously:
 
 ```bash
-aivo logs --source run --watch
-aivo logs --watch --interval 2
+aivo logs --by run --watch
 aivo logs --watch --jsonl
 ```
 

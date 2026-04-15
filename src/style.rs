@@ -108,6 +108,32 @@ pub fn spinner_frame(index: usize) -> &'static str {
     BRAILLE_SPINNER_FRAMES[index % BRAILLE_SPINNER_FRAMES.len()]
 }
 
+/// Renders a horizontal bar using block-element glyphs with eighth-block resolution.
+/// `value` is drawn proportionally to `max_value`, up to `width` full-block characters.
+/// Non-zero values render at least the thinnest partial-block glyph.
+pub fn bar(value: u64, max_value: u64, width: usize) -> String {
+    if max_value == 0 || value == 0 || width == 0 {
+        return String::new();
+    }
+    let eighths = ((value as f64 / max_value as f64) * (width * 8) as f64).round() as usize;
+    let eighths = eighths.min(width * 8);
+    let full = eighths / 8;
+    let frac = eighths % 8;
+    let mut s = "\u{2588}".repeat(full);
+    if let Some(ch) = [
+        "", "\u{258f}", "\u{258e}", "\u{258d}", "\u{258c}", "\u{258b}", "\u{258a}", "\u{2589}",
+    ][frac]
+        .chars()
+        .next()
+    {
+        s.push(ch);
+    }
+    if s.is_empty() {
+        s.push('\u{258f}');
+    }
+    s
+}
+
 /// Starts a braille spinner on stderr. Returns the flag and join handle.
 /// Pass an optional label to display after the spinner character.
 pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
@@ -169,5 +195,35 @@ mod tests {
         assert!(!arrow_symbol().is_empty());
         assert!(!bullet_symbol().is_empty());
         assert!(!empty_bullet_symbol().is_empty());
+    }
+
+    #[test]
+    fn bar_renders_full_width_at_max() {
+        assert_eq!(bar(100, 100, 20), "\u{2588}".repeat(20));
+    }
+
+    #[test]
+    fn bar_renders_half_width_at_half() {
+        assert_eq!(bar(50, 100, 20), "\u{2588}".repeat(10));
+    }
+
+    #[test]
+    fn bar_returns_empty_for_zero_inputs() {
+        assert_eq!(bar(0, 100, 20), "");
+        assert_eq!(bar(10, 0, 20), "");
+        assert_eq!(bar(10, 100, 0), "");
+    }
+
+    #[test]
+    fn bar_shows_minimum_partial_block_for_tiny_values() {
+        let b = bar(1, 1000, 20);
+        assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn bar_never_exceeds_requested_width_under_rounding() {
+        // Float rounding could otherwise push eighths above width * 8.
+        let b = bar(u64::MAX, u64::MAX, 32);
+        assert_eq!(b.chars().count(), 32);
     }
 }

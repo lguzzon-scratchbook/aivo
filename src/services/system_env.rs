@@ -69,6 +69,12 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     expand_tilde_with_home(path, home_dir().as_deref())
 }
 
+/// Replaces a leading home directory with `~` for display purposes.
+/// Returns the path unchanged if it doesn't start with the user's home.
+pub fn collapse_tilde(path: &str) -> String {
+    collapse_tilde_with_home(path, home_dir().as_deref())
+}
+
 /// Best-effort current working directory lookup with canonicalization when possible.
 pub fn current_dir() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
@@ -195,6 +201,24 @@ fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn collapse_tilde_with_home(path: &str, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        let home_str = home.to_string_lossy();
+        if !home_str.is_empty()
+            && let Some(rest) = path.strip_prefix(&*home_str)
+        {
+            if rest.is_empty() {
+                return "~".to_string();
+            }
+            // Guard against matching `/home/userfoo` when home is `/home/user`.
+            if rest.starts_with('/') || rest.starts_with('\\') {
+                return format!("~{rest}");
+            }
+        }
+    }
+    path.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +231,41 @@ mod tests {
             home.join("config/aivo")
         );
         assert_eq!(expand_tilde_with_home("~", Some(home)), home);
+    }
+
+    #[test]
+    fn collapse_tilde_replaces_home_prefix() {
+        let home = Path::new("/tmp/example-home");
+        assert_eq!(
+            collapse_tilde_with_home("/tmp/example-home/config/aivo", Some(home)),
+            "~/config/aivo"
+        );
+        assert_eq!(
+            collapse_tilde_with_home("/tmp/example-home", Some(home)),
+            "~"
+        );
+    }
+
+    #[test]
+    fn collapse_tilde_does_not_match_sibling_paths() {
+        // e.g. home = /home/user, path = /home/user2 — must NOT become ~2
+        let home = Path::new("/home/user");
+        assert_eq!(
+            collapse_tilde_with_home("/home/user2/foo", Some(home)),
+            "/home/user2/foo"
+        );
+    }
+
+    #[test]
+    fn collapse_tilde_leaves_non_home_paths_unchanged() {
+        assert_eq!(
+            collapse_tilde_with_home("/var/tmp/aivo", Some(Path::new("/tmp/home"))),
+            "/var/tmp/aivo"
+        );
+        assert_eq!(
+            collapse_tilde_with_home("/var/tmp/aivo", None),
+            "/var/tmp/aivo"
+        );
     }
 
     #[test]

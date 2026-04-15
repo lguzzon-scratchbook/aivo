@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn stable_sort_preserves_original_order_within_ties() {
         // Two items with identical scores: sort_by_cached_key is stable.
-        let items = vec!["openai one".to_string(), "openai two".to_string()];
+        let items = ["openai one".to_string(), "openai two".to_string()];
         let mut filtered: Vec<(usize, &String)> = items.iter().enumerate().collect();
         filtered.sort_by_cached_key(|(_, item)| score_match("openai", item));
         assert_eq!(filtered[0].0, 0);

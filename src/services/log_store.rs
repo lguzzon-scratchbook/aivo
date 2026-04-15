@@ -67,8 +67,8 @@ pub struct LogEvent {
 pub struct LogQuery {
     pub limit: usize,
     pub search: Option<String>,
-    pub source: Option<String>,
-    pub tool: Option<String>,
+    /// Matches against the `source` column (exact) or `tool` column (substring).
+    pub by: Option<String>,
     pub model: Option<String>,
     pub key_query: Option<String>,
     pub cwd: Option<String>,
@@ -89,6 +89,14 @@ pub struct LogStatus {
 pub struct SourceCount {
     pub source: String,
     pub count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCount {
+    pub tool: String,
+    pub count: u64,
 }
 
 impl LogStore {
@@ -96,10 +104,6 @@ impl LogStore {
         Self {
             path: config_dir.join("logs.db"),
         }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub async fn append(&self, event: LogEvent) -> Result<String> {
@@ -429,13 +433,10 @@ fn build_list_query(query: &LogQuery, include_run_phase_fields: bool) -> (String
     );
     let mut params: Vec<SqlValue> = Vec::new();
 
-    if let Some(source) = normalize_text_filter(query.source.clone()) {
-        sql.push_str(" and source = ?");
-        params.push(SqlValue::Text(source));
-    }
-    if let Some(tool) = normalize_text_filter(query.tool.clone()) {
-        sql.push_str(" and lower(coalesce(tool, '')) like ?");
-        params.push(SqlValue::Text(format!("%{tool}%")));
+    if let Some(by) = normalize_text_filter(query.by.clone()) {
+        sql.push_str(" and (source = ? or lower(coalesce(tool, '')) like ?)");
+        params.push(SqlValue::Text(by.clone()));
+        params.push(SqlValue::Text(format!("%{by}%")));
     }
     if let Some(model) = normalize_text_filter(query.model.clone()) {
         sql.push_str(" and lower(coalesce(model, '')) like ?");
@@ -600,20 +601,41 @@ fn status_with_connection(conn: &Connection, path: &Path) -> Result<LogStatus> {
         .context("Failed to count log entries")?;
 
     let mut statement = conn
-        .prepare("select source, count(*) from events group by source order by source")
+        .prepare(
+            "select source, coalesce(tool, ''), count(*) from events \
+             group by source, tool order by source, count(*) desc",
+        )
         .context("Failed to prepare log status query")?;
     let rows = statement
         .query_map([], |row| {
-            Ok(SourceCount {
-                source: row.get(0)?,
-                count: row.get::<_, i64>(1)? as u64,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))
         })
         .context("Failed to read log status rows")?;
 
-    let mut counts_by_source = Vec::new();
+    let mut counts_by_source: Vec<SourceCount> = Vec::new();
     for row in rows {
-        counts_by_source.push(row?);
+        let (source, tool, count) = row?;
+        let entry = match counts_by_source.last_mut() {
+            Some(last) if last.source == source => last,
+            _ => {
+                counts_by_source.push(SourceCount {
+                    source: source.clone(),
+                    count: 0,
+                    tools: Vec::new(),
+                });
+                counts_by_source
+                    .last_mut()
+                    .expect("just pushed a SourceCount")
+            }
+        };
+        entry.count += count;
+        if !tool.is_empty() {
+            entry.tools.push(ToolCount { tool, count });
+        }
     }
 
     let file_size_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
@@ -767,7 +789,7 @@ mod tests {
         let filtered = store
             .list(LogQuery {
                 limit: 10,
-                source: Some("chat".to_string()),
+                by: Some("chat".to_string()),
                 search: Some("summarize".to_string()),
                 ..Default::default()
             })
