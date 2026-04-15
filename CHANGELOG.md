@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.17.0
+
+### Features
+
+- **Improved the ux of adding keys**: Interactive provider picker backed by the full known-provider catalog
+- **Added JSON output via `--json`**: Enables scripting and `| jq` pipelines
+
+### Refactors
+
+- Streamline `logs` command and redesign the status output
+
 ## v0.16.2
 
 ### Bug Fixes
