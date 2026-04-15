@@ -20,20 +20,25 @@ static KNOWN_PROVIDERS: LazyLock<Vec<KnownProvider>> = LazyLock::new(|| {
         .expect("embedded providers.json must be valid")
 });
 
-/// Find a provider whose id or display name matches the input as a substring
-/// in either direction (case-insensitive). Matches both "my-openrouter-key"
-/// (id contained in input) and "google" (input contained in id or name).
+/// Find a provider whose id matches the input as a substring in either
+/// direction (case-insensitive). Matches both "my-openrouter-key" (id
+/// contained in input) and "google" (input contained in id).
+///
+/// Requires at least 3 characters of input — the shortest provider id is
+/// 3 chars (e.g. "xai", "poe"), and 1–2 char inputs like "hi" or "ai"
+/// produce coincidental substring hits against longer ids (e.g. "hi" in
+/// "zhipuai"). Display names are intentionally not matched because they
+/// contain descriptive words like "China" or "Gateway" that also produce
+/// false positives on short inputs.
 pub fn find_by_name_substring(input: &str) -> Option<&KnownProvider> {
-    if input.is_empty() {
+    const MIN_LEN: usize = 3;
+    if input.len() < MIN_LEN {
         return None;
     }
     let input_lower = input.to_ascii_lowercase();
     KNOWN_PROVIDERS.iter().find(|p| {
         let id_lower = p.id.to_ascii_lowercase();
-        let name_lower = p.name.to_ascii_lowercase();
-        id_lower.contains(&input_lower)
-            || name_lower.contains(&input_lower)
-            || input_lower.contains(&id_lower)
+        id_lower.contains(&input_lower) || input_lower.contains(&id_lower)
     })
 }
 
@@ -76,5 +81,34 @@ mod tests {
 
         let p = find_by_name_substring("GROQ_KEY").unwrap();
         assert_eq!(p.id, "groq");
+    }
+
+    #[test]
+    fn short_input_does_not_match() {
+        // Regression: "hi" previously matched "Moonshot AI (China)" because
+        // the display name contained "hi" (from "china"), and would also
+        // match "zhipuai" by id substring. 1–2 char inputs are never a
+        // useful provider hint — require 3+ chars.
+        assert!(find_by_name_substring("hi").is_none());
+        assert!(find_by_name_substring("ai").is_none());
+        assert!(find_by_name_substring("x").is_none());
+        assert!(find_by_name_substring("cn").is_none());
+    }
+
+    #[test]
+    fn descriptive_name_words_do_not_match() {
+        // Words that appear only in display names (not ids) should not
+        // auto-detect a provider — they're too ambiguous.
+        assert!(find_by_name_substring("china").is_none());
+        assert!(find_by_name_substring("gateway").is_none());
+    }
+
+    #[test]
+    fn short_exact_id_still_matches() {
+        // 3-char ids are the shortest and must still be detectable.
+        let p = find_by_name_substring("xai").unwrap();
+        assert_eq!(p.id, "xai");
+        let p = find_by_name_substring("poe").unwrap();
+        assert_eq!(p.id, "poe");
     }
 }

@@ -1027,13 +1027,27 @@ impl KeysCommand {
         choices.push(ProviderChoice::Custom);
 
         let detected_url = (!name.is_empty()).then(|| detect_base_url(name)).flatten();
+        let detected_idx =
+            detected_url.and_then(|url| providers.iter().position(|p| p.base_url == url));
+
+        // Hoist the detected provider to the top (right after Custom URL) so
+        // the preselected match is visible without scrolling past unrelated
+        // entries.
+        if let Some(di) = detected_idx {
+            let p = &providers[di];
+            let url = truncate_url_for_display(&p.base_url, PICKER_URL_MAX_LEN);
+            labels.push(format_picker_choice(&p.name, &url));
+            choices.push(ProviderChoice::Known(di));
+            preselected = Some(labels.len() - 1);
+        }
+
         for (i, p) in providers.iter().enumerate() {
+            if Some(i) == detected_idx {
+                continue;
+            }
             let url = truncate_url_for_display(&p.base_url, PICKER_URL_MAX_LEN);
             labels.push(format_picker_choice(&p.name, &url));
             choices.push(ProviderChoice::Known(i));
-            if preselected.is_none() && detected_url == Some(p.base_url.as_str()) {
-                preselected = Some(labels.len() - 1);
-            }
         }
 
         // Ollama is pickable like a regular provider, but retains its own flow
