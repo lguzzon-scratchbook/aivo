@@ -1229,8 +1229,7 @@ impl KeysCommand {
 
     async fn add_custom_interactive(&self, name: &str) -> Result<ExitCode> {
         let base_url = loop {
-            let input =
-                term_read_line(&style::dim("Base URL (e.g., https://api.openai.com/v1): "))?;
+            let input = term_read_line(&style::dim("Base URL: "))?;
             if input.is_empty() {
                 continue;
             }
@@ -1310,11 +1309,13 @@ impl KeysCommand {
         // Defensive: a previously-crashed invocation may have left the terminal
         // in raw mode, which breaks backspace in the first prompt.
         restore_cooked_mode();
+        let mut name_was_prompted = false;
         let name = if let Some(n) = add_options.name.or(provided_name) {
             n.to_string()
         } else if add_options.base_url.is_some() && add_options.key.is_some() {
             String::new()
         } else {
+            name_was_prompted = true;
             read_line("Name (optional): ")?
         };
 
@@ -1326,6 +1327,11 @@ impl KeysCommand {
             add_options.base_url.is_none() && add_options.key.is_none() && !is_name_shortcut;
 
         if interactive {
+            // Echo the name when it came from arg/flag so the user sees what
+            // was used before the provider picker takes over.
+            if !name_was_prompted && !name.is_empty() {
+                println!("{} {}", style::dim("Name:"), style::cyan(&name));
+            }
             return self.interactive_add(&name).await;
         }
 
@@ -1363,7 +1369,7 @@ impl KeysCommand {
                 } else {
                     let prompt = match detected_url {
                         Some(default) => format!("Base URL [{}]: ", default),
-                        None => "Base URL (e.g., https://api.openai.com/v1): ".to_string(),
+                        None => "Base URL: ".to_string(),
                     };
                     let input = read_line(&prompt)?;
                     if input.is_empty() {
