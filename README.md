@@ -152,8 +152,8 @@ aivo claude --env BASH_DEFAULT_TIMEOUT_MS=60000
 
 #### `aivo run`
 
-Without a tool name, `aivo run` uses the interactive start flow, which remembers your key + tool selection per directory,
-so next time you run `aivo run` in the same directory, it will skip the selection step and go straight to launching the tool.
+Without a tool name, `aivo run` uses the interactive start flow, which remembers your last key + tool selection globally,
+so next time you run `aivo run`, it will skip the selection step and go straight to launching the tool.
 
 ```bash
 aivo run
@@ -213,6 +213,14 @@ Bypass the model cache when opening the model picker:
 
 ```bash
 aivo chat -r
+```
+
+#### `--json`
+
+In one-shot mode (`-x`), print the result as JSON for scripting:
+
+```bash
+aivo chat -x "hello" --json
 ```
 
 #### Slash commands
@@ -315,6 +323,8 @@ Manage saved API keys. Keys are stored locally and encrypted in the user config 
 
 ```bash
 aivo keys                                # list all keys
+aivo keys --ping                         # list with live ping status
+aivo keys --json                         # machine-readable list (secret excluded)
 ```
 
 #### `keys add`
@@ -420,6 +430,14 @@ Filter models by substring:
 aivo models -s sonnet
 ```
 
+#### `--json`
+
+Output the model list as JSON:
+
+```bash
+aivo models --json | jq '.models[].id'
+```
+
 ## alias
 
 Create short names for models. Aliases work anywhere a model name is accepted.
@@ -448,9 +466,17 @@ aivo chat -m best
 aivo alias rm fast
 ```
 
+#### `--json`
+
+Output the alias list as JSON:
+
+```bash
+aivo alias --json
+```
+
 ## info
 
-Show a compact overview of saved keys, installed tools, the remembered tool/model for the current directory, and the cached model count for the active key. (`ls` is accepted as an alias.)
+Show a compact overview of saved keys, installed tools, the last remembered tool/model selection, and the cached model count for the active key. (`ls` is accepted as an alias.)
 
 ```bash
 aivo info
@@ -462,6 +488,15 @@ Also health-check all keys:
 
 ```bash
 aivo info --ping
+```
+
+#### `--json`
+
+Output info as JSON (combines with `--ping`):
+
+```bash
+aivo info --json
+aivo info --ping --json | jq '.keys[] | select(.ping.ok==false)'
 ```
 
 ## logs
@@ -567,6 +602,14 @@ Show the heaviest native session files:
 
 ```bash
 aivo stats --top-sessions
+```
+
+#### `--json`
+
+Output stats as JSON (all models, exact numbers):
+
+```bash
+aivo stats --json | jq '.totals.tokens'
 ```
 
 ## update
