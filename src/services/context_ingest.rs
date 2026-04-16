@@ -653,7 +653,7 @@ fn opencode_extract_session(
 // Filesystem walking — newest-first
 // ---------------------------------------------------------------------------
 
-async fn list_jsonl_newest_first(dir: &Path) -> Vec<PathBuf> {
+pub(crate) async fn list_jsonl_newest_first(dir: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
     let mut read_dir = match fs::read_dir(dir).await {
         Ok(rd) => rd,
@@ -675,7 +675,7 @@ async fn list_jsonl_newest_first(dir: &Path) -> Vec<PathBuf> {
     entries.into_iter().map(|(p, _)| p).collect()
 }
 
-async fn walk_jsonl_newest_first(root: &Path) -> Vec<PathBuf> {
+pub(crate) async fn walk_jsonl_newest_first(root: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -863,7 +863,7 @@ async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread>
 }
 
 /// Pulls natural-language text from a Claude `message` field.
-fn extract_claude_text(message: Option<&Value>) -> Option<String> {
+pub(crate) fn extract_claude_text(message: Option<&Value>) -> Option<String> {
     let content = message?.get("content")?;
     if let Some(s) = content.as_str() {
         return Some(s.to_string());
@@ -888,7 +888,7 @@ fn extract_claude_text(message: Option<&Value>) -> Option<String> {
 }
 
 /// Pulls natural-language text from a Codex `response_item.payload`.
-fn extract_codex_message_text(payload: &Value) -> Option<String> {
+pub(crate) fn extract_codex_message_text(payload: &Value) -> Option<String> {
     let arr = payload.get("content")?.as_array()?;
     let mut buf = String::new();
     for block in arr {
@@ -947,7 +947,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     format!("{}…", prefix)
 }
 
-fn paths_match(a: &str, b: &str) -> bool {
+pub(crate) fn paths_match(a: &str, b: &str) -> bool {
     let norm = |s: &str| {
         let trimmed = s.trim_end_matches('/');
         std::fs::canonicalize(trimmed)

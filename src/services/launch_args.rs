@@ -241,6 +241,21 @@ pub(crate) fn inject_codex_provider_config(
         "--config".to_string(),
         "model_providers.aivo.env_key=\"AIVO_CODEX_API_KEY\"".to_string(),
     ];
+    // Disable the built-in `codex_apps` MCP (OpenAI Connectors registry).
+    // When aivo is routing codex to a non-OpenAI provider, the user is not
+    // authed with ChatGPT, so codex_apps can't do anything useful — but it
+    // still tries to fetch chatgpt.com/backend-api/connectors/directory on
+    // startup, which costs 10s of wall-clock time and fails outright
+    // without VPN. Disabling removes that tax; users who need apps should
+    // run `codex` directly rather than going through aivo.
+    if !args.iter().any(|a| a == "apps" || a == "connectors")
+        && !args
+            .windows(2)
+            .any(|w| (w[0] == "--disable" || w[0] == "--enable") && w[1] == "apps")
+    {
+        config_args.push("--disable".to_string());
+        config_args.push("apps".to_string());
+    }
     config_args.append(args);
     *args = config_args;
 }
@@ -281,6 +296,16 @@ fn preview_codex_provider_config_args(
         "--config".to_string(),
         "model_providers.aivo.env_key=\"AIVO_CODEX_API_KEY\"".to_string(),
     ];
+    // Mirror the runtime behavior of inject_codex_provider_config: disable
+    // the codex_apps MCP to avoid a startup call to chatgpt.com that would
+    // hang without VPN and yield nothing useful under aivo's routing.
+    if !args
+        .windows(2)
+        .any(|w| (w[0] == "--disable" || w[0] == "--enable") && w[1] == "apps")
+    {
+        prefix.push("--disable".to_string());
+        prefix.push("apps".to_string());
+    }
     prefix.extend(args);
     prefix
 }
@@ -693,6 +718,8 @@ mod tests {
                 "model_providers.aivo.base_url=\"https://api.openai.com/v1\"",
                 "--config",
                 "model_providers.aivo.env_key=\"AIVO_CODEX_API_KEY\"",
+                "--disable",
+                "apps",
                 "-m",
                 "o4-mini",
             ]
@@ -782,12 +809,14 @@ mod tests {
         ];
         inject_codex_provider_config(&mut env, &mut args);
 
-        // Config flags prepended, original args preserved at the end
-        assert_eq!(args[8], "--config");
-        assert_eq!(args[9], "model_catalog_json=\"/tmp/cat.json\"");
-        assert_eq!(args[10], "-m");
-        assert_eq!(args[11], "gpt-4o");
-        assert_eq!(args[12], "fix bug");
+        // Config flags + --disable apps prepended, original args at the end
+        assert_eq!(args[8], "--disable");
+        assert_eq!(args[9], "apps");
+        assert_eq!(args[10], "--config");
+        assert_eq!(args[11], "model_catalog_json=\"/tmp/cat.json\"");
+        assert_eq!(args[12], "-m");
+        assert_eq!(args[13], "gpt-4o");
+        assert_eq!(args[14], "fix bug");
     }
 
     #[test]
@@ -814,8 +843,10 @@ mod tests {
         assert_eq!(result[0], "--config");
         assert_eq!(result[1], "model_provider=\"aivo\"");
         assert!(result[5].contains("https://api.openai.com/v1"));
-        assert_eq!(result[8], "-m");
-        assert_eq!(result[9], "gpt-4o");
+        assert_eq!(result[8], "--disable");
+        assert_eq!(result[9], "apps");
+        assert_eq!(result[10], "-m");
+        assert_eq!(result[11], "gpt-4o");
     }
 
     #[test]

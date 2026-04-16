@@ -17,8 +17,10 @@ use crate::services::context_ingest::{IngestOptions, ingest_project};
 use crate::services::context_render::{RenderedContext, render_single_session};
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
+use crate::services::nickname_registry;
 use crate::services::project_id::Thread;
 use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::share_config::{ShareCleanup, maybe_enable_share};
 use crate::services::system_env;
 use crate::style;
 
@@ -89,6 +91,7 @@ impl RunCommand {
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
+        as_name: Option<String>,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -101,6 +104,7 @@ impl RunCommand {
                 env,
                 key_override,
                 context_selector,
+                as_name,
             )
             .await
         {
@@ -124,6 +128,7 @@ impl RunCommand {
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
+        as_name: Option<String>,
     ) -> anyhow::Result<ExitCode> {
         let tool = match tool {
             Some(t) => t,
@@ -197,6 +202,52 @@ impl RunCommand {
             args
         };
 
+        // --as wiring: expose aivo's MCP server to the tool so it can
+        // call list_sessions / get_session on its peer mid-session. Nothing
+        // is persisted — Claude gets an ephemeral temp config file, Codex
+        // gets `-c` CLI overrides. Safe to run under --dry-run too.
+        let (args, _share_cleanup) = if let Some(ref nickname) = as_name {
+            let cwd = system_env::current_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+
+            // Register the nickname in the shared registry
+            let registry_root = nickname_registry::registry_dir_for_cwd(&cwd);
+            let registry_guard = if let Some(ref root) = registry_root {
+                match nickname_registry::register(nickname, ai_tool.as_str(), root).await {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        eprintln!(
+                            "  {} --as: {}; launching without nickname.",
+                            style::yellow("!"),
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let fallback = args.clone();
+            match maybe_enable_share(ai_tool, args, &cwd, nickname).await {
+                Ok((new_args, mut cleanup)) => {
+                    if let Some(guard) = registry_guard {
+                        cleanup.set_registry_guard(guard);
+                    }
+                    (new_args, cleanup)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  {} --as: {}; launching without MCP wiring.",
+                        style::yellow("!"),
+                        e
+                    );
+                    (fallback, ShareCleanup::empty())
+                }
+            }
+        } else {
+            (args, ShareCleanup::empty())
+        };
+
         // Launch the AI tool
         let options = LaunchOptions {
             tool: ai_tool,
@@ -257,6 +308,10 @@ impl RunCommand {
         print_opt(
             "-c, --context[=<id>]",
             "Inject one past session (bare = picker; id from `aivo context`)",
+        );
+        print_opt(
+            "--as <name>",
+            "Name this tool for cross-tool MCP communication",
         );
         print_opt(
             "--dry-run",

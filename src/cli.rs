@@ -5,6 +5,7 @@
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 fn non_empty() -> NonEmptyStringValueParser {
     NonEmptyStringValueParser::new()
@@ -69,6 +70,10 @@ pub enum Commands {
 
     /// Cross-CLI context — auto-extracted from your sessions; bare command shows your last activity
     Context(ContextArgs),
+
+    /// Internal stdio MCP server exposing cross-tool session data to Claude/Codex
+    #[command(hide = true)]
+    McpServe(McpServeArgs),
 }
 
 /// Arguments for the alias command
@@ -171,6 +176,12 @@ pub struct RunArgs {
     /// (prefix match; see `aivo context` for available ids).
     #[arg(short = 'c', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
     pub context: Option<String>,
+
+    /// Give this tool a nickname for cross-tool communication via MCP.
+    /// Other tools in the same directory can query by nickname instead
+    /// of juggling session IDs. Example: `aivo claude --as reviewer`
+    #[arg(long = "as", value_name = "NAME")]
+    pub as_name: Option<String>,
 
     /// Inject environment variable (KEY=VALUE)
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
@@ -315,6 +326,26 @@ pub struct UpdateArgs {
     /// Restore the previous version from the last update backup
     #[arg(long)]
     pub rollback: bool,
+}
+
+/// Arguments for the internal `aivo mcp-serve` subcommand.
+///
+/// Launched by Claude or Codex as a subprocess when `aivo run --as <name>` has
+/// registered aivo in their MCP config. Not meant to be invoked directly by
+/// users — stdin/stdout are the JSON-RPC protocol channel.
+#[derive(Args, Debug, Clone)]
+pub struct McpServeArgs {
+    /// Project root to scope sessions to. Defaults to the server's cwd,
+    /// which may differ from the tool's cwd when launched via MCP — always
+    /// pass this explicitly in registered configs.
+    #[arg(long, value_name = "PATH")]
+    pub cwd: Option<PathBuf>,
+    /// Nickname of the calling tool (set by --as)
+    #[arg(long, value_name = "NAME")]
+    pub nickname: Option<String>,
+    /// CLI type of the caller (claude, codex, etc.)
+    #[arg(long, value_name = "CLI")]
+    pub caller_cli: Option<String>,
 }
 
 /// Arguments for the info command
