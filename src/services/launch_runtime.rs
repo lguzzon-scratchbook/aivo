@@ -251,7 +251,10 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
         .clone();
 
     let models_json = match port {
-        Some(p) => raw.replace(PLACEHOLDER_LOOPBACK_URL, &format!("http://127.0.0.1:{p}")),
+        Some(p) => {
+            ensure_loopback_no_proxy(env);
+            raw.replace(PLACEHOLDER_LOOPBACK_URL, &format!("http://127.0.0.1:{p}"))
+        }
         None => raw,
     };
 
@@ -283,6 +286,7 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
 
 fn set_local_base_url(env: &mut HashMap<String, String>, key: &str, port: u16) {
     env.insert(key.to_string(), format!("http://127.0.0.1:{port}"));
+    ensure_loopback_no_proxy(env);
 }
 
 fn patch_opencode_config_content(env: &mut HashMap<String, String>, port: u16) {
@@ -290,6 +294,31 @@ fn patch_opencode_config_content(env: &mut HashMap<String, String>, port: u16) {
     if let Some(content) = env.get("OPENCODE_CONFIG_CONTENT").cloned() {
         let patched = content.replace(PLACEHOLDER_LOOPBACK_URL, &real_url);
         env.insert("OPENCODE_CONFIG_CONTENT".to_string(), patched);
+        ensure_loopback_no_proxy(env);
+    }
+}
+
+/// Ensures the spawned subprocess will bypass any HTTP proxy when talking to
+/// the local loopback router. Without this, a user's `HTTP_PROXY`/`HTTPS_PROXY`
+/// would route the subprocess's `http://127.0.0.1:<port>` request through the
+/// proxy, which cannot reach the user's localhost. We append loopback entries
+/// to both the upper- and lower-case variants since different HTTP libraries
+/// check different casings.
+fn ensure_loopback_no_proxy(env: &mut HashMap<String, String>) {
+    const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+    for var in ["NO_PROXY", "no_proxy"] {
+        let existing = env.get(var).cloned().unwrap_or_default();
+        let mut entries: Vec<String> = existing
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for host in LOOPBACK_HOSTS {
+            if !entries.iter().any(|e| e == host) {
+                entries.push((*host).to_string());
+            }
+        }
+        env.insert(var.to_string(), entries.join(","));
     }
 }
 
@@ -677,5 +706,66 @@ mod tests {
             env.get("OPENCODE_CONFIG_CONTENT").unwrap(),
             "{\"baseUrl\":\"http://127.0.0.1:9876\"}"
         );
+    }
+
+    #[test]
+    fn set_local_base_url_injects_loopback_no_proxy() {
+        use super::set_local_base_url;
+        let mut env = HashMap::new();
+        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", 9999);
+
+        let no_proxy = env.get("NO_PROXY").expect("NO_PROXY should be set");
+        assert!(no_proxy.contains("127.0.0.1"), "NO_PROXY={no_proxy}");
+        assert!(no_proxy.contains("localhost"), "NO_PROXY={no_proxy}");
+        assert!(no_proxy.contains("::1"), "NO_PROXY={no_proxy}");
+
+        let no_proxy_lower = env.get("no_proxy").expect("no_proxy should be set");
+        assert!(no_proxy_lower.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn set_local_base_url_appends_to_existing_no_proxy() {
+        use super::set_local_base_url;
+        let mut env = HashMap::from([("NO_PROXY".to_string(), "internal.corp".to_string())]);
+        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", 9999);
+
+        let no_proxy = env.get("NO_PROXY").unwrap();
+        assert!(no_proxy.contains("internal.corp"), "NO_PROXY={no_proxy}");
+        assert!(no_proxy.contains("127.0.0.1"), "NO_PROXY={no_proxy}");
+    }
+
+    #[test]
+    fn set_local_base_url_does_not_duplicate_existing_loopback_entry() {
+        use super::set_local_base_url;
+        let mut env = HashMap::from([(
+            "NO_PROXY".to_string(),
+            "127.0.0.1,localhost,::1".to_string(),
+        )]);
+        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", 9999);
+
+        let no_proxy = env.get("NO_PROXY").unwrap();
+        assert_eq!(
+            no_proxy.matches("127.0.0.1").count(),
+            1,
+            "NO_PROXY={no_proxy}"
+        );
+        assert_eq!(
+            no_proxy.matches("localhost").count(),
+            1,
+            "NO_PROXY={no_proxy}"
+        );
+    }
+
+    #[test]
+    fn patch_opencode_config_content_injects_loopback_no_proxy() {
+        let mut env = HashMap::from([(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            "{\"baseUrl\":\"http://127.0.0.1:0\"}".to_string(),
+        )]);
+        patch_opencode_config_content(&mut env, 24860);
+
+        let no_proxy = env.get("NO_PROXY").expect("NO_PROXY should be set");
+        assert!(no_proxy.contains("127.0.0.1"));
+        assert!(no_proxy.contains("localhost"));
     }
 }
