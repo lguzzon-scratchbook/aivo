@@ -26,6 +26,7 @@ pub mod launch_runtime;
 pub mod log_store;
 pub mod model_names;
 pub mod models_cache;
+pub mod nickname_registry;
 pub mod ollama;
 pub mod openai_anthropic_bridge;
 pub mod openai_gemini_bridge;
@@ -44,6 +45,8 @@ pub mod serve_stream_converters;
 pub mod serve_upstream;
 pub mod session_crypto;
 pub mod session_store;
+pub mod session_transcript;
+pub mod share_config;
 pub mod system_env;
 pub mod usage_stats_store;
 
