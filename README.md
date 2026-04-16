@@ -6,6 +6,7 @@ A lightweight CLI for managing API keys and running Claude Code, Codex, Gemini, 
 
 - Securely manages multiple API keys for different providers.
 - Runs `claude`, `codex`, `gemini`, `opencode`, and `pi` CLI tools seamlessly.
+- Bridges context across tools — each CLI can see the others' recent work on the same project, and Claude/Codex can read each other mid-conversation.
 - Provides a simple chat TUI and a one-shot `-x` mode.
 - Can expose the active provider as a local OpenAI-compatible server.
 
@@ -83,6 +84,7 @@ aivo claude --model llama3.2
 | [info](#info) | Show system info, keys, tools, and directory state |
 | [logs](#logs) | Query local SQLite logs for chat, run, and serve |
 | [stats](#stats) | Show usage statistics |
+| [context](#context) | Show recent cross-CLI activity for this project |
 | [update](#update) | Update to the latest version |
 
 ## run
@@ -149,6 +151,28 @@ Inject extra environment variables into the child process:
 ```bash
 aivo claude --env BASH_DEFAULT_TIMEOUT_MS=60000
 ```
+
+#### `--context, -c`
+
+Inject a past session from another CLI as background context for this launch. Bridges cross-tool handoffs that each tool's native `--resume` can't span — e.g. pick up in Claude where Codex left off:
+
+```bash
+aivo claude --context                    # opens session picker
+aivo claude --context=abc123             # specific session (prefix match)
+```
+
+Use `aivo context` to see available session IDs.
+
+#### `--as <name>`
+
+Give this launch a nickname so other tools in the same directory can query its live session by name instead of juggling session IDs:
+
+```bash
+aivo claude --as reviewer
+aivo codex --as coder
+```
+
+Cross-tool MCP is enabled by default — each tool auto-registers under its CLI name (`claude`, `codex`, etc.), incrementing on collision (`claude-2`, `claude-3`). Use `--as` only to override. Claude and Codex can call each other via `list_sessions` / `get_session`; Pi, Gemini, and OpenCode are read-only peers (queryable, but they can't query others).
 
 #### `aivo run`
 
@@ -610,6 +634,40 @@ Output stats as JSON (all models, exact numbers):
 
 ```bash
 aivo stats --json | jq '.totals.tokens'
+```
+
+## context
+
+Show recent cross-CLI activity for the current project. Sessions are derived on demand from each tool's native storage (Claude, Codex, Gemini, Pi, OpenCode) — aivo keeps no duplicate state.
+
+```bash
+aivo context
+```
+
+Pair with `aivo run <tool> --context` to inject one of these sessions into your next launch.
+
+#### `--all, -a`
+
+Show all sessions, bypassing the default 14-day age cap:
+
+```bash
+aivo context --all
+```
+
+#### `--last-days <N>`
+
+Override the default age cap:
+
+```bash
+aivo context --last-days 30
+```
+
+#### `--json`
+
+Dump every available thread as JSON:
+
+```bash
+aivo context --json | jq '.threads'
 ```
 
 ## update
