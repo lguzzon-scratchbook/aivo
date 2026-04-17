@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+use crate::services::atomic_write::atomic_write_secure;
 use crate::services::session_store::{ConfigContext, ConfigLockGuard, UsageStats};
 
 #[derive(Debug, Clone)]
@@ -39,28 +40,7 @@ impl StatsFileContext {
         }
 
         let data = serde_json::to_string_pretty(stats).context("Failed to serialize stats")?;
-        let tmp_path = self.stats_path.with_extension("json.tmp");
-
-        tokio::fs::write(&tmp_path, &data)
-            .await
-            .with_context(|| format!("Failed to write temp stats file: {:?}", tmp_path))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = tokio::fs::metadata(&tmp_path).await?;
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o600);
-            tokio::fs::set_permissions(&tmp_path, permissions).await?;
-        }
-
-        tokio::fs::rename(&tmp_path, &self.stats_path)
-            .await
-            .with_context(|| {
-                format!("Failed to rename temp stats file to {:?}", self.stats_path)
-            })?;
-
-        Ok(())
+        atomic_write_secure(&self.stats_path, data.into_bytes()).await
     }
 }
 

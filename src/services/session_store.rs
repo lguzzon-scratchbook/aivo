@@ -11,6 +11,7 @@ pub use crate::services::session_crypto::{decrypt, encrypt, is_encrypted};
 use crate::services::system_env;
 
 use crate::services::api_key_store::ApiKeyStore;
+use crate::services::atomic_write::atomic_write_secure;
 use crate::services::chat_session_store::ChatSessionStore;
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
@@ -699,40 +700,7 @@ impl ConfigContext {
             .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
 
         let data = serde_json::to_string_pretty(config).context("Failed to serialize config")?;
-
-        let tmp_path = self.config_path.with_extension("json.tmp");
-
-        // Create the temp file with restrictive permissions from the start so
-        // no window exists where the encrypted config is world-readable.
-        let tmp_path_for_write = tmp_path.clone();
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use std::io::Write;
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut file = opts.open(&tmp_path_for_write)?;
-            file.write_all(data.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        })
-        .await
-        .context("Join error writing temp config file")?
-        .with_context(|| format!("Failed to write temp config file: {:?}", tmp_path))?;
-
-        tokio::fs::rename(&tmp_path, &self.config_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to rename temp config file to {:?}",
-                    self.config_path
-                )
-            })?;
-
-        Ok(())
+        atomic_write_secure(&self.config_path, data.into_bytes()).await
     }
 
     /// Loads config from the config file. Keys remain encrypted;

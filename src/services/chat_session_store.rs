@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::PathBuf;
 
+use crate::services::atomic_write::atomic_write_secure;
 use crate::services::session_crypto::encrypt;
 use crate::services::session_store::{
     ChatSessionState, ConfigContext, ConfigLockGuard, SessionIndex, SessionIndexEntry,
@@ -100,18 +101,7 @@ impl ChatSessionStore {
 
         let data =
             serde_json::to_string_pretty(index).context("Failed to serialize session index")?;
-        let path = self.index_path();
-        let tmp_path = path.with_extension("json.tmp");
-
-        tokio::fs::write(&tmp_path, &data)
-            .await
-            .with_context(|| format!("Failed to write temp index file: {:?}", tmp_path))?;
-
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .with_context(|| format!("Failed to rename temp index to {:?}", path))?;
-
-        Ok(())
+        atomic_write_secure(&self.index_path(), data.into_bytes()).await
     }
 
     async fn load_session_file(&self, session_id: &str) -> Result<ChatSessionState> {
@@ -129,18 +119,11 @@ impl ChatSessionStore {
             .with_context(|| format!("Failed to create sessions directory: {:?}", sessions_dir))?;
 
         let data = serde_json::to_string_pretty(state).context("Failed to serialize session")?;
-        let path = self.session_file_path(&state.session_id);
-        let tmp_path = path.with_extension("json.tmp");
-
-        tokio::fs::write(&tmp_path, &data)
-            .await
-            .with_context(|| format!("Failed to write temp session file: {:?}", tmp_path))?;
-
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .with_context(|| format!("Failed to rename temp session to {:?}", path))?;
-
-        Ok(())
+        atomic_write_secure(
+            &self.session_file_path(&state.session_id),
+            data.into_bytes(),
+        )
+        .await
     }
 
     // ── Migration ─────────────────────────────────────────────────────────

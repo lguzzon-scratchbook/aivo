@@ -8,6 +8,7 @@ pub mod anthropic_route_pipeline;
 pub mod anthropic_router;
 pub mod anthropic_to_openai_router;
 pub mod api_key_store;
+pub mod atomic_write;
 pub mod chat_session_store;
 pub mod codex_model_map;
 pub mod context_ingest;
