@@ -773,4 +773,52 @@ mod tests {
         assert!(output.contains("\"cache_read_input_tokens\":90"));
         assert!(output.contains("data: [DONE]"));
     }
+
+    #[test]
+    fn test_anthropic_parallel_tool_calls_preserve_nonzero_index() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-sonnet-4-5");
+        // Text at index 0, then two tool_use blocks at index 1 and 2
+        let input = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Running two tools\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"read_file\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"b.txt\\\"}\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":15}}\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        // Verify tool_calls at index 1 and 2 (not 0)
+        assert!(output.contains("\"index\":1"));
+        assert!(output.contains("\"id\":\"toolu_1\""));
+        assert!(output.contains("\"index\":2"));
+        assert!(output.contains("\"id\":\"toolu_2\""));
+        assert!(output.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn test_gemini_multiple_function_calls_sequential_index() {
+        let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-pro");
+        // Single candidate with text + two functionCall parts
+        let input = concat!(
+            "data: {\"responseId\":\"resp_1\",\"candidates\":[{\"content\":{\"parts\":[",
+            "{\"text\":\"Running tools\"},",
+            "{\"functionCall\":{\"id\":\"call_1\",\"name\":\"read_file\",\"args\":{\"path\":\"a.txt\"}}},",
+            "{\"functionCall\":{\"id\":\"call_2\",\"name\":\"write_file\",\"args\":{\"path\":\"b.txt\"}}}",
+            "],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        // Verify sequential tool indices 0 and 1
+        assert!(output.contains("\"index\":0"));
+        assert!(output.contains("\"id\":\"call_1\""));
+        assert!(output.contains("\"name\":\"read_file\""));
+        assert!(output.contains("\"index\":1"));
+        assert!(output.contains("\"id\":\"call_2\""));
+        assert!(output.contains("\"name\":\"write_file\""));
+        assert!(output.contains("\"finish_reason\":\"tool_calls\""));
+    }
 }

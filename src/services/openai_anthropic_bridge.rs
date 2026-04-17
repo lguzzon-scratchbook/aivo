@@ -71,19 +71,43 @@ pub fn convert_openai_chat_to_anthropic_request(
         }
     }
     if let Some(tc) = body.get("tool_choice") {
-        req["tool_choice"] = match tc {
-            Value::String(s) if s == "auto" => json!({"type": "auto"}),
-            Value::String(s) if s == "required" => json!({"type": "any"}),
-            Value::Object(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("function") => {
-                let name = obj
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                json!({"type": "tool", "name": name})
+        match tc {
+            // Anthropic has no "none" mode — disable tools by removing them entirely
+            Value::String(s) if s == "none" => {
+                if let Some(obj) = req.as_object_mut() {
+                    obj.remove("tools");
+                }
             }
-            _ => tc.clone(),
-        };
+            _ => {
+                req["tool_choice"] = match tc {
+                    Value::String(s) if s == "auto" => json!({"type": "auto"}),
+                    Value::String(s) if s == "required" => json!({"type": "any"}),
+                    Value::Object(obj)
+                        if obj.get("type").and_then(|v| v.as_str()) == Some("function") =>
+                    {
+                        let name = obj
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        json!({"type": "tool", "name": name})
+                    }
+                    _ => tc.clone(),
+                };
+            }
+        }
+    }
+
+    // OpenAI parallel_tool_calls:false → Anthropic disable_parallel_tool_use:true
+    if body.get("parallel_tool_calls") == Some(&json!(false)) && req.get("tools").is_some() {
+        match req.get_mut("tool_choice").and_then(|v| v.as_object_mut()) {
+            Some(tc) => {
+                tc.insert("disable_parallel_tool_use".to_string(), json!(true));
+            }
+            None => {
+                req["tool_choice"] = json!({"type": "auto", "disable_parallel_tool_use": true});
+            }
+        }
     }
 
     req
@@ -682,6 +706,105 @@ mod tests {
         assert_eq!(converted["usage"]["prompt_tokens"], 0);
         assert_eq!(converted["usage"]["completion_tokens"], 0);
         assert_eq!(converted["usage"]["total_tokens"], 0);
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_empty_string_arguments() {
+        // OpenAI legitimately streams arguments: "" (empty string, not "{}")
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "do_stuff", "arguments": ""}
+                }]}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        // Empty string arguments should fall back to {}
+        let tool_block = &converted["messages"][1]["content"][0];
+        assert_eq!(tool_block["type"], "tool_use");
+        assert_eq!(tool_block["input"], json!({}));
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_parallel_tool_calls_false() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "ls", "description": "list", "parameters": {"type":"object"}}
+            }],
+            "parallel_tool_calls": false
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        // Should inject disable_parallel_tool_use into tool_choice
+        assert_eq!(
+            converted["tool_choice"]["disable_parallel_tool_use"],
+            json!(true)
+        );
+        assert_eq!(converted["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_parallel_tool_calls_false_with_existing_tool_choice() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "ls", "description": "list", "parameters": {"type":"object"}}
+            }],
+            "tool_choice": "required",
+            "parallel_tool_calls": false
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        // Should inject disable_parallel_tool_use into existing tool_choice
+        assert_eq!(converted["tool_choice"]["type"], "any");
+        assert_eq!(
+            converted["tool_choice"]["disable_parallel_tool_use"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_tool_choice_none_strips_tools() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "ls", "description": "list", "parameters": {"type":"object"}}
+            }],
+            "tool_choice": "none"
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        // "none" should strip tools and not set tool_choice
+        assert!(converted.get("tools").is_none());
+        assert!(converted.get("tool_choice").is_none());
     }
 
     #[test]
