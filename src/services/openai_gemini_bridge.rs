@@ -171,10 +171,13 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                         .get("tool_call_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
+                    // Gemini matches by function name, not ID — fall back to call_id
+                    // when the assistant message with the original tool_call is not in history
                     let name = tool_names_by_call_id
                         .get(call_id)
+                        .filter(|n| !n.is_empty())
                         .cloned()
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| call_id.to_string());
                     let response = parse_tool_content(message.get("content"));
                     contents.push(json!({
                         "role": "user",
@@ -234,6 +237,7 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
     if let Some(choice) = body.get("tool_choice") {
         let function_calling_config = match choice {
             Value::String(value) if value == "auto" => Some(json!({ "mode": "AUTO" })),
+            Value::String(value) if value == "none" => Some(json!({ "mode": "NONE" })),
             Value::String(value) if value == "required" => Some(json!({ "mode": "ANY" })),
             Value::Object(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("function") => {
                 obj.get("function")
@@ -746,6 +750,74 @@ mod tests {
         let fc_config = &converted["toolConfig"]["functionCallingConfig"];
         assert_eq!(fc_config["mode"], "ANY");
         assert_eq!(fc_config["allowedFunctionNames"][0], "X");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_empty_string_arguments() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "do_stuff", "arguments": ""}
+                }]}
+            ]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        // Empty string arguments should fall back to {}
+        let fc = &converted["contents"][1]["parts"][0]["functionCall"];
+        assert_eq!(fc["name"], "do_stuff");
+        assert_eq!(fc["args"], json!({}));
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_tool_result_without_prior_assistant_call() {
+        // When tool result references a call_id not in conversation history,
+        // the function name should fall back to the call_id itself
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "tool_call_id": "call_abc123", "content": "{\"result\": 42}"}
+            ]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        let fr = &converted["contents"][1]["parts"][0]["functionResponse"];
+        // Should use call_id as fallback name, not empty string
+        assert_eq!(fr["name"], "call_abc123");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_tool_choice_none() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "ls", "description": "list", "parameters": {"type": "object"}}
+            }],
+            "tool_choice": "none"
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        let fc_config = &converted["toolConfig"]["functionCallingConfig"];
+        assert_eq!(fc_config["mode"], "NONE");
     }
 
     #[test]

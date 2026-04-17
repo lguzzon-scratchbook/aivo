@@ -105,6 +105,10 @@ pub fn convert_anthropic_to_openai_request(
     }
 
     if let Some(tc) = body.get("tool_choice") {
+        // Anthropic disable_parallel_tool_use → OpenAI parallel_tool_calls:false
+        if tc.get("disable_parallel_tool_use") == Some(&json!(true)) {
+            req["parallel_tool_calls"] = json!(false);
+        }
         match tc.get("type").and_then(|t| t.as_str()) {
             Some("auto") => {
                 req["tool_choice"] = json!("auto");
@@ -232,5 +236,74 @@ fn convert_content_blocks(
             msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
         }
         messages.push(msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> AnthropicToOpenAIConfig {
+        AnthropicToOpenAIConfig {
+            default_model: "test-model",
+            preserve_stream: false,
+            model_transform: None,
+            include_reasoning_content: false,
+            require_non_empty_reasoning_content: false,
+            stringify_other_tool_result_content: false,
+            fallback_tool_arguments_json: "{}",
+        }
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_maps_to_parallel_tool_calls_false() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "ls", "description": "list", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert_eq!(req["parallel_tool_calls"], json!(false));
+        assert_eq!(req["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn tool_choice_without_disable_parallel_omits_field() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "ls", "description": "list", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"}
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert!(req.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn tool_result_image_blocks_are_text_extracted_only() {
+        let config = AnthropicToOpenAIConfig {
+            stringify_other_tool_result_content: false,
+            ..test_config()
+        };
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "Screenshot taken"},
+                        {"type": "image", "source": {"type": "base64", "data": "abc"}}
+                    ]
+                }]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &config);
+        let tool_msg = &req["messages"][0];
+        assert_eq!(tool_msg["role"], "tool");
+        // Only text content extracted — image block is silently dropped
+        assert_eq!(tool_msg["content"], "Screenshot taken");
     }
 }
