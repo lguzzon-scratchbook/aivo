@@ -605,9 +605,7 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Result
             include_reasoning_content: true,
             require_non_empty_reasoning_content: requires_reasoning_content,
             stringify_other_tool_result_content: true,
-            // OpenAIChatRequest round-trip below strips non-text parts, so
-            // building multimodal arrays upstream would be wasted work.
-            tool_result_supports_multimodal: false,
+            tool_result_supports_multimodal: true,
             fallback_tool_arguments_json: "{}",
         },
     );
@@ -1351,6 +1349,43 @@ mod tests {
         assert_eq!(parsed["usage"]["output_tokens"], 5);
         assert_eq!(parsed["usage"]["cache_read_input_tokens"], 90);
         assert_eq!(parsed["usage"]["cache_creation_input_tokens"], 15);
+    }
+
+    #[test]
+    fn anthropic_to_openai_preserves_tool_result_images_through_typed_roundtrip() {
+        // Regression for P0-1 Tier B: the typed round-trip in
+        // `anthropic_to_openai` (OpenAIChatRequest → stringify →
+        // OpenAIChatRequest) used to strip image_url parts. Images in
+        // tool_result should now reach the upstream request intact.
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_screenshot",
+                    "content": [
+                        {"type": "text", "text": "Screenshot of the home page."},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}
+                    ]
+                }]
+            }]
+        });
+        let req = anthropic_to_openai(&body, false).expect("conversion succeeds");
+        let tool_msg = &req["messages"][0];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], "toolu_screenshot");
+        let content = tool_msg["content"]
+            .as_array()
+            .expect("multimodal content array survives round-trip");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Screenshot of the home page.");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo"
+        );
     }
 
     #[test]

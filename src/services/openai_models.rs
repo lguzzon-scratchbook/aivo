@@ -75,12 +75,31 @@ impl OpenAIContentPart {
             Self::Object(part) => part.text.clone(),
         }
     }
+
+    fn is_text_only(&self) -> bool {
+        match self {
+            Self::Text(_) => true,
+            Self::Object(part) => part.image_url.is_none(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIContentPartObject {
-    #[serde(default)]
+    // Preserve the OpenAI `type` discriminator across deserialize/serialize.
+    // Strict providers reject parts without it; flattening to text drops the
+    // field, which is fine because the Text variant carries no discriminator.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<OpenAIImageUrl>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct OpenAIImageUrl {
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -392,9 +411,27 @@ pub(crate) struct OpenAIChatUsage {
 
 pub(crate) fn stringify_message_content(request: &mut OpenAIChatRequest) {
     for message in &mut request.messages {
-        if let Some(content) = &message.content {
-            message.content = Some(OpenAIMessageContent::Text(content.flatten_text()));
+        let Some(content) = &message.content else {
+            continue;
+        };
+        if matches!(content, OpenAIMessageContent::Text(_)) {
+            continue;
         }
+        // Messages carrying images must stay as multimodal arrays —
+        // flattening would silently erase the images. Strict providers
+        // that reject array content will fail loudly on such requests,
+        // which is the correct outcome over losing data.
+        if !content_is_pure_text(content) {
+            continue;
+        }
+        message.content = Some(OpenAIMessageContent::Text(content.flatten_text()));
+    }
+}
+
+fn content_is_pure_text(content: &OpenAIMessageContent) -> bool {
+    match content {
+        OpenAIMessageContent::Text(_) => true,
+        OpenAIMessageContent::Parts(parts) => parts.iter().all(OpenAIContentPart::is_text_only),
     }
 }
 
@@ -601,9 +638,11 @@ mod tests {
                     content: Some(OpenAIMessageContent::Parts(vec![
                         OpenAIContentPart::Object(OpenAIContentPartObject {
                             text: Some("hello".to_string()),
+                            ..Default::default()
                         }),
                         OpenAIContentPart::Object(OpenAIContentPartObject {
                             text: Some("world".to_string()),
+                            ..Default::default()
                         }),
                     ])),
                     tool_calls: None,
@@ -630,7 +669,10 @@ mod tests {
                 OpenAIChatMessage {
                     role: "user".to_string(),
                     content: Some(OpenAIMessageContent::Parts(vec![
-                        OpenAIContentPart::Object(OpenAIContentPartObject { text: None }),
+                        OpenAIContentPart::Object(OpenAIContentPartObject {
+                            text: None,
+                            ..Default::default()
+                        }),
                     ])),
                     tool_calls: None,
                     tool_call_id: None,
@@ -665,6 +707,84 @@ mod tests {
             req.messages[3].content,
             Some(OpenAIMessageContent::Text(String::new()))
         );
+    }
+
+    #[test]
+    fn stringify_preserves_messages_containing_image_url_parts() {
+        let mut req = OpenAIChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                OpenAIChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(OpenAIMessageContent::Parts(vec![
+                        OpenAIContentPart::Object(OpenAIContentPartObject {
+                            kind: Some("text".to_string()),
+                            text: Some("Screenshot taken".to_string()),
+                            image_url: None,
+                        }),
+                        OpenAIContentPart::Object(OpenAIContentPartObject {
+                            kind: Some("image_url".to_string()),
+                            text: None,
+                            image_url: Some(OpenAIImageUrl {
+                                url: "data:image/png;base64,abc".to_string(),
+                            }),
+                        }),
+                    ])),
+                    tool_calls: None,
+                    tool_call_id: Some("toolu_1".to_string()),
+                    reasoning_content: None,
+                },
+                OpenAIChatMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIMessageContent::Text("hi".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra: Map::new(),
+        };
+
+        stringify_message_content(&mut req);
+
+        match &req.messages[0].content {
+            Some(OpenAIMessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[1] {
+                    OpenAIContentPart::Object(obj) => {
+                        assert_eq!(
+                            obj.image_url.as_ref().map(|i| i.url.as_str()),
+                            Some("data:image/png;base64,abc")
+                        );
+                    }
+                    _ => panic!("expected Object variant with image_url"),
+                }
+            }
+            other => panic!("expected Parts, got {other:?}"),
+        }
+        assert_eq!(
+            req.messages[1].content,
+            Some(OpenAIMessageContent::Text("hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn content_part_object_preserves_image_url_through_serde_roundtrip() {
+        let raw = json!({
+            "type": "image_url",
+            "image_url": {"url": "https://example.com/x.png"},
+        });
+        let part: OpenAIContentPart = serde_json::from_value(raw.clone()).unwrap();
+        // Round-trip back to JSON and confirm fields survive.
+        let back = serde_json::to_value(&part).unwrap();
+        assert_eq!(back, raw);
     }
 
     #[test]
