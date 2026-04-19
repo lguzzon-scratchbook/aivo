@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.18.1
+
+- Fix build on windows.
+
 ## v0.18.0
 
 ### Features
