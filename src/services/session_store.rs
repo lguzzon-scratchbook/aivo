@@ -2049,4 +2049,45 @@ mod tests {
         assert_eq!(tools.get("claude").unwrap().key_id, "key1");
         assert_eq!(tools.get("codex").unwrap().key_id, "key2");
     }
+
+    /// The custom `zeroizing_string` serde module bridges `Zeroizing<String>`
+    /// to a plain JSON string. Guards against silent breakage if upstream
+    /// `zeroize` derives change.
+    #[test]
+    fn zeroizing_string_serde_roundtrip() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            #[serde(with = "super::zeroizing_string")]
+            secret: Zeroizing<String>,
+        }
+
+        let original = Wrap {
+            secret: Zeroizing::new("sk-secret-12345".to_string()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(json, r#"{"secret":"sk-secret-12345"}"#);
+
+        let decoded: Wrap = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.secret.as_str(), "sk-secret-12345");
+        assert_eq!(decoded, original);
+    }
+
+    /// `ApiKey` uses `zeroizing_string` for its `key` field — verify the full
+    /// struct roundtrips without exposing the secret in unexpected places.
+    #[test]
+    fn api_key_zeroizing_roundtrip() {
+        let key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "http://localhost".to_string(),
+            None,
+            "sk-roundtrip-secret".to_string(),
+        );
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(json.contains("\"key\":\"sk-roundtrip-secret\""));
+
+        let decoded: ApiKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.key.as_str(), "sk-roundtrip-secret");
+        assert_eq!(decoded, key);
+    }
 }

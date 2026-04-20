@@ -1338,4 +1338,108 @@ mod tests {
         );
         assert_eq!(chat.choices[0].finish_reason, "stop");
     }
+
+    /// Catch schema drift: a representative `OpenAIChatRequest` (text + parts +
+    /// tools + image + provider-specific extras) must survive a JSON
+    /// round-trip without losing fields. If a future struct change drops
+    /// `extra`, `image_url`, or a typed field, this fails fast.
+    #[test]
+    fn openai_chat_request_json_roundtrip() {
+        let mut extra = Map::new();
+        extra.insert("provider_specific".to_string(), json!({"foo": "bar"}));
+        let mut content_extra = Map::new();
+        content_extra.insert("annotations".to_string(), json!([]));
+
+        let original = OpenAIChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                OpenAIChatMessage {
+                    role: "system".to_string(),
+                    content: Some(OpenAIMessageContent::Text("be helpful".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                OpenAIChatMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIMessageContent::Parts(vec![
+                        OpenAIContentPart::Object(OpenAIContentPartObject {
+                            kind: Some("text".to_string()),
+                            text: Some("hi".to_string()),
+                            image_url: None,
+                            extra: content_extra.clone(),
+                        }),
+                        OpenAIContentPart::Object(OpenAIContentPartObject {
+                            kind: Some("image_url".to_string()),
+                            text: None,
+                            image_url: Some(OpenAIImageUrl {
+                                url: "data:image/png;base64,AAA".to_string(),
+                            }),
+                            extra: Map::new(),
+                        }),
+                    ])),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                OpenAIChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![OpenAIChatToolCall {
+                        id: "call_1".to_string(),
+                        kind: "function".to_string(),
+                        function: OpenAIChatToolCallFunction {
+                            name: "get_weather".to_string(),
+                            arguments: r#"{"city":"NYC"}"#.to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: Some("thinking".to_string()),
+                },
+            ],
+            stream: true,
+            max_tokens: Some(json!(1024)),
+            temperature: Some(json!(0.7)),
+            top_p: None,
+            tools: Some(vec![OpenAIChatTool {
+                kind: "function".to_string(),
+                function: OpenAIChatFunctionTool {
+                    name: "get_weather".to_string(),
+                    description: "look up weather".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+            }]),
+            tool_choice: Some(OpenAIChatToolChoice::Mode("auto".to_string())),
+            reasoning_effort: Some("high".to_string()),
+            extra,
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: OpenAIChatRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+
+        // Assistant tool_call message must keep an explicit `"content":null`
+        // so strict providers (e.g. Cloudflare Workers AI) accept it.
+        assert!(
+            json.contains("\"content\":null"),
+            "expected null content for tool_call message, got: {json}"
+        );
+        // Provider-specific extras flatten through unchanged.
+        assert!(json.contains("\"provider_specific\":{\"foo\":\"bar\"}"));
+    }
+
+    /// `OpenAIChatToolChoice::Named` is the less-common branch; verify it also
+    /// roundtrips since `untagged` enums are easy to break by accident.
+    #[test]
+    fn openai_chat_tool_choice_named_roundtrip() {
+        let original = OpenAIChatToolChoice::Named(OpenAIChatNamedToolChoice {
+            kind: "function".to_string(),
+            function: OpenAIChatToolChoiceFunction {
+                name: "get_weather".to_string(),
+            },
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: OpenAIChatToolChoice = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+    }
 }
