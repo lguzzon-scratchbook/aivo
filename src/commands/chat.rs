@@ -2366,4 +2366,20 @@ mod tests {
         let e = anyhow::anyhow!("API returned 401 Unauthorized");
         assert!(!is_responses_api_required(&e));
     }
+
+    #[test]
+    fn test_detect_initial_chat_format() {
+        // Generic / unknown bases default to OpenAI-compatible.
+        for (base_url, expected) in [
+            ("https://api.anthropic.com", ChatFormat::Anthropic),
+            (
+                "https://generativelanguage.googleapis.com/v1beta",
+                ChatFormat::Google,
+            ),
+            ("https://openrouter.ai/api/v1", ChatFormat::OpenAI),
+            ("http://localhost:8080", ChatFormat::OpenAI),
+        ] {
+            assert_eq!(detect_initial_chat_format(base_url), expected, "{base_url}");
+        }
+    }
 }

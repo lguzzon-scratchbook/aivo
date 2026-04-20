@@ -2223,4 +2223,93 @@ mod tests {
         assert!(choice.contains("a2b"));
         assert!(choice.contains("https://openrouter.ai/api/v1"));
     }
+
+    #[test]
+    fn key_preview_redacts_by_length() {
+        for (input, expected) in [
+            ("sk-abc", "sk-..."),
+            ("1234567890", "123..."),
+            ("sk-abcdefghijklmnop", "sk-abc...mnop"),
+            ("", "..."),
+        ] {
+            assert_eq!(key_preview(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn key_preview_unicode_safe() {
+        // Multi-byte chars: prove we slice on char boundaries, not bytes.
+        let key = "🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑";
+        let out = key_preview(key);
+        assert!(out.contains("..."));
+        assert!(out.starts_with("🔑"));
+    }
+
+    #[test]
+    fn key_metadata_json_excludes_secret() {
+        let key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "https://api.example.com".to_string(),
+            None,
+            "sk-must-not-leak".to_string(),
+        );
+        let payload = key_metadata_json(&key, Some("abc"));
+        let s = serde_json::to_string(&payload).unwrap();
+        assert!(!s.contains("sk-must-not-leak"));
+        assert!(s.contains("\"active\":true"));
+        assert_eq!(payload["id"], "abc");
+        assert_eq!(payload["name"], "test");
+        assert_eq!(payload["base_url"], "https://api.example.com");
+    }
+
+    #[test]
+    fn key_metadata_json_inactive() {
+        let key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "https://api.example.com".to_string(),
+            None,
+            "sk".to_string(),
+        );
+        let payload = key_metadata_json(&key, Some("xyz"));
+        assert_eq!(payload["active"], false);
+        let payload = key_metadata_json(&key, None);
+        assert_eq!(payload["active"], false);
+    }
+
+    #[test]
+    fn ping_result_json_ok_includes_latency() {
+        let result = PingResult {
+            name: "test".to_string(),
+            url: "https://api.example.com".to_string(),
+            status: PingStatus::Ok,
+            latency: Some(std::time::Duration::from_millis(42)),
+        };
+        let payload = ping_result_json(&result);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["latency_ms"], 42);
+    }
+
+    #[test]
+    fn ping_result_json_error_status_keys() {
+        for (status, expected_key) in [
+            (PingStatus::AuthError, "auth_error"),
+            (PingStatus::Unreachable, "unreachable"),
+            (PingStatus::Timeout, "timeout"),
+            (PingStatus::Error("boom".into()), "error"),
+        ] {
+            let result = PingResult {
+                name: "n".to_string(),
+                url: "u".to_string(),
+                status,
+                latency: None,
+            };
+            let payload = ping_result_json(&result);
+            assert_eq!(payload["ok"], false);
+            assert_eq!(payload["status"], expected_key);
+            assert!(payload["latency_ms"].is_null());
+        }
+    }
 }
