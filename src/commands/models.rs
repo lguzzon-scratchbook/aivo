@@ -348,9 +348,9 @@ impl ModelsCommand {
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
-            let name_w = models.iter().map(|m| m.id.len()).max().unwrap_or(0);
+            let widths = ColumnWidths::from_models(&models);
             for model in &models {
-                println!("{}", format_model_line(model, name_w));
+                println!("{}", format_model_line(model, &widths));
             }
 
             if is_static {
@@ -492,26 +492,64 @@ fn format_price_per_million(per_token: &str) -> Option<String> {
     }
 }
 
-fn format_model_line(model: &ModelInfo, name_width: usize) -> String {
+#[derive(Default)]
+struct ColumnWidths {
+    name: usize,
+    context: usize,
+    max_output: usize,
+    input_price: usize,
+}
+
+impl ColumnWidths {
+    fn from_models(models: &[ModelInfo]) -> Self {
+        let mut w = Self::default();
+        for m in models {
+            w.name = w.name.max(m.id.len());
+            if let Some(c) = &m.context {
+                w.context = w.context.max(c.len());
+            }
+            if let Some(o) = &m.max_output {
+                w.max_output = w.max_output.max(o.len());
+            }
+            if let Some(p) = &m.input_price {
+                w.input_price = w.input_price.max(p.len());
+            }
+        }
+        w
+    }
+}
+
+fn format_model_line(model: &ModelInfo, widths: &ColumnWidths) -> String {
     let has_info =
         model.context.is_some() || model.max_output.is_some() || model.multiplier.is_some();
     if !has_info {
         return model.id.clone();
     }
 
-    let mut line = format!("{:<width$}", model.id, width = name_width);
+    let mut line = format!("{:<width$}", model.id, width = widths.name);
     if model.context.is_some() || model.max_output.is_some() {
         let ctx = model.context.as_deref().unwrap_or("?");
         let out = model.max_output.as_deref().unwrap_or("?");
         line.push_str(&format!(
             "  {}",
-            style::dim(format!("{} ctx \u{00b7} {} out", ctx, out))
+            style::dim(format!(
+                "{:>cw$} ctx \u{00b7} {:>ow$} out",
+                ctx,
+                out,
+                cw = widths.context.max(1),
+                ow = widths.max_output.max(1),
+            ))
         ));
     }
     if let (Some(input), Some(output)) = (&model.input_price, &model.output_price) {
         line.push_str(&format!(
             "  {}",
-            style::dim(format!("{}/{}", input, output))
+            style::dim(format!(
+                "{:>iw$}/{}",
+                input,
+                output,
+                iw = widths.input_price.max(1),
+            ))
         ));
     }
     if let Some(mult) = model.multiplier {
