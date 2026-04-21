@@ -124,6 +124,12 @@ fn key_preview(key: &str) -> String {
     }
 }
 
+fn display_secret(key: &ApiKey) -> String {
+    key.credential_label()
+        .map(str::to_string)
+        .unwrap_or_else(|| key_preview(&key.key))
+}
+
 pub struct KeysCommand {
     session_store: SessionStore,
 }
@@ -814,7 +820,7 @@ impl KeysCommand {
                 .set_last_selection(key, &existing_tool, None)
                 .await;
         }
-        let preview = key_preview(&key.key);
+        let preview = display_secret(key);
         println!(
             "{} Activated key: {} {}",
             style::success_symbol(),
@@ -892,6 +898,10 @@ impl KeysCommand {
         println!("Base URL: {}", style::blue(&key.base_url));
         if key.key.is_empty() {
             println!("API Key:  {}", style::dim("(none)"));
+        } else if let Some(label) = key.credential_label() {
+            // Dumping OAuth bundles / Copilot device tokens would leak live
+            // access/refresh tokens that the user can't re-enter anywhere.
+            println!("API Key:  {}", style::dim(label));
         } else {
             println!("API Key:  {}", style::yellow(&*key.key));
         }
@@ -1010,7 +1020,7 @@ impl KeysCommand {
 
         // API Key
         let api_key = loop {
-            let preview = key_preview(&key.key);
+            let preview = display_secret(&key);
             let input = term_read_secret(&format!("API Key [{}]: ", preview))?;
             let value = if input.is_empty() {
                 key.key.as_str().to_string()
@@ -2105,7 +2115,7 @@ pub(crate) async fn prompt_select_key(
         Some(mut key) => {
             SessionStore::decrypt_key_secret(&mut key)?;
             session_store.set_active_key(&key.id).await?;
-            let preview = key_preview(&key.key);
+            let preview = display_secret(&key);
             eprintln!(
                 "{} Activated key: {} {}",
                 style::success_symbol(),
@@ -2518,6 +2528,44 @@ mod tests {
         let out = key_preview(key);
         assert!(out.contains("..."));
         assert!(out.starts_with("🔑"));
+    }
+
+    #[test]
+    fn display_secret_labels_oauth_and_copilot() {
+        use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
+        use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
+        use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
+
+        let cases = [
+            (CLAUDE_OAUTH_SENTINEL, "<Claude OAuth>"),
+            (CODEX_OAUTH_SENTINEL, "<Codex OAuth>"),
+            (GEMINI_OAUTH_SENTINEL, "<Gemini OAuth>"),
+            ("copilot", "<Copilot>"),
+        ];
+        for (base_url, expected) in cases {
+            let key = ApiKey::new_with_protocol(
+                "id".to_string(),
+                "name".to_string(),
+                base_url.to_string(),
+                None,
+                "must-not-leak-this-credential-blob".to_string(),
+            );
+            let out = display_secret(&key);
+            assert_eq!(out, expected, "base_url: {base_url}");
+            assert!(!out.contains("must-not-leak"), "base_url: {base_url}");
+        }
+    }
+
+    #[test]
+    fn display_secret_falls_back_to_preview_for_api_keys() {
+        let key = ApiKey::new_with_protocol(
+            "id".to_string(),
+            "name".to_string(),
+            "https://api.example.com".to_string(),
+            None,
+            "sk-abcdefghijklmnop".to_string(),
+        );
+        assert_eq!(display_secret(&key), "sk-abc...mnop");
     }
 
     #[test]
