@@ -225,6 +225,24 @@ impl ChatCommand {
             return Ok(ExitCode::UserError);
         }
 
+        // Claude Code OAuth tokens target Anthropic's subscription backend
+        // via `CLAUDE_CODE_OAUTH_TOKEN` (injected by the native `claude`
+        // CLI), not the `/v1/messages` or chat-completions endpoints that
+        // `aivo chat` speaks. Refuse early with a pointer to
+        // `aivo run claude`.
+        if key.is_claude_oauth() {
+            eprintln!(
+                "{} Key '{}' is a Claude Code OAuth account — `aivo chat` can't use it.",
+                style::red("Error:"),
+                key.display_name()
+            );
+            eprintln!(
+                "  {} Use `aivo run claude` to start an interactive Claude Code session, or select a regular API key first.",
+                style::dim("hint:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
         let client = crate::services::http_utils::router_http_client();
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());

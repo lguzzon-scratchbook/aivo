@@ -202,24 +202,37 @@ impl RunCommand {
         };
 
         // Codex ChatGPT OAuth keys carry serialized tokens — only `aivo run
-        // codex` knows how to project them into a shadow CODEX_HOME. For
-        // every other tool, refuse early with a clear message instead of
-        // sending a JSON blob as an API key.
-        if let Some(ref key) = key_override
-            && key.is_codex_oauth()
-            && ai_tool != AIToolType::Codex
-        {
-            eprintln!(
-                "{} Key '{}' is a Codex ChatGPT OAuth account and can only be used with 'aivo run codex'.",
-                style::red("Error:"),
-                key.display_name()
-            );
-            eprintln!(
-                "  {} Add or select a regular API key for {}.",
-                style::dim("hint:"),
-                tool
-            );
-            return Ok(ExitCode::UserError);
+        // codex` knows how to project them into a shadow CODEX_HOME. Claude
+        // Code OAuth keys carry a serialized token — only `aivo run claude`
+        // sets CLAUDE_CODE_OAUTH_TOKEN. For every other tool, refuse early
+        // with a clear message instead of sending a JSON blob as an API key.
+        if let Some(ref key) = key_override {
+            if key.is_codex_oauth() && ai_tool != AIToolType::Codex {
+                eprintln!(
+                    "{} Key '{}' is a Codex ChatGPT OAuth account and can only be used with 'aivo run codex'.",
+                    style::red("Error:"),
+                    key.display_name()
+                );
+                eprintln!(
+                    "  {} Add or select a regular API key for {}.",
+                    style::dim("hint:"),
+                    tool
+                );
+                return Ok(ExitCode::UserError);
+            }
+            if key.is_claude_oauth() && ai_tool != AIToolType::Claude {
+                eprintln!(
+                    "{} Key '{}' is a Claude Code OAuth account and can only be used with 'aivo run claude'.",
+                    style::red("Error:"),
+                    key.display_name()
+                );
+                eprintln!(
+                    "  {} Add or select a regular API key for {}.",
+                    style::dim("hint:"),
+                    tool
+                );
+                return Ok(ExitCode::UserError);
+            }
         }
 
         let client = http_utils::router_http_client();

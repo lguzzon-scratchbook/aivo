@@ -11,6 +11,7 @@ pub mod api_key_store;
 pub mod atomic_write;
 pub mod browser_open;
 pub mod chat_session_store;
+pub mod claude_oauth;
 pub mod codex_home_shadow;
 pub mod codex_model_map;
 pub mod codex_oauth;

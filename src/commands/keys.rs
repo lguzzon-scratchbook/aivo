@@ -203,6 +203,10 @@ const CODEX_OAUTH_INFO: (&str, &str) = (
     "OpenAI Codex (ChatGPT)",
     "sign in to your ChatGPT account — multiple accounts supported",
 );
+const CLAUDE_OAUTH_INFO: (&str, &str) = (
+    "Claude Code (Anthropic)",
+    "sign in to your Anthropic account — multiple accounts supported",
+);
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
@@ -383,11 +387,11 @@ async fn ping_with_retries(key: &ApiKey) -> PingStatus {
 async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
     use crate::services::provider_profile::{ModelListingStrategy, provider_profile_for_key};
 
-    // Codex ChatGPT OAuth keys have no reachable REST endpoint (the token
-    // is consumed by native codex at launch-time against a private ChatGPT
-    // backend). Report "Ok" so the list doesn't look scary — the real
-    // health check is `aivo run codex` succeeding.
-    if key.is_codex_oauth() {
+    // Codex ChatGPT OAuth keys have no reachable REST endpoint. Same for
+    // Claude Code OAuth keys — the token is consumed by the native `claude`
+    // CLI against Anthropic's subscription backend. Report "Ok" so the list
+    // doesn't look scary; the real health check is `aivo run claude`.
+    if key.is_codex_oauth() || key.is_claude_oauth() {
         return Ok(PingStatus::Ok);
     }
 
@@ -919,11 +923,11 @@ impl KeysCommand {
             term_read_line(prompt)
         }
 
-        // Codex ChatGPT OAuth entries hold a serialized credential bundle in
-        // the encrypted key slot — there is no meaningful base URL or
-        // user-editable "API key" to change. Only the display name is
-        // safe to edit; everything else is preserved verbatim.
-        if key.is_codex_oauth() {
+        // Codex ChatGPT and Claude Code OAuth entries hold a serialized
+        // credential bundle in the encrypted key slot — there is no meaningful
+        // base URL or user-editable "API key" to change. Only the display name
+        // is safe to edit; everything else is preserved verbatim.
+        if key.is_codex_oauth() || key.is_claude_oauth() {
             let current_name = if key.name.is_empty() {
                 format!("unnamed; shown as {}", key.short_id())
             } else {
@@ -1075,6 +1079,7 @@ impl KeysCommand {
             Known(usize),
             Copilot,
             CodexOAuth,
+            ClaudeOAuth,
             Ollama,
             Starter,
             Custom,
@@ -1133,6 +1138,12 @@ impl KeysCommand {
         ));
         choices.push(ProviderChoice::CodexOAuth);
 
+        labels.push(format_picker_choice(
+            "Claude Code (Anthropic)",
+            "browser login — multi-account",
+        ));
+        choices.push(ProviderChoice::ClaudeOAuth);
+
         // Starter is a singleton — hide the picker entry once one is already set up.
         if !has_starter {
             labels.push(format_picker_choice("aivo starter", "free"));
@@ -1161,6 +1172,7 @@ impl KeysCommand {
             ),
             ProviderChoice::Copilot => ("GitHub Copilot", None),
             ProviderChoice::CodexOAuth => ("OpenAI Codex (ChatGPT)", None),
+            ProviderChoice::ClaudeOAuth => ("Claude Code (Anthropic)", None),
             ProviderChoice::Ollama => ("Ollama", Some(ollama_base_url.clone())),
             ProviderChoice::Starter => ("aivo starter", None),
             ProviderChoice::Custom => ("Custom URL", None),
@@ -1179,6 +1191,7 @@ impl KeysCommand {
             ProviderChoice::Known(i) => self.add_known_provider(name, &providers[*i]).await,
             ProviderChoice::Copilot => self.add_copilot_interactive(name).await,
             ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
+            ProviderChoice::ClaudeOAuth => self.add_claude_oauth_interactive(name).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
             ProviderChoice::Custom => self.add_custom_interactive(name).await,
@@ -1307,6 +1320,77 @@ impl KeysCommand {
             final_name,
             &email_line,
             Some(("aivo run codex", "(launches codex with this account)")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
+    }
+
+    /// Interactive Claude Code OAuth sign-in. Unlike Copilot we allow MULTIPLE
+    /// accounts — each login produces a fresh key entry. Shells out to
+    /// `claude setup-token`, which drives the browser OAuth flow itself; we
+    /// capture the opaque token it prints on stdout and store it encrypted.
+    async fn add_claude_oauth_interactive(&self, name: &str) -> Result<ExitCode> {
+        use crate::services::claude_oauth::{
+            CLAUDE_OAUTH_SENTINEL, SetupTokenError, spawn_setup_token_and_capture,
+        };
+
+        keys_ui::provider_info(CLAUDE_OAUTH_INFO.0, CLAUDE_OAUTH_INFO.1);
+        keys_ui::step_header(
+            3,
+            3,
+            "Sign in",
+            "running `claude setup-token` — follow the browser prompt",
+        );
+
+        let creds = match spawn_setup_token_and_capture().await {
+            Ok(c) => c,
+            Err(SetupTokenError::ClaudeNotFound) => {
+                eprintln!(
+                    "{} The `claude` CLI wasn't found on PATH.",
+                    style::red("Error:")
+                );
+                eprintln!(
+                    "  {} Install Claude Code first: {}",
+                    style::dim("hint:"),
+                    style::cyan("npm i -g @anthropic-ai/claude-code")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            Err(SetupTokenError::EmptyOutput) => {
+                eprintln!(
+                    "{} `claude setup-token` exited without printing a token.",
+                    style::red("Error:")
+                );
+                eprintln!(
+                    "  {} If the login was cancelled, try again. Otherwise report the output above.",
+                    style::dim("hint:"),
+                );
+                return Ok(ExitCode::UserError);
+            }
+            Err(SetupTokenError::NonZeroExit { status }) => {
+                eprintln!(
+                    "{} `claude setup-token` failed ({}).",
+                    style::red("Error:"),
+                    status
+                );
+                return Ok(ExitCode::UserError);
+            }
+            Err(SetupTokenError::Other(e)) => return Err(e),
+        };
+
+        let final_name = if name.is_empty() { "claude" } else { name };
+        let creds_json = creds.to_json()?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(final_name, CLAUDE_OAUTH_SENTINEL, None, &creds_json)
+            .await?;
+
+        self.finalize_add(
+            &id,
+            final_name,
+            "Signed in to Claude Code",
+            Some(("aivo run claude", "(launches claude with this account)")),
         )
         .await?;
         Ok(ExitCode::Success)
@@ -1462,7 +1546,7 @@ impl KeysCommand {
 
         let is_name_shortcut = matches!(
             name.as_str(),
-            "copilot" | "codex" | "ollama" | "aivo-starter" | "aivo starter"
+            "copilot" | "codex" | "claude" | "ollama" | "aivo-starter" | "aivo starter"
         );
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_name_shortcut;
@@ -1517,6 +1601,24 @@ impl KeysCommand {
                 return Ok(ExitCode::UserError);
             }
             return self.add_codex_oauth_interactive("").await;
+        } else if name == "claude" {
+            // `aivo keys add claude` shortcut → Claude Code OAuth flow. Takes no
+            // flags; any --base-url / --key is rejected.
+            if add_options.base_url.is_some() {
+                eprintln!(
+                    "{} Name 'claude' is reserved for the Claude Code OAuth shortcut. Use a different name or omit --base-url.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            if add_options.key.is_some() {
+                eprintln!(
+                    "{} Do not pass --key for Claude Code OAuth. Use 'aivo keys add claude' to start browser login.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            return self.add_claude_oauth_interactive("").await;
         } else if name == "aivo-starter" || name == "aivo starter" {
             crate::constants::AIVO_STARTER_SENTINEL.to_string()
         } else {
@@ -1570,6 +1672,16 @@ impl KeysCommand {
                 if value == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL {
                     eprintln!(
                         "{} Codex ChatGPT login requires the explicit shortcut 'aivo keys add codex'.",
+                        style::red("Error:")
+                    );
+                    if add_options.base_url.is_some() {
+                        return Ok(ExitCode::UserError);
+                    }
+                    continue;
+                }
+                if value == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL {
+                    eprintln!(
+                        "{} Claude Code login requires the explicit shortcut 'aivo keys add claude'.",
                         style::red("Error:")
                     );
                     if add_options.base_url.is_some() {

@@ -145,6 +145,13 @@ impl ApiKey {
     pub fn is_codex_oauth(&self) -> bool {
         self.base_url == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL
     }
+
+    /// True when this entry stores a Claude Code OAuth token (captured via
+    /// `claude setup-token`, stored as serialized `ClaudeOAuthCredential` JSON
+    /// in `key`) rather than a plain API key.
+    pub fn is_claude_oauth(&self) -> bool {
+        self.base_url == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
+    }
 }
 
 /// Per-directory, per-tool start records. Outer key = cwd, inner key = tool name.
@@ -1154,6 +1161,25 @@ mod tests {
     use super::*;
     use crate::services::api_key_store::{KEY_ID_ALPHABET, KEY_ID_LENGTH};
     use tempfile::TempDir;
+
+    #[test]
+    fn is_claude_oauth_tracks_sentinel() {
+        let k = ApiKey {
+            id: "x".into(),
+            name: "".into(),
+            base_url: "claude-oauth".into(),
+            claude_protocol: None,
+            gemini_protocol: None,
+            responses_api_supported: None,
+            codex_mode: None,
+            opencode_mode: None,
+            pi_mode: None,
+            key: Zeroizing::new("{}".into()),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        assert!(k.is_claude_oauth());
+        assert!(!k.is_codex_oauth());
+    }
 
     #[tokio::test]
     async fn test_save_load_empty() {
