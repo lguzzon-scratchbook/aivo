@@ -457,7 +457,7 @@ impl ChatCommand {
         println!(
             "{}",
             style::dim(
-                "Slash commands are available inside chat: /new, /resume, /model, /key, /attach, /detach, /clear, /help, /exit."
+                "Slash commands are available inside chat: /new, /resume, /model, /key, /attach, /detach, /help, /exit."
             )
         );
         println!();
@@ -514,7 +514,6 @@ impl ChatCommand {
             "Attach a text file or image to the next message",
         );
         print_cmd("/detach <n>", "Remove one queued attachment by number");
-        print_cmd("/clear", "Clear queued attachments from the composer");
         print_cmd("/help / /exit", "Open command help / leave chat");
         print_cmd("//message", "Send a literal leading slash");
         println!();

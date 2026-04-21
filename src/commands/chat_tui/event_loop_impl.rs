@@ -223,13 +223,6 @@ impl ChatTuiApp {
                 break Err(err);
             }
 
-            if self.pending_clear_screen {
-                self.pending_clear_screen = false;
-                if let Err(err) = terminal.clear() {
-                    break Err(err.into());
-                }
-            }
-
             if let Err(err) = terminal.draw(|frame| self.render(frame)) {
                 break Err(err.into());
             }

@@ -72,9 +72,9 @@ impl ChatTuiApp {
             );
         }
 
-        if let Some(error) = error_notice(self.notice.as_ref()) {
+        if let Some((color, text)) = notice_display(self.notice.as_ref()) {
             push_message_spacing(&mut lines);
-            render_error_notice(&mut lines, error);
+            render_notice_line(&mut lines, color, text.as_ref());
         }
 
         compact_styled_lines(&mut lines);
@@ -285,15 +285,13 @@ impl ChatTuiApp {
             content_width,
         ) as u16;
 
-        let error_height = error_notice(self.notice.as_ref())
-            .map(|error| {
-                wrapped_text_line_count(format!("Error: {error}"), content_width) as u16 + 1
-            })
+        let notice_height = notice_display(self.notice.as_ref())
+            .map(|(_, text)| wrapped_text_line_count(text.into_owned(), content_width) as u16 + 1)
             .unwrap_or(0);
 
         intro_height
             .saturating_add(EMPTY_STATE_BOTTOM_GAP)
-            .saturating_add(error_height)
+            .saturating_add(notice_height)
     }
 
     pub(super) fn render_empty_state(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -347,11 +345,11 @@ impl ChatTuiApp {
         };
 
         let mut lines = lines;
-        if let Some(error) = error_notice(self.notice.as_ref()) {
+        if let Some((color, text)) = notice_display(self.notice.as_ref()) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                format!("Error: {error}"),
-                Style::default().fg(ERROR),
+                text.into_owned(),
+                Style::default().fg(color),
             )));
         }
 
