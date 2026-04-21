@@ -215,6 +215,35 @@ impl EnvironmentInjector {
 
     /// Prepares environment variables for Claude CLI
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        if key.is_claude_oauth() {
+            let _ = model;
+            let mut env = HashMap::new();
+            match crate::services::claude_oauth::ClaudeOAuthCredential::from_json(key.key.as_str())
+            {
+                Ok(creds) => {
+                    env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), creds.token);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "aivo: failed to decode Claude OAuth credential for key '{}': {e}. \
+                         Re-run `aivo keys add claude` to refresh.",
+                        key.display_name()
+                    );
+                }
+            }
+            // Claude Code's auth resolver prefers ANTHROPIC_API_KEY /
+            // ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL over the OAuth
+            // token, so a shell-exported value would shadow or misroute it.
+            env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), String::new());
+            env.insert("ANTHROPIC_BASE_URL".to_string(), String::new());
+            env.insert(
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                "1".to_string(),
+            );
+            return env;
+        }
+
         let profile = provider_profile_for_key(key);
         let mode = if profile.kind == ProviderKind::Ollama {
             ConnectionMode::Ollama
@@ -776,6 +805,86 @@ mod tests {
             Some(&"1".to_string())
         );
         assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn for_claude_injects_oauth_token_and_clears_api_key_vars() {
+        use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
+        let creds = ClaudeOAuthCredential {
+            token: "sk-ant-oat01-TEST".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "id".into(),
+            "work".into(),
+            CLAUDE_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let injector = EnvironmentInjector::new();
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(&"sk-ant-oat01-TEST".to_string())
+        );
+        // Must not let ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN shadow the OAuth
+        // token — Claude Code's auth precedence prefers those env vars.
+        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&String::new()));
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+            Some(&"1".to_string())
+        );
+        // ANTHROPIC_BASE_URL is cleared so a caller-exported value can't
+        // misroute OAuth traffic (Claude Code falls back to its default
+        // subscription backend when the env var is empty).
+        assert_eq!(env.get("ANTHROPIC_BASE_URL"), Some(&String::new()));
+        // No routed-mode indicators.
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn for_claude_oauth_ignores_model_override() {
+        use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
+        let creds = ClaudeOAuthCredential {
+            token: "sk-ant-oat01-TEST".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "id".into(),
+            "work".into(),
+            CLAUDE_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let env = EnvironmentInjector::new().for_claude(&key, Some("claude-opus-4-7"));
+        assert!(!env.contains_key("ANTHROPIC_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
+        assert!(!env.contains_key("CLAUDE_CODE_SUBAGENT_MODEL"));
+    }
+
+    #[test]
+    fn for_claude_oauth_with_corrupt_json_still_clears_api_key_vars() {
+        use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
+        let key = ApiKey::new_with_protocol(
+            "id".into(),
+            "work".into(),
+            CLAUDE_OAUTH_SENTINEL.into(),
+            None,
+            "not valid json".into(),
+        );
+        let env = EnvironmentInjector::new().for_claude(&key, None);
+        // Degraded but safe: no OAuth token → Claude Code fails auth at launch
+        // loudly, rather than silently falling through to the user's Keychain
+        // account. The cleared API-key vars block that fall-through.
+        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&String::new()));
+        assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
     }
 
     #[test]
