@@ -9,6 +9,7 @@ pub(super) const USER: Color = Color::Rgb(166, 193, 226);
 pub(super) const LINK: Color = Color::Rgb(142, 181, 219);
 pub(super) const QUOTE: Color = Color::Rgb(143, 164, 146);
 pub(super) const ERROR: Color = Color::Rgb(230, 134, 128);
+pub(super) const WARNING: Color = Color::Rgb(230, 184, 107);
 pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 1;
 pub(super) const TRANSCRIPT_BOTTOM_PADDING: u16 = 1;
 pub(super) const COMPOSER_PREFIX_WIDTH: u16 = 2;
@@ -78,12 +79,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         help_label: "/detach <n>",
         description: "remove one queued attachment",
         takes_argument: true,
-    },
-    SlashCommandSpec {
-        name: "clear",
-        help_label: "/clear",
-        description: "clear queued attachments",
-        takes_argument: false,
     },
     SlashCommandSpec {
         name: "help",
@@ -575,7 +570,6 @@ pub(super) enum SlashCommand {
     Key(Option<String>),
     Attach(String),
     Detach(usize),
-    Clear,
     Help,
 }
 
@@ -635,5 +629,5 @@ pub(super) struct ChatTuiApp {
     pub(super) reduce_motion: bool,
     pub(super) frame_tick: usize,
     pub(super) picker_hitbox: Option<PickerHitbox>,
-    pub(super) pending_clear_screen: bool,
+    pub(super) exit_confirm_pending: bool,
 }

@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 pub(super) struct StyledLine {
     pub(super) line: Line<'static>,
@@ -222,10 +223,15 @@ pub(super) fn spinner_frame_indexed(frame_tick: usize, reduce_motion: bool) -> &
     spinner_frame(frame_tick / 5)
 }
 
-pub(super) fn error_notice(notice: Option<&(Color, String)>) -> Option<&str> {
-    notice
-        .filter(|(color, _)| *color == ERROR)
-        .map(|(_, text)| text.as_str())
+pub(super) fn notice_display(notice: Option<&(Color, String)>) -> Option<(Color, Cow<'_, str>)> {
+    notice.map(|(color, text)| {
+        let formatted = if *color == ERROR {
+            Cow::Owned(format!("Error: {text}"))
+        } else {
+            Cow::Borrowed(text.as_str())
+        };
+        (*color, formatted)
+    })
 }
 
 pub(super) fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
@@ -236,8 +242,8 @@ pub(super) fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
         && y < area.y.saturating_add(area.height)
 }
 
-pub(super) fn render_error_notice(lines: &mut Vec<StyledLine>, error: &str) {
-    push_styled_line(lines, format!("Error: {error}"), Style::default().fg(ERROR));
+pub(super) fn render_notice_line(lines: &mut Vec<StyledLine>, color: Color, text: &str) {
+    push_styled_line(lines, text.to_string(), Style::default().fg(color));
 }
 
 pub(super) fn render_system_message(lines: &mut Vec<StyledLine>, role: &str, content: &str) {

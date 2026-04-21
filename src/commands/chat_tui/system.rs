@@ -107,7 +107,6 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
                 .parse::<usize>()
                 .map_err(|_| anyhow::anyhow!("Usage: /detach <n>"))?,
         )),
-        "clear" => Ok(SlashCommand::Clear),
         "help" => Ok(SlashCommand::Help),
         "" => anyhow::bail!("Type a command after '/'"),
         other => anyhow::bail!("Unknown command '/{other}'"),

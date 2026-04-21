@@ -403,7 +403,7 @@ fn test_kill_to_end_of_line() {
 }
 
 #[tokio::test]
-async fn test_ctrl_c_clears_prompt_without_exiting() {
+async fn test_ctrl_l_clears_prompt_without_exiting() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.draft = "hello world".to_string();
@@ -417,7 +417,7 @@ async fn test_ctrl_c_clears_prompt_without_exiting() {
     });
 
     let should_exit = app
-        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
         .await
         .unwrap();
 
@@ -425,24 +425,10 @@ async fn test_ctrl_c_clears_prompt_without_exiting() {
     assert!(app.draft.is_empty());
     assert!(app.draft_attachments.is_empty());
     assert_eq!(app.cursor, 0);
-    assert!(!app.pending_clear_screen);
 }
 
 #[tokio::test]
-async fn test_ctrl_c_exits_when_prompt_empty() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-
-    let should_exit = app
-        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .await
-        .unwrap();
-
-    assert!(should_exit);
-}
-
-#[tokio::test]
-async fn test_ctrl_c_clears_attachment_only_prompt() {
+async fn test_ctrl_l_clears_attachment_only_prompt() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.draft_attachments.push(MessageAttachment {
@@ -454,7 +440,7 @@ async fn test_ctrl_c_clears_attachment_only_prompt() {
     });
 
     let should_exit = app
-        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
         .await
         .unwrap();
 
@@ -463,7 +449,7 @@ async fn test_ctrl_c_clears_attachment_only_prompt() {
 }
 
 #[tokio::test]
-async fn test_ctrl_c_clears_history_navigation_state() {
+async fn test_ctrl_l_clears_history_navigation_state() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.draft_history = vec!["older".to_string(), "newer".to_string()];
@@ -471,7 +457,7 @@ async fn test_ctrl_c_clears_history_navigation_state() {
     assert!(app.draft_history_index.is_some());
     assert!(!app.draft.is_empty());
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
         .await
         .unwrap();
 
@@ -481,38 +467,40 @@ async fn test_ctrl_c_clears_history_navigation_state() {
 }
 
 #[tokio::test]
-async fn test_ctrl_c_exits_when_overlay_open() {
+async fn test_ctrl_c_requires_confirmation_to_exit() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.draft = "hidden behind overlay".to_string();
-    app.cursor = app.draft.len();
-    app.overlay = Overlay::Help;
 
     let should_exit = app
         .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .await
         .unwrap();
+    assert!(!should_exit);
+    assert!(app.exit_confirm_pending);
+    assert!(app.notice.is_some());
 
+    let should_exit = app
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
     assert!(should_exit);
-    assert_eq!(app.draft, "hidden behind overlay");
 }
 
 #[tokio::test]
-async fn test_ctrl_l_requests_clear_screen_without_touching_prompt() {
+async fn test_ctrl_c_pending_resets_on_other_key() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.draft = "hello world".to_string();
-    app.cursor = app.draft.len();
 
-    let should_exit = app
-        .handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .await
         .unwrap();
+    assert!(app.exit_confirm_pending);
 
-    assert!(!should_exit);
-    assert!(app.pending_clear_screen);
-    assert_eq!(app.draft, "hello world");
-    assert_eq!(app.cursor, "hello world".len());
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!app.exit_confirm_pending);
+    assert!(app.notice.is_none());
 }
 
 fn make_test_app(
@@ -568,7 +556,7 @@ fn make_test_app(
         reduce_motion: false,
         frame_tick: 0,
         picker_hitbox: None,
-        pending_clear_screen: false,
+        exit_confirm_pending: false,
     }
 }
 
@@ -829,12 +817,19 @@ fn test_key_filter_does_not_match_across_full_url_path() {
 }
 
 #[test]
-fn test_error_notice_only_returns_errors() {
+fn test_notice_display_prefixes_errors_only() {
     let error = (ERROR, "boom".to_string());
     let info = (MUTED, "ok".to_string());
 
-    assert_eq!(error_notice(Some(&error)), Some("boom"));
-    assert_eq!(error_notice(Some(&info)), None);
+    let displayed = notice_display(Some(&error)).unwrap();
+    assert_eq!(displayed.0, ERROR);
+    assert_eq!(displayed.1.as_ref(), "Error: boom");
+
+    let displayed = notice_display(Some(&info)).unwrap();
+    assert_eq!(displayed.0, MUTED);
+    assert_eq!(displayed.1.as_ref(), "ok");
+
+    assert!(notice_display(None).is_none());
 }
 
 #[test]
@@ -957,7 +952,6 @@ fn test_parse_slash_command_with_argument() {
         parse_slash_command("detach 2").unwrap(),
         SlashCommand::Detach(2)
     );
-    assert_eq!(parse_slash_command("clear").unwrap(), SlashCommand::Clear);
 }
 
 #[test]

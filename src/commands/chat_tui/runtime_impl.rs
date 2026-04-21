@@ -167,22 +167,6 @@ impl ChatTuiApp {
         Ok(())
     }
 
-    pub(super) fn clear_draft_attachments(&mut self) {
-        let count = self.draft_attachments.len();
-        self.draft_attachments.clear();
-        self.notice = Some((
-            MUTED,
-            if count == 0 {
-                "No queued attachments".to_string()
-            } else {
-                format!(
-                    "Cleared {count} attachment{}",
-                    if count == 1 { "" } else { "s" }
-                )
-            },
-        ));
-    }
-
     pub(super) async fn execute_slash_command(&mut self, command: SlashCommand) -> Result<bool> {
         match command {
             SlashCommand::New => {
@@ -209,10 +193,6 @@ impl ChatTuiApp {
             }
             SlashCommand::Detach(index) => {
                 self.detach_attachment(index)?;
-                Ok(false)
-            }
-            SlashCommand::Clear => {
-                self.clear_draft_attachments();
                 Ok(false)
             }
             SlashCommand::Help => {

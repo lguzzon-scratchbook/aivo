@@ -259,7 +259,6 @@ Inside the chat TUI:
 | `/key [id\|name]` | Switch to another saved key for this chat |
 | `/attach <path>` | Attach a text file or image to the next message |
 | `/detach <n>` | Remove one queued attachment by number |
-| `/clear` | Clear queued attachments from the composer |
 | `/help` | Open command help |
 | `/exit` | Leave chat |
 | `//message` | Send a literal leading slash |
