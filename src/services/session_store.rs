@@ -167,6 +167,28 @@ impl ApiKey {
     pub fn is_any_oauth(&self) -> bool {
         self.is_codex_oauth() || self.is_claude_oauth() || self.is_gemini_oauth()
     }
+
+    /// True when this entry is a GitHub Copilot device-token login.
+    pub fn is_copilot(&self) -> bool {
+        crate::services::provider_profile::is_copilot_base(&self.base_url)
+    }
+
+    /// Returns a display label for credentials the user cannot retype (OAuth
+    /// bundles, Copilot device tokens). Used by inspection UIs to avoid
+    /// echoing live access/refresh tokens that have no copy-paste use.
+    pub fn credential_label(&self) -> Option<&'static str> {
+        if self.is_claude_oauth() {
+            Some("<Claude OAuth>")
+        } else if self.is_codex_oauth() {
+            Some("<Codex OAuth>")
+        } else if self.is_gemini_oauth() {
+            Some("<Gemini OAuth>")
+        } else if self.is_copilot() {
+            Some("<Copilot>")
+        } else {
+            None
+        }
+    }
 }
 
 /// Per-directory, per-tool start records. Outer key = cwd, inner key = tool name.
