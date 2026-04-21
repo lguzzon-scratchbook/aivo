@@ -58,14 +58,14 @@ aivo claude --model moonshotai/kimi-k2.5
 Use your GitHub Copilot subscription.
 
 ```bash
-aivo keys add copilot
+aivo keys add        # pick "GitHub Copilot" from the provider list
 aivo claude
 ```
 
 Use local models via Ollama.
 
 ```bash
-aivo keys add ollama
+aivo keys add        # pick "Ollama" from the provider list
 
 # auto pull the model if not present
 aivo claude --model llama3.2
@@ -76,10 +76,10 @@ aivo claude --model llama3.2
 | Command | Description |
 | ------- | ----------- |
 | [run](#run) | Launch an AI tool (claude, codex, gemini, opencode, pi) |
-| [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
-| [serve](#serve) | Local OpenAI-compatible API server |
 | [keys](#keys) | Manage API keys (add, use, rm, cat, edit, ping) |
 | [models](#models) | List available models from the active provider |
+| [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
+| [serve](#serve) | Local OpenAI-compatible API server |
 | [alias](#alias) | Create short names for models |
 | [info](#info) | Show system info, keys, tools, and directory state |
 | [logs](#logs) | Query local SQLite logs for chat, run, and serve |
@@ -183,163 +183,6 @@ so next time you run `aivo run`, it will skip the selection step and go straight
 aivo run
 ```
 
-## chat
-
-`aivo chat` starts the full-screen chat UI.
-
-```bash
-aivo chat
-```
-
-#### `--model, -m`
-
-Specify or change the chat model. Omit the value to open the model picker. The selected model is remembered per saved key.
-
-```bash
-aivo chat --model gpt-4o
-aivo chat -m claude-sonnet-4-5
-aivo chat --model                        # opens model picker
-```
-
-#### `--key, -k`
-
-Use a different saved key for this chat session:
-
-```bash
-aivo chat --key openrouter
-aivo chat -k                             # opens key picker
-```
-
-#### `--execute, -x`
-
-Send a single prompt and exit. When `-x` has a message, piped stdin is appended as context. When `-x` has no message, the entire stdin becomes the prompt.
-
-```bash
-aivo chat -x "Summarize this repository"
-git diff | aivo -x "Write a one-line commit message"
-cat error.log | aivo -x
-aivo -x                                 # type interactively, Ctrl-D to send
-```
-
-`aivo -x` is a shortcut for `aivo chat -x`.
-
-#### `--attach`
-
-Attach text files or images to the next message (repeatable):
-
-```bash
-aivo chat --attach README.md --attach screenshot.png
-```
-
-#### `--refresh, -r`
-
-Bypass the model cache when opening the model picker:
-
-```bash
-aivo chat -r
-```
-
-#### `--json`
-
-In one-shot mode (`-x`), print the result as JSON for scripting:
-
-```bash
-aivo chat -x "hello" --json
-```
-
-#### Slash commands
-
-Inside the chat TUI:
-
-| Command | Description |
-| ------- | ----------- |
-| `/new` | Start a fresh chat with the current key and model |
-| `/resume [query]` | Resume a saved chat from this directory |
-| `/model [name]` | Switch the current chat model |
-| `/key [id\|name]` | Switch to another saved key for this chat |
-| `/attach <path>` | Attach a text file or image to the next message |
-| `/detach <n>` | Remove one queued attachment by number |
-| `/help` | Open command help |
-| `/exit` | Leave chat |
-| `//message` | Send a literal leading slash |
-
-
-## serve
-
-`aivo serve` exposes the active provider as a local OpenAI-compatible endpoint. Handy for scripts and tools that already speak the OpenAI API.
-
-```bash
-aivo serve                               # http://127.0.0.1:24860
-```
-
-#### `--port, -p`
-
-Listen on a custom port (default: 24860):
-
-```bash
-aivo serve --port 8080
-aivo serve -p 8080
-```
-
-#### `--host`
-
-Bind to a specific address (default: 127.0.0.1):
-
-```bash
-aivo serve --host 0.0.0.0               # expose on all interfaces
-```
-
-#### `--key, -k`
-
-Use a different saved key:
-
-```bash
-aivo serve --key openrouter
-aivo serve -k                            # opens key picker
-```
-
-#### `--log`
-
-Enable request logging. Logs to stdout by default, or to a file if a path is given:
-
-```bash
-aivo serve --log | jq .                  # JSONL to stdout
-aivo serve --log /tmp/requests.jsonl     # JSONL to file
-```
-
-#### `--failover`
-
-Enable multi-key failover on 429/5xx errors. Automatically retries with other saved keys:
-
-```bash
-aivo serve --failover
-```
-
-#### `--cors`
-
-Enable CORS headers for browser-based clients:
-
-```bash
-aivo serve --cors
-```
-
-#### `--timeout`
-
-Upstream request timeout in seconds (default: 300, 0 = no timeout):
-
-```bash
-aivo serve --timeout 60
-```
-
-#### `--auth-token`
-
-Require a bearer token. Auto-generated if no value given:
-
-```bash
-aivo serve --auth-token                  # auto-generated token
-aivo serve --auth-token my-secret        # specific token
-```
-
 ## keys
 
 Manage saved API keys. Keys are stored locally and encrypted in the user config directory.
@@ -363,16 +206,21 @@ aivo keys add --name deepseek --base-url https://api.deepseek.com/v1 --key sk-xx
 
 Any endpoint that speaks a supported protocol can be saved — you are not limited to the providers above.
 
-Three special names skip the base-url/key prompts:
+Running `aivo keys add` with no flags opens an interactive picker that covers the built-in OAuth flows:
 
-- **`copilot`** — uses your GitHub Copilot subscription via OAuth device flow
-- **`ollama`** — connects to a local Ollama instance (auto-starts if needed)
-- **`aivo-starter`** — free built-in provider (auto-created on first run, re-add if removed)
+- **GitHub Copilot** — uses your Copilot subscription via OAuth device flow
+- **OpenAI Codex (ChatGPT)** — browser login, multi-account
+- **Claude Code (Anthropic)** — browser login, multi-account
+- **Gemini (Google)** — browser login, multi-account
+- **Ollama** — connects to a local Ollama instance (auto-starts if needed)
+- **aivo starter** — free built-in provider (auto-created on first run, re-add if removed)
+
+Typing a matching name as the label (e.g. `aivo keys add codex`) pre-focuses the picker on that row, so it's still a one-keypress confirm.
 
 ```bash
-aivo keys add copilot
-aivo keys add ollama
-aivo keys add aivo-starter
+aivo keys add                  # open the picker
+aivo keys add codex            # picker with Codex pre-focused
+aivo keys add aivo-starter     # non-interactive re-add
 ```
 
 #### `keys use`
@@ -459,6 +307,162 @@ Output the model list as JSON:
 
 ```bash
 aivo models --json | jq '.models[].id'
+```
+
+## chat
+
+`aivo chat` starts the full-screen chat UI.
+
+```bash
+aivo chat
+```
+
+#### `--model, -m`
+
+Specify or change the chat model. Omit the value to open the model picker. The selected model is remembered per saved key.
+
+```bash
+aivo chat --model gpt-4o
+aivo chat -m claude-sonnet-4-5
+aivo chat --model                        # opens model picker
+```
+
+#### `--key, -k`
+
+Use a different saved key for this chat session:
+
+```bash
+aivo chat --key openrouter
+aivo chat -k                             # opens key picker
+```
+
+#### `--execute, -x`
+
+Send a single prompt and exit. When `-x` has a message, piped stdin is appended as context. When `-x` has no message, the entire stdin becomes the prompt.
+
+```bash
+aivo chat -x "Summarize this repository"
+git diff | aivo -x "Write a one-line commit message"
+cat error.log | aivo -x
+aivo -x                                 # type interactively, Ctrl-D to send
+```
+
+`aivo -x` is a shortcut for `aivo chat -x`.
+
+#### `--attach`
+
+Attach text files or images to the next message (repeatable):
+
+```bash
+aivo chat --attach README.md --attach screenshot.png
+```
+
+#### `--refresh, -r`
+
+Bypass the model cache when opening the model picker:
+
+```bash
+aivo chat -r
+```
+
+#### `--json`
+
+In one-shot mode (`-x`), print the result as JSON for scripting:
+
+```bash
+aivo chat -x "hello" --json
+```
+
+#### Slash commands
+
+Inside the chat TUI:
+
+| Command | Description |
+| ------- | ----------- |
+| `/new` | Start a fresh chat with the current key and model |
+| `/resume [query]` | Resume a saved chat from this directory |
+| `/model [name]` | Switch the current chat model |
+| `/key [id\|name]` | Switch to another saved key for this chat |
+| `/attach <path>` | Attach a text file or image to the next message |
+| `/detach <n>` | Remove one queued attachment by number |
+| `/help` | Open command help |
+| `/exit` | Leave chat |
+| `//message` | Send a literal leading slash |
+
+## serve
+
+`aivo serve` exposes the active provider as a local OpenAI-compatible endpoint. Handy for scripts and tools that already speak the OpenAI API.
+
+```bash
+aivo serve                               # http://127.0.0.1:24860
+```
+
+#### `--port, -p`
+
+Listen on a custom port (default: 24860):
+
+```bash
+aivo serve --port 8080
+aivo serve -p 8080
+```
+
+#### `--host`
+
+Bind to a specific address (default: 127.0.0.1):
+
+```bash
+aivo serve --host 0.0.0.0               # expose on all interfaces
+```
+
+#### `--key, -k`
+
+Use a different saved key:
+
+```bash
+aivo serve --key openrouter
+aivo serve -k                            # opens key picker
+```
+
+#### `--log`
+
+Enable request logging. Logs to stdout by default, or to a file if a path is given:
+
+```bash
+aivo serve --log | jq .                  # JSONL to stdout
+aivo serve --log /tmp/requests.jsonl     # JSONL to file
+```
+
+#### `--failover`
+
+Enable multi-key failover on 429/5xx errors. Automatically retries with other saved keys:
+
+```bash
+aivo serve --failover
+```
+
+#### `--cors`
+
+Enable CORS headers for browser-based clients:
+
+```bash
+aivo serve --cors
+```
+
+#### `--timeout`
+
+Upstream request timeout in seconds (default: 300, 0 = no timeout):
+
+```bash
+aivo serve --timeout 60
+```
+
+#### `--auth-token`
+
+Require a bearer token. Auto-generated if no value given:
+
+```bash
+aivo serve --auth-token                  # auto-generated token
+aivo serve --auth-token my-secret        # specific token
 ```
 
 ## alias

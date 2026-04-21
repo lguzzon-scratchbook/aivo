@@ -1078,6 +1078,7 @@ impl KeysCommand {
     /// `name` is the pre-collected key name (may be empty — each arm supplies
     /// its own default when empty).
     async fn interactive_add(&self, name: &str) -> Result<ExitCode> {
+        #[derive(Clone, Copy, PartialEq)]
         enum ProviderChoice {
             Known(usize),
             Copilot,
@@ -1095,69 +1096,100 @@ impl KeysCommand {
             .iter()
             .any(|k| is_aivo_starter_base(&k.base_url));
 
+        let ollama_base_url = crate::services::ollama::ollama_openai_base_url();
+
+        let label_for = |choice: ProviderChoice| -> (&str, String) {
+            match choice {
+                ProviderChoice::Known(i) => {
+                    let p = &providers[i];
+                    (
+                        p.name.as_str(),
+                        truncate_url_for_display(&p.base_url, PICKER_URL_MAX_LEN),
+                    )
+                }
+                ProviderChoice::Ollama => ("Ollama", ollama_base_url.clone()),
+                ProviderChoice::Copilot => ("GitHub Copilot", "device login".to_string()),
+                ProviderChoice::CodexOAuth => (
+                    "OpenAI Codex (ChatGPT)",
+                    "browser login — multi-account".to_string(),
+                ),
+                ProviderChoice::ClaudeOAuth => (
+                    "Claude Code (Anthropic)",
+                    "browser login — multi-account".to_string(),
+                ),
+                ProviderChoice::GeminiOAuth => (
+                    "Gemini (Google)",
+                    "browser login — multi-account".to_string(),
+                ),
+                ProviderChoice::Starter => ("aivo starter", "free".to_string()),
+                ProviderChoice::Custom => ("Custom URL", "enter manually".to_string()),
+            }
+        };
+
         let mut choices: Vec<ProviderChoice> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         let mut preselected: Option<usize> = None;
+        let push = |choices: &mut Vec<ProviderChoice>,
+                    labels: &mut Vec<String>,
+                    choice: ProviderChoice| {
+            let (label, hint) = label_for(choice);
+            labels.push(format_picker_choice(label, &hint));
+            choices.push(choice);
+        };
 
-        labels.push(format_picker_choice("Custom URL", "enter manually"));
-        choices.push(ProviderChoice::Custom);
+        push(&mut choices, &mut labels, ProviderChoice::Custom);
 
         let detected_url = (!name.is_empty()).then(|| detect_base_url(name)).flatten();
         let detected_idx =
             detected_url.and_then(|url| providers.iter().position(|p| p.base_url == url));
 
-        // Hoist the detected provider to the top (right after Custom URL) so
-        // the preselected match is visible without scrolling past unrelated
-        // entries.
+        let hoisted_special: Option<ProviderChoice> = if detected_idx.is_none() && !name.is_empty()
+        {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "ollama" => Some(ProviderChoice::Ollama),
+                "copilot" => Some(ProviderChoice::Copilot),
+                "codex" => Some(ProviderChoice::CodexOAuth),
+                "claude" => Some(ProviderChoice::ClaudeOAuth),
+                "gemini" => Some(ProviderChoice::GeminiOAuth),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Hoist the matched entry right after Custom URL so it's visible
+        // without scrolling.
         if let Some(di) = detected_idx {
-            let p = &providers[di];
-            let url = truncate_url_for_display(&p.base_url, PICKER_URL_MAX_LEN);
-            labels.push(format_picker_choice(&p.name, &url));
-            choices.push(ProviderChoice::Known(di));
+            push(&mut choices, &mut labels, ProviderChoice::Known(di));
+            preselected = Some(labels.len() - 1);
+        } else if let Some(special) = hoisted_special {
+            push(&mut choices, &mut labels, special);
             preselected = Some(labels.len() - 1);
         }
 
-        for (i, p) in providers.iter().enumerate() {
+        for (i, _) in providers.iter().enumerate() {
             if Some(i) == detected_idx {
                 continue;
             }
-            let url = truncate_url_for_display(&p.base_url, PICKER_URL_MAX_LEN);
-            labels.push(format_picker_choice(&p.name, &url));
-            choices.push(ProviderChoice::Known(i));
+            push(&mut choices, &mut labels, ProviderChoice::Known(i));
         }
 
-        // Ollama is pickable like a regular provider, but retains its own flow
-        // (installation check, no API key). The `aivo keys add ollama` shortcut
-        // also continues to work via the non-interactive path.
-        let ollama_base_url = crate::services::ollama::ollama_openai_base_url();
-        labels.push(format_picker_choice("Ollama", &ollama_base_url));
-        choices.push(ProviderChoice::Ollama);
-
-        labels.push(format_picker_choice("GitHub Copilot", "device login"));
-        choices.push(ProviderChoice::Copilot);
-
-        labels.push(format_picker_choice(
-            "OpenAI Codex (ChatGPT)",
-            "browser login — multi-account",
-        ));
-        choices.push(ProviderChoice::CodexOAuth);
-
-        labels.push(format_picker_choice(
-            "Claude Code (Anthropic)",
-            "browser login — multi-account",
-        ));
-        choices.push(ProviderChoice::ClaudeOAuth);
-
-        labels.push(format_picker_choice(
-            "Gemini (Google)",
-            "browser login — multi-account",
-        ));
-        choices.push(ProviderChoice::GeminiOAuth);
+        for choice in [
+            ProviderChoice::Ollama,
+            ProviderChoice::Copilot,
+            ProviderChoice::CodexOAuth,
+            ProviderChoice::ClaudeOAuth,
+            ProviderChoice::GeminiOAuth,
+        ] {
+            if hoisted_special == Some(choice) {
+                continue;
+            }
+            push(&mut choices, &mut labels, choice);
+        }
 
         // Starter is a singleton — hide the picker entry once one is already set up.
         if !has_starter {
-            labels.push(format_picker_choice("aivo starter", "free"));
-            choices.push(ProviderChoice::Starter);
+            push(&mut choices, &mut labels, ProviderChoice::Starter);
         }
 
         keys_ui::step_header(2, 3, "Provider", "preset or custom URL");
@@ -1175,18 +1207,12 @@ impl KeysCommand {
         // FuzzySelect's `console` crate can leave termios flags off.
         restore_cooked_mode();
 
-        let (picked_label, picked_url): (&str, Option<String>) = match &choices[idx] {
-            ProviderChoice::Known(i) => (
-                providers[*i].name.as_str(),
-                Some(providers[*i].base_url.clone()),
-            ),
-            ProviderChoice::Copilot => ("GitHub Copilot", None),
-            ProviderChoice::CodexOAuth => ("OpenAI Codex (ChatGPT)", None),
-            ProviderChoice::ClaudeOAuth => ("Claude Code (Anthropic)", None),
-            ProviderChoice::GeminiOAuth => ("Gemini (Google)", None),
-            ProviderChoice::Ollama => ("Ollama", Some(ollama_base_url.clone())),
-            ProviderChoice::Starter => ("aivo starter", None),
-            ProviderChoice::Custom => ("Custom URL", None),
+        let picked = choices[idx];
+        let picked_label = label_for(picked).0;
+        let picked_url: Option<String> = match picked {
+            ProviderChoice::Known(i) => Some(providers[i].base_url.clone()),
+            ProviderChoice::Ollama => Some(ollama_base_url.clone()),
+            _ => None,
         };
         match picked_url {
             Some(url) => println!(
@@ -1198,8 +1224,8 @@ impl KeysCommand {
             None => println!("{} {}", style::dim("Provider:"), style::cyan(picked_label)),
         }
 
-        match &choices[idx] {
-            ProviderChoice::Known(i) => self.add_known_provider(name, &providers[*i]).await,
+        match picked {
+            ProviderChoice::Known(i) => self.add_known_provider(name, &providers[i]).await,
             ProviderChoice::Copilot => self.add_copilot_interactive(name).await,
             ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
             ProviderChoice::ClaudeOAuth => self.add_claude_oauth_interactive(name).await,
@@ -1481,6 +1507,10 @@ impl KeysCommand {
     async fn add_starter_interactive(&self, name: &str) -> Result<ExitCode> {
         keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
 
+        if let Some(code) = self.notify_if_starter_already_added().await? {
+            return Ok(code);
+        }
+
         let _ = self.session_store.set_starter_key_dismissed(false).await;
 
         let (starter, _) = self
@@ -1501,6 +1531,28 @@ impl KeysCommand {
         )
         .await?;
         Ok(ExitCode::Success)
+    }
+
+    /// Prints a notice and returns `Some(Success)` if an aivo-starter key is
+    /// already configured; returns `None` otherwise so the caller can create one.
+    async fn notify_if_starter_already_added(&self) -> Result<Option<ExitCode>> {
+        let Some(existing) = self
+            .session_store
+            .get_keys()
+            .await?
+            .into_iter()
+            .find(|k| k.base_url == crate::constants::AIVO_STARTER_SENTINEL)
+        else {
+            return Ok(None);
+        };
+        println!(
+            "{} aivo starter is already added as {} (ID: {}). Run {} to use it.",
+            style::yellow("Note:"),
+            style::cyan(&existing.name),
+            style::dim(&existing.id),
+            style::cyan("aivo chat"),
+        );
+        Ok(Some(ExitCode::Success))
     }
 
     async fn add_custom_interactive(&self, name: &str) -> Result<ExitCode> {
@@ -1597,12 +1649,9 @@ impl KeysCommand {
             read_line("Name (optional): ")?
         };
 
-        let is_name_shortcut = matches!(
-            name.as_str(),
-            "copilot" | "codex" | "claude" | "gemini" | "ollama" | "aivo-starter" | "aivo starter"
-        );
+        let is_starter_name = name == "aivo-starter" || name == "aivo starter";
         let interactive =
-            add_options.base_url.is_none() && add_options.key.is_none() && !is_name_shortcut;
+            add_options.base_url.is_none() && add_options.key.is_none() && !is_starter_name;
 
         if interactive {
             // Echo the name when it came from arg/flag so the user sees what
@@ -1613,84 +1662,7 @@ impl KeysCommand {
             return self.interactive_add(&name).await;
         }
 
-        // Shortcut: `aivo keys add copilot` skips all prompts unless flags conflict.
-        let base_url = if name == "copilot" {
-            match add_options.base_url {
-                Some("copilot") | None => "copilot".to_string(),
-                Some(_) => {
-                    eprintln!(
-                        "{} Name 'copilot' is reserved for GitHub Copilot. Use a different name or omit --base-url.",
-                        style::red("Error:")
-                    );
-                    return Ok(ExitCode::UserError);
-                }
-            }
-        } else if name == "ollama" {
-            match add_options.base_url {
-                Some("ollama") | None => "ollama".to_string(),
-                Some(_) => {
-                    eprintln!(
-                        "{} Name 'ollama' is reserved for local Ollama. Use a different name or omit --base-url.",
-                        style::red("Error:")
-                    );
-                    return Ok(ExitCode::UserError);
-                }
-            }
-        } else if name == "codex" {
-            // `aivo keys add codex` shortcut → ChatGPT OAuth flow. Takes no
-            // flags; any --base-url / --key is rejected.
-            if add_options.base_url.is_some() {
-                eprintln!(
-                    "{} Name 'codex' is reserved for the OpenAI Codex OAuth shortcut. Use a different name or omit --base-url.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-            if add_options.key.is_some() {
-                eprintln!(
-                    "{} Do not pass --key for Codex OAuth. Use 'aivo keys add codex' to start browser login.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-            return self.add_codex_oauth_interactive("").await;
-        } else if name == "claude" {
-            // `aivo keys add claude` shortcut → Claude Code OAuth flow. Takes no
-            // flags; any --base-url / --key is rejected.
-            if add_options.base_url.is_some() {
-                eprintln!(
-                    "{} Name 'claude' is reserved for the Claude Code OAuth shortcut. Use a different name or omit --base-url.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-            if add_options.key.is_some() {
-                eprintln!(
-                    "{} Do not pass --key for Claude Code OAuth. Use 'aivo keys add claude' to start browser login.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-            return self.add_claude_oauth_interactive("").await;
-        } else if name == "gemini" {
-            // `aivo keys add gemini` shortcut → Google OAuth flow. Takes no
-            // flags; any --base-url / --key is rejected.
-            if add_options.base_url.is_some() {
-                eprintln!(
-                    "{} Name 'gemini' is reserved for the Gemini OAuth shortcut. Use a different name or omit --base-url.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-            if add_options.key.is_some() {
-                eprintln!(
-                    "{} Do not pass --key for Gemini OAuth. Use 'aivo keys add gemini' to start browser login.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-            return self.add_gemini_oauth_interactive("").await;
-        } else if name == "aivo-starter" || name == "aivo starter" {
+        let base_url = if is_starter_name {
             crate::constants::AIVO_STARTER_SENTINEL.to_string()
         } else {
             let detected_url = detect_base_url(&name);
@@ -1710,75 +1682,50 @@ impl KeysCommand {
                         input
                     }
                 };
-                if value == "copilot" {
-                    eprintln!(
-                        "{} GitHub Copilot login requires the explicit shortcut 'aivo keys add copilot'.",
-                        style::red("Error:")
-                    );
-                    if add_options.base_url.is_some() {
-                        return Ok(ExitCode::UserError);
-                    }
-                    continue;
-                }
-                if value == "ollama" {
-                    eprintln!(
-                        "{} Ollama setup requires the explicit shortcut 'aivo keys add ollama'.",
-                        style::red("Error:")
-                    );
-                    if add_options.base_url.is_some() {
-                        return Ok(ExitCode::UserError);
+                let picker_hint =
+                    "run 'aivo keys add' (no flags) and pick it from the provider list";
+                let picker_rejections: &[(&str, &str)] = &[
+                    ("copilot", "GitHub Copilot login needs the device flow"),
+                    ("ollama", "Ollama setup needs a local installation check"),
+                    (
+                        crate::services::codex_oauth::CODEX_OAUTH_SENTINEL,
+                        "Codex ChatGPT login needs browser auth",
+                    ),
+                    (
+                        crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL,
+                        "Claude Code login needs browser auth",
+                    ),
+                    (
+                        crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL,
+                        "Gemini login needs browser auth",
+                    ),
+                ];
+                let reject = |msg: String| -> Option<ExitCode> {
+                    eprintln!("{} {msg}", style::red("Error:"));
+                    add_options
+                        .base_url
+                        .is_some()
+                        .then_some(ExitCode::UserError)
+                };
+                if let Some((_, reason)) = picker_rejections.iter().find(|(s, _)| value == *s) {
+                    if let Some(code) = reject(format!("{reason} — {picker_hint}.")) {
+                        return Ok(code);
                     }
                     continue;
                 }
                 if value == "aivo-starter" || value == "aivo starter" {
-                    eprintln!(
-                        "{} Use 'aivo keys add aivo-starter' instead.",
-                        style::red("Error:")
-                    );
-                    if add_options.base_url.is_some() {
-                        return Ok(ExitCode::UserError);
-                    }
-                    continue;
-                }
-                if value == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL {
-                    eprintln!(
-                        "{} Codex ChatGPT login requires the explicit shortcut 'aivo keys add codex'.",
-                        style::red("Error:")
-                    );
-                    if add_options.base_url.is_some() {
-                        return Ok(ExitCode::UserError);
-                    }
-                    continue;
-                }
-                if value == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL {
-                    eprintln!(
-                        "{} Claude Code login requires the explicit shortcut 'aivo keys add claude'.",
-                        style::red("Error:")
-                    );
-                    if add_options.base_url.is_some() {
-                        return Ok(ExitCode::UserError);
-                    }
-                    continue;
-                }
-                if value == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL {
-                    eprintln!(
-                        "{} Gemini login requires the explicit shortcut 'aivo keys add gemini'.",
-                        style::red("Error:")
-                    );
-                    if add_options.base_url.is_some() {
-                        return Ok(ExitCode::UserError);
+                    if let Some(code) =
+                        reject("Use 'aivo keys add aivo-starter' instead.".to_string())
+                    {
+                        return Ok(code);
                     }
                     continue;
                 }
                 if value.starts_with("http://") || value.starts_with("https://") {
                     break value;
                 }
-                eprintln!(
-                    "{} URL must start with http:// or https:// (or enter 'copilot' / 'ollama' for special providers)",
-                    style::red("Error:")
-                );
-                if add_options.base_url.is_some() {
-                    return Ok(ExitCode::UserError);
+                if let Some(code) = reject("URL must start with http:// or https://".to_string()) {
+                    return Ok(code);
                 }
             }
         };
@@ -1787,7 +1734,7 @@ impl KeysCommand {
         if base_url == "copilot" {
             if add_options.key.is_some() {
                 eprintln!(
-                    "{} Do not pass --key for GitHub Copilot. Use 'aivo keys add copilot' to start device login.",
+                    "{} GitHub Copilot uses device login; run 'aivo keys add' (no flags) and pick GitHub Copilot.",
                     style::red("Error:")
                 );
                 return Ok(ExitCode::UserError);
@@ -1892,6 +1839,10 @@ impl KeysCommand {
         // Aivo starter: free provider, no API key needed
         if base_url == crate::constants::AIVO_STARTER_SENTINEL {
             keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
+
+            if let Some(code) = self.notify_if_starter_already_added().await? {
+                return Ok(code);
+            }
 
             // Clear the dismissed flag so ensure_starter_key works again
             let _ = self.session_store.set_starter_key_dismissed(false).await;
