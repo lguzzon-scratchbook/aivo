@@ -168,6 +168,18 @@ impl ApiKey {
         self.is_codex_oauth() || self.is_claude_oauth() || self.is_gemini_oauth()
     }
 
+    pub fn oauth_tool_hint(&self) -> &'static str {
+        if self.is_claude_oauth() {
+            "aivo run claude"
+        } else if self.is_codex_oauth() {
+            "aivo run codex"
+        } else if self.is_gemini_oauth() {
+            "aivo run gemini"
+        } else {
+            "aivo run <tool>"
+        }
+    }
+
     /// True when this entry is a GitHub Copilot device-token login.
     pub fn is_copilot(&self) -> bool {
         crate::services::provider_profile::is_copilot_base(&self.base_url)

@@ -99,6 +99,20 @@ impl ServeCommand {
             }
         };
 
+        if key.is_any_oauth() {
+            eprintln!(
+                "{} Key '{}' is an OAuth credential — `aivo serve` can't proxy it.",
+                style::red("Error:"),
+                key.display_name()
+            );
+            eprintln!(
+                "  {} Use `{}` to launch the tool directly, or switch to a regular API key with `aivo use`.",
+                style::dim("hint:"),
+                key.oauth_tool_hint()
+            );
+            return Ok(ExitCode::UserError);
+        }
+
         let profile = provider_profile_for_key(&key);
         let is_copilot = profile.serve_flags.is_copilot;
         let is_openrouter = profile.serve_flags.is_openrouter;
