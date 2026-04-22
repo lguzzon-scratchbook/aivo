@@ -87,6 +87,8 @@ pub struct CodexHomeShadow {
 
 impl CodexHomeShadow {
     /// Creates the temp dir and writes `auth.json`.
+    /// Also copies the user's `config.toml` from the real `~/.codex/` so
+    /// settings like project trust levels are preserved.
     pub async fn create(creds: &CodexOAuthCredential) -> Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("aivo-codex-")
@@ -98,6 +100,13 @@ impl CodexHomeShadow {
         tokio::fs::write(dir.path().join("auth.json"), body)
             .await
             .context("write shadow auth.json")?;
+
+        if let Some(real_home) = real_codex_home() {
+            let src = real_home.join("config.toml");
+            if src.exists() {
+                let _ = tokio::fs::copy(&src, dir.path().join("config.toml")).await;
+            }
+        }
 
         Ok(Self { dir })
     }
@@ -126,6 +135,16 @@ impl CodexHomeShadow {
             Err(_) => Ok(None),
         }
     }
+}
+
+fn real_codex_home() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("CODEX_HOME") {
+        let p = std::path::PathBuf::from(v);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    crate::services::system_env::home_dir().map(|h| h.join(".codex"))
 }
 
 /// Returns true if the on-disk tokens differ from `original` in any field
