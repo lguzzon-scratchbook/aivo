@@ -272,6 +272,20 @@ impl ModelsCommand {
             },
         };
 
+        if key.is_any_oauth() {
+            eprintln!(
+                "{} Key '{}' is an OAuth credential — it doesn't have a model listing API.",
+                style::red("Error:"),
+                key.display_name()
+            );
+            eprintln!(
+                "  {} Use `{}` to launch the tool directly, or switch to a regular API key with `aivo use`.",
+                style::dim("hint:"),
+                key.oauth_tool_hint()
+            );
+            return Ok(ExitCode::UserError);
+        }
+
         let profile = provider_profile_for_base_url(&key.base_url);
         let is_static = matches!(
             profile.model_listing_strategy,
@@ -587,6 +601,13 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
 /// Google returns inputTokenLimit and outputTokenLimit.
 /// Other providers return just IDs.
 pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>> {
+    if key.is_any_oauth() {
+        anyhow::bail!(
+            "Key '{}' is an OAuth credential with no model listing API. Use `{}` to launch directly, or switch to a regular API key with `aivo use`.",
+            key.display_name(),
+            key.oauth_tool_hint()
+        );
+    }
     let base = normalize_base_url(&key.base_url);
     let profile = provider_profile_for_key(key);
 
