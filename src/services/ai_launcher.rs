@@ -472,20 +472,14 @@ impl AILauncher {
             // Ollama is always OpenAI-compatible; no protocol probing needed.
         } else if options.tool == AIToolType::Claude {
             key = self
-                .resolve_claude_protocol(
-                    key,
-                    persist && options.key_override.is_none(),
-                    options.model.as_deref(),
-                )
+                .resolve_claude_protocol(key, options.model.as_deref())
                 .await?;
         } else if options.tool == AIToolType::Codex {
             key = self
                 .resolve_codex_mode(key, persist && options.key_override.is_none())
                 .await?;
         } else if options.tool == AIToolType::Gemini {
-            key = self
-                .resolve_gemini_protocol(key, persist && options.key_override.is_none())
-                .await?;
+            key = self.resolve_gemini_protocol(key).await?;
         } else if options.tool == AIToolType::Opencode {
             key = self
                 .resolve_opencode_mode(key, persist && options.key_override.is_none())
@@ -529,7 +523,6 @@ impl AILauncher {
     async fn resolve_claude_protocol(
         &self,
         mut key: ApiKey,
-        persist: bool,
         _model: Option<&str>,
     ) -> Result<ApiKey> {
         let profile = provider_profile_for_base_url(&key.base_url);
@@ -537,13 +530,9 @@ impl AILauncher {
             return Ok(key);
         }
         if key.claude_protocol.is_none() {
+            // Default guess only; persist_runtime_discoveries writes the pin
+            // to disk after the router confirms the working protocol.
             key.claude_protocol = Some(preferred_claude_protocol(&key.base_url));
-            if persist {
-                let _ = self
-                    .session_store
-                    .set_key_claude_protocol(&key.id, key.claude_protocol)
-                    .await;
-            }
         }
         Ok(key)
     }
@@ -564,7 +553,7 @@ impl AILauncher {
         Ok(key)
     }
 
-    async fn resolve_gemini_protocol(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
+    async fn resolve_gemini_protocol(&self, mut key: ApiKey) -> Result<ApiKey> {
         if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
@@ -575,13 +564,8 @@ impl AILauncher {
             return Ok(key);
         }
         if key.gemini_protocol.is_none() {
+            // Default guess only — see resolve_claude_protocol.
             key.gemini_protocol = Some(preferred_gemini_protocol(&key.base_url));
-            if persist {
-                let _ = self
-                    .session_store
-                    .set_key_gemini_protocol(&key.id, key.gemini_protocol)
-                    .await;
-            }
         }
         Ok(key)
     }
@@ -912,6 +896,28 @@ mod tests {
     }
 
     #[test]
+    fn preferred_protocols_always_start_with_cli_native_across_hosts() {
+        for url in [
+            "https://api.anthropic.com",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com",
+            "aivo-starter",
+        ] {
+            assert_eq!(
+                preferred_claude_protocol(url),
+                ClaudeProviderProtocol::Anthropic,
+                "claude should start with Anthropic for {url}",
+            );
+            assert_eq!(
+                preferred_gemini_protocol(url),
+                GeminiProviderProtocol::Google,
+                "gemini should start with Google for {url}",
+            );
+        }
+    }
+
+    #[test]
     fn test_preferred_opencode_mode() {
         assert_eq!(
             preferred_opencode_mode("https://api.openai.com/v1"),
@@ -929,5 +935,74 @@ mod tests {
             let hint = tool.install_hint();
             assert!(!hint.is_empty(), "{:?} should have an install hint", tool);
         }
+    }
+
+    // ── resolve_*_protocol: in-memory only, disk-write is the caller's job ──
+
+    async fn test_launcher_with_store() -> (SessionStore, AILauncher, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+        let launcher = AILauncher::new(
+            store.clone(),
+            EnvironmentInjector::new(),
+            ModelsCache::new(),
+        );
+        (store, launcher, temp_dir)
+    }
+
+    async fn test_insert_key(store: &SessionStore, base_url: &str) -> ApiKey {
+        let id = store
+            .add_key_with_protocol("test-key", base_url, None, "sk-test")
+            .await
+            .unwrap();
+        store.get_key_by_id(&id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_claude_protocol_populates_in_memory_only() {
+        // A generic OpenAI-compatible host with no pin. After resolve_* the
+        // returned key must carry the guess in-memory, but the store on disk
+        // must stay clean — persist_runtime_discoveries is the sole writer
+        // once the router confirms a working protocol.
+        let (store, launcher, _tmp) = test_launcher_with_store().await;
+        let key = test_insert_key(&store, "https://api.example.com/v1").await;
+        assert!(key.claude_protocol.is_none(), "precondition: no pin");
+
+        let resolved = launcher
+            .resolve_claude_protocol(key.clone(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            resolved.claude_protocol.is_some(),
+            "in-memory pin must be populated for this launch"
+        );
+
+        let reloaded = store.get_key_by_id(&key.id).await.unwrap().unwrap();
+        assert!(
+            reloaded.claude_protocol.is_none(),
+            "disk pin must stay None — persist_runtime_discoveries is the sole writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_gemini_protocol_populates_in_memory_only() {
+        let (store, launcher, _tmp) = test_launcher_with_store().await;
+        let key = test_insert_key(&store, "https://api.example.com/v1").await;
+        assert!(key.gemini_protocol.is_none(), "precondition: no pin");
+
+        let resolved = launcher.resolve_gemini_protocol(key.clone()).await.unwrap();
+
+        assert!(
+            resolved.gemini_protocol.is_some(),
+            "in-memory pin must be populated for this launch"
+        );
+
+        let reloaded = store.get_key_by_id(&key.id).await.unwrap().unwrap();
+        assert!(
+            reloaded.gemini_protocol.is_none(),
+            "disk pin must stay None — persist_runtime_discoveries is the sole writer"
+        );
     }
 }

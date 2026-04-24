@@ -754,6 +754,9 @@ async fn start_anthropic_to_openai_router(
     let max_tokens_cap = env
         .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAX_TOKENS_CAP")
         .and_then(|v| v.parse::<u64>().ok());
+    let anthropic_path_prefix = env
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_ANTHROPIC_PATH_PREFIX")
+        .cloned();
     let target_protocol = env
         .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL")
         .and_then(|value| ProviderProtocol::parse(value))
@@ -765,6 +768,7 @@ async fn start_anthropic_to_openai_router(
         model_prefix,
         requires_reasoning_content,
         max_tokens_cap,
+        anthropic_path_prefix,
         is_starter: env
             .get("AIVO_IS_STARTER")
             .map(|v| v == "1")

@@ -13,7 +13,9 @@ use crate::services::ollama::ollama_openai_base_url;
 use crate::services::provider_profile::{
     ProviderKind, ProviderProfile, is_direct_openai_base, provider_profile_for_key,
 };
-use crate::services::provider_protocol::{ProviderProtocol, is_anthropic_endpoint};
+use crate::services::provider_protocol::{
+    ProviderProtocol, is_anthropic_endpoint, is_google_endpoint,
+};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
 };
@@ -78,13 +80,17 @@ impl EnvironmentInjector {
     /// Returns true when the URL points to a native Anthropic endpoint that speaks
     /// the Anthropic Messages API directly (no format conversion needed).
     ///
-    /// This includes Anthropic's official API plus provider-hosted Anthropic-compatible
-    /// bases such as MiniMax's `/anthropic` endpoint.
+    /// Invariant: Direct mode requires a native endpoint. The `claude_protocol`
+    /// pin expresses "send this protocol through the router first" and must not
+    /// on its own bypass the router, since the router is where protocol fallback
+    /// runs for generic OpenAI-compatible hosts.
     fn use_direct_anthropic_for_claude(key: &ApiKey) -> bool {
+        if !is_anthropic_endpoint(&key.base_url) {
+            return false;
+        }
         match key.claude_protocol {
-            Some(ClaudeProviderProtocol::Anthropic) => true,
+            Some(ClaudeProviderProtocol::Anthropic) | None => true,
             Some(ClaudeProviderProtocol::Openai | ClaudeProviderProtocol::Google) => false,
-            None => is_anthropic_endpoint(&key.base_url),
         }
     }
 
@@ -97,10 +103,14 @@ impl EnvironmentInjector {
     }
 
     fn use_google_native_for_gemini(key: &ApiKey) -> bool {
+        // Same invariant as use_direct_anthropic_for_claude: only a genuinely
+        // Google-native endpoint may skip the router.
+        if !is_google_endpoint(&key.base_url) {
+            return false;
+        }
         match key.gemini_protocol {
-            Some(GeminiProviderProtocol::Google) => true,
+            Some(GeminiProviderProtocol::Google) | None => true,
             Some(GeminiProviderProtocol::Openai | GeminiProviderProtocol::Anthropic) => false,
-            None => provider_profile_for_key(key).default_protocol == ProviderProtocol::Google,
         }
     }
 
@@ -853,6 +863,66 @@ mod tests {
         )
     }
 
+    fn test_api_key(base_url: &str) -> ApiKey {
+        let mut k = test_key();
+        k.base_url = base_url.to_string();
+        k
+    }
+
+    #[test]
+    fn use_direct_anthropic_false_for_generic_openai_host_with_anthropic_pin() {
+        let mut key = test_api_key("https://api.example.com/v1");
+        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
+    }
+
+    #[test]
+    fn use_direct_anthropic_true_for_anthropic_host_with_no_pin() {
+        let key = test_api_key("https://api.anthropic.com");
+        assert!(EnvironmentInjector::use_direct_anthropic_for_claude(&key));
+    }
+
+    #[test]
+    fn use_direct_anthropic_true_for_anthropic_host_with_anthropic_pin() {
+        let mut key = test_api_key("https://api.anthropic.com");
+        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        assert!(EnvironmentInjector::use_direct_anthropic_for_claude(&key));
+    }
+
+    #[test]
+    fn use_direct_anthropic_false_for_anthropic_host_with_openai_pin() {
+        let mut key = test_api_key("https://api.anthropic.com");
+        key.claude_protocol = Some(ClaudeProviderProtocol::Openai);
+        assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
+    }
+
+    #[test]
+    fn use_google_native_false_for_generic_openai_host_with_google_pin() {
+        let mut key = test_api_key("https://api.example.com/v1");
+        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
+    }
+
+    #[test]
+    fn use_google_native_true_for_google_host_with_no_pin() {
+        let key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
+        assert!(EnvironmentInjector::use_google_native_for_gemini(&key));
+    }
+
+    #[test]
+    fn use_google_native_true_for_google_host_with_google_pin() {
+        let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
+        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        assert!(EnvironmentInjector::use_google_native_for_gemini(&key));
+    }
+
+    #[test]
+    fn use_google_native_false_for_google_host_with_openai_pin() {
+        let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
+        key.gemini_protocol = Some(GeminiProviderProtocol::Openai);
+        assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
+    }
+
     #[test]
     fn test_for_claude_starter_with_anthropic_pin_uses_router_not_direct() {
         // Regression: if the starter key's claude_protocol pin is Anthropic
@@ -1032,7 +1102,11 @@ mod tests {
     }
 
     #[test]
-    fn test_for_claude_protocol_override_anthropic_direct() {
+    fn test_for_claude_protocol_override_anthropic_routes_on_non_native_host() {
+        // Even when claude_protocol pins Anthropic, a non-native base URL
+        // must go through the router so its protocol-fallback path can try
+        // /v1/messages first and downgrade to /v1/chat/completions on 404.
+        // Direct mode requires a genuinely Anthropic-native endpoint.
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.example.com/v1".to_string();
@@ -1040,10 +1114,23 @@ mod tests {
         let env = injector.for_claude(&key, Some("claude-sonnet-4-6"));
 
         assert_eq!(
-            env.get("ANTHROPIC_BASE_URL"),
-            Some(&"https://api.example.com".to_string())
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string()),
+            "non-native host must route through the Anthropic-to-OpenAI router"
         );
-        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL"),
+            Some(&"https://api.example.com/v1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"anthropic".to_string()),
+            "router should target the pinned Anthropic upstream"
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
     }
 
     #[test]
@@ -1565,17 +1652,26 @@ mod tests {
     }
 
     #[test]
-    fn test_for_gemini_protocol_override_google_direct() {
+    fn test_for_gemini_protocol_override_google_routes_on_non_native_host() {
+        // Same invariant as the Claude side: gemini_protocol pinning Google
+        // on a non-Google host must still route through the Gemini router
+        // so protocol fallback can kick in. Direct mode requires a genuinely
+        // Google-native endpoint (generativelanguage.googleapis.com).
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.example.com".to_string();
         key.gemini_protocol = Some(GeminiProviderProtocol::Google);
         let env = injector.for_gemini(&key, None);
 
-        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
+        assert_eq!(env.get("AIVO_USE_GEMINI_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
-            env.get("GOOGLE_GEMINI_BASE_URL"),
+            env.get("AIVO_GEMINI_ROUTER_BASE_URL"),
             Some(&"https://api.example.com".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"google".to_string()),
+            "router should target the pinned Google upstream"
         );
     }
 

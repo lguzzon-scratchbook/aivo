@@ -127,12 +127,33 @@ async fn handle_request(
                     }
                 }
                 ForwardResult::ProviderError { status, body } => {
-                    Ok(http_utils::http_response(status, CONTENT_TYPE_JSON, &body))
+                    let wrapped = wrap_upstream_error_as_json(status, &body);
+                    Ok(http_utils::http_response(
+                        status,
+                        CONTENT_TYPE_JSON,
+                        &wrapped,
+                    ))
                 }
             }
         }
         None => Ok(http_utils::http_error_response(404, "not found")),
     }
+}
+
+/// Wraps plaintext/HTML error bodies in a Google-native error envelope so
+/// gemini-cli's JSON.parse doesn't crash. JSON bodies pass through unchanged.
+fn wrap_upstream_error_as_json(status: u16, body: &str) -> String {
+    if serde_json::from_str::<Value>(body).is_ok() {
+        return body.to_string();
+    }
+    serde_json::json!({
+        "error": {
+            "code": status as i64,
+            "message": body,
+            "status": "UNKNOWN",
+        }
+    })
+    .to_string()
 }
 
 async fn forward_to_provider(
@@ -959,6 +980,27 @@ fn responses_to_chat_response(body_text: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_upstream_error_wraps_plaintext_body() {
+        let out = wrap_upstream_error_as_json(401, "Authentication Fails (governor)");
+        let v: Value = serde_json::from_str(&out).expect("must be valid JSON");
+        assert_eq!(v["error"]["code"], 401);
+        assert_eq!(v["error"]["message"], "Authentication Fails (governor)");
+    }
+
+    #[test]
+    fn wrap_upstream_error_passes_through_existing_json() {
+        let body = r#"{"error":{"code":401,"message":"invalid_api_key"}}"#;
+        assert_eq!(wrap_upstream_error_as_json(401, body), body);
+    }
+
+    #[test]
+    fn wrap_upstream_error_handles_empty_body() {
+        let out = wrap_upstream_error_as_json(502, "");
+        let v: Value = serde_json::from_str(&out).expect("must be valid JSON");
+        assert_eq!(v["error"]["code"], 502);
+    }
 
     #[test]
     fn test_parse_gemini_path_generate_content() {

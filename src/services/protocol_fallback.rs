@@ -34,9 +34,8 @@ pub fn commit_protocol_switch(
 
 /// Classify an HTTP response into an attempt outcome.
 ///
-/// - `Some(T)` → `Success(T)`
-/// - `None` + protocol-mismatch status → `Mismatch`
-/// - `None` + other status → `ProviderError`
+/// 401 with a non-JSON body is a mismatch: CDN/governor layers reject unknown
+/// paths with plaintext, while real protocol-aware auth failures return JSON.
 pub fn classify_attempt<T>(
     status: u16,
     response_text: String,
@@ -48,11 +47,19 @@ pub fn classify_attempt<T>(
             status,
             body: response_text,
         },
+        None if status == 401 && !body_is_json(&response_text) => AttemptOutcome::Mismatch {
+            status,
+            body: response_text,
+        },
         None => AttemptOutcome::ProviderError {
             status,
             body: response_text,
         },
     }
+}
+
+fn body_is_json(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok()
 }
 
 #[cfg(test)]
@@ -76,10 +83,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_attempt_provider_error() {
-        match classify_attempt::<()>(401, "unauthorized".into(), None) {
+    fn classify_attempt_401_non_json_is_mismatch() {
+        match classify_attempt::<()>(401, "Authentication Fails (governor)".into(), None) {
+            AttemptOutcome::Mismatch { status, .. } => assert_eq!(status, 401),
+            _ => panic!("expected Mismatch for 401 with non-JSON body"),
+        }
+    }
+
+    #[test]
+    fn classify_attempt_401_json_stays_provider_error() {
+        let body = r#"{"error":{"code":"invalid_api_key","message":"Bad key"}}"#;
+        match classify_attempt::<()>(401, body.into(), None) {
             AttemptOutcome::ProviderError { status, .. } => assert_eq!(status, 401),
-            _ => panic!("expected ProviderError"),
+            _ => panic!("expected ProviderError for 401 with JSON body"),
         }
     }
 
