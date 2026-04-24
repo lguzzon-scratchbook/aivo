@@ -229,6 +229,22 @@ pub async fn spawn_setup_token_with_binary_for_test(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    static SPAWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(unix)]
+    fn write_executable_stub(path: &std::path::Path, body: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(body).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
     #[test]
     fn credential_json_roundtrip() {
         let c = ClaudeOAuthCredential {
@@ -322,17 +338,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_extracts_token_from_stub_stdout() {
+        let _guard = SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("claude-stub.sh");
-        std::fs::write(
+        write_executable_stub(
             &stub,
-            "#!/usr/bin/env sh\nprintf 'Follow the browser prompt...\\nsk-ant-oat01-abcdefghijklmnop\\n'\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).unwrap();
+            b"#!/usr/bin/env sh\nprintf 'Follow the browser prompt...\\nsk-ant-oat01-abcdefghijklmnop\\n'\n",
+        );
 
         let cred = spawn_setup_token_with_binary_for_test(&stub).await.unwrap();
         assert_eq!(cred.token, "sk-ant-oat01-abcdefghijklmnop");
@@ -341,13 +353,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_errors_on_non_zero_exit() {
+        let _guard = SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("claude-fail.sh");
-        std::fs::write(&stub, "#!/usr/bin/env sh\nexit 7\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).unwrap();
+        write_executable_stub(&stub, b"#!/usr/bin/env sh\nexit 7\n");
 
         let err = spawn_setup_token_with_binary_for_test(&stub)
             .await
@@ -358,13 +367,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_errors_on_empty_stdout() {
+        let _guard = SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("claude-empty.sh");
-        std::fs::write(&stub, "#!/usr/bin/env sh\nexit 0\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).unwrap();
+        write_executable_stub(&stub, b"#!/usr/bin/env sh\nexit 0\n");
 
         let err = spawn_setup_token_with_binary_for_test(&stub)
             .await
