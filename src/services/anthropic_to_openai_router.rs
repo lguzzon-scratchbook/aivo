@@ -300,6 +300,14 @@ async fn try_native_anthropic(
     }))
 }
 
+/// The `target_protocol` branch covers gateway models with abstract names
+/// (e.g. `aivo/starter`) whose upstream is known to be Anthropic-native —
+/// model-name sniffing alone would miss them and downgrade to OpenAI
+/// translation.
+fn should_try_native_anthropic(model_is_claude: bool, target_protocol: ProviderProtocol) -> bool {
+    model_is_claude || target_protocol == ProviderProtocol::Anthropic
+}
+
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
 async fn handle_anthropic_to_upstream(
     request: &str,
@@ -318,13 +326,12 @@ async fn handle_anthropic_to_upstream(
 
     let body: Value = serde_json::from_str(body_str)?;
 
-    // If the model is Claude, try native Anthropic first — preserves model name and prompt caching.
     let model_is_claude = body
         .get("model")
         .and_then(|m| m.as_str())
         .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
 
-    if model_is_claude
+    if should_try_native_anthropic(model_is_claude, config.target_protocol)
         && let Some(response) = try_native_anthropic(
             &body,
             config,
@@ -1315,6 +1322,30 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_try_native_anthropic_for_claude_model() {
+        assert!(should_try_native_anthropic(true, ProviderProtocol::Openai));
+    }
+
+    #[test]
+    fn should_try_native_anthropic_for_abstract_model_when_target_is_anthropic() {
+        // Regression for gateway models like `aivo/starter`: the model name
+        // isn't "claude"-flavored, but the Anthropic pin means the upstream
+        // speaks /v1/messages natively.
+        assert!(should_try_native_anthropic(
+            false,
+            ProviderProtocol::Anthropic
+        ));
+    }
+
+    #[test]
+    fn should_skip_native_anthropic_for_generic_model_without_pin() {
+        assert!(!should_try_native_anthropic(
+            false,
+            ProviderProtocol::Openai
+        ));
+    }
 
     #[test]
     fn test_convert_openai_to_anthropic_uses_response_model_and_created() {
