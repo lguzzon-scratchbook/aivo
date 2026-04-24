@@ -38,6 +38,11 @@ pub struct ProviderQuirks {
     pub model_prefix: Option<&'static str>,
     pub requires_reasoning_content: bool,
     pub max_tokens_cap: Option<u64>,
+    /// Sub-path prepended to `/v1/messages` when probing the provider's native
+    /// Anthropic endpoint. For hosts like DeepSeek that expose both
+    /// `/v1/chat/completions` (OpenAI) and `/anthropic/v1/messages` (Anthropic)
+    /// on one base URL.
+    pub anthropic_path_prefix: Option<&'static str>,
 }
 
 impl ProviderQuirks {
@@ -58,10 +63,16 @@ impl ProviderQuirks {
         } else {
             None
         };
+        let anthropic_path_prefix = if base_url.contains("deepseek.com") {
+            Some("/anthropic")
+        } else {
+            None
+        };
         Self {
             model_prefix,
             requires_reasoning_content,
             max_tokens_cap,
+            anthropic_path_prefix,
         }
     }
 
@@ -69,6 +80,7 @@ impl ProviderQuirks {
         self.model_prefix.is_some()
             || self.requires_reasoning_content
             || self.max_tokens_cap.is_some()
+            || self.anthropic_path_prefix.is_some()
     }
 
     pub fn inject(&self, env: &mut HashMap<String, String>, prefix: &str) {
@@ -80,6 +92,9 @@ impl ProviderQuirks {
         }
         if let Some(cap) = self.max_tokens_cap {
             env.insert(format!("{prefix}_MAX_TOKENS_CAP"), cap.to_string());
+        }
+        if let Some(sub) = self.anthropic_path_prefix {
+            env.insert(format!("{prefix}_ANTHROPIC_PATH_PREFIX"), sub.to_string());
         }
     }
 }
@@ -94,21 +109,23 @@ pub struct ProviderProfile {
 }
 
 impl ProviderProfile {
-    /// Upstream protocol to use when no per-key user override is set.
+    /// First protocol the router will try when no per-key user override is set.
     ///
-    /// Returns `cli_native` when we'd otherwise blindly pick an OpenAI
-    /// variant — most hosts are OpenAI-compatible or could be multi-protocol
-    /// gateways, and forwarding the CLI's native protocol lets a smart
-    /// gateway route natively while plain OpenAI-only hosts self-correct via
-    /// protocol fallback (one 4xx, learned and persisted to the key pin).
-    /// Known non-OpenAI hosts (Anthropic/Google) keep their exact protocol
-    /// so cross-CLI use (e.g. Claude → Google host) avoids a multi-hop
-    /// fallback chain.
+    /// Always the CLI's native protocol. Any provider may speak multiple
+    /// protocols (OpenAI-compat hosts that also serve `/v1/messages`, Anthropic
+    /// hosts that also expose `/v1/chat/completions`, multi-protocol gateways),
+    /// so we don't let the provider's perceived default protocol override the
+    /// tool's choice. The router's fallback loop (`protocol_candidates` /
+    /// `fallback_protocols`) handles protocol mismatches: a 404/401/403 on the
+    /// first attempt triggers the next candidate, and the winning protocol is
+    /// persisted to the key pin so subsequent launches skip the probe.
+    ///
+    /// Trade-off: cross-tool usage against a single-protocol host (e.g. `aivo
+    /// gemini` against `api.anthropic.com`) pays extra round-trips on the very
+    /// first launch — fine, because the pin persists and subsequent launches
+    /// go straight to the learned protocol.
     pub fn upstream_protocol_for_cli(&self, cli_native: ProviderProtocol) -> ProviderProtocol {
-        match self.default_protocol {
-            ProviderProtocol::Anthropic | ProviderProtocol::Google => self.default_protocol,
-            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => cli_native,
-        }
+        cli_native
     }
 }
 
@@ -354,10 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_protocol_prefers_cli_native_for_starter() {
-        // Starter has default_protocol=Openai — same treatment as any other
-        // Openai-flavored host. Anthropic/Responses/Google get tried first;
-        // protocol fallback handles the 403 on paths whose auth isn't wired.
+    fn upstream_protocol_forwards_cli_native_for_starter() {
         let profile = provider_profile_for_base_url("aivo-starter");
         assert!(profile.serve_flags.is_starter);
         assert_eq!(
@@ -367,6 +381,14 @@ mod tests {
         assert_eq!(
             profile.upstream_protocol_for_cli(ProviderProtocol::Google),
             ProviderProtocol::Google,
+        );
+        assert_eq!(
+            profile.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi),
+            ProviderProtocol::ResponsesApi,
+        );
+        assert_eq!(
+            profile.upstream_protocol_for_cli(ProviderProtocol::Openai),
+            ProviderProtocol::Openai,
         );
     }
 
@@ -384,11 +406,26 @@ mod tests {
     }
 
     #[test]
-    fn upstream_protocol_keeps_known_anthropic_host() {
-        let profile = provider_profile_for_base_url("https://api.anthropic.com");
+    fn upstream_protocol_always_forwards_cli_native_even_on_known_hosts() {
+        let anthropic = provider_profile_for_base_url("https://api.anthropic.com");
         assert_eq!(
-            profile.upstream_protocol_for_cli(ProviderProtocol::Google),
+            anthropic.upstream_protocol_for_cli(ProviderProtocol::Google),
+            ProviderProtocol::Google,
+        );
+        assert_eq!(
+            anthropic.upstream_protocol_for_cli(ProviderProtocol::Anthropic),
             ProviderProtocol::Anthropic,
+        );
+
+        let google =
+            provider_profile_for_base_url("https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(
+            google.upstream_protocol_for_cli(ProviderProtocol::Anthropic),
+            ProviderProtocol::Anthropic,
+        );
+        assert_eq!(
+            google.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi),
+            ProviderProtocol::ResponsesApi,
         );
     }
 
@@ -520,6 +557,7 @@ mod tests {
             model_prefix: Some("@cf/"),
             requires_reasoning_content: true,
             max_tokens_cap: Some(8192),
+            anthropic_path_prefix: Some("/anthropic"),
         };
         let mut env = HashMap::new();
         quirks.inject(&mut env, "TEST");
@@ -527,6 +565,7 @@ mod tests {
         assert_eq!(env.get("TEST_MODEL_PREFIX").unwrap(), "@cf/");
         assert_eq!(env.get("TEST_REQUIRE_REASONING").unwrap(), "1");
         assert_eq!(env.get("TEST_MAX_TOKENS_CAP").unwrap(), "8192");
+        assert_eq!(env.get("TEST_ANTHROPIC_PATH_PREFIX").unwrap(), "/anthropic");
     }
 
     #[test]
@@ -538,10 +577,21 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
+            anthropic_path_prefix: None,
         };
         let mut env = HashMap::new();
         quirks.inject(&mut env, "TEST");
 
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn deepseek_has_anthropic_path_prefix_quirk() {
+        use super::ProviderQuirks;
+        let quirks = ProviderQuirks::for_base_url("https://api.deepseek.com/v1");
+        assert_eq!(quirks.anthropic_path_prefix, Some("/anthropic"));
+
+        let other = ProviderQuirks::for_base_url("https://api.example.com/v1");
+        assert_eq!(other.anthropic_path_prefix, None);
     }
 }

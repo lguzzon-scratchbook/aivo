@@ -63,6 +63,10 @@ pub struct AnthropicToOpenAIRouterConfig {
     /// Cap applied to `max_tokens` before forwarding to the provider.
     /// Use for providers with hard limits (e.g., DeepSeek: 8192).
     pub max_tokens_cap: Option<u64>,
+    /// Known Anthropic sub-path (e.g. `"/anthropic"` for DeepSeek). When set,
+    /// the native probe targets `{base}{prefix}/v1/messages` instead of
+    /// `{base}/v1/messages`.
+    pub anthropic_path_prefix: Option<String>,
     /// Whether this is the aivo starter provider (requires device fingerprint headers).
     pub is_starter: bool,
 }
@@ -75,12 +79,70 @@ struct AnthropicToOpenAIRouterState {
     config: Arc<AnthropicToOpenAIRouterConfig>,
     client: reqwest::Client,
     active_protocol: Arc<AtomicU8>,
-    /// Set to true after a native Anthropic attempt returns a protocol mismatch,
-    /// so we don't waste a round-trip on every subsequent Claude request.
-    native_anthropic_failed: Arc<AtomicBool>,
+    probe: ProbeState,
+}
+
+/// Learned state for the native Anthropic probe, cloned into each request
+/// handler so it can be mutated across concurrent requests.
+#[derive(Clone)]
+struct ProbeState {
+    anthropic_outcome: Arc<AtomicU8>,
     /// Set to true when the provider rejects `anthropic-beta` headers (e.g. Bedrock, Vertex AI).
     /// Once learned, the header is stripped from all future requests.
     beta_header_rejected: Arc<AtomicBool>,
+}
+
+impl ProbeState {
+    fn new() -> Self {
+        Self {
+            anthropic_outcome: Arc::new(AtomicU8::new(ProbeOutcome::Unlearned as u8)),
+            beta_header_rejected: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn outcome(&self) -> ProbeOutcome {
+        ProbeOutcome::from_u8(self.anthropic_outcome.load(Ordering::Relaxed))
+    }
+
+    fn set_outcome(&self, outcome: ProbeOutcome) {
+        self.anthropic_outcome
+            .store(outcome as u8, Ordering::Relaxed);
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeOutcome {
+    Unlearned = 0,
+    UseRoot = 1,
+    UsePrefixed = 2,
+    Failed = 3,
+}
+
+impl ProbeOutcome {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::UseRoot,
+            2 => Self::UsePrefixed,
+            3 => Self::Failed,
+            _ => Self::Unlearned,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnthropicProbePath {
+    Root,
+    Prefixed,
+}
+
+impl AnthropicProbePath {
+    fn to_outcome(self) -> ProbeOutcome {
+        match self {
+            Self::Root => ProbeOutcome::UseRoot,
+            Self::Prefixed => ProbeOutcome::UsePrefixed,
+        }
+    }
 }
 
 enum RouterResponse {
@@ -109,8 +171,7 @@ impl AnthropicToOpenAIRouter {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
             active_protocol: active_protocol.clone(),
-            native_anthropic_failed: Arc::new(AtomicBool::new(false)),
-            beta_header_rejected: Arc::new(AtomicBool::new(false)),
+            probe: ProbeState::new(),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, active_protocol, handle))
@@ -126,8 +187,7 @@ async fn run_router(
         let config = state.config.clone();
         let client = state.client.clone();
         let active_protocol = state.active_protocol.clone();
-        let native_anthropic_failed = state.native_anthropic_failed.clone();
-        let beta_header_rejected = state.beta_header_rejected.clone();
+        let probe = state.probe.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -154,8 +214,7 @@ async fn run_router(
                 &config,
                 &client,
                 &active_protocol,
-                &native_anthropic_failed,
-                &beta_header_rejected,
+                &probe,
                 &mut socket,
             )
             .await
@@ -210,40 +269,68 @@ fn build_native_anthropic_headers(
     Ok(headers)
 }
 
-/// Try sending the request in native Anthropic format to the upstream's `/v1/messages`.
-/// Returns `Some(response)` on success or non-mismatch error, `None` on protocol mismatch.
-async fn try_native_anthropic(
-    body: &Value,
+/// Build the native `/v1/messages` URL, optionally under a sub-path prefix
+/// (e.g. `/anthropic` for DeepSeek). Strips a trailing `/v1` from the base so
+/// the prefix can slot in before the version segment, producing
+/// `{base}{prefix}/v1/messages`.
+fn build_anthropic_messages_url(base_url: &str, prefix: Option<&str>) -> String {
+    let base = base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    let prefix = prefix
+        .map(|p| p.trim_end_matches('/').trim_start_matches('/'))
+        .filter(|p| !p.is_empty());
+    match prefix {
+        Some(p) => format!("{}/{}/v1/messages", base, p),
+        None => format!("{}/v1/messages", base),
+    }
+}
+
+/// Generic fallback sub-path used by the `Prefixed` probe when the provider's
+/// profile didn't configure one — common convention for OpenAI-first hosts
+/// that also expose an Anthropic-compatible endpoint.
+const DEFAULT_ANTHROPIC_SUB_PATH: &str = "/anthropic";
+
+/// Candidate paths to try, ordered, for a given learned state.
+///
+/// A `None` return means the probe has given up for this router lifetime —
+/// the caller should bail out without making a request.
+fn probe_paths(
+    outcome: ProbeOutcome,
+    configured_prefix: Option<&str>,
+) -> Option<&'static [AnthropicProbePath]> {
+    match outcome {
+        ProbeOutcome::UseRoot => Some(&[AnthropicProbePath::Root]),
+        ProbeOutcome::UsePrefixed => Some(&[AnthropicProbePath::Prefixed]),
+        ProbeOutcome::Failed => None,
+        ProbeOutcome::Unlearned => Some(match configured_prefix {
+            Some(_) => &[AnthropicProbePath::Prefixed],
+            None => &[AnthropicProbePath::Root, AnthropicProbePath::Prefixed],
+        }),
+    }
+}
+
+/// Send a single native `/v1/messages` attempt. Returns `Ok(None)` on
+/// mismatch (so the caller can try the next candidate), `Ok(Some(response))`
+/// on success or non-mismatch error.
+async fn send_native_anthropic(
+    url: &str,
+    native_body: &Value,
     config: &AnthropicToOpenAIRouterConfig,
     client: &reqwest::Client,
     passthrough_headers: &HeaderMap,
-    native_anthropic_failed: &AtomicBool,
     beta_header_rejected: &AtomicBool,
 ) -> Result<Option<RouterResponse>> {
-    if native_anthropic_failed.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-
-    let mut native_body = body.clone();
-    let ctx = RequestContext {
-        upstream_base_url: &config.target_base_url,
-    };
-    CacheControlPatch.patch_json("messages", &mut native_body, &ctx)?;
-
-    let url = http_utils::build_target_url(&config.target_base_url, "/v1/messages");
     let headers = build_native_anthropic_headers(passthrough_headers, &config.target_api_key)?;
-
     let is_starter = config.is_starter;
     let response = device_fingerprint::maybe_with_starter_headers(
-        client.post(&url).headers(headers).json(&native_body),
+        client.post(url).headers(headers).json(native_body),
         is_starter,
     )
     .send()
     .await?;
 
     let status_code = response.status().as_u16();
-    if is_protocol_mismatch(status_code) {
-        native_anthropic_failed.store(true, Ordering::Relaxed);
+    if native_probe_is_mismatch(status_code) {
         return Ok(None);
     }
 
@@ -263,15 +350,14 @@ async fn try_native_anthropic(
             http_utils::strip_beta_headers(&mut retry_headers);
 
             let retry_response = device_fingerprint::maybe_with_starter_headers(
-                client.post(&url).headers(retry_headers).json(&native_body),
+                client.post(url).headers(retry_headers).json(native_body),
                 is_starter,
             )
             .send()
             .await?;
 
             let retry_status = retry_response.status().as_u16();
-            if is_protocol_mismatch(retry_status) {
-                native_anthropic_failed.store(true, Ordering::Relaxed);
+            if native_probe_is_mismatch(retry_status) {
                 return Ok(None);
             }
 
@@ -300,12 +386,67 @@ async fn try_native_anthropic(
     }))
 }
 
-/// The `target_protocol` branch covers gateway models with abstract names
-/// (e.g. `aivo/starter`) whose upstream is known to be Anthropic-native —
-/// model-name sniffing alone would miss them and downgrade to OpenAI
-/// translation.
-fn should_try_native_anthropic(model_is_claude: bool, target_protocol: ProviderProtocol) -> bool {
-    model_is_claude || target_protocol == ProviderProtocol::Anthropic
+/// Try sending the request in native Anthropic format to the upstream's `/v1/messages`.
+/// Iterates candidate paths (`/v1/messages`, `{prefix}/v1/messages`) based on
+/// the configured prefix and the path learned on earlier requests.
+/// Returns `Some(response)` on success or non-mismatch error, `None` when every
+/// candidate returned a mismatch.
+async fn try_native_anthropic(
+    body: &Value,
+    config: &AnthropicToOpenAIRouterConfig,
+    client: &reqwest::Client,
+    passthrough_headers: &HeaderMap,
+    probe: &ProbeState,
+) -> Result<Option<RouterResponse>> {
+    let configured = config.anthropic_path_prefix.as_deref();
+    let Some(candidates) = probe_paths(probe.outcome(), configured) else {
+        return Ok(None);
+    };
+
+    let mut native_body = body.clone();
+    let ctx = RequestContext {
+        upstream_base_url: &config.target_base_url,
+    };
+    CacheControlPatch.patch_json("messages", &mut native_body, &ctx)?;
+
+    for &path in candidates {
+        let sub_path = match path {
+            AnthropicProbePath::Root => None,
+            AnthropicProbePath::Prefixed => Some(configured.unwrap_or(DEFAULT_ANTHROPIC_SUB_PATH)),
+        };
+        let url = build_anthropic_messages_url(&config.target_base_url, sub_path);
+
+        if let Some(response) = send_native_anthropic(
+            &url,
+            &native_body,
+            config,
+            client,
+            passthrough_headers,
+            &probe.beta_header_rejected,
+        )
+        .await?
+        {
+            probe.set_outcome(path.to_outcome());
+            return Ok(Some(response));
+        }
+    }
+
+    probe.set_outcome(ProbeOutcome::Failed);
+    Ok(None)
+}
+
+/// Gate the speculative native `/v1/messages` probe on the pin. Sniffing the
+/// model name would re-probe on every launch even after the pin learned the
+/// host speaks Openai.
+fn should_try_native_anthropic(target_protocol: ProviderProtocol) -> bool {
+    target_protocol == ProviderProtocol::Anthropic
+}
+
+/// Permissive variant of [`is_protocol_mismatch`] for the speculative native
+/// probe: OpenAI-only gateways (e.g. Cloudflare Workers AI) return 401/403
+/// for unknown paths. Bad creds still surface via the OpenAI fallback.
+fn native_probe_is_mismatch(status: u16) -> bool {
+    is_protocol_mismatch(status) || matches!(status, 401 | 403)
 }
 
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
@@ -314,12 +455,11 @@ async fn handle_anthropic_to_upstream(
     config: &Arc<AnthropicToOpenAIRouterConfig>,
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
-    native_anthropic_failed: &Arc<AtomicBool>,
-    beta_header_rejected: &Arc<AtomicBool>,
+    probe: &ProbeState,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<RouterResponse> {
     let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
-    if beta_header_rejected.load(Ordering::Relaxed) {
+    if probe.beta_header_rejected.load(Ordering::Relaxed) {
         http_utils::strip_beta_headers(&mut passthrough_headers);
     }
     let body_str = http_utils::extract_request_body(request)?;
@@ -331,18 +471,16 @@ async fn handle_anthropic_to_upstream(
         .and_then(|m| m.as_str())
         .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
 
-    if should_try_native_anthropic(model_is_claude, config.target_protocol)
-        && let Some(response) = try_native_anthropic(
-            &body,
-            config,
-            client,
-            &passthrough_headers,
-            native_anthropic_failed,
-            beta_header_rejected,
-        )
-        .await?
-    {
-        return Ok(response);
+    if should_try_native_anthropic(config.target_protocol) {
+        if let Some(response) =
+            try_native_anthropic(&body, config, client, &passthrough_headers, probe).await?
+        {
+            return Ok(response);
+        }
+        // Native probe failed — advance the atomic past Anthropic so
+        // `persist_runtime_discoveries` sees the learned Openai pin.
+        // (`commit_protocol_switch` is a no-op on attempt==0.)
+        active_protocol.store(ProviderProtocol::Openai.to_u8(), Ordering::Relaxed);
     }
 
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content)?;
@@ -1324,27 +1462,115 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_try_native_anthropic_for_claude_model() {
-        assert!(should_try_native_anthropic(true, ProviderProtocol::Openai));
+    fn should_try_native_anthropic_when_target_is_anthropic() {
+        assert!(should_try_native_anthropic(ProviderProtocol::Anthropic));
     }
 
     #[test]
-    fn should_try_native_anthropic_for_abstract_model_when_target_is_anthropic() {
-        // Regression for gateway models like `aivo/starter`: the model name
-        // isn't "claude"-flavored, but the Anthropic pin means the upstream
-        // speaks /v1/messages natively.
-        assert!(should_try_native_anthropic(
-            false,
-            ProviderProtocol::Anthropic
-        ));
+    fn should_skip_native_anthropic_when_pin_is_not_anthropic() {
+        for pin in [
+            ProviderProtocol::Openai,
+            ProviderProtocol::ResponsesApi,
+            ProviderProtocol::Google,
+        ] {
+            assert!(!should_try_native_anthropic(pin), "pin={pin:?}");
+        }
     }
 
     #[test]
-    fn should_skip_native_anthropic_for_generic_model_without_pin() {
-        assert!(!should_try_native_anthropic(
-            false,
-            ProviderProtocol::Openai
-        ));
+    fn native_probe_mismatch_includes_auth_statuses_for_openai_only_providers() {
+        assert!(native_probe_is_mismatch(401));
+        assert!(native_probe_is_mismatch(403));
+    }
+
+    #[test]
+    fn native_probe_mismatch_covers_standard_mismatch_statuses() {
+        for code in [404, 405, 415, 501] {
+            assert!(native_probe_is_mismatch(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn native_probe_mismatch_rejects_success_and_ambiguous_statuses() {
+        // 400 is excluded: the probe has a separate beta-header-rejection branch for it.
+        for code in [200, 201, 400, 500, 502, 503] {
+            assert!(!native_probe_is_mismatch(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn build_anthropic_messages_url_without_prefix() {
+        assert_eq!(
+            build_anthropic_messages_url("https://api.deepseek.com", None),
+            "https://api.deepseek.com/v1/messages",
+        );
+        assert_eq!(
+            build_anthropic_messages_url("https://api.deepseek.com/v1", None),
+            "https://api.deepseek.com/v1/messages",
+        );
+        assert_eq!(
+            build_anthropic_messages_url("https://api.deepseek.com/v1/", None),
+            "https://api.deepseek.com/v1/messages",
+        );
+    }
+
+    #[test]
+    fn build_anthropic_messages_url_with_prefix_normalises_slashes() {
+        for base in [
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/",
+            "https://api.deepseek.com/v1",
+            "https://api.deepseek.com/v1/",
+        ] {
+            for prefix in ["/anthropic", "anthropic", "/anthropic/"] {
+                assert_eq!(
+                    build_anthropic_messages_url(base, Some(prefix)),
+                    "https://api.deepseek.com/anthropic/v1/messages",
+                    "base={base} prefix={prefix}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probe_paths_uses_configured_prefix_only_when_no_prior_learning() {
+        // Known provider → single targeted probe, no wasted fallback.
+        assert_eq!(
+            probe_paths(ProbeOutcome::Unlearned, Some("/anthropic")),
+            Some(&[AnthropicProbePath::Prefixed][..]),
+        );
+    }
+
+    #[test]
+    fn probe_paths_falls_back_to_anthropic_prefix_for_unknown_provider() {
+        // Unknown provider → probe root first, then /anthropic.
+        assert_eq!(
+            probe_paths(ProbeOutcome::Unlearned, None),
+            Some(&[AnthropicProbePath::Root, AnthropicProbePath::Prefixed][..]),
+        );
+    }
+
+    #[test]
+    fn probe_paths_locks_in_after_first_success() {
+        assert_eq!(
+            probe_paths(ProbeOutcome::UseRoot, None),
+            Some(&[AnthropicProbePath::Root][..]),
+        );
+        assert_eq!(
+            probe_paths(ProbeOutcome::UsePrefixed, None),
+            Some(&[AnthropicProbePath::Prefixed][..]),
+        );
+        // Learned state trumps the configured prefix.
+        assert_eq!(
+            probe_paths(ProbeOutcome::UseRoot, Some("/anthropic")),
+            Some(&[AnthropicProbePath::Root][..]),
+        );
+    }
+
+    #[test]
+    fn probe_paths_returns_none_when_failed() {
+        assert_eq!(probe_paths(ProbeOutcome::Failed, None), None);
+        assert_eq!(probe_paths(ProbeOutcome::Failed, Some("/anthropic")), None);
     }
 
     #[test]
@@ -1542,6 +1768,7 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
+            anthropic_path_prefix: None,
             is_starter: false,
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
@@ -1565,6 +1792,7 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
+            anthropic_path_prefix: None,
             is_starter: false,
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
