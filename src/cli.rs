@@ -46,6 +46,9 @@ pub enum Commands {
     /// Start the interactive chat TUI
     Chat(ChatArgs),
 
+    /// Generate images from a text prompt (OpenAI-compatible providers)
+    Image(ImageArgs),
+
     /// List available models from the active provider
     Models(ModelsArgs),
 
@@ -458,6 +461,57 @@ pub struct ChatArgs {
     /// Attach a file or image to the next chat message (repeatable)
     #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]
     pub attachments: Vec<String>,
+}
+
+/// Arguments for the image command
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageArgs {
+    /// Text prompt (read from stdin if absent and stdin is piped)
+    #[arg(value_name = "PROMPT", value_parser = non_empty())]
+    pub prompt: Option<String>,
+
+    /// Image model to use (e.g. gpt-image-1, dall-e-3, grok-2-image)
+    #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub model: Option<String>,
+
+    /// Select API key by ID or name
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "ID|NAME",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub key: Option<String>,
+
+    /// Output path: file (`cat.png`), directory (`out/`), or template with
+    /// `{n}`/`{ts}`/`{model}` tokens. Default: `./aivo-<timestamp>.png`.
+    #[arg(short = 'o', long, value_name = "PATH", value_parser = non_empty())]
+    pub output: Option<String>,
+
+    /// Overwrite existing files without prompting
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Image size, e.g. 1024x1024, 1792x1024, 1024x1792
+    #[arg(short = 's', long, value_name = "WxH", value_parser = non_empty())]
+    pub size: Option<String>,
+
+    /// Quality: standard | hd | high | low (provider-dependent)
+    #[arg(short = 'q', long, value_name = "LEVEL", value_parser = non_empty())]
+    pub quality: Option<String>,
+
+    /// Bypass cache and fetch fresh model list for the model picker
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
+
+    /// Skip download; print the provider URL only (URLs may expire)
+    #[arg(long)]
+    pub url: bool,
+
+    /// Emit a JSON object with the result (path, bytes, url, model, size)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE

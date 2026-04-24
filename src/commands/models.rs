@@ -294,15 +294,18 @@ impl ModelsCommand {
 
         let client = http_utils::router_http_client();
         let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
-        let cache_warm = !refresh && self.cache.get(&key.base_url).await.is_some();
+        let all_cache_key = all_models_cache_key(&key.base_url);
+        let cache_warm = !refresh && self.cache.get(&all_cache_key).await.is_some();
 
+        // `aivo models` shows the provider's full catalog, including image,
+        // audio, and embedding models. Chat pickers filter/annotate at their
+        // own call sites.
         let mut models = if cache_warm {
-            // Spinner-free: fetch in the background but don't block UX
-            fetch_models_detailed(&client, &key).await?
+            fetch_models_detailed_filtered(&client, &key, false).await?
         } else {
             let started_at = Instant::now();
             let (spinning, spinner_handle) = style::start_spinner(Some(" Fetching models..."));
-            let result = fetch_models_detailed(&client, &key).await;
+            let result = fetch_models_detailed_filtered(&client, &key, false).await;
             let min_visible = Duration::from_millis(350);
             if let Some(remaining) = min_visible.checked_sub(started_at.elapsed()) {
                 tokio::time::sleep(remaining).await;
@@ -312,10 +315,11 @@ impl ModelsCommand {
             result?
         };
 
-        // Cache the IDs for other commands
+        // Cache the full list (including image/audio/embed) under the `#all`
+        // namespace so `aivo image` and future broad pickers can share it.
         if !is_ollama {
             let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-            self.cache.set(&key.base_url, ids).await;
+            self.cache.set(&all_cache_key, ids).await;
         }
 
         let is_starter = is_aivo_starter_base(&key.base_url);
@@ -430,23 +434,12 @@ fn url_origin(url: &str) -> Option<String> {
     Some(origin)
 }
 
-/// Returns true if the model is suitable for text chat.
-/// Filters out embedding models and image/audio-only generation models.
+/// Returns true if the model is suitable for text chat. Single source of
+/// truth lives in `services::model_compat::text_chat_incompat_reason`; this
+/// is the boolean flip used by upstream filters (Copilot, hoisted
+/// `chat_only` gate in `fetch_models_detailed_filtered`).
 pub(crate) fn is_text_chat_model(id: &str) -> bool {
-    let lower = id.to_lowercase();
-    // Embedding models
-    if lower.contains("embed") {
-        return false;
-    }
-    // Image generation, TTS, and speech recognition
-    if lower.starts_with("dall-e")
-        || lower.starts_with("tts-")
-        || lower.starts_with("whisper-")
-        || lower.contains("-image")
-    {
-        return false;
-    }
-    true
+    crate::services::model_compat::text_chat_incompat_reason(id).is_none()
 }
 
 /// Copilot's Claude/OpenAI chat routing uses the chat completions API.
@@ -596,11 +589,63 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
         .map(|v| v.into_iter().map(|m| m.id).collect())
 }
 
+/// Like `fetch_models`, but keeps image/audio models in the list. Used by
+/// `aivo image`, where providers like xai advertise `grok-2-image` /
+/// `grok-imagine-image` that `is_text_chat_model` would otherwise strip.
+pub(crate) async fn fetch_all_models(client: &Client, key: &ApiKey) -> Result<Vec<String>> {
+    fetch_models_detailed_filtered(client, key, false)
+        .await
+        .map(|v| v.into_iter().map(|m| m.id).collect())
+}
+
+/// Cache key for the unfiltered model list. Separate namespace from the
+/// chat picker's cache (`key.base_url`) so a broad fetch by `aivo models`
+/// or `aivo image` doesn't pollute chat pickers with image / embedding
+/// entries on their next cache hit.
+pub(crate) fn all_models_cache_key(base_url: &str) -> String {
+    format!("{base_url}#all")
+}
+
+/// Cached variant of `fetch_all_models`.
+pub(crate) async fn fetch_all_models_cached(
+    client: &Client,
+    key: &ApiKey,
+    cache: &ModelsCache,
+    bypass_cache: bool,
+) -> Result<Vec<String>> {
+    let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
+    let cache_key = all_models_cache_key(&key.base_url);
+    if !bypass_cache
+        && !is_ollama
+        && let Some(cached) = cache.get(&cache_key).await
+    {
+        return Ok(cached);
+    }
+    let models = fetch_all_models(client, key).await?;
+    if !is_ollama {
+        cache.set(&cache_key, models.clone()).await;
+    }
+    Ok(models)
+}
+
 /// Fetch models with full metadata from the API where available.
 /// Providers like OpenRouter/Vercel return context window, pricing, and max output.
 /// Google returns inputTokenLimit and outputTokenLimit.
 /// Other providers return just IDs.
 pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>> {
+    fetch_models_detailed_filtered(client, key, true).await
+}
+
+/// Implementation behind `fetch_models_detailed` / `fetch_all_models`. When
+/// `chat_only` is true (the default), applies `is_text_chat_model` to the
+/// OpenAI-compatible / Anthropic / CloudflareSearch branches so chat pickers
+/// don't surface image, audio, or embedding models. Set to false for the
+/// image command and `aivo models`, which show the full catalog.
+async fn fetch_models_detailed_filtered(
+    client: &Client,
+    key: &ApiKey,
+    chat_only: bool,
+) -> Result<Vec<ModelInfo>> {
     if key.is_any_oauth() {
         anyhow::bail!(
             "Key '{}' is an OAuth credential with no model listing API. Use `{}` to launch directly, or switch to a regular API key with `aivo use`.",
@@ -611,11 +656,13 @@ pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Resu
     let base = normalize_base_url(&key.base_url);
     let profile = provider_profile_for_key(key);
 
-    match profile.model_listing_strategy {
-        ModelListingStrategy::Static(models) => Ok(models
-            .iter()
-            .map(|s| ModelInfo::id_only(s.to_string()))
-            .collect()),
+    let raw: Vec<ModelInfo> = match profile.model_listing_strategy {
+        ModelListingStrategy::Static(models) => Ok::<_, anyhow::Error>(
+            models
+                .iter()
+                .map(|s| ModelInfo::id_only(s.to_string()))
+                .collect(),
+        ),
         ModelListingStrategy::AivoStarter => {
             let starter_base = crate::constants::AIVO_STARTER_REAL_URL;
             let url = format!("{}/v1/models", starter_base.trim_end_matches('/'));
@@ -724,12 +771,7 @@ pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Resu
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
-            Ok(resp
-                .data
-                .into_iter()
-                .filter(|m| is_text_chat_model(&m.id))
-                .map(|m| m.into_model_info())
-                .collect())
+            Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
         }
         ModelListingStrategy::CloudflareSearch => {
             let cloudflare_base = cloudflare_ai_base(base)
@@ -758,7 +800,7 @@ pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Resu
 
                 let resp: CloudflareModelsResponse = response.json().await?;
                 for model in resp.result.into_iter().map(cloudflare_model_name) {
-                    if seen.insert(model.clone()) && is_text_chat_model(&model) {
+                    if seen.insert(model.clone()) {
                         models.push(ModelInfo::id_only(model));
                     }
                 }
@@ -787,6 +829,7 @@ pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Resu
             let auth = format!("Bearer {}", key.key.as_str());
 
             let mut last_err = String::new();
+            let mut success: Option<Vec<ModelInfo>> = None;
             for url in &candidates {
                 let response = client
                     .get(url)
@@ -794,32 +837,40 @@ pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Resu
                     .send()
                     .await?;
 
-                if response.status().is_success() {
+                if !response.status().is_success() {
+                    let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    match serde_json::from_str::<OpenAIModelsResponse>(&body) {
-                        Ok(resp) => {
-                            return Ok(resp
-                                .data
-                                .into_iter()
-                                .filter(|m| is_text_chat_model(&m.id))
-                                .map(|m| m.into_model_info())
-                                .collect());
-                        }
-                        Err(e) => {
-                            last_err = format!("Invalid models response from {}: {}", url, e);
-                            continue;
-                        }
-                    }
+                    last_err = format!("API returned {} from {} — {}", status, url, body);
+                    continue;
                 }
 
-                let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                last_err = format!("API returned {} from {} — {}", status, url, body);
+                match serde_json::from_str::<OpenAIModelsResponse>(&body) {
+                    Ok(resp) => {
+                        success =
+                            Some(resp.data.into_iter().map(|m| m.into_model_info()).collect());
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = format!("Invalid models response from {}: {}", url, e);
+                    }
+                }
             }
 
-            anyhow::bail!("{}", last_err)
+            match success {
+                Some(v) => Ok(v),
+                None => anyhow::bail!("{}", last_err),
+            }
         }
-    }
+    }?;
+
+    Ok(if chat_only {
+        raw.into_iter()
+            .filter(|m| is_text_chat_model(&m.id))
+            .collect()
+    } else {
+        raw
+    })
 }
 
 fn build_google_models_url(base_url: &str) -> String {
@@ -902,7 +953,15 @@ pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -
 /// is hidden since a concrete model is required.
 /// Returns `Some(MODEL_DEFAULT_PLACEHOLDER)` if the default is chosen,
 /// `Some(model_name)` for a real model, or `None` if cancelled.
-pub(crate) fn prompt_model_picker(models: Vec<String>, tool: Option<AIToolType>) -> Option<String> {
+/// Shows a fuzzy model picker with per-row annotations. `annotations[i] =
+/// Some(reason)` disables the matching model and renders `reason` dim at the
+/// end of the row (parallels the key picker). Pass `vec![]` for a vanilla
+/// picker with every row selectable.
+pub(crate) fn prompt_model_picker(
+    models: Vec<String>,
+    tool: Option<AIToolType>,
+    annotations: Vec<Option<String>>,
+) -> Option<String> {
     use crate::constants;
     use crate::tui::FuzzySelect;
 
@@ -911,14 +970,22 @@ pub(crate) fn prompt_model_picker(models: Vec<String>, tool: Option<AIToolType>)
         .unwrap_or(false);
 
     let mut items = Vec::with_capacity(models.len() + show_default as usize);
+    let mut row_annotations: Vec<Option<String>> = Vec::with_capacity(items.capacity());
     if show_default {
         items.push(constants::MODEL_DEFAULT_DISPLAY.to_string());
+        row_annotations.push(None);
     }
     items.extend(models);
+    // Align annotations with the model rows (after the optional default row).
+    // A shorter/empty `annotations` means "no annotations" for those rows.
+    for i in 0..items.len() - row_annotations.len() {
+        row_annotations.push(annotations.get(i).cloned().flatten());
+    }
 
     let selected = FuzzySelect::new()
         .with_prompt("Select model")
         .items(&items)
+        .annotations(row_annotations)
         .default(0)
         .interact_opt()
         .ok()

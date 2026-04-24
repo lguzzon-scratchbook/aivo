@@ -7,9 +7,7 @@ use anyhow::Result;
 use reqwest::Client;
 
 use crate::commands::chat_tui_format::format_time_ago_short_dt;
-use crate::commands::models::{
-    fetch_models_for_select, prompt_model_picker, resolve_model_placeholder,
-};
+use crate::commands::models::resolve_model_placeholder;
 use crate::commands::{print_launch_preview, trim_to_one_line};
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
@@ -76,13 +74,13 @@ impl RunCommand {
             Some(_) => {}
         }
 
-        let models_list = if refresh {
-            crate::commands::models::fetch_models_cached(client, key, &self.cache, true)
+        // Fetch the full catalog and annotate non-chat models as disabled
+        // instead of hiding them. Users running `aivo run claude` see image /
+        // audio / embedding entries with a dim reason, not silently filtered.
+        let models_list =
+            crate::commands::models::fetch_all_models_cached(client, key, &self.cache, refresh)
                 .await
-                .unwrap_or_default()
-        } else {
-            fetch_models_for_select(client, key, &self.cache).await
-        };
+                .unwrap_or_default();
 
         if models_list.is_empty() {
             // No fetchable model list (common for providers without a public
@@ -101,7 +99,8 @@ impl RunCommand {
             return Ok(ModelOutcome::UseDefault);
         }
 
-        match prompt_model_picker(models_list, Some(tool)) {
+        let annotations = crate::services::model_compat::text_chat_annotations(&models_list);
+        match crate::commands::models::prompt_model_picker(models_list, Some(tool), annotations) {
             Some(m) => Ok(ModelOutcome::Model(m)),
             None => Ok(ModelOutcome::Cancelled),
         }

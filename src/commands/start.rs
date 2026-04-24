@@ -3,9 +3,7 @@ use console::{Key, Term};
 
 use crate::cli::parse_env_vars;
 use crate::commands::keys::prompt_pick_key_without_activation;
-use crate::commands::models::{
-    fetch_models_for_select, model_display_label, prompt_model_picker, resolve_model_placeholder,
-};
+use crate::commands::models::{model_display_label, resolve_model_placeholder};
 use crate::commands::print_launch_preview;
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
@@ -363,13 +361,12 @@ impl StartCommand {
         explicit_picker: bool,
     ) -> Result<Resolved<Option<String>>> {
         let client = http_utils::router_http_client();
-        let models = if refresh {
-            crate::commands::models::fetch_models_cached(&client, key, &self.cache, true)
+        // Full catalog + per-row annotations: non-chat models show as
+        // disabled with a reason, rather than being silently stripped.
+        let models =
+            crate::commands::models::fetch_all_models_cached(&client, key, &self.cache, refresh)
                 .await
-                .unwrap_or_default()
-        } else {
-            fetch_models_for_select(&client, key, &self.cache).await
-        };
+                .unwrap_or_default();
         if models.is_empty() {
             // No fetchable model list (common for providers without a public
             // /v1/models endpoint — e.g. Codex ChatGPT OAuth). Skip the
@@ -390,7 +387,8 @@ impl StartCommand {
             });
         }
 
-        match prompt_model_picker(models, Some(tool)) {
+        let annotations = crate::services::model_compat::text_chat_annotations(&models);
+        match crate::commands::models::prompt_model_picker(models, Some(tool), annotations) {
             Some(selected) => Ok(Resolved {
                 value: Some(selected),
                 interactive: true,

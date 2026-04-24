@@ -8,6 +8,8 @@
 //! command.
 
 use crate::services::ai_launcher::AIToolType;
+use crate::services::provider_profile::{is_copilot_base, is_ollama_base};
+use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use crate::services::session_store::ApiKey;
 
 /// Describes which command is asking for a key, so the picker can annotate
@@ -21,6 +23,9 @@ pub enum KeyCompatContext {
     Tool(AIToolType),
     /// `aivo chat` — all OAuth keys are incompatible.
     Chat,
+    /// `aivo image` — OAuth, Copilot, Ollama, and the starter key are all
+    /// incompatible (none expose an image-generation endpoint).
+    Image,
 }
 
 impl KeyCompatContext {
@@ -31,6 +36,7 @@ impl KeyCompatContext {
             KeyCompatContext::None => None,
             KeyCompatContext::Tool(tool) => tool.oauth_incompat_reason(key),
             KeyCompatContext::Chat => key.oauth_run_requirement(),
+            KeyCompatContext::Image => image_incompat_reason(key),
         }
     }
 
@@ -39,6 +45,29 @@ impl KeyCompatContext {
         keys.iter()
             .map(|k| self.incompat_reason(k).map(str::to_string))
             .collect()
+    }
+}
+
+/// Image generation rejects any key that can't hit OpenAI-compatible
+/// `/v1/images/generations`:
+///   * OAuth bundles (Claude / Codex / Gemini) — no REST image endpoint;
+///   * Copilot — no image endpoint;
+///   * Ollama — no image endpoint;
+///   * aivo-starter — gateway-limited, no image capacity;
+///   * Anthropic / Google protocol keys — `image_gen::generate` hard-fails
+///     both (Anthropic has no image API; Google Imagen isn't wired yet).
+fn image_incompat_reason(key: &ApiKey) -> Option<&'static str> {
+    const NO_IMAGE_GEN: &str = "no image generation";
+    if key.is_any_oauth() || is_copilot_base(&key.base_url) || is_ollama_base(&key.base_url) {
+        return Some(NO_IMAGE_GEN);
+    }
+    if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
+        return Some("starter key: no image gen");
+    }
+    match detect_provider_protocol(&key.base_url) {
+        ProviderProtocol::Anthropic => Some("Anthropic has no image API"),
+        ProviderProtocol::Google => Some("Google Imagen not supported yet"),
+        _ => None,
     }
 }
 
@@ -114,5 +143,65 @@ mod tests {
     fn none_context_disables_nothing() {
         let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
         assert!(KeyCompatContext::None.incompat_reason(&claude).is_none());
+    }
+
+    #[test]
+    fn image_rejects_oauth_keys() {
+        let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
+        let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
+        let gemini = make_key("gemini", GEMINI_OAUTH_SENTINEL);
+
+        let ctx = KeyCompatContext::Image;
+        assert_eq!(ctx.incompat_reason(&claude), Some("no image generation"));
+        assert_eq!(ctx.incompat_reason(&codex), Some("no image generation"));
+        assert_eq!(ctx.incompat_reason(&gemini), Some("no image generation"));
+    }
+
+    #[test]
+    fn image_rejects_copilot_and_ollama() {
+        let copilot = make_key("copilot", "copilot");
+        let ollama = make_key("ollama", "ollama");
+
+        let ctx = KeyCompatContext::Image;
+        assert_eq!(ctx.incompat_reason(&copilot), Some("no image generation"));
+        assert_eq!(ctx.incompat_reason(&ollama), Some("no image generation"));
+    }
+
+    #[test]
+    fn image_rejects_starter_key() {
+        let starter = make_key("starter", crate::constants::AIVO_STARTER_SENTINEL);
+        let ctx = KeyCompatContext::Image;
+        assert_eq!(
+            ctx.incompat_reason(&starter),
+            Some("starter key: no image gen")
+        );
+    }
+
+    #[test]
+    fn image_rejects_anthropic_and_google_protocols() {
+        let anthropic = make_key("anthropic", "https://api.anthropic.com/v1");
+        let google = make_key("google", "https://generativelanguage.googleapis.com/v1beta");
+
+        let ctx = KeyCompatContext::Image;
+        assert_eq!(
+            ctx.incompat_reason(&anthropic),
+            Some("Anthropic has no image API")
+        );
+        assert_eq!(
+            ctx.incompat_reason(&google),
+            Some("Google Imagen not supported yet")
+        );
+    }
+
+    #[test]
+    fn image_accepts_openai_compatible_keys() {
+        let openai = make_key("openai", "https://api.openai.com/v1");
+        let openrouter = make_key("openrouter", "https://openrouter.ai/api/v1");
+        let xai = make_key("xai", "https://api.x.ai/v1");
+
+        let ctx = KeyCompatContext::Image;
+        assert!(ctx.incompat_reason(&openai).is_none());
+        assert!(ctx.incompat_reason(&openrouter).is_none());
+        assert!(ctx.incompat_reason(&xai).is_none());
     }
 }

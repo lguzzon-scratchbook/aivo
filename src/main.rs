@@ -4,7 +4,7 @@
  */
 use std::process;
 
-use clap::{CommandFactory, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
 
 mod cli;
 mod commands;
@@ -18,7 +18,7 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    AliasCommand, ChatCommand, ContextCommand, InfoCommand, KeysCommand, LogsCommand,
+    AliasCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand, KeysCommand, LogsCommand,
     McpServeCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand,
     StartFlowArgs, StatsCommand, UpdateCommand,
 };
@@ -31,22 +31,48 @@ use services::{AILauncher, EnvironmentInjector, SessionStore};
 /// Known AI tool names that can be used as shortcut aliases for `run`.
 const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
-/// Collects all single-character short flags from the CLI definition,
-/// including global flags and all subcommands.
-fn collect_known_short_flags() -> Vec<char> {
+/// Classification of short flags collected from the clap tree, used by the
+/// short-cluster expander.
+#[derive(Default)]
+struct ShortFlagSets {
+    /// Flags that never consume a value (SetTrue / SetFalse / Count). Safe
+    /// to bundle anywhere (e.g. `-nar` -> `-n -a -r`).
+    bundleable: Vec<char>,
+    /// Flags declared `num_args = 0..=1` — can stand alone via clap's
+    /// `default_missing_value`. Used for 2-char shorthands like `-km`.
+    optional_value: Vec<char>,
+}
+
+/// Walks the clap tree once and classifies each short flag. One-shot CLI
+/// startup calls this on every invocation, so the single-pass variant is
+/// cheaper than traversing for each list separately.
+fn collect_short_flag_sets() -> ShortFlagSets {
     let cmd = Cli::command();
-    let mut flags: Vec<char> = Vec::new();
+    let mut sets = ShortFlagSets::default();
     let all_args = cmd
         .get_arguments()
         .chain(cmd.get_subcommands().flat_map(|s| s.get_arguments()));
     for arg in all_args {
-        if let Some(c) = arg.get_short()
-            && !flags.contains(&c)
+        let Some(c) = arg.get_short() else { continue };
+        let is_bool = matches!(
+            arg.get_action(),
+            ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
+        );
+        if is_bool {
+            if !sets.bundleable.contains(&c) {
+                sets.bundleable.push(c);
+            }
+            continue;
+        }
+        if arg
+            .get_num_args()
+            .is_some_and(|r| r.min_values() == 0 && r.max_values() >= 1)
+            && !sets.optional_value.contains(&c)
         {
-            flags.push(c);
+            sets.optional_value.push(c);
         }
     }
-    flags
+    sets
 }
 
 /// Refuses to run a `test-fast-crypto`-built binary against real user config.
@@ -96,6 +122,7 @@ async fn main() {
             Commands::Run(_) => RunCommand::print_help(),
             Commands::Keys(_) => KeysCommand::print_help(),
             Commands::Chat(_) => ChatCommand::print_help(),
+            Commands::Image(_) => ImageCommand::print_help(),
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
             Commands::Alias(_) => AliasCommand::print_help(),
@@ -186,6 +213,44 @@ async fn main() {
                     chat_args.json,
                 )
                 .await
+        }
+
+        Commands::Image(image_args) => {
+            // Bare `aivo image` with no prompt and no flags on a TTY should
+            // show help rather than lurch through key/model pickers.
+            if ImageCommand::is_bare_invocation(&image_args) {
+                ImageCommand::print_help();
+                process::exit(ExitCode::Success.code());
+            }
+            let key_override = key_or_exit(
+                resolve_key_override(
+                    &session_store,
+                    image_args.key.as_deref(),
+                    KeyLookupMode::RequireActiveOrPrompt,
+                    KeyCompatContext::Image,
+                )
+                .await,
+            );
+            let initial_key = match key_override {
+                Some(k) => k,
+                None => {
+                    eprintln!(
+                        "{} No API key available for image generation.",
+                        style::red("Error:")
+                    );
+                    process::exit(ExitCode::AuthError.code());
+                }
+            };
+            // resolve_key_override only annotates the picker; active-key /
+            // last-used / explicit `--key` paths bypass the annotation, so
+            // we have to re-check compat here and offer a swap if the
+            // resolved key can't actually talk to /v1/images/generations.
+            let key = match ensure_image_compatible_key(&session_store, initial_key).await {
+                Some(k) => k,
+                None => process::exit(ExitCode::UserError.code()),
+            };
+            let command = ImageCommand::new(session_store, models_cache.clone());
+            command.execute(image_args, key).await
         }
 
         Commands::Run(run_args) => {
@@ -437,11 +502,14 @@ async fn main() {
 }
 
 /// Expands combined short flags (e.g. `-nar`) into individual flags (`-n`, `-a`, `-r`)
-/// when every character after the leading `-` is a known single-character flag.
+/// when every character after the leading `-` is safe to treat as a bare flag.
 /// Tokens that don't match are left untouched (e.g. `-p8080`, `-mfoo`, `--model`).
 /// Stops processing after a bare `--` separator.
 fn expand_combined_short_flags(args: Vec<String>) -> Vec<String> {
-    let known = collect_known_short_flags();
+    let ShortFlagSets {
+        bundleable,
+        optional_value,
+    } = collect_short_flag_sets();
     let mut result = Vec::with_capacity(args.len());
     let mut past_separator = false;
 
@@ -460,7 +528,8 @@ fn expand_combined_short_flags(args: Vec<String>) -> Vec<String> {
         if arg.starts_with('-')
             && !arg.starts_with("--")
             && arg.len() > 2
-            && arg[1..].chars().all(|c| known.contains(&c))
+            && should_expand_short_cluster(&arg[1..], &bundleable, &optional_value)
+            && has_unique_chars(&arg[1..])
         {
             for c in arg[1..].chars() {
                 result.push(format!("-{c}"));
@@ -471,6 +540,42 @@ fn expand_combined_short_flags(args: Vec<String>) -> Vec<String> {
     }
 
     result
+}
+
+fn should_expand_short_cluster(
+    cluster: &str,
+    bundleable: &[char],
+    optional_value: &[char],
+) -> bool {
+    let chars: Vec<char> = cluster.chars().collect();
+    if chars.iter().all(|c| bundleable.contains(c)) {
+        return true;
+    }
+
+    // 2-char clusters where the first char is an optional-value flag
+    // (value slot is skippable) and the second is either bool or another
+    // optional-value flag. Covers shorthands like `-mr`, `-xr`, `-km`, `-kr`.
+    if chars.len() == 2
+        && optional_value.contains(&chars[0])
+        && (bundleable.contains(&chars[1]) || optional_value.contains(&chars[1]))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Guards against ambiguous repeated clusters like `-nn`; real flag bundles
+/// such as `-nar`, `-xr`, and `-hv` use each short flag once.
+fn has_unique_chars(s: &str) -> bool {
+    let mut seen = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        if seen.contains(&c) {
+            return false;
+        }
+        seen.push(c);
+    }
+    true
 }
 
 fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
@@ -523,6 +628,7 @@ fn print_help() {
     };
     print_cmd("run", "Launch AI tool, or use the saved start flow");
     print_cmd("chat", "Start the interactive chat TUI");
+    print_cmd("image", "Generate images from a text prompt");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
     print_cmd("models", "List available models from the active provider");
@@ -606,6 +712,80 @@ fn print_version() {
         style::cyan("aivo"),
         style::dim(format!("v{}", version::VERSION))
     );
+}
+
+/// Re-checks `KeyCompatContext::Image` compatibility against a concrete key
+/// *after* `resolve_key_override` returns. The picker path already annotates
+/// incompatible entries, but the active-key and explicit-`--key` paths skip
+/// that, so a user with an OAuth / Copilot / Ollama / Anthropic / Google
+/// active key can reach this command. Returns the original key if already
+/// compatible, or prompts the user to pick a compatible one. Returns `None`
+/// when the user cancels or no compatible keys exist.
+async fn ensure_image_compatible_key(
+    session_store: &SessionStore,
+    key: services::session_store::ApiKey,
+) -> Option<services::session_store::ApiKey> {
+    use std::io::IsTerminal;
+
+    let compat = KeyCompatContext::Image;
+    let reason = match compat.incompat_reason(&key) {
+        Some(r) => r,
+        None => return Some(key),
+    };
+
+    let all_keys = match session_store.get_keys().await {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            return None;
+        }
+    };
+    let annotations = compat.annotations_for(&all_keys);
+    let has_eligible = annotations.iter().any(Option::is_none);
+
+    if !has_eligible {
+        eprintln!(
+            "{} Key '{}' can't be used for image generation ({}).",
+            style::red("Error:"),
+            key.display_name(),
+            reason
+        );
+        eprintln!(
+            "  {} Add an OpenAI-compatible key with `aivo keys add`.",
+            style::dim("hint:")
+        );
+        return None;
+    }
+
+    if !std::io::stderr().is_terminal() {
+        eprintln!(
+            "{} Key '{}' can't be used for image generation ({}). Pass `--key <id|name>` to pick another.",
+            style::red("Error:"),
+            key.display_name(),
+            reason
+        );
+        return None;
+    }
+
+    eprintln!(
+        "{} Key '{}' can't be used for image generation ({}) — pick a compatible key.",
+        style::yellow("Note:"),
+        key.display_name(),
+        reason
+    );
+    match commands::keys::prompt_pick_key_without_activation(
+        &all_keys,
+        &annotations,
+        "Select a key",
+        0,
+    ) {
+        Ok(Some(picked)) => Some(picked),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            None
+        }
+    }
 }
 
 /// Resolves a model alias if the model is a non-empty Some value.
@@ -1214,10 +1394,54 @@ mod tests {
 
     #[test]
     fn expand_leaves_unknown_chars_intact() {
+        // `-mzgj` contains chars that aren't registered as short flags
+        // anywhere; the expander must leave it alone so clap can still
+        // parse `-m` with a literal value starting with an unknown char.
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "chat", "-mzgj"])),
+            args(&["aivo", "chat", "-mzgj"])
+        );
+    }
+
+    #[test]
+    fn expand_leaves_attached_value_intact_when_chars_repeat() {
+        // `-mfoo` is `-m foo` (the repeating `o` rules out a flag bundle),
+        // even though `m`, `f`, `o` are all registered short flags. Same for
+        // `-ofoo`. This guards against the image-command short flags (`-f`,
+        // `-o`) accidentally eating user-supplied values.
         assert_eq!(
             expand_combined_short_flags(args(&["aivo", "chat", "-mfoo"])),
             args(&["aivo", "chat", "-mfoo"])
         );
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "image", "-ofoo"])),
+            args(&["aivo", "image", "-ofoo"])
+        );
+    }
+
+    #[test]
+    fn expand_leaves_attached_value_intact_when_chars_are_bundleable() {
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "chat", "-msonar"])),
+            args(&["aivo", "chat", "-msonar"])
+        );
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "image", "-ogold.png"])),
+            args(&["aivo", "image", "-ogold.png"])
+        );
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "image", "-sgold"])),
+            args(&["aivo", "image", "-sgold"])
+        );
+    }
+
+    #[test]
+    fn has_unique_chars_detects_duplicates() {
+        assert!(has_unique_chars("nar"));
+        assert!(has_unique_chars("xr"));
+        assert!(has_unique_chars(""));
+        assert!(!has_unique_chars("foo"));
+        assert!(!has_unique_chars("aa"));
     }
 
     #[test]
@@ -1253,10 +1477,33 @@ mod tests {
     }
 
     #[test]
+    fn expand_km_picks_both() {
+        // `-km` for image means "pick a key, pick a model" — both are
+        // optional-value flags, so the cluster splits into `-k -m`.
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "image", "an apple", "-km"])),
+            args(&["aivo", "image", "an apple", "-k", "-m"])
+        );
+    }
+
+    #[test]
+    fn expand_kr_and_mk() {
+        // Optional-value + bool, and optional-value + optional-value.
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "image", "cat", "-kr"])),
+            args(&["aivo", "image", "cat", "-k", "-r"])
+        );
+        assert_eq!(
+            expand_combined_short_flags(args(&["aivo", "image", "cat", "-mk"])),
+            args(&["aivo", "image", "cat", "-m", "-k"])
+        );
+    }
+
+    #[test]
     fn expand_multiple_groups() {
         assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "stats", "-na", "-rs"])),
-            args(&["aivo", "stats", "-n", "-a", "-r", "-s"])
+            expand_combined_short_flags(args(&["aivo", "stats", "-na", "-ra"])),
+            args(&["aivo", "stats", "-n", "-a", "-r", "-a"])
         );
     }
 

@@ -18,7 +18,6 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::commands::models::fetch_models_for_select;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
@@ -147,11 +146,6 @@ impl ChatCommand {
         }
     }
 
-    /// Fetches the model list (cache-first) with a spinner for network fetches.
-    async fn fetch_models_for_select(&self, client: &Client, key: &ApiKey) -> Vec<String> {
-        fetch_models_for_select(client, key, &self.cache).await
-    }
-
     /// Transforms model names for OpenRouter compatibility
     /// OpenRouter uses dots in version numbers: 4.6 instead of 4-6
     fn transform_model_for_provider(base_url: &str, model: &str) -> String {
@@ -233,13 +227,17 @@ impl ChatCommand {
             Some(m) => m,
             None => {
                 ensure_picker_terminal("model", "--model <name>")?;
-                let models_list = if refresh {
-                    crate::commands::models::fetch_models_cached(&client, &key, &self.cache, true)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    self.fetch_models_for_select(&client, &key).await
-                };
+                // Fetch the full catalog and annotate non-chat models as
+                // disabled rather than hiding them — users see why image /
+                // audio / embedding entries aren't selectable.
+                let models_list = crate::commands::models::fetch_all_models_cached(
+                    &client,
+                    &key,
+                    &self.cache,
+                    refresh,
+                )
+                .await
+                .unwrap_or_default();
 
                 if models_list.is_empty() {
                     anyhow::bail!(
@@ -247,7 +245,9 @@ impl ChatCommand {
                     );
                 }
 
-                match crate::commands::models::prompt_model_picker(models_list, None) {
+                let annotations =
+                    crate::services::model_compat::text_chat_annotations(&models_list);
+                match crate::commands::models::prompt_model_picker(models_list, None, annotations) {
                     Some(selected) => {
                         self.session_store
                             .set_chat_model(&key.id, &selected)
