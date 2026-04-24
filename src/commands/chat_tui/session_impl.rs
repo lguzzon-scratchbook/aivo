@@ -1,4 +1,5 @@
 use super::*;
+use crate::commands::models::fetch_models_for_select;
 
 impl ChatTuiApp {
     pub(super) fn open_model_picker(
