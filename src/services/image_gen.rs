@@ -1,9 +1,10 @@
 //! Image generation service.
 //!
-//! Handles OpenAI-compatible `/v1/images/generations` requests plus the output
-//! path UX (default/exact/directory/template forms), overwrite policy,
-//! and atomic file writes. Google Imagen is not yet implemented (returns a
-//! clear error) and is tracked for a follow-up.
+//! Handles OpenAI-compatible `/v1/images/generations` and Google's
+//! `generativelanguage.googleapis.com` surfaces (Gemini-native multimodal
+//! image models via `:generateContent`, Imagen via `:predict`), plus the
+//! output path UX (default/exact/directory/template forms), overwrite
+//! policy, and atomic file writes.
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -335,6 +336,141 @@ struct OpenAIImageItem {
     b64_json: Option<String>,
 }
 
+/// Translate the CLI's `-s` argument to a Google `aspectRatio`. Accepts
+/// either OpenAI-style `WxH` (mapped to the closest Google ratio) or a
+/// pass-through `W:H` form. Returns `None` for absent or unrecognized
+/// values — callers treat that as "let the server pick its default" rather
+/// than guessing.
+fn aspect_ratio_for_size(size: Option<&str>) -> Option<String> {
+    let raw = size?.trim();
+    if raw.contains(':') {
+        return Some(raw.to_string());
+    }
+    match raw {
+        "1024x1024" => Some("1:1".into()),
+        "1792x1024" => Some("16:9".into()),
+        "1024x1792" => Some("9:16".into()),
+        _ => None,
+    }
+}
+
+/// True for Imagen models (use `:predict`). Gemini multimodal image models
+/// (`gemini-*-image*`) use `:generateContent` instead and are the default
+/// path for anything that isn't recognized as Imagen.
+fn is_imagen_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("imagen-")
+}
+
+/// Build `{base}/v1beta/models/{model}:{verb}`. Tolerates a trailing slash
+/// or a `/v1beta` suffix already present on the stored `base_url`, so users
+/// who pasted either form get the same endpoint.
+fn google_endpoint(base_url: &str, model: &str, verb: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1beta").unwrap_or(trimmed);
+    format!("{root}/v1beta/models/{model}:{verb}")
+}
+
+/// Build the JSON body for Google's Gemini-native image generation
+/// (`:generateContent`). Always sets `responseModalities` to request both
+/// text and image; emits `imageConfig.aspectRatio` only when the user's
+/// `-s` arg resolves to a known ratio, otherwise lets the server default.
+fn build_gemini_image_body(prompt: &str, size: Option<&str>) -> Value {
+    let mut generation_config = json!({
+        "responseModalities": ["TEXT", "IMAGE"],
+    });
+    if let Some(ratio) = aspect_ratio_for_size(size) {
+        generation_config["imageConfig"] = json!({ "aspectRatio": ratio });
+    }
+    json!({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": generation_config,
+    })
+}
+
+/// Build the JSON body for Google's Imagen `:predict` REST call. Always
+/// emits `instances[0].prompt` and a default `parameters.sampleCount = 1`.
+/// `aspect_ratio_for_size` translates the user's `-s` arg when it
+/// resolves; `quality` of `hd` or `high` (case-insensitive) maps to
+/// `imageSize: "2K"`, otherwise the server's 1K default is used.
+fn build_imagen_body(prompt: &str, size: Option<&str>, quality: Option<&str>) -> Value {
+    let mut parameters = json!({ "sampleCount": 1 });
+    if let Some(ratio) = aspect_ratio_for_size(size) {
+        parameters["aspectRatio"] = Value::String(ratio);
+    }
+    if matches!(
+        quality
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("hd") | Some("high")
+    ) {
+        parameters["imageSize"] = Value::String("2K".into());
+    }
+    json!({
+        "instances": [{"prompt": prompt}],
+        "parameters": parameters,
+    })
+}
+
+/// Decode a Gemini-native (`:generateContent`) image response. Walks
+/// `candidates[0].content.parts[]` and returns the first image part's
+/// `(decoded_bytes, mime_type)`. Tolerates both snake_case (`inline_data`,
+/// `mime_type`) and camelCase (`inlineData`, `mimeType`) — Google's REST
+/// surface emits both depending on context.
+fn decode_gemini_image_response(body: &Value) -> Result<(Vec<u8>, Option<String>)> {
+    let parts = body
+        .get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| anyhow!("Google response missing candidates[0].content.parts"))?;
+
+    for part in parts {
+        let inline = part.get("inline_data").or_else(|| part.get("inlineData"));
+        let Some(inline) = inline else { continue };
+        let data = inline
+            .get("data")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| anyhow!("Google inline_data/inlineData missing 'data' field"))?;
+        let mime = inline
+            .get("mime_type")
+            .or_else(|| inline.get("mimeType"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .context("failed to decode base64 image payload from Google response")?;
+        return Ok((bytes, mime));
+    }
+    bail!("Google response contained no image (no inline_data/inlineData part)")
+}
+
+/// Decode an Imagen `:predict` response. Reads `predictions[0]` and
+/// returns `(decoded_bytes, mime_type)`. Bails when there are no
+/// predictions; the field name is `bytesBase64Encoded` per Google's
+/// documented Imagen REST shape.
+fn decode_imagen_response(body: &Value) -> Result<(Vec<u8>, Option<String>)> {
+    let prediction = body
+        .get("predictions")
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| anyhow!("Imagen response had no predictions"))?;
+
+    let data = prediction
+        .get("bytesBase64Encoded")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow!("Imagen prediction missing 'bytesBase64Encoded'"))?;
+    let mime = prediction
+        .get("mimeType")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .context("failed to decode base64 from Imagen response")?;
+    Ok((bytes, mime))
+}
+
 /// Top-level generation entry point. Picks the protocol from `key.base_url`
 /// and dispatches accordingly. `path` is the pre-resolved, overwrite-applied
 /// target path (or `None` when `url_only` is set). When `pinned_extension`
@@ -357,10 +493,7 @@ pub async fn generate(
             generate_openai(key, request, path, pinned_extension, url_only).await
         }
         ProviderProtocol::Google => {
-            bail!(
-                "Google Imagen support is not yet implemented; try an OpenAI-compatible key \
-                 (e.g. openai, openrouter, xai)"
-            )
+            generate_google(key, request, path, pinned_extension, url_only).await
         }
         ProviderProtocol::Anthropic => {
             bail!("Anthropic does not support image generation")
@@ -482,6 +615,75 @@ async fn generate_openai(
     Ok(ImageArtifact {
         path: Some(final_path),
         url: maybe_url,
+        bytes: written,
+    })
+}
+
+async fn generate_google(
+    key: &ApiKey,
+    request: &ImageRequest,
+    path: Option<&Path>,
+    pinned_extension: bool,
+    url_only: bool,
+) -> Result<ImageArtifact> {
+    if url_only {
+        bail!("--url is not supported for Google: the API returns base64 only");
+    }
+
+    let imagen = is_imagen_model(&request.model);
+    let verb = if imagen { "predict" } else { "generateContent" };
+    let url = google_endpoint(&key.base_url, &request.model, verb);
+
+    let body = if imagen {
+        build_imagen_body(
+            &request.prompt,
+            request.size.as_deref(),
+            request.quality.as_deref(),
+        )
+    } else {
+        build_gemini_image_body(&request.prompt, request.size.as_deref())
+    };
+
+    let client = router_http_client();
+    let response = client
+        .post(&url)
+        .header("x-goog-api-key", key.key.as_str())
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("image request to {url} failed"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        let detail = extract_error_message(&text).unwrap_or_else(|| text.clone());
+        bail!("image generation failed ({}): {}", status.as_u16(), detail);
+    }
+
+    let parsed: Value = response
+        .json()
+        .await
+        .context("failed to decode Google image response")?;
+
+    let (bytes, mime) = if imagen {
+        decode_imagen_response(&parsed)?
+    } else {
+        decode_gemini_image_response(&parsed)?
+    };
+
+    let Some(target_path) = path else {
+        return Ok(ImageArtifact {
+            path: None,
+            url: None,
+            bytes: bytes.len() as u64,
+        });
+    };
+
+    let final_path = align_extension(target_path, mime.as_deref(), pinned_extension);
+    let written = atomic_write(&final_path, &bytes)?;
+    Ok(ImageArtifact {
+        path: Some(final_path),
+        url: None,
         bytes: written,
     })
 }
@@ -836,5 +1038,243 @@ mod tests {
     #[test]
     fn extract_error_message_returns_none_for_plain_text() {
         assert!(extract_error_message("not json").is_none());
+    }
+
+    #[test]
+    fn aspect_ratio_for_size_maps_common_openai_sizes() {
+        assert_eq!(aspect_ratio_for_size(Some("1024x1024")), Some("1:1".into()));
+        assert_eq!(
+            aspect_ratio_for_size(Some("1792x1024")),
+            Some("16:9".into())
+        );
+        assert_eq!(
+            aspect_ratio_for_size(Some("1024x1792")),
+            Some("9:16".into())
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_for_size_passes_through_ratio_form() {
+        assert_eq!(aspect_ratio_for_size(Some("16:9")), Some("16:9".into()));
+        assert_eq!(aspect_ratio_for_size(Some("3:4")), Some("3:4".into()));
+    }
+
+    #[test]
+    fn aspect_ratio_for_size_none_when_absent_or_unknown() {
+        assert_eq!(aspect_ratio_for_size(None), None);
+        // Unknown WxH falls through to None rather than guessing.
+        assert_eq!(aspect_ratio_for_size(Some("512x768")), None);
+        assert_eq!(aspect_ratio_for_size(Some("garbage")), None);
+    }
+
+    #[test]
+    fn is_imagen_model_matches_imagen_prefix() {
+        assert!(is_imagen_model("imagen-4.0-generate-001"));
+        assert!(is_imagen_model("imagen-4.0-ultra-generate-001"));
+        assert!(is_imagen_model("imagen-4.0-fast-generate-001"));
+    }
+
+    #[test]
+    fn is_imagen_model_rejects_gemini_or_other() {
+        assert!(!is_imagen_model("gemini-2.5-flash-image"));
+        assert!(!is_imagen_model("gemini-3-pro-image-preview"));
+        assert!(!is_imagen_model("gpt-image-1"));
+        assert!(!is_imagen_model(""));
+    }
+
+    #[test]
+    fn google_endpoint_uses_v1beta_models_path() {
+        assert_eq!(
+            google_endpoint(
+                "https://generativelanguage.googleapis.com",
+                "gemini-2.5-flash-image",
+                "generateContent",
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent"
+        );
+    }
+
+    #[test]
+    fn build_gemini_image_body_includes_prompt_and_response_modalities() {
+        let body = build_gemini_image_body("a red panda", None);
+        assert_eq!(
+            body["contents"][0]["parts"][0]["text"],
+            serde_json::Value::String("a red panda".into())
+        );
+        assert_eq!(
+            body["generationConfig"]["responseModalities"],
+            serde_json::json!(["TEXT", "IMAGE"])
+        );
+        // Without a size hint, no imageConfig block is emitted (let server default).
+        assert!(body["generationConfig"].get("imageConfig").is_none());
+    }
+
+    #[test]
+    fn build_gemini_image_body_emits_aspect_ratio_when_size_known() {
+        let body = build_gemini_image_body("x", Some("1792x1024"));
+        assert_eq!(
+            body["generationConfig"]["imageConfig"]["aspectRatio"],
+            serde_json::Value::String("16:9".into())
+        );
+    }
+
+    #[test]
+    fn build_gemini_image_body_skips_aspect_ratio_for_unknown_size() {
+        let body = build_gemini_image_body("x", Some("512x512"));
+        assert!(body["generationConfig"].get("imageConfig").is_none());
+    }
+
+    #[test]
+    fn build_imagen_body_includes_prompt_and_default_sample_count() {
+        let body = build_imagen_body("a red panda", None, None);
+        assert_eq!(
+            body["instances"][0]["prompt"],
+            serde_json::Value::String("a red panda".into())
+        );
+        assert_eq!(
+            body["parameters"]["sampleCount"],
+            serde_json::Value::from(1u64)
+        );
+        assert!(body["parameters"].get("aspectRatio").is_none());
+    }
+
+    #[test]
+    fn build_imagen_body_sets_aspect_ratio_when_resolvable() {
+        let body = build_imagen_body("x", Some("1024x1792"), None);
+        assert_eq!(
+            body["parameters"]["aspectRatio"],
+            serde_json::Value::String("9:16".into())
+        );
+    }
+
+    #[test]
+    fn build_imagen_body_maps_quality_to_image_size() {
+        let body_hd = build_imagen_body("x", None, Some("hd"));
+        assert_eq!(
+            body_hd["parameters"]["imageSize"],
+            serde_json::Value::String("2K".into())
+        );
+        let body_high = build_imagen_body("x", None, Some("high"));
+        assert_eq!(
+            body_high["parameters"]["imageSize"],
+            serde_json::Value::String("2K".into())
+        );
+        let body_low = build_imagen_body("x", None, Some("low"));
+        assert!(body_low["parameters"].get("imageSize").is_none());
+        // Case-insensitive + trimmed: locks in `to_ascii_lowercase` + `trim`.
+        let body_caps = build_imagen_body("x", None, Some(" HD "));
+        assert_eq!(
+            body_caps["parameters"]["imageSize"],
+            serde_json::Value::String("2K".into())
+        );
+    }
+
+    #[test]
+    fn decode_gemini_image_response_extracts_inline_data_snake_case() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "ok"},
+                        {"inline_data": {"mime_type": "image/png", "data": "aGVsbG8="}}
+                    ]
+                }
+            }]
+        });
+        let (bytes, mime) = decode_gemini_image_response(&body).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(mime.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn decode_gemini_image_response_handles_camel_case() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"inlineData": {"mimeType": "image/jpeg", "data": "aGVsbG8="}}
+                    ]
+                }
+            }]
+        });
+        let (bytes, mime) = decode_gemini_image_response(&body).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(mime.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn decode_gemini_image_response_errors_when_no_image_part() {
+        let body = serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "no image for you"}]}}]
+        });
+        let err = decode_gemini_image_response(&body).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("no image"));
+    }
+
+    #[test]
+    fn decode_imagen_response_extracts_bytes_base64_encoded() {
+        let body = serde_json::json!({
+            "predictions": [
+                {"bytesBase64Encoded": "aGVsbG8=", "mimeType": "image/png"}
+            ]
+        });
+        let (bytes, mime) = decode_imagen_response(&body).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(mime.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn decode_imagen_response_errors_when_predictions_empty() {
+        let body = serde_json::json!({"predictions": []});
+        let err = decode_imagen_response(&body).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("no predictions"));
+    }
+
+    #[test]
+    fn google_endpoint_strips_trailing_slash_and_v1beta_suffix() {
+        let bare = google_endpoint(
+            "https://generativelanguage.googleapis.com/",
+            "imagen-4.0-generate-001",
+            "predict",
+        );
+        let with_v1beta = google_endpoint(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "imagen-4.0-generate-001",
+            "predict",
+        );
+        let with_trailing = google_endpoint(
+            "https://generativelanguage.googleapis.com/v1beta/",
+            "imagen-4.0-generate-001",
+            "predict",
+        );
+        let expected = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict";
+        assert_eq!(bare, expected);
+        assert_eq!(with_v1beta, expected);
+        assert_eq!(with_trailing, expected);
+    }
+
+    #[tokio::test]
+    async fn generate_google_rejects_url_only_with_clear_message() {
+        // The Google APIs return base64 only — there is no signed-URL form.
+        // Verify the dispatcher rejects --url before any HTTP is attempted.
+        let key = ApiKey::new_with_protocol(
+            "test".into(),
+            "test".into(),
+            "https://generativelanguage.googleapis.com".into(),
+            None,
+            "fake".into(),
+        );
+        let request = ImageRequest {
+            prompt: "x".into(),
+            model: "imagen-4.0-generate-001".into(),
+            size: None,
+            quality: None,
+        };
+        let err = generate_google(&key, &request, None, false, true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--url"), "got: {msg}");
+        assert!(msg.contains("base64"), "got: {msg}");
     }
 }
