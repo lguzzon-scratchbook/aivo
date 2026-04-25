@@ -52,18 +52,10 @@ impl ProviderQuirks {
         } else {
             None
         };
-        let requires_reasoning_content = base_url.contains("moonshot.cn")
-            || base_url.contains("moonshot.ai")
-            || base_url.contains("deepseek.com");
-        let max_tokens_cap = if base_url.contains("deepseek.com")
-            || base_url.contains("getaivo.dev")
-            || base_url == "aivo-starter"
-        {
-            Some(8192)
-        } else {
-            None
-        };
-        let anthropic_path_prefix = if base_url.contains("deepseek.com") {
+        let is_deepseek = base_url.contains("deepseek.com");
+        let requires_reasoning_content =
+            is_deepseek || base_url.contains("moonshot.cn") || base_url.contains("moonshot.ai");
+        let anthropic_path_prefix = if is_deepseek {
             Some("/anthropic")
         } else {
             None
@@ -71,7 +63,7 @@ impl ProviderQuirks {
         Self {
             model_prefix,
             requires_reasoning_content,
-            max_tokens_cap,
+            max_tokens_cap: None,
             anthropic_path_prefix,
         }
     }
@@ -516,13 +508,13 @@ mod tests {
 
         let deepseek = provider_profile_for_base_url("https://api.deepseek.com/v1");
         assert!(deepseek.quirks.requires_reasoning_content);
-        assert_eq!(deepseek.quirks.max_tokens_cap, Some(8192));
+        assert_eq!(deepseek.quirks.max_tokens_cap, None);
 
         let starter_url = provider_profile_for_base_url("https://api.getaivo.dev");
-        assert_eq!(starter_url.quirks.max_tokens_cap, Some(8192));
+        assert_eq!(starter_url.quirks.max_tokens_cap, None);
 
         let starter_sentinel = provider_profile_for_base_url("aivo-starter");
-        assert_eq!(starter_sentinel.quirks.max_tokens_cap, Some(8192));
+        assert_eq!(starter_sentinel.quirks.max_tokens_cap, None);
     }
 
     #[test]

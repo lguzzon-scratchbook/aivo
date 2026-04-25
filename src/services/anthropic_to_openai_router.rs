@@ -62,8 +62,8 @@ pub struct AnthropicToOpenAIRouterConfig {
     pub model_prefix: Option<String>,
     /// Whether the provider requires `reasoning_content` on assistant tool-call turns (e.g., Moonshot)
     pub requires_reasoning_content: bool,
-    /// Cap applied to `max_tokens` before forwarding to the provider.
-    /// Use for providers with hard limits (e.g., DeepSeek: 8192).
+    /// Cap applied to `max_tokens` before forwarding to the provider,
+    /// for providers that reject values above a fixed output ceiling.
     pub max_tokens_cap: Option<u64>,
     /// Known Anthropic sub-path (e.g. `"/anthropic"` for DeepSeek). When set,
     /// the native probe targets `{base}{prefix}/v1/messages` instead of

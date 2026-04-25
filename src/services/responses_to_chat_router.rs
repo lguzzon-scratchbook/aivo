@@ -65,8 +65,8 @@ pub struct ResponsesToChatRouterConfig {
     pub requires_reasoning_content: bool,
     /// The actual model name to use with the provider (e.g., "kimi-k2.5" while Codex CLI sees "gpt-4o")
     pub actual_model: Option<String>,
-    /// Cap applied to `max_tokens` / `max_output_tokens` before forwarding to the provider.
-    /// Use for providers with hard limits (e.g., DeepSeek: 8192).
+    /// Cap applied to `max_tokens` / `max_output_tokens` before forwarding to the provider,
+    /// for providers that reject values above a fixed output ceiling.
     pub max_tokens_cap: Option<u64>,
     /// Persisted Responses API support state: None = unknown, Some(true) = supported,
     /// Some(false) = not supported.  Avoids a wasted probe request on every session.
