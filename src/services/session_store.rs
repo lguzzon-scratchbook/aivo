@@ -552,6 +552,15 @@ pub struct StoredConfig {
         deserialize_with = "deserialize_last_selection"
     )]
     pub last_selection: Option<LastSelection>,
+    /// Last-used key/model for `aivo image`. Kept separate from `last_selection`
+    /// so picking an image-only key/model doesn't override the chat default and
+    /// vice-versa.
+    #[serde(
+        rename = "last_image_selection",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_image_selection: Option<LastSelection>,
     /// Legacy field — read from old configs but never written back.
     /// Sessions are now stored in individual files under sessions/.
     #[serde(rename = "chat_sessions", default, skip_serializing)]
@@ -657,6 +666,7 @@ impl StoredConfig {
             stats: UsageStats::default(),
             aliases: HashMap::new(),
             last_selection: None,
+            last_image_selection: None,
             chat_sessions: HashMap::new(),
             starter_key_dismissed: false,
         }
@@ -1072,7 +1082,9 @@ impl SessionStore {
     // ── Last selection (delegated to LastSelectionStore) ───────────────────
 
     pub async fn get_last_selection(&self) -> Result<Option<LastSelection>> {
-        self.last_sel.get().await
+        self.last_sel
+            .get(crate::services::last_selection::SelectionScope::Default)
+            .await
     }
 
     pub async fn set_last_selection(
@@ -1081,12 +1093,48 @@ impl SessionStore {
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        self.last_sel.set(key, tool, model).await
+        self.last_sel
+            .set(
+                crate::services::last_selection::SelectionScope::Default,
+                key,
+                tool,
+                model,
+            )
+            .await
     }
 
     #[allow(dead_code)]
     pub async fn clear_last_selection(&self) -> Result<()> {
-        self.last_sel.clear().await
+        self.last_sel
+            .clear(crate::services::last_selection::SelectionScope::Default)
+            .await
+    }
+
+    /// Last (key, model) used by `aivo image`. Stored separately from
+    /// `last_selection` so chat/run defaults don't get overwritten by an image
+    /// session and vice-versa.
+    pub async fn get_last_image_selection(&self) -> Result<Option<LastSelection>> {
+        self.last_sel
+            .get(crate::services::last_selection::SelectionScope::Image)
+            .await
+    }
+
+    pub async fn set_last_image_selection(&self, key: &ApiKey, model: Option<&str>) -> Result<()> {
+        self.last_sel
+            .set(
+                crate::services::last_selection::SelectionScope::Image,
+                key,
+                "image",
+                model,
+            )
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn clear_last_image_selection(&self) -> Result<()> {
+        self.last_sel
+            .clear(crate::services::last_selection::SelectionScope::Image)
+            .await
     }
 
     // ── Usage stats (delegated to UsageStatsStore) ────────────────────────

@@ -23,7 +23,9 @@ use commands::{
     StartFlowArgs, StatsCommand, UpdateCommand,
 };
 use errors::ExitCode;
-use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
+use key_resolution::{
+    KeyLookupMode, KeyResolution, key_or_exit, resolve_image_key_override, resolve_key_override,
+};
 use services::ai_launcher::AIToolType;
 use services::key_compat::KeyCompatContext;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
@@ -115,6 +117,10 @@ async fn main() {
         process::exit(0);
     }
 
+    // Initialize services
+    let session_store = SessionStore::new();
+    let models_cache = services::ModelsCache::new();
+
     if args.help
         && let Some(cmd) = &args.command
     {
@@ -122,7 +128,10 @@ async fn main() {
             Commands::Run(_) => RunCommand::print_help(),
             Commands::Keys(_) => KeysCommand::print_help(),
             Commands::Chat(_) => ChatCommand::print_help(),
-            Commands::Image(_) => ImageCommand::print_help(),
+            Commands::Image(_) => {
+                ImageCommand::print_help();
+                ImageCommand::print_active_selection(&session_store).await;
+            }
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
             Commands::Alias(_) => AliasCommand::print_help(),
@@ -142,10 +151,6 @@ async fn main() {
         }
         process::exit(0);
     }
-
-    // Initialize services
-    let session_store = SessionStore::new();
-    let models_cache = services::ModelsCache::new();
 
     // Ensure the free starter key exists for all users.
     // For new users (no keys), also activate it.
@@ -216,8 +221,23 @@ async fn main() {
         }
 
         Commands::Image(image_args) => {
+            // No prompt → short-circuit before any key resolution so the
+            // user gets help + active-selection footer without a forced
+            // key picker. Mirrors the bare `aivo` and `aivo image -h` paths.
+            if image_args
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                ImageCommand::print_help();
+                ImageCommand::print_active_selection(&session_store).await;
+                process::exit(ExitCode::Success.code());
+            }
+
             let key_override = key_or_exit(
-                resolve_key_override(
+                resolve_image_key_override(
                     &session_store,
                     image_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,

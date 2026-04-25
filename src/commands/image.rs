@@ -1,8 +1,10 @@
 //! `aivo image` — generate images from a text prompt.
 //!
-//! Mirrors the chat one-shot pattern: resolve key, resolve prompt (from arg or
-//! stdin), call the provider, save the result(s). Uses the shared
-//! `services::image_gen` module for the actual HTTP + file work.
+//! Resolve key, take the prompt from the positional argument, call the
+//! provider, save the result(s). Uses the shared `services::image_gen`
+//! module for the actual HTTP + file work. When no prompt is provided we
+//! print the command help and the image-scope active key/model — same shape
+//! as the top-level `aivo` command.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -42,13 +44,13 @@ impl ImageCommand {
             style::dim("— generate images from a prompt")
         );
         println!();
-        println!("{} aivo image [OPTIONS] [PROMPT]", style::bold("Usage:"));
+        println!("{} aivo image [OPTIONS] <PROMPT>", style::bold("Usage:"));
         println!();
         println!("{}", style::bold("Arguments:"));
         println!(
             "  {}{}",
             style::cyan(format!("{:<24}", "PROMPT")),
-            style::dim("Text prompt, or read from stdin when omitted")
+            style::dim("Text prompt for the image")
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -80,31 +82,74 @@ impl ImageCommand {
             "  {}",
             style::dim("aivo image \"logo sketch\" -m dall-e-3 -o logo.png")
         );
+    }
+
+    /// Prints the image-scope active key and model at the bottom of the help
+    /// output. Mirrors the shape of `aivo`'s root help footer but reads the
+    /// image-only `last_image_selection` slot so it doesn't surface a chat key
+    /// the user picked for `aivo chat`.
+    pub async fn print_active_selection(session_store: &SessionStore) {
+        let sel = match session_store
+            .get_last_image_selection()
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(sel) => sel,
+            None => return,
+        };
+
+        // Load config directly to get the display name without triggering
+        // PBKDF2 decryption — same pattern as the root help footer.
+        let key_label = session_store
+            .load()
+            .await
+            .ok()
+            .and_then(|c| {
+                c.api_keys
+                    .into_iter()
+                    .find(|k| k.id == sel.key_id)
+                    .map(|k| k.display_name().to_string())
+            })
+            .unwrap_or(sel.key_id.clone());
+        let model_display = crate::commands::models::model_display_label(sel.model.as_deref());
+
+        println!();
+        println!("{}", style::bold("Active key:"));
         println!(
-            "  {}",
-            style::dim("echo \"a minimalist poster\" | aivo image --json")
+            "  {} {}  {}",
+            style::bullet_symbol(),
+            key_label,
+            style::dim(model_display),
         );
     }
 
     pub async fn execute(self, args: ImageArgs, key: ApiKey) -> ExitCode {
-        // Resolve the model BEFORE reading stdin for the prompt. The fuzzy
-        // picker reads keystrokes from stdin, so consuming stdin first (for
-        // a piped prompt) would leave the picker at EOF. Matches
-        // `aivo chat -x` which picks the model before reading stdin.
+        // No prompt → print help + image-scope active selection, like the
+        // top-level `aivo` command. We deliberately do NOT fall back to
+        // stdin: image generation is interactive enough that an unintended
+        // empty stdin (cron, CI, redirection) shouldn't fire a model picker
+        // and burn an API call.
+        let prompt = match args
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(p) => p.to_string(),
+            None => {
+                Self::print_help();
+                Self::print_active_selection(&self.session_store).await;
+                return ExitCode::Success;
+            }
+        };
+
         let model = match resolve_image_model(&self.session_store, &self.cache, &args, &key).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 // Picker cancelled (ESC) — treat as clean exit, no error.
                 return ExitCode::Success;
             }
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                return ExitCode::UserError;
-            }
-        };
-
-        let prompt = match resolve_prompt(args.prompt.as_deref()) {
-            Ok(p) => p,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
                 return ExitCode::UserError;
@@ -164,11 +209,14 @@ impl ImageCommand {
             }
         };
 
-        // Intentionally not persisting the chosen image model: aivo chat
-        // reads from the same per-key slot unconditionally, so writing
-        // `gpt-image-1` there would make the next `aivo chat` on this key
-        // default to an image model. Until a dedicated per-key image slot
-        // lands, the user re-selects (or re-passes `-m`) each time.
+        // Persist (key, model) into the image-only last-selection slot so
+        // the next `aivo image` defaults to it. Stored separately from
+        // `last_selection` so chat/run defaults are not overwritten with
+        // an image model.
+        let _ = self
+            .session_store
+            .set_last_image_selection(&key, Some(&model))
+            .await;
 
         if args.json {
             print_json(&artifact, &key, &model, &request, elapsed);
@@ -177,26 +225,6 @@ impl ImageCommand {
         }
         ExitCode::Success
     }
-}
-
-fn resolve_prompt(arg: Option<&str>) -> anyhow::Result<String> {
-    if let Some(p) = arg {
-        let trimmed = p.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    // Mirrors `aivo chat -x`: on a TTY, show a hint and read until EOF;
-    // on a pipe, read silently. Either way, fall through to stdin when
-    // no positional prompt was supplied.
-    if std::io::stdin().is_terminal() {
-        eprintln!("{}", style::dim("Enter prompt, then press Ctrl-D to send."));
-    }
-    let stdin = image_gen::read_stdin_prompt()?;
-    if stdin.is_empty() {
-        anyhow::bail!("empty prompt on stdin");
-    }
-    Ok(stdin)
 }
 
 async fn resolve_image_model(
@@ -211,10 +239,22 @@ async fn resolve_image_model(
             let resolved = session_store.resolve_alias(m).await.unwrap_or(m.clone());
             Ok(Some(resolved))
         }
-        // Bare `-m`, or no flag at all → picker. The shared chat-model slot
-        // doesn't hold image models (see comment in `execute`), so there's
-        // no safe auto-reuse candidate to try first.
-        _ => pick_image_model_interactively(cache, key, args.refresh).await,
+        // Bare `-m` (empty string) → force the picker, ignoring any prior pick.
+        Some(_) => pick_image_model_interactively(cache, key, args.refresh).await,
+        // No flag → reuse the last image model picked for this key, if any.
+        // Falls back to the picker when the slot is empty or for a different
+        // key (image models are key-specific: a key from one provider can't
+        // run another provider's image model).
+        None => {
+            if let Ok(Some(sel)) = session_store.get_last_image_selection().await
+                && sel.key_id == key.id
+                && let Some(model) = sel.model
+                && !model.is_empty()
+            {
+                return Ok(Some(model));
+            }
+            pick_image_model_interactively(cache, key, args.refresh).await
+        }
     }
 }
 

@@ -6,7 +6,7 @@
 //! clear error) and is tracked for a follow-up.
 
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -519,16 +519,6 @@ fn extract_error_message(body: &str) -> Option<String> {
                 .and_then(|m| m.as_str())
                 .map(str::to_string)
         })
-}
-
-/// Reads the full stdin into a string. Used as the fallback prompt source
-/// when `aivo image` is invoked without a positional prompt.
-pub fn read_stdin_prompt() -> Result<String> {
-    let mut buf = String::new();
-    io::stdin()
-        .read_to_string(&mut buf)
-        .context("failed to read prompt from stdin")?;
-    Ok(buf.trim().to_string())
 }
 
 #[cfg(test)]
