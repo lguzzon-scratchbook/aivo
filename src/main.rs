@@ -4,7 +4,7 @@
  */
 use std::process;
 
-use clap::{ArgAction, CommandFactory, Parser};
+use clap::Parser;
 
 mod cli;
 mod commands;
@@ -32,50 +32,6 @@ use services::{AILauncher, EnvironmentInjector, SessionStore};
 
 /// Known AI tool names that can be used as shortcut aliases for `run`.
 const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
-
-/// Classification of short flags collected from the clap tree, used by the
-/// short-cluster expander.
-#[derive(Default)]
-struct ShortFlagSets {
-    /// Flags that never consume a value (SetTrue / SetFalse / Count). Safe
-    /// to bundle anywhere (e.g. `-nar` -> `-n -a -r`).
-    bundleable: Vec<char>,
-    /// Flags declared `num_args = 0..=1` — can stand alone via clap's
-    /// `default_missing_value`. Used for 2-char shorthands like `-km`.
-    optional_value: Vec<char>,
-}
-
-/// Walks the clap tree once and classifies each short flag. One-shot CLI
-/// startup calls this on every invocation, so the single-pass variant is
-/// cheaper than traversing for each list separately.
-fn collect_short_flag_sets() -> ShortFlagSets {
-    let cmd = Cli::command();
-    let mut sets = ShortFlagSets::default();
-    let all_args = cmd
-        .get_arguments()
-        .chain(cmd.get_subcommands().flat_map(|s| s.get_arguments()));
-    for arg in all_args {
-        let Some(c) = arg.get_short() else { continue };
-        let is_bool = matches!(
-            arg.get_action(),
-            ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
-        );
-        if is_bool {
-            if !sets.bundleable.contains(&c) {
-                sets.bundleable.push(c);
-            }
-            continue;
-        }
-        if arg
-            .get_num_args()
-            .is_some_and(|r| r.min_values() == 0 && r.max_values() >= 1)
-            && !sets.optional_value.contains(&c)
-        {
-            sets.optional_value.push(c);
-        }
-    }
-    sets
-}
 
 /// Refuses to run a `test-fast-crypto`-built binary against real user config.
 ///
@@ -109,7 +65,7 @@ fn fast_crypto_guard() {}
 async fn main() {
     fast_crypto_guard();
     let raw_args: Vec<String> = std::env::args().collect();
-    let args = Cli::parse_from(rewrite_cli_args(expand_combined_short_flags(raw_args)));
+    let args = Cli::parse_from(rewrite_cli_args(raw_args));
 
     // Handle --version and subcommand --help early, before any service initialization.
     if args.version {
@@ -519,83 +475,6 @@ async fn main() {
     services::ollama::stop_if_we_started();
 
     process::exit(exit_code.code());
-}
-
-/// Expands combined short flags (e.g. `-nar`) into individual flags (`-n`, `-a`, `-r`)
-/// when every character after the leading `-` is safe to treat as a bare flag.
-/// Tokens that don't match are left untouched (e.g. `-p8080`, `-mfoo`, `--model`).
-/// Stops processing after a bare `--` separator.
-fn expand_combined_short_flags(args: Vec<String>) -> Vec<String> {
-    let ShortFlagSets {
-        bundleable,
-        optional_value,
-    } = collect_short_flag_sets();
-    let mut result = Vec::with_capacity(args.len());
-    let mut past_separator = false;
-
-    for arg in args {
-        if past_separator {
-            result.push(arg);
-            continue;
-        }
-
-        if arg == "--" {
-            past_separator = true;
-            result.push(arg);
-            continue;
-        }
-
-        if arg.starts_with('-')
-            && !arg.starts_with("--")
-            && arg.len() > 2
-            && should_expand_short_cluster(&arg[1..], &bundleable, &optional_value)
-            && has_unique_chars(&arg[1..])
-        {
-            for c in arg[1..].chars() {
-                result.push(format!("-{c}"));
-            }
-        } else {
-            result.push(arg);
-        }
-    }
-
-    result
-}
-
-fn should_expand_short_cluster(
-    cluster: &str,
-    bundleable: &[char],
-    optional_value: &[char],
-) -> bool {
-    let chars: Vec<char> = cluster.chars().collect();
-    if chars.iter().all(|c| bundleable.contains(c)) {
-        return true;
-    }
-
-    // 2-char clusters where the first char is an optional-value flag
-    // (value slot is skippable) and the second is either bool or another
-    // optional-value flag. Covers shorthands like `-mr`, `-xr`, `-km`, `-kr`.
-    if chars.len() == 2
-        && optional_value.contains(&chars[0])
-        && (bundleable.contains(&chars[1]) || optional_value.contains(&chars[1]))
-    {
-        return true;
-    }
-
-    false
-}
-
-/// Guards against ambiguous repeated clusters like `-nn`; real flag bundles
-/// such as `-nar`, `-xr`, and `-hv` use each short flag once.
-fn has_unique_chars(s: &str) -> bool {
-    let mut seen = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        if seen.contains(&c) {
-            return false;
-        }
-        seen.push(c);
-    }
-    true
 }
 
 fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
@@ -1384,176 +1263,5 @@ mod tests {
             &args(&["fix", "the", "bug"]),
         );
         assert_eq!(r.remaining_args, args(&["fix", "the", "bug"]));
-    }
-
-    // --- expand_combined_short_flags tests ---
-
-    #[test]
-    fn expand_boolean_flags() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "stats", "-nar"])),
-            args(&["aivo", "stats", "-n", "-a", "-r"])
-        );
-    }
-
-    #[test]
-    fn expand_does_not_touch_single_flag() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "-m"])),
-            args(&["aivo", "-m"])
-        );
-    }
-
-    #[test]
-    fn expand_does_not_touch_long_flag() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "--model"])),
-            args(&["aivo", "--model"])
-        );
-    }
-
-    #[test]
-    fn expand_leaves_unknown_chars_intact() {
-        // `-mzgj` contains chars that aren't registered as short flags
-        // anywhere; the expander must leave it alone so clap can still
-        // parse `-m` with a literal value starting with an unknown char.
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "chat", "-mzgj"])),
-            args(&["aivo", "chat", "-mzgj"])
-        );
-    }
-
-    #[test]
-    fn expand_leaves_attached_value_intact_when_chars_repeat() {
-        // `-mfoo` is `-m foo` (the repeating `o` rules out a flag bundle),
-        // even though `m`, `f`, `o` are all registered short flags. Same for
-        // `-ofoo`. This guards against the image-command short flags (`-f`,
-        // `-o`) accidentally eating user-supplied values.
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "chat", "-mfoo"])),
-            args(&["aivo", "chat", "-mfoo"])
-        );
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "image", "-ofoo"])),
-            args(&["aivo", "image", "-ofoo"])
-        );
-    }
-
-    #[test]
-    fn expand_leaves_attached_value_intact_when_chars_are_bundleable() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "chat", "-msonar"])),
-            args(&["aivo", "chat", "-msonar"])
-        );
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "image", "-ogold.png"])),
-            args(&["aivo", "image", "-ogold.png"])
-        );
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "image", "-sgold"])),
-            args(&["aivo", "image", "-sgold"])
-        );
-    }
-
-    #[test]
-    fn has_unique_chars_detects_duplicates() {
-        assert!(has_unique_chars("nar"));
-        assert!(has_unique_chars("xr"));
-        assert!(has_unique_chars(""));
-        assert!(!has_unique_chars("foo"));
-        assert!(!has_unique_chars("aa"));
-    }
-
-    #[test]
-    fn expand_leaves_digit_value_intact() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "serve", "-p8080"])),
-            args(&["aivo", "serve", "-p8080"])
-        );
-    }
-
-    #[test]
-    fn expand_stops_after_separator() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "run", "claude", "--", "-nar"])),
-            args(&["aivo", "run", "claude", "--", "-nar"])
-        );
-    }
-
-    #[test]
-    fn expand_xr_full_pipeline() {
-        let expanded = expand_combined_short_flags(args(&["aivo", "-xr", "hello"]));
-        assert_eq!(expanded, args(&["aivo", "-x", "-r", "hello"]));
-        let rewritten = rewrite_cli_args(expanded);
-        assert_eq!(rewritten, args(&["aivo", "chat", "-x", "-r", "hello"]));
-    }
-
-    #[test]
-    fn expand_mr() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "run", "claude", "-mr"])),
-            args(&["aivo", "run", "claude", "-m", "-r"])
-        );
-    }
-
-    #[test]
-    fn expand_km_picks_both() {
-        // `-km` for image means "pick a key, pick a model" — both are
-        // optional-value flags, so the cluster splits into `-k -m`.
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "image", "an apple", "-km"])),
-            args(&["aivo", "image", "an apple", "-k", "-m"])
-        );
-    }
-
-    #[test]
-    fn expand_kr_and_mk() {
-        // Optional-value + bool, and optional-value + optional-value.
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "image", "cat", "-kr"])),
-            args(&["aivo", "image", "cat", "-k", "-r"])
-        );
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "image", "cat", "-mk"])),
-            args(&["aivo", "image", "cat", "-m", "-k"])
-        );
-    }
-
-    #[test]
-    fn expand_multiple_groups() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "stats", "-na", "-ra"])),
-            args(&["aivo", "stats", "-n", "-a", "-r", "-a"])
-        );
-    }
-
-    #[test]
-    fn expand_preserves_surrounding_args() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "stats", "--search", "gpt", "-na"])),
-            args(&["aivo", "stats", "--search", "gpt", "-n", "-a"])
-        );
-    }
-
-    #[test]
-    fn expand_global_hv() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo", "-hv"])),
-            args(&["aivo", "-h", "-v"])
-        );
-    }
-
-    #[test]
-    fn expand_no_args() {
-        assert_eq!(
-            expand_combined_short_flags(args(&["aivo"])),
-            args(&["aivo"])
-        );
-    }
-
-    #[test]
-    fn expand_empty() {
-        let empty: Vec<String> = vec![];
-        assert_eq!(expand_combined_short_flags(empty.clone()), empty);
     }
 }
