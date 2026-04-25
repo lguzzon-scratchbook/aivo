@@ -240,6 +240,24 @@ fn model_family(p: ProviderProtocol) -> ProviderProtocol {
     }
 }
 
+/// True for OpenAI chat models (`gpt-*`), excluding the `o*` reasoning series.
+pub(crate) fn is_gpt_chat_model_name(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let name_only = lower.split('/').next_back().unwrap_or(&lower);
+    name_only.starts_with("gpt-")
+}
+
+/// True for any OpenAI-style model: `gpt-*` chat models or the `o1`/`o3`/`o4`
+/// reasoning series. Superset of [`is_gpt_chat_model_name`].
+pub(crate) fn is_openai_style_model_name(model: &str) -> bool {
+    if is_gpt_chat_model_name(model) {
+        return true;
+    }
+    let lower = model.to_ascii_lowercase();
+    let name_only = lower.split('/').next_back().unwrap_or(&lower);
+    name_only.starts_with("o1") || name_only.starts_with("o3") || name_only.starts_with("o4")
+}
+
 fn infer_model_protocol(model: &str) -> Option<ProviderProtocol> {
     let lower = model.to_ascii_lowercase();
     let name_only = lower.split('/').next_back().unwrap_or(&lower);
@@ -473,5 +491,33 @@ mod tests {
             ),
             "gpt-4o"
         );
+    }
+
+    #[test]
+    fn test_is_gpt_chat_model_name() {
+        assert!(is_gpt_chat_model_name("gpt-4o"));
+        assert!(is_gpt_chat_model_name("gpt-5.5"));
+        assert!(is_gpt_chat_model_name("openai/gpt-4.1"));
+        assert!(is_gpt_chat_model_name("GPT-4o"));
+
+        assert!(!is_gpt_chat_model_name("o1-preview"));
+        assert!(!is_gpt_chat_model_name("o4-mini"));
+        assert!(!is_gpt_chat_model_name("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn test_is_openai_style_model_name() {
+        assert!(is_openai_style_model_name("gpt-4o"));
+        assert!(is_openai_style_model_name("gpt-5"));
+        assert!(is_openai_style_model_name("openai/gpt-4.1"));
+        assert!(is_openai_style_model_name("o1-preview"));
+        assert!(is_openai_style_model_name("o3-mini"));
+        assert!(is_openai_style_model_name("o4-mini"));
+        assert!(is_openai_style_model_name("GPT-4o"));
+
+        assert!(!is_openai_style_model_name("claude-sonnet-4"));
+        assert!(!is_openai_style_model_name("anthropic/claude-sonnet-4-5"));
+        assert!(!is_openai_style_model_name("gemini-2.5-pro"));
+        assert!(!is_openai_style_model_name("ollama/llama3"));
     }
 }

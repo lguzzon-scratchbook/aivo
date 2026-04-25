@@ -21,6 +21,7 @@ use crate::services::launch_runtime::{
     persist_runtime_discoveries, prepare_runtime_env, process_pi_sessions, record_launch_state,
 };
 use crate::services::log_store::{LogEvent, new_log_id};
+use crate::services::model_names::{is_gpt_chat_model_name, is_openai_style_model_name};
 use crate::services::models_cache::ModelsCache;
 use crate::services::ollama;
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
@@ -636,9 +637,15 @@ impl AILauncher {
         models.sort();
         models.dedup();
 
+        // Default to a non-reasoning OpenAI-style model so cost/latency match a
+        // typical workhorse session. Reverse iteration over the alphabetically
+        // sorted list yields the newest version (gpt-5.5 over gpt-3.5-turbo).
+        // Falls back to o-series, then to first alphabetical.
         let selected_model = models
             .iter()
-            .find(|m| m.contains("claude") && m.contains("sonnet"))
+            .rev()
+            .find(|m| is_gpt_chat_model_name(m))
+            .or_else(|| models.iter().rev().find(|m| is_openai_style_model_name(m)))
             .or_else(|| models.first())
             .cloned()
             .ok_or_else(|| {
