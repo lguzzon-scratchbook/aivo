@@ -110,6 +110,18 @@ fn derive_key_v4_inner() -> SecretKey {
     SecretKey(key)
 }
 
+/// Pre-warm the key derivation cache by computing keys in a background thread.
+/// Call this early in main() to overlap PBKDF2 computation with other startup work.
+/// This eliminates the cold-start delay on first encrypt/decrypt.
+pub fn warmup_key_cache() {
+    std::thread::spawn(|| {
+        // Force OnceLock initialization for all key versions
+        let _ = derive_key_v4();
+        let _ = derive_key_v3();
+        let _ = derive_key();
+    });
+}
+
 pub fn is_encrypted(value: &str) -> bool {
     value.starts_with(V4_ENCRYPTION_MARKER)
         || value.starts_with(V3_ENCRYPTION_MARKER)

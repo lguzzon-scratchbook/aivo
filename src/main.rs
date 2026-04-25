@@ -108,6 +108,9 @@ fn fast_crypto_guard() {}
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     fast_crypto_guard();
+
+    services::session_crypto::warmup_key_cache();
+
     let raw_args: Vec<String> = std::env::args().collect();
     let args = Cli::parse_from(rewrite_cli_args(expand_combined_short_flags(raw_args)));
 

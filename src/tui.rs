@@ -79,17 +79,22 @@ impl FuzzySelect {
         let page_size = 10;
 
         loop {
+            // Pre-compute lowercase query bytes for zero-allocation comparison
+            let query_lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+
             let mut filtered: Vec<(usize, &String)> = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, item)| matches_fuzzy(&query, item))
+                .filter(|(_, item)| matches_fuzzy_bytes(&query_lower, item.as_bytes()))
                 .collect();
 
             if !query.is_empty() {
                 // `sort_by_cached_key` scores each item once and is stable, so
                 // equal-score items keep their original insertion order.
-                filtered.sort_by_cached_key(|(_, item)| score_match(&query, item));
+                filtered.sort_by_cached_key(|(_, item)| {
+                    score_match_bytes(&query_lower, item.as_bytes())
+                });
             }
 
             let count = filtered.len();
@@ -318,40 +323,145 @@ fn truncate_to_width(s: &str, width: usize) -> String {
 ///
 /// Assumes `matches_fuzzy(query, target)` is true (i.e. already passed filter).
 /// Tuple components, in priority order:
-///   0. rank: 0 = case-insensitive prefix, 1 = case-insensitive substring,
-///            2 = subsequence-only.
-///   1. position: byte index of the match start (earlier wins). For
-///      subsequence matches, the byte index of the first query char in target.
-///   2. target length: shorter target wins for otherwise-equal matches, so
-///      exact-length hits float above longer strings with the query embedded.
-pub(crate) fn score_match(query: &str, target: &str) -> (u8, usize, usize) {
+/// 0. rank: 0 = case-insensitive prefix, 1 = case-insensitive substring,
+///    2 = subsequence-only.
+/// 1. position: byte index of the match start (earlier wins). For
+///    subsequence matches, the byte index of the first query char in target.
+/// 2. target length: shorter target wins for otherwise-equal matches, so
+///    exact-length hits float above longer strings with the query embedded.
+#[allow(dead_code)]
+pub fn score_match(query: &str, target: &str) -> (u8, usize, usize) {
     // ASCII case-folding to stay consistent with `matches_fuzzy`, which uses
     // `eq_ignore_ascii_case`. Picker content (provider names, URLs, model IDs)
     // is ASCII-dominant, and `target.len()` byte length is a fine tiebreak.
-    let q_lower = query.to_ascii_lowercase();
-    let t_lower = target.to_ascii_lowercase();
 
-    if t_lower.starts_with(&q_lower) {
+    // Zero-allocation case-insensitive prefix check
+    if starts_with_ignore_ascii_case(target, query) {
         return (0, 0, target.len());
     }
-    if let Some(pos) = t_lower.find(&q_lower) {
+
+    // Zero-allocation case-insensitive substring find
+    if let Some(pos) = find_ignore_ascii_case(target, query) {
         return (1, pos, target.len());
     }
+
     // Invariant: `matches_fuzzy(query, target)` was true, so the first query
     // char must appear somewhere in target.
-    let first_q = q_lower
-        .chars()
+    let first_q = query
+        .bytes()
         .next()
+        .map(|b| b.to_ascii_lowercase())
         .expect("score_match called with empty query; guarded by !query.is_empty()");
-    let pos = t_lower
-        .char_indices()
-        .find(|(_, c)| *c == first_q)
+    let pos = target
+        .bytes()
+        .enumerate()
+        .find(|(_, b)| b.to_ascii_lowercase() == first_q)
         .map(|(i, _)| i)
         .expect("matches_fuzzy guarantees the first query char is present");
     (2, pos, target.len())
 }
 
-pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
+/// Check if s starts with prefix, case-insensitively (zero-allocation).
+#[allow(clippy::manual_ignore_case_cmp, dead_code)]
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    if s.len() < prefix.len() {
+        return false;
+    }
+    s.bytes()
+        .zip(prefix.bytes())
+        .all(|(sb, pb)| sb.to_ascii_lowercase() == pb.to_ascii_lowercase())
+}
+
+/// Find position of substring, case-insensitively, returning byte index (zero-allocation).
+#[allow(clippy::manual_ignore_case_cmp, dead_code)]
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let needle_first = needle.bytes().next().unwrap().to_ascii_lowercase();
+    let needle_len = needle.len();
+
+    // Scan through haystack looking for first char match
+    for (i, b) in haystack.bytes().enumerate() {
+        if b.to_ascii_lowercase() == needle_first {
+            // Check if rest of needle matches at this position
+            let remaining = &haystack[i..];
+            if remaining.len() < needle_len {
+                return None;
+            }
+            if remaining
+                .bytes()
+                .zip(needle.bytes())
+                .all(|(h, n)| h.to_ascii_lowercase() == n.to_ascii_lowercase())
+            {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Check if target matches query using fuzzy matching (bytes version, zero-allocation).
+#[allow(clippy::manual_ignore_case_cmp)]
+pub fn matches_fuzzy_bytes(query_lower: &[u8], target: &[u8]) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    let mut q_idx = 0;
+    for t in target.iter() {
+        if t.to_ascii_lowercase() == query_lower[q_idx] {
+            q_idx += 1;
+            if q_idx >= query_lower.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Score match using pre-computed lowercase query bytes (zero-allocation).
+#[allow(clippy::manual_ignore_case_cmp)]
+pub fn score_match_bytes(query_lower: &[u8], target: &[u8]) -> (u8, usize, usize) {
+    // Zero-allocation case-insensitive prefix check
+    if target.len() >= query_lower.len()
+        && target[..query_lower.len()]
+            .iter()
+            .zip(query_lower.iter())
+            .all(|(t, q)| t.to_ascii_lowercase() == *q)
+    {
+        return (0, 0, target.len());
+    }
+
+    // Zero-allocation case-insensitive substring find
+    let needle_first = query_lower[0];
+    for (i, t) in target.iter().enumerate() {
+        if t.to_ascii_lowercase() == needle_first {
+            let remaining = &target[i..];
+            if remaining.len() < query_lower.len() {
+                break;
+            }
+            if remaining
+                .iter()
+                .zip(query_lower.iter())
+                .all(|(t, q)| t.to_ascii_lowercase() == *q)
+            {
+                return (1, i, target.len());
+            }
+        }
+    }
+
+    // Subsequence fallback - find position of first query char
+    let pos = target
+        .iter()
+        .enumerate()
+        .find(|(_, b)| b.to_ascii_lowercase() == needle_first)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    (2, pos, target.len())
+}
+
+/// Check if target matches query using fuzzy matching
+pub fn matches_fuzzy(query: &str, target: &str) -> bool {
     let mut q_chars = query.chars();
     let mut current_q_char = match q_chars.next() {
         Some(c) => c,

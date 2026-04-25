@@ -729,6 +729,7 @@ pub(crate) async fn walk_jsonl_newest_first(root: &Path) -> Vec<PathBuf> {
 /// Caller must pass an already-canonicalized path; we don't canonicalize
 /// here so this is a pure string transform suitable for sharing the
 /// canonical computation.
+/// Encode a directory path using Claude Code's convention
 pub fn encode_claude_dir(canonical_path: &str) -> String {
     // `std::fs::canonicalize` on Windows returns the extended-length form
     // (`\\?\C:\…` or `\\?\UNC\server\share\…`), but Claude Code encodes the
@@ -766,6 +767,12 @@ fn warn_unreadable_session(path: &Path, reason: &str) {
 // Per-file JSONL extractors
 // ---------------------------------------------------------------------------
 
+/// Max substantive turns to read after seeing last_assistant before deciding
+/// the conversation has "died down. This ensures we capture the bracket
+/// (first substantive user + last substantive assistant) while still
+/// providing early-exit optimization for very long JSONL files.
+const MAX_TURNS_AFTER_LAST_ASSISTANT: usize = 100;
+
 async fn extract_claude_thread(path: &Path) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
@@ -780,11 +787,22 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
     let mut last_assistant: Option<String> = None;
     let mut session_id: Option<String> = None;
     let mut last_timestamp: Option<DateTime<Utc>> = None;
+    let mut turns_after_last_assistant = 0usize;
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.is_empty() {
             continue;
         }
+
+        // Early termination: once we have both first_user AND last_assistant,
+        // and haven't seen a new assistant in N turns, stop.
+        if first_user.is_some()
+            && last_assistant.is_some()
+            && turns_after_last_assistant >= MAX_TURNS_AFTER_LAST_ASSISTANT
+        {
+            break;
+        }
+
         let v: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
@@ -826,8 +844,13 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
             }
             "assistant" => {
                 last_assistant = Some(text);
+                turns_after_last_assistant = 0;
             }
             _ => {}
+        }
+
+        if first_user.is_some() {
+            turns_after_last_assistant += 1;
         }
     }
 
@@ -924,7 +947,8 @@ async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread>
 }
 
 /// Pulls natural-language text from a Claude `message` field.
-pub(crate) fn extract_claude_text(message: Option<&Value>) -> Option<String> {
+/// Extract text from Claude message format (string or array)
+pub fn extract_claude_text(message: Option<&Value>) -> Option<String> {
     let content = message?.get("content")?;
     if let Some(s) = content.as_str() {
         return Some(s.to_string());
@@ -949,7 +973,8 @@ pub(crate) fn extract_claude_text(message: Option<&Value>) -> Option<String> {
 }
 
 /// Pulls natural-language text from a Codex `response_item.payload`.
-pub(crate) fn extract_codex_message_text(payload: &Value) -> Option<String> {
+/// Extract text from Codex message payload
+pub fn extract_codex_message_text(payload: &Value) -> Option<String> {
     let arr = payload.get("content")?.as_array()?;
     let mut buf = String::new();
     for block in arr {
@@ -967,7 +992,8 @@ pub(crate) fn extract_codex_message_text(payload: &Value) -> Option<String> {
     if buf.is_empty() { None } else { Some(buf) }
 }
 
-fn is_substantive(text: &str) -> bool {
+/// Check if text is substantive (not too short and not boilerplate)
+pub fn is_substantive(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.chars().count() < MIN_TURN_CHARS {
         return false;
@@ -981,7 +1007,8 @@ fn is_substantive(text: &str) -> bool {
 
 /// Strip any echoed aivo-context payload, then cap at `MAX_TURN_CHARS`.
 /// Returns None if what's left after stripping isn't substantive.
-fn sanitize_turn(text: &str) -> Option<String> {
+/// Sanitize a turn: strip aivo context and truncate to max chars
+pub fn sanitize_turn(text: &str) -> Option<String> {
     let cleaned = strip_aivo_context(text);
     let trimmed = cleaned.trim();
     if !is_substantive(trimmed) {
@@ -990,7 +1017,8 @@ fn sanitize_turn(text: &str) -> Option<String> {
     Some(truncate_chars(trimmed, MAX_TURN_CHARS))
 }
 
-fn strip_aivo_context(text: &str) -> String {
+/// Strip aivo context markers from text
+pub fn strip_aivo_context(text: &str) -> String {
     let mut earliest = text.len();
     for marker in AIVO_CONTEXT_MARKERS {
         if let Some(pos) = text.find(marker) {

@@ -57,6 +57,20 @@ test-fast-crypto = []
 [dev-dependencies]
 http = "1"
 tempfile = "3.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.14", features = ["flamegraph", "criterion"] }
+
+[[bench]]
+name = "crypto_perf"
+harness = false
+
+[[bench]]
+name = "tui_perf"
+harness = false
+
+[[bench]]
+name = "context_ingest_perf"
+harness = false
 
 [profile.dev]
 debug = "line-tables-only"
