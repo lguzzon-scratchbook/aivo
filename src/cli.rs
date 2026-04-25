@@ -466,7 +466,8 @@ pub struct ChatArgs {
 /// Arguments for the image command
 #[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImageArgs {
-    /// Text prompt, or read from stdin when omitted
+    /// Text prompt for the image. When omitted, `aivo image` prints help
+    /// and the active key/model instead of generating anything.
     #[arg(value_name = "PROMPT", value_parser = non_empty())]
     pub prompt: Option<String>,
 
