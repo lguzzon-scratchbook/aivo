@@ -54,8 +54,7 @@ impl KeyCompatContext {
 ///   * Copilot — no image endpoint;
 ///   * Ollama — no image endpoint;
 ///   * aivo-starter — gateway-limited, no image capacity;
-///   * Anthropic / Google protocol keys — `image_gen::generate` hard-fails
-///     both (Anthropic has no image API; Google Imagen isn't wired yet).
+///   * Anthropic protocol keys — `image_gen::generate` hard-fails (no image API).
 fn image_incompat_reason(key: &ApiKey) -> Option<&'static str> {
     const NO_IMAGE_GEN: &str = "no image generation";
     if key.is_any_oauth() || is_copilot_base(&key.base_url) || is_ollama_base(&key.base_url) {
@@ -66,7 +65,6 @@ fn image_incompat_reason(key: &ApiKey) -> Option<&'static str> {
     }
     match detect_provider_protocol(&key.base_url) {
         ProviderProtocol::Anthropic => Some("Anthropic has no image API"),
-        ProviderProtocol::Google => Some("Google Imagen not supported yet"),
         _ => None,
     }
 }
@@ -178,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn image_rejects_anthropic_and_google_protocols() {
+    fn image_rejects_anthropic_protocol_but_accepts_google() {
         let anthropic = make_key("anthropic", "https://api.anthropic.com/v1");
         let google = make_key("google", "https://generativelanguage.googleapis.com/v1beta");
 
@@ -187,10 +185,8 @@ mod tests {
             ctx.incompat_reason(&anthropic),
             Some("Anthropic has no image API")
         );
-        assert_eq!(
-            ctx.incompat_reason(&google),
-            Some("Google Imagen not supported yet")
-        );
+        // After Google image generation landed, Google REST keys are compatible.
+        assert!(ctx.incompat_reason(&google).is_none());
     }
 
     #[test]
