@@ -35,7 +35,14 @@ impl StatsCommand {
             }
         };
 
-        let global = global_stats::collect_all(args.refresh).await;
+        let cutoff = match resolve_since(args.since.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} {e}", style::red("Error:"));
+                return ExitCode::UserError;
+            }
+        };
+        let global = global_stats::collect_all(args.refresh, cutoff).await;
 
         if stats.is_empty() && global.is_empty() {
             if args.json {
@@ -68,21 +75,29 @@ impl StatsCommand {
                 },
             );
         }
-        // When global stats have 0 tokens for a tool, fall back to aivo-tracked data
-        for (tool, &count) in &aivo_tool_counts {
-            if tool == "chat" || count == 0 {
-                continue;
-            }
-            let dominated_by_global = tool_tokens.get(tool).is_some_and(|t| t.total_tokens() > 0);
-            if !dominated_by_global {
-                let mut aivo = tool_token_totals(&stats, tool, &key_ids);
-                aivo.sessions = count;
-                tool_tokens.insert(tool.clone(), aivo);
+        // When global stats have 0 tokens for a tool, fall back to aivo-tracked data.
+        // Suppress when --since is set: aivo-proxy aggregates lack per-event timestamps,
+        // so they can't be filtered to the requested window.
+        if cutoff.is_none() {
+            for (tool, &count) in &aivo_tool_counts {
+                if tool == "chat" || count == 0 {
+                    continue;
+                }
+                let dominated_by_global =
+                    tool_tokens.get(tool).is_some_and(|t| t.total_tokens() > 0);
+                if !dominated_by_global {
+                    let mut aivo = tool_token_totals(&stats, tool, &key_ids);
+                    aivo.sessions = count;
+                    tool_tokens.insert(tool.clone(), aivo);
+                }
             }
         }
         // Add chat — use actual session file count, not record_selection count
         // (record_selection is called on every model/key switch, inflating the count)
-        let chat_sessions = self.store.count_chat_sessions().await;
+        let chat_sessions = match cutoff {
+            Some(c) => self.store.count_chat_sessions_since(c).await,
+            None => self.store.count_chat_sessions().await,
+        };
         let chat_tokens = tool_token_totals(&stats, "chat", &key_ids);
         if chat_tokens.total_tokens() > 0 || chat_sessions > 0 {
             tool_tokens.insert(
@@ -113,6 +128,13 @@ impl StatsCommand {
         let model_tokens = combine_model_tokens(&global, &aivo_model_usage);
         let total_models = model_tokens.values().filter(|t| **t > 0).count() as u64;
 
+        let omitted_sources: &[&str] = if cutoff.is_some() {
+            &["aivo-proxy"]
+        } else {
+            &[]
+        };
+        let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
+
         if args.json {
             return print_json(&build_overview_json(
                 &tool_tokens,
@@ -122,6 +144,8 @@ impl StatsCommand {
                 total_sessions,
                 total_models,
                 args.search.as_deref(),
+                window,
+                omitted_sources,
             ));
         }
 
@@ -197,6 +221,7 @@ impl StatsCommand {
         }
 
         render_model_table(&model_tokens, fmt, args);
+        render_since_footer(args.since.as_deref(), omitted_sources);
 
         ExitCode::Success
     }
@@ -218,7 +243,15 @@ impl StatsCommand {
             format_human
         };
 
-        let global = match global_stats::collect(&tool, args.refresh).await {
+        let cutoff = match resolve_since(args.since.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} {e}", style::red("Error:"));
+                return ExitCode::UserError;
+            }
+        };
+
+        let global = match global_stats::collect(&tool, args.refresh, cutoff).await {
             Ok(g) => g,
             Err(e) => {
                 eprintln!(
@@ -266,7 +299,12 @@ impl StatsCommand {
                     .map(|(name, m)| (name.clone(), m.input_tokens + m.output_tokens))
                     .collect(),
             };
-            let top = if args.top_sessions && matches!(tool.as_str(), "codex" | "claude" | "gemini")
+            // top_sessions ranks by lifetime totals from the per-file cache, so
+            // suppress it when --since is set rather than mixing a filtered
+            // overview with an unfiltered ranking.
+            let top = if args.top_sessions
+                && cutoff.is_none()
+                && matches!(tool.as_str(), "codex" | "claude" | "gemini")
             {
                 match global_stats::top_sessions(&tool, args.refresh, 10).await {
                     Ok(sessions) => Some(sessions),
@@ -297,12 +335,16 @@ impl StatsCommand {
             (view, None)
         };
 
+        let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
+
         if args.json {
             return print_json(&build_tool_view_json(
                 &tool,
                 &view,
                 top_sessions.as_deref(),
                 args,
+                window,
+                &[],
             ));
         }
 
@@ -310,6 +352,7 @@ impl StatsCommand {
         if let Some(sessions) = top_sessions {
             render_top_sessions(&sessions, fmt);
         }
+        render_since_footer(args.since.as_deref(), &[]);
 
         ExitCode::Success
     }
@@ -379,6 +422,10 @@ impl StatsCommand {
         print_opt("-s, --search <QUERY>", "Search by key, model, or tool name");
         print_opt("-a, --all", "Show all models (default: top 20)");
         print_opt("--top-sessions", "Show the heaviest native session files");
+        print_opt(
+            "--since <DURATION>",
+            "Filter to the last N units (7d, 24h, 30m, 2w)",
+        );
         print_opt("--json", "Output stats as JSON (all models, exact numbers)");
         println!();
         println!("{}", style::bold("Examples:"));
@@ -387,6 +434,8 @@ impl StatsCommand {
         println!("  {}", style::dim("aivo stats claude -n"));
         println!("  {}", style::dim("aivo stats -n"));
         println!("  {}", style::dim("aivo stats -s openrouter"));
+        println!("  {}", style::dim("aivo stats --since 7d"));
+        println!("  {}", style::dim("aivo stats claude --since 24h"));
         println!(
             "  {}",
             style::dim("aivo stats --json | jq '.totals.tokens'")
@@ -426,6 +475,7 @@ fn print_json(payload: &Value) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_overview_json(
     tool_tokens: &HashMap<String, ToolTokenSummary>,
     model_tokens: &HashMap<String, u64>,
@@ -434,6 +484,8 @@ fn build_overview_json(
     total_sessions: u64,
     total_models: u64,
     search: Option<&str>,
+    window: Option<(&str, chrono::DateTime<chrono::Utc>)>,
+    omitted_sources: &[&str],
 ) -> Value {
     let mut tool_rows: Vec<(&String, &ToolTokenSummary)> = tool_tokens.iter().collect();
     tool_rows.sort_by_key(|r| std::cmp::Reverse(r.1.total_tokens()));
@@ -457,7 +509,7 @@ fn build_overview_json(
         .map(|(name, tok)| json!({ "name": name, "tokens": tok }))
         .collect();
 
-    json!({
+    let mut payload = json!({
         "totals": {
             "tokens": total_input.saturating_add(total_output),
             "input_tokens": total_input,
@@ -470,7 +522,15 @@ fn build_overview_json(
         },
         "by_tool": by_tool,
         "by_model": by_model,
-    })
+        "omitted_sources": omitted_sources,
+    });
+    if let Some((raw, cutoff)) = window {
+        payload["window"] = json!({
+            "since": raw,
+            "since_iso": cutoff.to_rfc3339(),
+        });
+    }
+    payload
 }
 
 fn build_tool_view_json(
@@ -478,6 +538,8 @@ fn build_tool_view_json(
     view: &ToolView,
     top_sessions: Option<&[NativeSessionSummary]>,
     args: &StatsArgs,
+    window: Option<(&str, chrono::DateTime<chrono::Utc>)>,
+    omitted_sources: &[&str],
 ) -> Value {
     let source = match view.source {
         StatsSource::Global => "global",
@@ -503,7 +565,14 @@ fn build_tool_view_json(
             "models": total_models,
         },
         "by_model": by_model,
+        "omitted_sources": omitted_sources,
     });
+    if let Some((raw, cutoff)) = window {
+        payload["window"] = json!({
+            "since": raw,
+            "since_iso": cutoff.to_rfc3339(),
+        });
+    }
     // Always emit `top_sessions` when --top-sessions was requested, so consumers
     // see a stable schema (empty array means "tool doesn't expose native sessions").
     if args.top_sessions {
@@ -735,6 +804,18 @@ fn render_model_table(models: &HashMap<String, u64>, fmt: fn(u64) -> String, arg
     println!("{}", style::dim(hints.join(" · ")));
 }
 
+fn render_since_footer(since: Option<&str>, omitted_sources: &[&str]) {
+    let Some(raw) = since else {
+        return;
+    };
+    let mut bits = vec![format!("filtered to last {raw}")];
+    for src in omitted_sources {
+        bits.push(format!("{src} omitted"));
+    }
+    println!();
+    println!("{}", style::dim(bits.join(" · ")));
+}
+
 fn render_top_sessions(sessions: &[NativeSessionSummary], fmt: fn(u64) -> String) {
     if sessions.is_empty() {
         return;
@@ -891,6 +972,19 @@ fn aggregate_model_usage(
 
 fn is_valid_tool(tool: &str) -> bool {
     AIToolType::parse(tool).is_some() || tool == "chat"
+}
+
+fn resolve_since(arg: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    match arg {
+        None => Ok(None),
+        Some(raw) => {
+            let dur = crate::services::since::parse_since_duration(raw)?;
+            let cutoff = chrono::Utc::now()
+                .checked_sub_signed(dur)
+                .ok_or_else(|| format!("duration '{raw}' is too large"))?;
+            Ok(Some(cutoff))
+        }
+    }
 }
 
 const BAR_MAX: usize = 20;
@@ -1191,5 +1285,133 @@ mod tests {
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
         let result = aggregate_tool_counts(&stats, &keys);
         assert_eq!(result.get("claude"), Some(&5));
+    }
+
+    #[test]
+    fn overview_json_includes_window_block_when_since_set() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+        let tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
+        let model_tokens: HashMap<String, u64> = HashMap::new();
+        let payload = build_overview_json(
+            &tool_tokens,
+            &model_tokens,
+            (0, 0),
+            (0, 0),
+            0,
+            0,
+            None,
+            Some(("7d", cutoff)),
+            &["aivo-proxy"],
+        );
+        let window = payload.get("window").expect("window block");
+        assert_eq!(window.get("since").and_then(|v| v.as_str()), Some("7d"));
+        assert!(window.get("since_iso").and_then(|v| v.as_str()).is_some());
+        let omitted = payload
+            .get("omitted_sources")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(omitted.iter().any(|v| v == "aivo-proxy"));
+    }
+
+    #[test]
+    fn overview_json_omits_window_block_when_since_unset() {
+        let tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
+        let model_tokens: HashMap<String, u64> = HashMap::new();
+        let payload = build_overview_json(
+            &tool_tokens,
+            &model_tokens,
+            (0, 0),
+            (0, 0),
+            0,
+            0,
+            None,
+            None,
+            &[],
+        );
+        assert!(payload.get("window").is_none());
+        let omitted = payload
+            .get("omitted_sources")
+            .and_then(|v| v.as_array())
+            .expect("omitted_sources array");
+        assert!(omitted.is_empty());
+    }
+
+    #[test]
+    fn tool_view_json_includes_window_block_when_since_set() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        let view = ToolView {
+            source: StatsSource::Global,
+            count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+            models: HashMap::new(),
+        };
+        let args = StatsArgs {
+            tool: Some("claude".to_string()),
+            numbers: false,
+            refresh: false,
+            search: None,
+            all: false,
+            top_sessions: false,
+            json: true,
+            since: Some("24h".to_string()),
+        };
+        let payload =
+            build_tool_view_json("claude", &view, None, &args, Some(("24h", cutoff)), &[]);
+        let window = payload.get("window").expect("window block");
+        assert_eq!(window.get("since").and_then(|v| v.as_str()), Some("24h"));
+        assert!(window.get("since_iso").and_then(|v| v.as_str()).is_some());
+        let omitted = payload
+            .get("omitted_sources")
+            .and_then(|v| v.as_array())
+            .expect("omitted_sources array");
+        assert!(omitted.is_empty());
+    }
+
+    #[test]
+    fn tool_view_json_omits_window_block_when_since_unset() {
+        let view = ToolView {
+            source: StatsSource::Global,
+            count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+            models: HashMap::new(),
+        };
+        let args = StatsArgs {
+            tool: Some("claude".to_string()),
+            numbers: false,
+            refresh: false,
+            search: None,
+            all: false,
+            top_sessions: false,
+            json: true,
+            since: None,
+        };
+        let payload = build_tool_view_json("claude", &view, None, &args, None, &[]);
+        assert!(payload.get("window").is_none());
+        let omitted = payload
+            .get("omitted_sources")
+            .and_then(|v| v.as_array())
+            .expect("omitted_sources array");
+        assert!(omitted.is_empty());
+    }
+
+    #[test]
+    fn parse_since_arg_to_cutoff() {
+        use chrono::Utc;
+        let now = Utc::now();
+        let cutoff = resolve_since(Some("7d")).unwrap().unwrap();
+        let delta = (now - cutoff).num_seconds();
+        // Allow a few seconds of drift between Utc::now() calls.
+        assert!((7 * 86400 - 5..=7 * 86400 + 5).contains(&delta));
+        assert!(resolve_since(None).unwrap().is_none());
+        assert!(resolve_since(Some("garbage")).is_err());
+        // Duration that fits in chrono::Duration but overflows Utc::now() - dur
+        // must surface as Err, not panic.
+        assert!(resolve_since(Some("99999999w")).is_err());
     }
 }

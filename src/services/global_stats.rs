@@ -75,13 +75,16 @@ struct StatsCache {
 /// Collect global stats for all known tools sequentially.
 /// Sequential avoids progress line flickering (all tools share one stderr line).
 /// Returns a map of tool name → stats (only tools with data).
-pub async fn collect_all(refresh: bool) -> HashMap<String, GlobalToolStats> {
+pub async fn collect_all(
+    refresh: bool,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> HashMap<String, GlobalToolStats> {
     let tools = ["claude", "codex", "gemini", "opencode", "pi"];
     let total_tools = tools.len();
     let mut result = HashMap::new();
     for (i, tool) in tools.iter().enumerate() {
         let step = Some((i + 1, total_tools));
-        if let Ok(Some(stats)) = collect_with_step(tool, refresh, step).await
+        if let Ok(Some(stats)) = collect_with_step(tool, refresh, step, cutoff).await
             && (stats.total_tokens() > 0 || stats.sessions > 0)
         {
             result.insert(tool.to_string(), stats);
@@ -90,8 +93,12 @@ pub async fn collect_all(refresh: bool) -> HashMap<String, GlobalToolStats> {
     result
 }
 
-pub async fn collect(tool: &str, refresh: bool) -> Result<Option<GlobalToolStats>> {
-    collect_with_step(tool, refresh, None).await
+pub async fn collect(
+    tool: &str,
+    refresh: bool,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<GlobalToolStats>> {
+    collect_with_step(tool, refresh, None, cutoff).await
 }
 
 pub async fn top_sessions(
@@ -187,12 +194,15 @@ async fn collect_with_step(
     tool: &str,
     refresh: bool,
     step: Option<(usize, usize)>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<Option<GlobalToolStats>> {
     // Prefer Claude Code's own ~/.claude/stats-cache.json — it's the same
     // data source its `/stats` UI uses, so totals match exactly. The cache
     // persists across JSONL pruning, which a raw walk of ~/.claude/projects
-    // cannot reproduce.
+    // cannot reproduce. Skip this short-circuit when `cutoff` is set: the
+    // stats-cache holds lifetime-only totals with no per-period breakdown.
     if tool == "claude"
+        && cutoff.is_none()
         && let Some(stats) = collect_claude_from_cache().await
     {
         return Ok(Some(stats));
@@ -200,8 +210,8 @@ async fn collect_with_step(
 
     if !matches!(tool, "claude" | "codex" | "gemini") {
         return match tool {
-            "opencode" => collect_opencode().await,
-            "pi" => collect_pi().await,
+            "opencode" => collect_opencode(cutoff).await,
+            "pi" => collect_pi(cutoff).await,
             _ => Ok(None),
         };
     }
@@ -213,7 +223,12 @@ async fn collect_with_step(
 
     let filter = tool_file_filter(tool);
     let cache_path = cache_path(tool);
-    let mut cache = if refresh {
+    // When `cutoff` is set, parsed `FileEntry`s contain only post-cutoff
+    // token totals. Persisting them would corrupt later non-cutoff runs
+    // (size matches → no re-parse → wrong lifetime totals). Treat cutoff
+    // as "rebuild fresh, in-memory only, then drop" — same semantic as
+    // `refresh: true`, but with no write-back.
+    let mut cache = if cutoff.is_some() || refresh {
         StatsCache::default()
     } else {
         read_cache(&cache_path).await.unwrap_or_default()
@@ -248,7 +263,6 @@ async fn collect_with_step(
     // Re-parse stale files
     if !stale.is_empty() {
         let total = stale.len();
-        let parser = tool_file_parser(tool);
 
         let show_progress = total > 5;
         let update_interval = (total / 50).max(1);
@@ -257,7 +271,13 @@ async fn collect_with_step(
         }
 
         for (i, (path, size)) in stale.iter().enumerate() {
-            if let Some(entry) = parser(path).await {
+            let entry_opt = match tool {
+                "claude" => parse_claude_file_with_cutoff(path, cutoff).await,
+                "codex" => parse_codex_file(path).await,
+                "gemini" => parse_gemini_file(path).await,
+                _ => None,
+            };
+            if let Some(entry) = entry_opt {
                 cache.files.insert(
                     path.to_string_lossy().to_string(),
                     FileEntry {
@@ -274,21 +294,43 @@ async fn collect_with_step(
         if show_progress {
             eprint!("\r{:<30}\r", "");
         }
-        let _ = write_cache(&cache_path, &cache).await;
+        if cutoff.is_none() {
+            let _ = write_cache(&cache_path, &cache).await;
+        }
     }
 
-    // Aggregate from all cached file entries
-    let stats = aggregate_cache(&cache);
+    // Aggregate from all cached file entries, respecting `cutoff` via mtime.
+    // Skip the per-path mtime map when no cutoff is set — the filter never
+    // consults it and building it is N path-string allocations.
+    let mtimes: HashMap<String, SystemTime> = if cutoff.is_some() {
+        all_files
+            .iter()
+            .filter_map(|(p, _, m)| m.map(|t| (p.to_string_lossy().into_owned(), t)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let stats = aggregate_cache_filtered(&cache, &mtimes, cutoff);
     if stats.sessions == 0 && stats.total_tokens() == 0 {
         return Ok(None);
     }
     Ok(Some(stats))
 }
 
-fn aggregate_cache(cache: &StatsCache) -> GlobalToolStats {
-    let mut stats = GlobalToolStats::default();
+fn aggregate_cache_filtered(
+    cache: &StatsCache,
+    mtimes: &HashMap<String, SystemTime>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> GlobalToolStats {
+    let cutoff_st = cutoff.and_then(cutoff_to_systemtime);
 
-    for entry in cache.files.values() {
+    let mut stats = GlobalToolStats::default();
+    for (path, entry) in &cache.files {
+        if let (Some(c), Some(m)) = (cutoff_st, mtimes.get(path))
+            && *m < c
+        {
+            continue;
+        }
         stats.input_tokens += entry.input_tokens;
         stats.output_tokens += entry.output_tokens;
         stats.cache_read_tokens += entry.cache_read_tokens;
@@ -302,7 +344,6 @@ fn aggregate_cache(cache: &StatsCache) -> GlobalToolStats {
             m.output_tokens += out;
         }
     }
-
     stats
 }
 
@@ -345,7 +386,7 @@ type FileParser =
 
 fn tool_file_parser(tool: &str) -> FileParser {
     match tool {
-        "claude" => |p| Box::pin(parse_claude_file(p, None)),
+        "claude" => |p| Box::pin(parse_claude_file_with_cutoff(p, None)),
         "codex" => |p| Box::pin(parse_codex_file(p)),
         "gemini" => |p| Box::pin(parse_gemini_file(p)),
         _ => |_| Box::pin(async { None }),
@@ -447,6 +488,14 @@ async fn collect_claude_from_cache() -> Option<GlobalToolStats> {
 /// O(files touched today) work on the interactive `aivo stats` path.
 async fn merge_claude_jsonl_deltas(dir: &Path, cutoff_date: &str, stats: &mut GlobalToolStats) {
     let mtime_threshold = day_after_start_utc(cutoff_date);
+    let Some(cutoff_dt) = NaiveDate::parse_from_str(cutoff_date, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.succ_opt())
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|ndt| ndt.and_utc())
+    else {
+        return;
+    };
     let files = walk_files_with_size(dir, |name| name.ends_with(".jsonl")).await;
 
     for (path, _, mtime) in &files {
@@ -455,7 +504,7 @@ async fn merge_claude_jsonl_deltas(dir: &Path, cutoff_date: &str, stats: &mut Gl
         {
             continue;
         }
-        let Some(entry) = parse_claude_file(path, Some(cutoff_date)).await else {
+        let Some(entry) = parse_claude_file_with_cutoff(path, Some(cutoff_dt)).await else {
             continue;
         };
         stats.input_tokens += entry.input_tokens;
@@ -482,6 +531,11 @@ fn day_after_start_utc(date: &str) -> Option<SystemTime> {
         .succ_opt()?;
     let ts = next.and_hms_opt(0, 0, 0)?.and_utc().timestamp();
     Some(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(ts).ok()?))
+}
+
+fn cutoff_to_systemtime(cutoff: chrono::DateTime<chrono::Utc>) -> Option<SystemTime> {
+    let secs = u64::try_from(cutoff.timestamp()).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// Pure parser for Claude Code's `stats-cache.json` schema. Split out for
@@ -525,10 +579,14 @@ fn parse_claude_stats_cache(v: &Value) -> Option<GlobalToolStats> {
 
 /// Parse a single Claude Code JSONL file.
 ///
-/// When `cutoff_date` is `Some("YYYY-MM-DD")`, assistant lines whose ISO
-/// timestamp's date portion is on or before that date are skipped. Used by
-/// the stats-cache delta merge to accumulate only post-cutoff activity.
-async fn parse_claude_file(path: &Path, cutoff_date: Option<&str>) -> Option<FileEntry> {
+/// When `cutoff` is `Some(dt)`, assistant lines whose RFC3339 `timestamp`
+/// is strictly before `dt` (or is missing/unparseable) are skipped. Used
+/// by both the stats-cache delta merge and the `--since` filter on the
+/// direct JSONL walk.
+async fn parse_claude_file_with_cutoff(
+    path: &Path,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<FileEntry> {
     let file = fs::File::open(path).await.ok()?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -545,9 +603,13 @@ async fn parse_claude_file(path: &Path, cutoff_date: Option<&str>) -> Option<Fil
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(cutoff) = cutoff_date {
-            let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-            if ts.len() < 10 || &ts[..10] <= cutoff {
+        if let Some(c) = cutoff {
+            let ts_str = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+            let ts = match chrono::DateTime::parse_from_rfc3339(ts_str) {
+                Ok(t) => t.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            if ts < c {
                 continue;
             }
         }
@@ -737,7 +799,9 @@ async fn parse_gemini_file(path: &Path) -> Option<FileEntry> {
 // ---------------------------------------------------------------------------
 
 /// OpenCode: ~/.local/share/opencode/opencode.db (SQLite via rusqlite)
-async fn collect_opencode() -> Result<Option<GlobalToolStats>> {
+async fn collect_opencode(
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<GlobalToolStats>> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Ok(None),
@@ -760,69 +824,69 @@ async fn collect_opencode() -> Result<Option<GlobalToolStats>> {
             Ok(c) => c,
             Err(_) => return Ok(None),
         };
-
-        let mut stmt = match conn.prepare(
-            "SELECT session_id,
-                    json_extract(data, '$.modelID'),
-                    json_extract(data, '$.tokens.input'),
-                    json_extract(data, '$.tokens.output'),
-                    json_extract(data, '$.tokens.cache.read'),
-                    json_extract(data, '$.tokens.cache.write')
-             FROM message
-             WHERE json_extract(data, '$.role') = 'assistant'
-               AND json_extract(data, '$.tokens') IS NOT NULL",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
-        };
-
-        let mut stats = GlobalToolStats::default();
-        let mut session_ids = HashSet::new();
-
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1).unwrap_or_default(),
-                row.get::<_, u64>(2).unwrap_or(0),
-                row.get::<_, u64>(3).unwrap_or(0),
-                row.get::<_, u64>(4).unwrap_or(0),
-                row.get::<_, u64>(5).unwrap_or(0),
-            ))
-        });
-
-        let rows = match rows {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-
-        for row in rows.flatten() {
-            let (session_id, model, input, output, cache_read, cache_write) = row;
-
-            session_ids.insert(session_id);
-            stats.input_tokens += input;
-            stats.output_tokens += output;
-            stats.cache_read_tokens += cache_read;
-            stats.cache_write_tokens += cache_write;
-
-            if !model.is_empty() {
-                let key = normalize_model_for_display(&model);
-                let entry = stats.models.entry(key).or_default();
-                entry.input_tokens += input;
-                entry.output_tokens += output;
-            }
+        match aggregate_opencode_messages(&conn, cutoff) {
+            Ok(stats) if stats.sessions > 0 => Ok(Some(stats)),
+            _ => Ok(None),
         }
-
-        stats.sessions = session_ids.len() as u64;
-        if stats.sessions == 0 {
-            return Ok(None);
-        }
-        Ok(Some(stats))
     })
     .await?
 }
 
+/// Sum tokens from opencode's `message` table. `time_created` is epoch
+/// milliseconds; `COALESCE(?1, time_created)` lets the caller skip the
+/// cutoff by binding NULL.
+fn aggregate_opencode_messages(
+    conn: &rusqlite::Connection,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> rusqlite::Result<GlobalToolStats> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id,
+                json_extract(data, '$.modelID'),
+                json_extract(data, '$.tokens.input'),
+                json_extract(data, '$.tokens.output'),
+                json_extract(data, '$.tokens.cache.read'),
+                json_extract(data, '$.tokens.cache.write')
+         FROM message
+         WHERE json_extract(data, '$.role') = 'assistant'
+           AND json_extract(data, '$.tokens') IS NOT NULL
+           AND time_created >= COALESCE(?1, time_created)",
+    )?;
+    let cutoff_ms: Option<i64> = cutoff.map(|c| c.timestamp_millis());
+    let rows = stmt.query_map([cutoff_ms], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, u64>(2).unwrap_or(0),
+            row.get::<_, u64>(3).unwrap_or(0),
+            row.get::<_, u64>(4).unwrap_or(0),
+            row.get::<_, u64>(5).unwrap_or(0),
+        ))
+    })?;
+
+    let mut stats = GlobalToolStats::default();
+    let mut session_ids = HashSet::new();
+    for row in rows.filter_map(Result::ok) {
+        let (session_id, model, input, output, cache_read, cache_write) = row;
+        session_ids.insert(session_id);
+        stats.input_tokens += input;
+        stats.output_tokens += output;
+        stats.cache_read_tokens += cache_read;
+        stats.cache_write_tokens += cache_write;
+        if !model.is_empty() {
+            let key = normalize_model_for_display(&model);
+            let entry = stats.models.entry(key).or_default();
+            entry.input_tokens += input;
+            entry.output_tokens += output;
+        }
+    }
+    stats.sessions = session_ids.len() as u64;
+    Ok(stats)
+}
+
 /// Pi: ~/.pi/agent/sessions/**/*.jsonl
-async fn collect_pi() -> Result<Option<GlobalToolStats>> {
+async fn collect_pi(
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<GlobalToolStats>> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Ok(None),
@@ -838,10 +902,17 @@ async fn collect_pi() -> Result<Option<GlobalToolStats>> {
         return Ok(None);
     }
 
+    let cutoff_st = cutoff.and_then(cutoff_to_systemtime);
+
     let mut stats = GlobalToolStats::default();
     let mut session_ids: HashSet<String> = HashSet::new();
 
-    for (path, _, _) in &files {
+    for (path, _, mtime) in &files {
+        if let (Some(c), Some(m)) = (cutoff_st, mtime)
+            && *m < c
+        {
+            continue;
+        }
         if let Some((entry, ids)) = parse_pi_file(path).await {
             stats.input_tokens += entry.input_tokens;
             stats.output_tokens += entry.output_tokens;
@@ -963,6 +1034,13 @@ pub fn tool_display_name(tool: &str) -> &str {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn collect_all_accepts_cutoff_signature() {
+        // Compile-time check: the new signature accepts an Option<DateTime<Utc>>.
+        let _ = collect_all(false, None).await;
+        let _ = collect_all(false, Some(chrono::Utc::now())).await;
+    }
+
     fn parse_claude_line(line: &str) -> (u64, u64, u64, u64, Option<String>) {
         let v: Value = serde_json::from_str(line).unwrap();
         if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
@@ -1033,7 +1111,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let line = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}},"sessionId":"abc"}"#;
         let path = write_jsonl(&dir, "main.jsonl", &[line]).await;
-        let entry = parse_claude_file(&path, None).await.unwrap();
+        let entry = parse_claude_file_with_cutoff(&path, None).await.unwrap();
         assert!(
             entry.has_session,
             "main assistant line should register a session"
@@ -1047,7 +1125,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let line = r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}},"sessionId":"abc"}"#;
         let path = write_jsonl(&dir, "agent-xxx.jsonl", &[line]).await;
-        let entry = parse_claude_file(&path, None).await.unwrap();
+        let entry = parse_claude_file_with_cutoff(&path, None).await.unwrap();
         assert!(
             !entry.has_session,
             "a file containing only sidechain assistant lines must not count as a session"
@@ -1158,7 +1236,7 @@ mod tests {
         let sidechain = r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":2}},"sessionId":"abc"}"#;
         let main = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":3,"output_tokens":4}},"sessionId":"abc"}"#;
         let path = write_jsonl(&dir, "mixed.jsonl", &[sidechain, main]).await;
-        let entry = parse_claude_file(&path, None).await.unwrap();
+        let entry = parse_claude_file_with_cutoff(&path, None).await.unwrap();
         assert!(entry.has_session);
         assert_eq!(entry.input_tokens, 4);
         assert_eq!(entry.output_tokens, 6);
@@ -1341,5 +1419,185 @@ mod tests {
     fn day_after_start_utc_rejects_bad_input() {
         assert!(day_after_start_utc("not-a-date").is_none());
         assert!(day_after_start_utc("").is_none());
+    }
+
+    #[test]
+    fn aggregate_cache_cutoff_includes_boundary_excludes_older() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(30 * 24 * 3600);
+        let edge_mtime = now - Duration::from_secs(7 * 24 * 3600);
+
+        let mut cache = StatsCache::default();
+        cache.files.insert(
+            "/old.jsonl".into(),
+            FileEntry {
+                size: 1,
+                input_tokens: 100,
+                has_session: true,
+                ..Default::default()
+            },
+        );
+        cache.files.insert(
+            "/new.jsonl".into(),
+            FileEntry {
+                size: 1,
+                input_tokens: 50,
+                has_session: true,
+                ..Default::default()
+            },
+        );
+        cache.files.insert(
+            "/edge.jsonl".into(),
+            FileEntry {
+                size: 1,
+                input_tokens: 7,
+                has_session: true,
+                ..Default::default()
+            },
+        );
+
+        let mut mtimes = std::collections::HashMap::new();
+        mtimes.insert("/old.jsonl".to_string(), old);
+        mtimes.insert("/new.jsonl".to_string(), now);
+        mtimes.insert("/edge.jsonl".to_string(), edge_mtime);
+
+        // Cutoff is exactly the edge file's mtime — boundary must be included
+        // (spec: skip files whose mtime is `< cutoff`).
+        let cutoff = chrono::DateTime::<chrono::Utc>::from(edge_mtime);
+        let stats = aggregate_cache_filtered(&cache, &mtimes, Some(cutoff));
+        assert_eq!(
+            stats.input_tokens,
+            50 + 7,
+            "boundary file must be included; older file excluded"
+        );
+        assert_eq!(stats.sessions, 2);
+    }
+
+    #[tokio::test]
+    async fn parse_claude_file_filters_by_datetime_cutoff() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut f = tokio::fs::File::create(&path).await.unwrap();
+        let stale = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"usage":{"input_tokens":1000,"output_tokens":1000}}}"#;
+        let fresh = r#"{"type":"assistant","timestamp":"2099-01-01T00:00:00Z","message":{"usage":{"input_tokens":7,"output_tokens":11}}}"#;
+        f.write_all(format!("{stale}\n{fresh}\n").as_bytes())
+            .await
+            .unwrap();
+        f.flush().await.unwrap();
+
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let entry = parse_claude_file_with_cutoff(&path, Some(cutoff))
+            .await
+            .unwrap();
+        assert_eq!(entry.input_tokens, 7);
+        assert_eq!(entry.output_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn parse_claude_file_with_cutoff_handles_boundary_cases() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut f = tokio::fs::File::create(&path).await.unwrap();
+
+        // Line 1: missing timestamp field -- skipped when cutoff is set.
+        let no_ts =
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":100}}}"#;
+        // Line 2: malformed timestamp -- skipped when cutoff is set.
+        let bad_ts = r#"{"type":"assistant","timestamp":"not-a-date","message":{"usage":{"input_tokens":200,"output_tokens":200}}}"#;
+        // Line 3: timestamp == cutoff exactly -- INCLUDED (half-open [cutoff, ∞)).
+        let on_boundary = r#"{"type":"assistant","timestamp":"2025-06-01T00:00:00Z","message":{"usage":{"input_tokens":3,"output_tokens":5}}}"#;
+        // Line 4: pre-cutoff -- skipped.
+        let before = r#"{"type":"assistant","timestamp":"2025-05-31T23:59:59Z","message":{"usage":{"input_tokens":7,"output_tokens":11}}}"#;
+        // Line 5: post-cutoff -- INCLUDED.
+        let after = r#"{"type":"assistant","timestamp":"2025-06-02T00:00:00Z","message":{"usage":{"input_tokens":13,"output_tokens":17}}}"#;
+
+        f.write_all(format!("{no_ts}\n{bad_ts}\n{on_boundary}\n{before}\n{after}\n").as_bytes())
+            .await
+            .unwrap();
+        f.flush().await.unwrap();
+
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let entry = parse_claude_file_with_cutoff(&path, Some(cutoff))
+            .await
+            .expect("file with at least one valid usage should produce an entry");
+
+        // Only on_boundary (3+5) and after (13+17) should contribute.
+        assert_eq!(entry.input_tokens, 3 + 13);
+        assert_eq!(entry.output_tokens, 5 + 17);
+    }
+
+    #[test]
+    fn aggregate_cache_with_no_cutoff_includes_all() {
+        let mut cache = StatsCache::default();
+        cache.files.insert(
+            "/a.jsonl".into(),
+            FileEntry {
+                size: 1,
+                input_tokens: 10,
+                has_session: true,
+                ..Default::default()
+            },
+        );
+        let mtimes = std::collections::HashMap::new();
+        let stats = aggregate_cache_filtered(&cache, &mtimes, None);
+        assert_eq!(stats.input_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn collect_opencode_filters_by_cutoff_when_set() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // Old row (epoch ms = 1000000000000 -> 2001-09-09)
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
+            rusqlite::params![
+                "msg-old",
+                "sess-1",
+                1_000_000_000_000_i64,
+                r#"{"role":"assistant","modelID":"gpt-4","tokens":{"input":100,"output":100,"cache":{"read":0,"write":0}}}"#,
+            ],
+        )
+        .unwrap();
+        // New row (epoch ms ~ now)
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
+            rusqlite::params![
+                "msg-new",
+                "sess-2",
+                now_ms,
+                r#"{"role":"assistant","modelID":"gpt-4","tokens":{"input":7,"output":11,"cache":{"read":0,"write":0}}}"#,
+            ],
+        )
+        .unwrap();
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+        let stats = aggregate_opencode_messages(&conn, Some(cutoff)).expect("query OK");
+        assert_eq!(stats.input_tokens, 7);
+        assert_eq!(stats.output_tokens, 11);
+        assert_eq!(stats.sessions, 1);
+
+        let stats_no_cutoff = aggregate_opencode_messages(&conn, None).expect("query OK");
+        assert_eq!(stats_no_cutoff.input_tokens, 107);
+        assert_eq!(stats_no_cutoff.sessions, 2);
     }
 }

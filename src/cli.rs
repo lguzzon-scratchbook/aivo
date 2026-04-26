@@ -326,6 +326,10 @@ pub struct StatsArgs {
     /// Output stats as JSON (always uses exact numbers; includes all models)
     #[arg(long)]
     pub json: bool,
+
+    /// Filter to the last N units (e.g. 7d, 24h, 30m, 2w)
+    #[arg(long, value_name = "DURATION")]
+    pub since: Option<String>,
 }
 
 /// Arguments for the context command

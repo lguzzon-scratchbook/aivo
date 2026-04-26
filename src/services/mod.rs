@@ -60,6 +60,7 @@ pub mod session_crypto;
 pub mod session_store;
 pub mod session_transcript;
 pub mod share_config;
+pub mod since;
 pub mod system_env;
 pub mod usage_stats_store;
 

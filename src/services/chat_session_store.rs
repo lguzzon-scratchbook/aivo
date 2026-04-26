@@ -450,6 +450,20 @@ impl ChatSessionStore {
             .unwrap_or(0)
     }
 
+    pub(crate) async fn count_chat_sessions_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> u64 {
+        let Ok(idx) = self.load_index().await else {
+            return 0;
+        };
+        let cutoff_str = cutoff.to_rfc3339();
+        idx.entries
+            .iter()
+            .filter(|e| e.updated_at.as_str() >= cutoff_str.as_str())
+            .count() as u64
+    }
+
     pub(crate) async fn delete_chat_session(&self, session_id: &str) -> Result<bool> {
         self.migrate_sessions_if_needed().await?;
         let _lock = self.acquire_session_lock()?;
@@ -840,5 +854,47 @@ mod tests {
         assert_eq!(first_non_empty_line("\n\n  hello\nworld"), "hello");
         assert_eq!(first_non_empty_line(""), "");
         assert_eq!(first_non_empty_line("  \n  \n  "), "");
+    }
+
+    #[tokio::test]
+    async fn count_chat_sessions_since_filters_by_cutoff() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(30);
+        let recent = now - chrono::Duration::hours(1);
+
+        let index = SessionIndex {
+            entries: vec![
+                SessionIndexEntry {
+                    session_id: "old".to_string(),
+                    key_id: "k".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    cwd: "/tmp".to_string(),
+                    model: "gpt-4o".to_string(),
+                    updated_at: old.to_rfc3339(),
+                    created_at: old.to_rfc3339(),
+                    title: "old".to_string(),
+                    preview: "old".to_string(),
+                },
+                SessionIndexEntry {
+                    session_id: "recent".to_string(),
+                    key_id: "k".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    cwd: "/tmp".to_string(),
+                    model: "gpt-4o".to_string(),
+                    updated_at: recent.to_rfc3339(),
+                    created_at: recent.to_rfc3339(),
+                    title: "recent".to_string(),
+                    preview: "recent".to_string(),
+                },
+            ],
+        };
+        store.save_index(&index).await.unwrap();
+
+        assert_eq!(store.count_chat_sessions().await, 2);
+        let cutoff = now - chrono::Duration::days(7);
+        assert_eq!(store.count_chat_sessions_since(cutoff).await, 1);
     }
 }

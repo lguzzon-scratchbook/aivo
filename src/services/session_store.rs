@@ -1231,6 +1231,10 @@ impl SessionStore {
         self.sessions.count_chat_sessions().await
     }
 
+    pub async fn count_chat_sessions_since(&self, cutoff: chrono::DateTime<chrono::Utc>) -> u64 {
+        self.sessions.count_chat_sessions_since(cutoff).await
+    }
+
     /// Removes session files for all sessions belonging to a key.
     #[allow(dead_code)]
     pub async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {
