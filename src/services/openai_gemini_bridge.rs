@@ -153,7 +153,8 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
     let mut tool_names_by_call_id: HashMap<String, String> = HashMap::new();
 
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-        for message in messages {
+        let mut iter = messages.iter().peekable();
+        while let Some(message) = iter.next() {
             let role = message
                 .get("role")
                 .and_then(|r| r.as_str())
@@ -173,7 +174,7 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                         parts.push(json!({ "text": text }));
                     }
                     if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
-                        for (index, tool_call) in tool_calls.iter().enumerate() {
+                        for (tc_index, tool_call) in tool_calls.iter().enumerate() {
                             let name = tool_call
                                 .get("function")
                                 .and_then(|f| f.get("name"))
@@ -184,7 +185,7 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                                 .and_then(|v| v.as_str())
                                 .filter(|id| !id.is_empty())
                                 .map(ToOwned::to_owned)
-                                .unwrap_or_else(|| format!("call_{index}"));
+                                .unwrap_or_else(|| format!("call_{tc_index}"));
                             tool_names_by_call_id.insert(call_id.clone(), name.to_string());
                             let args = tool_call
                                 .get("function")
@@ -205,7 +206,7 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                             // documented Google placeholder so we don't 400 on
                             // missing thought_signature. See:
                             // https://ai.google.dev/gemini-api/docs/thought-signatures
-                            if index == 0 {
+                            if tc_index == 0 {
                                 let sig = lookup_signature(&call_id).unwrap_or_else(|| {
                                     SKIP_THOUGHT_SIGNATURE_PLACEHOLDER.to_string()
                                 });
@@ -219,28 +220,21 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                     }
                 }
                 "tool" => {
-                    let call_id = message
-                        .get("tool_call_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    // Gemini matches by function name, not ID — fall back to call_id
-                    // when the assistant message with the original tool_call is not in history
-                    let name = tool_names_by_call_id
-                        .get(call_id)
-                        .filter(|n| !n.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| call_id.to_string());
-                    let response = parse_tool_content(message.get("content"));
-                    contents.push(json!({
-                        "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "id": call_id,
-                                "name": name,
-                                "response": response
-                            }
-                        }]
-                    }));
+                    // Gemini validates parallel tool responses as one logical
+                    // user step. Group consecutive OpenAI `role: tool` messages
+                    // so assistant[FC1,FC2], tool(FR1), tool(FR2) becomes
+                    // model[FC1,FC2], user[FR1,FR2].
+                    let mut parts = vec![build_tool_response_part(message, &tool_names_by_call_id)];
+                    while iter
+                        .peek()
+                        .and_then(|m| m.get("role"))
+                        .and_then(|r| r.as_str())
+                        == Some("tool")
+                    {
+                        let next = iter.next().expect("peeked tool message");
+                        parts.push(build_tool_response_part(next, &tool_names_by_call_id));
+                    }
+                    contents.push(json!({ "role": "user", "parts": parts }));
                 }
                 _ => {
                     let text = extract_openai_text(message.get("content"));
@@ -451,6 +445,31 @@ fn parse_tool_content(content: Option<&Value>) -> Value {
         Some(other) => other.clone(),
         None => json!({}),
     }
+}
+
+fn build_tool_response_part(
+    tool_message: &Value,
+    tool_names_by_call_id: &HashMap<String, String>,
+) -> Value {
+    let call_id = tool_message
+        .get("tool_call_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // Gemini matches by function name, not ID — fall back to call_id
+    // when the assistant message with the original tool_call is not in history.
+    let name = tool_names_by_call_id
+        .get(call_id)
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .unwrap_or_else(|| call_id.to_string());
+    let response = parse_tool_content(tool_message.get("content"));
+    json!({
+        "functionResponse": {
+            "id": call_id,
+            "name": name,
+            "response": response
+        }
+    })
 }
 
 fn extract_openai_text(content: Option<&Value>) -> String {
@@ -852,6 +871,151 @@ mod tests {
         let fr = &converted["contents"][1]["parts"][0]["functionResponse"];
         // Should use call_id as fallback name, not empty string
         assert_eq!(fr["name"], "call_abc123");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_groups_parallel_tool_results_into_one_user_turn() {
+        let body = json!({
+            "model": "gemini-3-flash-preview",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": "{\"path\":\"b.txt\"}"}
+                    }
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":1}"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "{\"ok\":2}"},
+                {"role": "user", "content": "next"}
+            ]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+
+        let contents = converted["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 4);
+        assert_eq!(contents[2]["role"], "user");
+        let parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionResponse"]["id"], "call_1");
+        assert_eq!(parts[0]["functionResponse"]["name"], "read_file");
+        assert_eq!(parts[1]["functionResponse"]["id"], "call_2");
+        assert_eq!(parts[1]["functionResponse"]["name"], "write_file");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_single_tool_result_produces_one_user_turn() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":1}"},
+                {"role": "user", "content": "next"}
+            ]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+
+        let contents = converted["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 4);
+        assert_eq!(contents[2]["role"], "user");
+        let parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionResponse"]["id"], "call_1");
+        assert_eq!(parts[0]["functionResponse"]["name"], "read_file");
+        assert_eq!(contents[3]["role"], "user");
+        assert_eq!(contents[3]["parts"][0]["text"], "next");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_groups_tool_results_without_prior_assistant_call() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "tool_call_id": "call_a", "content": "{\"r\":1}"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "{\"r\":2}"}
+            ]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+
+        let contents = converted["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[1]["role"], "user");
+        let parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionResponse"]["id"], "call_a");
+        assert_eq!(parts[0]["functionResponse"]["name"], "call_a");
+        assert_eq!(parts[1]["functionResponse"]["id"], "call_b");
+        assert_eq!(parts[1]["functionResponse"]["name"], "call_b");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_tool_groups_separated_by_assistant_do_not_merge() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":1}"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_2", "content": "{\"ok\":2}"}
+            ]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+
+        let contents = converted["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 5);
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            "read_file"
+        );
+        assert_eq!(contents[4]["role"], "user");
+        assert_eq!(contents[4]["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            contents[4]["parts"][0]["functionResponse"]["name"],
+            "write_file"
+        );
     }
 
     #[test]
