@@ -1703,6 +1703,37 @@ mod tests {
     }
 
     #[test]
+    fn convert_anthropic_to_openai_three_unsigned_tool_uses_assigned_distinct_ids() {
+        // Defensive: confirms the per-block synthetic ID fallback scales.
+        // Three tool_use blocks without IDs must each get a unique call_N
+        // — collision would cross-wire tool_call_id responses in the next turn.
+        let resp = json!({
+            "id": "msg_x",
+            "model": "claude-opus-4-7",
+            "content": [
+                {"type": "tool_use", "name": "ls", "input": {"path": "."}},
+                {"type": "tool_use", "name": "cat", "input": {"path": "a"}},
+                {"type": "tool_use", "name": "stat", "input": {"path": "b"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let chat = convert_anthropic_to_openai_chat_response(&resp, "claude-opus-4-7");
+        let tcs = chat["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        let ids: std::collections::HashSet<String> = tcs
+            .iter()
+            .map(|tc| tc["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "all three synthesized IDs must be unique, got {tcs:?}"
+        );
+    }
+
+    #[test]
     fn convert_anthropic_to_openai_tool_use_without_ids_yields_unique_call_ids() {
         // Two tool_use blocks with no `id` must NOT collide on a shared
         // "call_0" — the matching tool_call_id responses would be ambiguous.

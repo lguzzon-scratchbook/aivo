@@ -607,6 +607,14 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         .get("usageMetadata")
         .and_then(|u| u.get("cachedContentTokenCount"))
         .and_then(|v| v.as_u64());
+    // Gemini 2.5+ exposes the thinking-token count separately as
+    // `thoughtsTokenCount`. Surface it via OpenAI's
+    // `completion_tokens_details.reasoning_tokens` so usage / billing
+    // pipelines see the same shape OpenAI's reasoning models use.
+    let thoughts_tokens = resp
+        .get("usageMetadata")
+        .and_then(|u| u.get("thoughtsTokenCount"))
+        .and_then(|v| v.as_u64());
 
     let mut usage = json!({
         "prompt_tokens": prompt_tokens,
@@ -615,6 +623,9 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
     });
     if let Some(value) = cache_read_input_tokens {
         usage["cache_read_input_tokens"] = json!(value);
+    }
+    if let Some(value) = thoughts_tokens {
+        usage["completion_tokens_details"] = json!({ "reasoning_tokens": value });
     }
 
     json!({
@@ -2026,6 +2037,29 @@ mod tests {
                 .any(|g| g.get("functionDeclarations").is_some())
         );
         assert!(groups.iter().any(|g| g.get("googleSearch").is_some()));
+    }
+
+    #[test]
+    fn gemini_thoughts_token_count_surfaces_in_openai_completion_tokens_details() {
+        // Gemini 2.5+ reports thinking tokens as `thoughtsTokenCount`.
+        // Map to OpenAI's `completion_tokens_details.reasoning_tokens` so
+        // billing / stats pipelines see the right shape.
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "answer"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 42
+            }
+        });
+        let chat = convert_gemini_to_openai_chat_response(&resp, "gemini-3-pro-preview");
+        assert_eq!(
+            chat["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            42
+        );
     }
 
     #[test]
