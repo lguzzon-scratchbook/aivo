@@ -3,7 +3,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
-use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
+use crate::services::openai_anthropic_bridge::{
+    ANTHROPIC_SERVER_BLOCKS_EXT, ANTHROPIC_THINKING_EXT,
+};
 
 pub type ModelTransform = fn(&str) -> String;
 
@@ -178,6 +180,10 @@ fn convert_content_blocks(
     // round-trip preservation. These travel on an extension field on the
     // OpenAI assistant message; see ANTHROPIC_THINKING_EXT.
     let mut anthropic_thinking_blocks: Vec<Value> = Vec::new();
+    // Anthropic server-tool blocks (web_search_tool_result, code_execution_tool_result,
+    // server_tool_use, etc.) — opaque JSON we round-trip via the OpenAI
+    // extension so server-side tool output isn't lost across the bridge.
+    let mut anthropic_server_blocks: Vec<Value> = Vec::new();
     // Parallel structured form: same text content, but each part keeps its
     // `cache_control` (including the `ttl: "1h"` field) so OpenAI-shape
     // upstreams that pass-through the annotation (OpenRouter, Anthropic-via-
@@ -189,6 +195,21 @@ fn convert_content_blocks(
 
     for block in blocks {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Server-tool blocks travel verbatim on an extension field. They
+        // must not be merged into text_parts or tool_calls because they
+        // describe Anthropic-side built-in work, not OpenAI tool calls.
+        if matches!(
+            block_type,
+            "server_tool_use"
+                | "web_search_tool_result"
+                | "code_execution_tool_result"
+                | "web_fetch_tool_result"
+                | "mcp_tool_use"
+                | "mcp_tool_result"
+        ) {
+            anthropic_server_blocks.push(block.clone());
+            continue;
+        }
         match block_type {
             "text" => {
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -308,6 +329,9 @@ fn convert_content_blocks(
         if role == "assistant" && !anthropic_thinking_blocks.is_empty() {
             msg[ANTHROPIC_THINKING_EXT] = Value::Array(anthropic_thinking_blocks);
         }
+        if role == "assistant" && !anthropic_server_blocks.is_empty() {
+            msg[ANTHROPIC_SERVER_BLOCKS_EXT] = Value::Array(anthropic_server_blocks);
+        }
         messages.push(msg);
     } else {
         let content = if any_text_has_cache_control {
@@ -321,6 +345,9 @@ fn convert_content_blocks(
         }
         if role == "assistant" && !anthropic_thinking_blocks.is_empty() {
             msg[ANTHROPIC_THINKING_EXT] = Value::Array(anthropic_thinking_blocks);
+        }
+        if role == "assistant" && !anthropic_server_blocks.is_empty() {
+            msg[ANTHROPIC_SERVER_BLOCKS_EXT] = Value::Array(anthropic_server_blocks);
         }
         messages.push(msg);
     }

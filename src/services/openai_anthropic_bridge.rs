@@ -16,6 +16,30 @@ use crate::services::openai_models::{
 /// when the conversation continues.
 pub const ANTHROPIC_THINKING_EXT: &str = "_anthropic_thinking_blocks";
 
+/// Extension field carrying Anthropic server-side tool blocks
+/// (`server_tool_use`, `web_search_tool_result`, `code_execution_tool_result`,
+/// `web_fetch_tool_result`, etc.) as opaque JSON. These describe work done
+/// by Anthropic-side built-in tools (web search, code exec, web fetch) and
+/// have no OpenAI equivalent — without this passthrough they are silently
+/// dropped, which breaks any client that depends on the search results /
+/// execution stdout in subsequent turns.
+pub const ANTHROPIC_SERVER_BLOCKS_EXT: &str = "_anthropic_server_blocks";
+
+/// Block-type names that we treat as opaque server-tool content. Listed
+/// once so capture and restore stay in sync.
+const ANTHROPIC_SERVER_BLOCK_TYPES: &[&str] = &[
+    "server_tool_use",
+    "web_search_tool_result",
+    "code_execution_tool_result",
+    "web_fetch_tool_result",
+    "mcp_tool_use",
+    "mcp_tool_result",
+];
+
+fn is_anthropic_server_block_type(t: &str) -> bool {
+    ANTHROPIC_SERVER_BLOCK_TYPES.contains(&t)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToAnthropicChatConfig {
     pub default_model: &'static str,
@@ -160,11 +184,17 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<OpenAIChatToolCall> = Vec::new();
     let mut thinking_blocks: Vec<Value> = Vec::new();
+    let mut server_blocks: Vec<Value> = Vec::new();
 
     if let Some(content) = resp.get("content").and_then(|c| c.as_array()) {
         let mut tool_use_index: usize = 0;
         for block in content {
-            match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if is_anthropic_server_block_type(block_type) {
+                server_blocks.push(block.clone());
+                continue;
+            }
+            match block_type {
                 "thinking" => {
                     if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str())
                         && !thinking.is_empty()
@@ -346,6 +376,22 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         message.insert(
             ANTHROPIC_THINKING_EXT.to_string(),
             Value::Array(thinking_blocks),
+        );
+    }
+    // Same pattern for server-side tool blocks (web_search_tool_result etc).
+    // Without this, Claude's web-search / code-execution outputs disappear
+    // from any continuation that flows through this bridge.
+    if !server_blocks.is_empty()
+        && let Some(message) = value
+            .get_mut("choices")
+            .and_then(|c| c.as_array_mut())
+            .and_then(|arr| arr.first_mut())
+            .and_then(|c| c.get_mut("message"))
+            .and_then(|m| m.as_object_mut())
+    {
+        message.insert(
+            ANTHROPIC_SERVER_BLOCKS_EXT.to_string(),
+            Value::Array(server_blocks),
         );
     }
     value
@@ -535,6 +581,21 @@ fn openai_assistant_to_anthropic(msg: &Value) -> Value {
                 "name": tc.get("function").and_then(|f| f.get("name")).cloned().unwrap_or(json!("")),
                 "input": args
             }));
+        }
+    }
+    // Restore Anthropic server-tool blocks (web_search_tool_result etc) at
+    // the end of the assistant content array so the model can reference its
+    // own previous server-side work in continuation turns.
+    if let Some(server_blocks) = msg
+        .get(ANTHROPIC_SERVER_BLOCKS_EXT)
+        .and_then(|v| v.as_array())
+    {
+        for block in server_blocks {
+            if let Some(t) = block.get("type").and_then(|v| v.as_str())
+                && is_anthropic_server_block_type(t)
+            {
+                blocks.push(block.clone());
+            }
         }
     }
     json!({
@@ -1386,6 +1447,65 @@ mod tests {
         );
         assert!(req.get("thinking").is_none());
         assert_eq!(req["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn anthropic_server_tool_blocks_round_trip_through_extension() {
+        let resp = json!({
+            "id": "msg_s1",
+            "model": "claude-opus-4-7",
+            "content": [
+                {"type": "text", "text": "Looking up current AAPL price."},
+                {
+                    "type": "server_tool_use",
+                    "id": "stu_1",
+                    "name": "web_search",
+                    "input": {"query": "AAPL stock price"}
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "stu_1",
+                    "content": [{"type": "web_search_result", "url": "https://example.com", "title": "AAPL"}]
+                },
+                {"type": "text", "text": "It is $200."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 4}
+        });
+        let chat = convert_anthropic_to_openai_chat_response(&resp, "claude-opus-4-7");
+        let blocks = chat["choices"][0]["message"]["_anthropic_server_blocks"]
+            .as_array()
+            .expect("server-blocks extension present");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "server_tool_use");
+        assert_eq!(blocks[1]["type"], "web_search_tool_result");
+
+        let openai_followup = json!({
+            "model": "claude-opus-4-7",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Looking up current AAPL price.\nIt is $200.",
+                    "_anthropic_server_blocks": blocks
+                },
+                {"role": "user", "content": "Anything else?"}
+            ]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &openai_followup,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let assistant_content = req["messages"][0]["content"].as_array().unwrap();
+        let server_block_count = assistant_content
+            .iter()
+            .filter(|b| {
+                let t = b["type"].as_str().unwrap_or("");
+                matches!(t, "server_tool_use" | "web_search_tool_result")
+            })
+            .count();
+        assert_eq!(server_block_count, 2);
     }
 
     #[test]

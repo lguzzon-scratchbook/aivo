@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 
-use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
+use crate::services::openai_anthropic_bridge::{
+    ANTHROPIC_SERVER_BLOCKS_EXT, ANTHROPIC_THINKING_EXT,
+};
 use crate::services::openai_models::OpenAIChatResponseView;
 
 pub enum UsageValueMode {
@@ -72,6 +74,21 @@ pub fn convert_openai_to_anthropic_message(
                     "name": tc.function.name,
                     "input": input,
                 }));
+            }
+        }
+
+        // Restore Anthropic server-tool blocks at the tail of the content
+        // array — they're opaque JSON we passed through verbatim.
+        if let Some(server_blocks) = resp
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.get(choice_index))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get(ANTHROPIC_SERVER_BLOCKS_EXT))
+            .and_then(|v| v.as_array())
+        {
+            for block in server_blocks {
+                content.push(block.clone());
             }
         }
     }
