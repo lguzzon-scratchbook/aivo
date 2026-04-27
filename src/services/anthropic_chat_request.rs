@@ -31,17 +31,44 @@ pub fn convert_anthropic_to_openai_request(
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(system) = body.get("system") {
-        let system_text = match system {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        };
-        if !system_text.is_empty() {
-            messages.push(json!({"role": "system", "content": system_text}));
+        // System prompts are the most common Anthropic cache target. Keep
+        // cache_control (including ttl: "1h") on the OpenAI side via the
+        // structured array form when any system block carries it; OpenRouter
+        // and other Anthropic-aware gateways pass it through.
+        match system {
+            Value::String(s) if !s.is_empty() => {
+                messages.push(json!({"role": "system", "content": s}));
+            }
+            Value::Array(blocks) => {
+                let mut parts: Vec<Value> = Vec::new();
+                let mut has_cache_control = false;
+                for block in blocks {
+                    let Some(text) = block.get("text").and_then(|t| t.as_str()) else {
+                        continue;
+                    };
+                    let mut part = json!({"type": "text", "text": text});
+                    if let Some(cc) = block.get("cache_control") {
+                        part["cache_control"] = cc.clone();
+                        has_cache_control = true;
+                    }
+                    parts.push(part);
+                }
+                if !parts.is_empty() {
+                    let content = if has_cache_control {
+                        Value::Array(parts)
+                    } else {
+                        Value::String(
+                            parts
+                                .iter()
+                                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                    };
+                    messages.push(json!({"role": "system", "content": content}));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -151,6 +178,14 @@ fn convert_content_blocks(
     // round-trip preservation. These travel on an extension field on the
     // OpenAI assistant message; see ANTHROPIC_THINKING_EXT.
     let mut anthropic_thinking_blocks: Vec<Value> = Vec::new();
+    // Parallel structured form: same text content, but each part keeps its
+    // `cache_control` (including the `ttl: "1h"` field) so OpenAI-shape
+    // upstreams that pass-through the annotation (OpenRouter, Anthropic-via-
+    // OpenAI-shape gateways) can still hit the prompt cache. Used only when
+    // at least one block carries cache_control; otherwise we keep the flat
+    // string form for legacy callers.
+    let mut text_parts_with_cache: Vec<Value> = Vec::new();
+    let mut any_text_has_cache_control = false;
 
     for block in blocks {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -158,6 +193,12 @@ fn convert_content_blocks(
             "text" => {
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                     text_parts.push(text.to_string());
+                    let mut part = json!({"type": "text", "text": text});
+                    if let Some(cc) = block.get("cache_control") {
+                        part["cache_control"] = cc.clone();
+                        any_text_has_cache_control = true;
+                    }
+                    text_parts_with_cache.push(part);
                 }
             }
             "thinking" => {
@@ -236,9 +277,13 @@ fn convert_content_blocks(
     } else if !tool_calls.is_empty() {
         // Per OpenAI spec, content must be null (not "") when tool_calls is
         // present without text. Strict OpenAI-compatible providers reject the
-        // empty-string form.
+        // empty-string form. When any text block has cache_control, surface
+        // the structured array so the annotation passes through to the
+        // upstream (OpenRouter forwards it on Anthropic models).
         let content = if text_parts.is_empty() {
             Value::Null
+        } else if any_text_has_cache_control {
+            Value::Array(text_parts_with_cache.clone())
         } else {
             Value::String(text_parts.join("\n"))
         };
@@ -265,7 +310,12 @@ fn convert_content_blocks(
         }
         messages.push(msg);
     } else {
-        let mut msg = json!({"role": role, "content": text_parts.join("\n")});
+        let content = if any_text_has_cache_control {
+            Value::Array(text_parts_with_cache)
+        } else {
+            Value::String(text_parts.join("\n"))
+        };
+        let mut msg = json!({"role": role, "content": content});
         if config.include_reasoning_content && !thinking_parts.is_empty() {
             msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
         }
@@ -538,6 +588,63 @@ mod tests {
         });
         let req = convert_anthropic_to_openai_request(&body, &config);
         assert_eq!(req["messages"][0]["content"], "Screenshot taken");
+    }
+
+    #[test]
+    fn cache_control_ttl_preserved_on_text_blocks_via_structured_content() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "long reusable preamble", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "the actual question"}
+                ]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let parts = req["messages"][0]["content"]
+            .as_array()
+            .expect("array form");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["cache_control"]["ttl"], "1h");
+        assert!(parts[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_control_absent_keeps_legacy_string_content_form() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": "world"}
+                ]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert_eq!(req["messages"][0]["content"], "hello\nworld");
+    }
+
+    #[test]
+    fn cache_control_preserved_on_anthropic_system_array_with_ttl() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "system": [
+                {"type": "text", "text": "stable instructions", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let system_msg = req["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "system")
+            .expect("system message present");
+        let parts = system_msg["content"].as_array().expect("array form");
+        assert_eq!(parts[0]["cache_control"]["ttl"], "1h");
     }
 
     #[test]
