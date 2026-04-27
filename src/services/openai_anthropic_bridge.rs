@@ -6,6 +6,15 @@ use crate::services::openai_models::{
     OpenAIChatToolCallFunction, OpenAIChatUsage,
 };
 
+/// Extension field on the OpenAI assistant message that round-trips Anthropic
+/// `thinking` and `redacted_thinking` blocks (with their `signature` / `data`)
+/// across the bridge. Anthropic Claude 4 streams require these signatures to
+/// be echoed back on subsequent turns, so the bridge cannot silently flatten
+/// thinking to plain `reasoning_content`. OpenAI clients ignore unknown
+/// fields; Anthropic-aware code uses this to reconstruct full content blocks
+/// when the conversation continues.
+pub const ANTHROPIC_THINKING_EXT: &str = "_anthropic_thinking_blocks";
+
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToAnthropicChatConfig {
     pub default_model: &'static str,
@@ -127,6 +136,7 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
     let mut text_parts: Vec<String> = Vec::new();
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<OpenAIChatToolCall> = Vec::new();
+    let mut thinking_blocks: Vec<Value> = Vec::new();
 
     if let Some(content) = resp.get("content").and_then(|c| c.as_array()) {
         let mut tool_use_index: usize = 0;
@@ -138,6 +148,24 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
                     {
                         thinking_parts.push(thinking.to_string());
                     }
+                    // Capture the full block (including the cryptographic
+                    // `signature`) so the next turn can echo it back to
+                    // Anthropic without a 400 on missing signature.
+                    let mut entry = json!({"type": "thinking"});
+                    if let Some(text) = block.get("thinking").cloned() {
+                        entry["thinking"] = text;
+                    }
+                    if let Some(sig) = block.get("signature").cloned() {
+                        entry["signature"] = sig;
+                    }
+                    thinking_blocks.push(entry);
+                }
+                "redacted_thinking" => {
+                    let mut entry = json!({"type": "redacted_thinking"});
+                    if let Some(data) = block.get("data").cloned() {
+                        entry["data"] = data;
+                    }
+                    thinking_blocks.push(entry);
                 }
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str())
@@ -279,6 +307,24 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
             Value::String(raw_stop_reason.to_string()),
         );
     }
+    // Attach captured thinking blocks (with signatures) on the assistant
+    // message so client history preserves them. On the next turn, the
+    // request-side converter (`openai_assistant_to_anthropic`) will lift
+    // them back into the Anthropic content array. Without this, multi-turn
+    // extended thinking 400s at Anthropic on missing signature.
+    if !thinking_blocks.is_empty()
+        && let Some(message) = value
+            .get_mut("choices")
+            .and_then(|c| c.as_array_mut())
+            .and_then(|arr| arr.first_mut())
+            .and_then(|c| c.get_mut("message"))
+            .and_then(|m| m.as_object_mut())
+    {
+        message.insert(
+            ANTHROPIC_THINKING_EXT.to_string(),
+            Value::Array(thinking_blocks),
+        );
+    }
     value
 }
 
@@ -418,6 +464,20 @@ fn openai_user_to_anthropic(msg: &Value, role: &str) -> Value {
 
 fn openai_assistant_to_anthropic(msg: &Value) -> Value {
     let mut blocks: Vec<Value> = Vec::new();
+    // Restore thinking / redacted_thinking blocks (with signatures) before
+    // text/tool_use. Anthropic expects these to come first in the content
+    // array of a continued assistant turn — that ordering is what a previous
+    // response originally produced, and the signature is validated against it.
+    if let Some(thinking_blocks) = msg.get(ANTHROPIC_THINKING_EXT).and_then(|v| v.as_array()) {
+        for block in thinking_blocks {
+            // Only carry through block shapes we recognize; drop anything else
+            // so a malformed extension can't poison the content array.
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("thinking") | Some("redacted_thinking") => blocks.push(block.clone()),
+                _ => {}
+            }
+        }
+    }
     let text = extract_openai_text(msg.get("content"));
     if !text.is_empty() {
         blocks.push(json!({"type": "text", "text": text}));
@@ -1063,6 +1123,113 @@ mod tests {
         assert_eq!(chat["choices"][0]["finish_reason"], "stop");
         // Extension field still preserves the exact reason for callers that need it.
         assert_eq!(chat["choices"][0]["_anthropic_stop_reason"], "pause_turn");
+    }
+
+    #[test]
+    fn anthropic_thinking_block_signature_round_trips_through_openai_intermediate() {
+        // Anthropic responses with extended-thinking blocks must surface
+        // their `signature` (and `data` on `redacted_thinking`) on the
+        // OpenAI assistant message so the next turn can echo them back
+        // — Claude 4 returns 400 if a continued conversation drops them.
+        let resp = json!({
+            "id": "msg_t1",
+            "model": "claude-opus-4-7",
+            "content": [
+                {"type": "thinking", "thinking": "Let me check.", "signature": "SIG_42"},
+                {"type": "redacted_thinking", "data": "BLOB_99"},
+                {"type": "text", "text": "Here is my answer."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 3}
+        });
+        let chat = convert_anthropic_to_openai_chat_response(&resp, "claude-opus-4-7");
+        let blocks = chat["choices"][0]["message"]["_anthropic_thinking_blocks"]
+            .as_array()
+            .expect("thinking-blocks extension present on assistant message");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["signature"], "SIG_42");
+        assert_eq!(blocks[0]["thinking"], "Let me check.");
+        assert_eq!(blocks[1]["type"], "redacted_thinking");
+        assert_eq!(blocks[1]["data"], "BLOB_99");
+
+        // Now feed those blocks back through the request converter as an
+        // OpenAI assistant message. They must reappear at the start of the
+        // Anthropic content array, with signature/data intact.
+        let openai_followup = json!({
+            "model": "claude-opus-4-7",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": "Here is my answer.",
+                    "_anthropic_thinking_blocks": [
+                        {"type": "thinking", "thinking": "Let me check.", "signature": "SIG_42"},
+                        {"type": "redacted_thinking", "data": "BLOB_99"}
+                    ]
+                },
+                {"role": "user", "content": "Continue please."}
+            ]
+        });
+        let anthropic_req = convert_openai_chat_to_anthropic_request(
+            &openai_followup,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let assistant_content = anthropic_req["messages"][1]["content"]
+            .as_array()
+            .expect("assistant content array");
+        assert_eq!(assistant_content[0]["type"], "thinking");
+        assert_eq!(assistant_content[0]["signature"], "SIG_42");
+        assert_eq!(assistant_content[0]["thinking"], "Let me check.");
+        assert_eq!(assistant_content[1]["type"], "redacted_thinking");
+        assert_eq!(assistant_content[1]["data"], "BLOB_99");
+        assert_eq!(assistant_content[2]["type"], "text");
+        assert_eq!(assistant_content[2]["text"], "Here is my answer.");
+    }
+
+    #[test]
+    fn anthropic_thinking_extension_is_omitted_when_response_has_no_thinking_blocks() {
+        let resp = json!({
+            "id": "msg_x",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let chat = convert_anthropic_to_openai_chat_response(&resp, "claude-sonnet-4-6");
+        assert!(
+            chat["choices"][0]["message"]
+                .get("_anthropic_thinking_blocks")
+                .is_none(),
+            "no thinking blocks → no extension field"
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_extension_drops_unknown_block_types() {
+        // Defensive: a malformed extension carrying an unrecognized block
+        // type must not poison the Anthropic content array.
+        let openai_msg = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{
+                "role": "assistant",
+                "content": "Hello.",
+                "_anthropic_thinking_blocks": [
+                    {"type": "definitely_not_a_real_type", "blob": "data"}
+                ]
+            }]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &openai_msg,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let content = req["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
     }
 
     #[test]

@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use crate::services::http_utils::{current_unix_ts, sse_data_payload};
+use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
 
 /// Drains the next complete SSE line from `pending`, returning its text
 /// with the trailing `\r` stripped. Returns `None` when no newline is in
@@ -37,6 +38,22 @@ struct AnthropicToolCallState {
     name: String,
 }
 
+/// Per-content-block accumulator for streamed `thinking` / `redacted_thinking`
+/// blocks. Anthropic emits the cryptographic `signature` (or `data` for
+/// redacted blocks) via a dedicated `signature_delta` event after the body
+/// of the block has streamed in via `thinking_delta` events.
+#[derive(Default)]
+struct AnthropicThinkingBlockState {
+    /// "thinking" or "redacted_thinking" — captured from `content_block_start`.
+    kind: String,
+    /// Accumulated thinking text from `thinking_delta` events.
+    text: String,
+    /// Signature attached on a `signature_delta` event for `thinking` blocks.
+    signature: Option<String>,
+    /// Opaque data carried verbatim for `redacted_thinking` blocks.
+    data: Option<String>,
+}
+
 pub(crate) struct AnthropicToOpenAIStreamConverter {
     pending: Vec<u8>,
     id: String,
@@ -47,6 +64,13 @@ pub(crate) struct AnthropicToOpenAIStreamConverter {
     finished: bool,
     saw_tool_call: bool,
     tool_calls: HashMap<usize, AnthropicToolCallState>,
+    /// Open thinking blocks indexed by `content_block_start.index`. Finalized
+    /// entries (after `content_block_stop`) are moved into `thinking_blocks`.
+    thinking_in_progress: HashMap<usize, AnthropicThinkingBlockState>,
+    /// Finalized thinking / redacted_thinking blocks, in arrival order. Emitted
+    /// on the final SSE chunk via the `_anthropic_thinking_blocks` extension
+    /// so OpenAI clients can echo signatures back on the next turn.
+    thinking_blocks: Vec<Value>,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_input_tokens: Option<u64>,
@@ -79,6 +103,8 @@ impl AnthropicToOpenAIStreamConverter {
             finished: false,
             saw_tool_call: false,
             tool_calls: HashMap::new(),
+            thinking_in_progress: HashMap::new(),
+            thinking_blocks: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
             cache_read_input_tokens: None,
@@ -168,12 +194,29 @@ impl AnthropicToOpenAIStreamConverter {
             }
             "content_block_start" => {
                 let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                if event
+                let block_kind = event
                     .get("content_block")
                     .and_then(|v| v.get("type"))
                     .and_then(|v| v.as_str())
-                    == Some("tool_use")
-                {
+                    .unwrap_or("");
+                if matches!(block_kind, "thinking" | "redacted_thinking") {
+                    let mut state = AnthropicThinkingBlockState {
+                        kind: block_kind.to_string(),
+                        ..Default::default()
+                    };
+                    // `redacted_thinking` blocks carry `data` directly on the
+                    // start event (no body deltas follow), so capture it now.
+                    if block_kind == "redacted_thinking"
+                        && let Some(data) = event
+                            .get("content_block")
+                            .and_then(|v| v.get("data"))
+                            .and_then(|v| v.as_str())
+                    {
+                        state.data = Some(data.to_string());
+                    }
+                    self.thinking_in_progress.insert(index, state);
+                }
+                if block_kind == "tool_use" {
                     let block = event
                         .get("content_block")
                         .cloned()
@@ -236,6 +279,50 @@ impl AnthropicToOpenAIStreamConverter {
                             ));
                         }
                     }
+                    "thinking_delta" => {
+                        if let Some(text) = delta.get("thinking").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            // Accumulate the running thinking text for the
+                            // final `_anthropic_thinking_blocks` payload.
+                            self.thinking_in_progress
+                                .entry(index)
+                                .or_insert_with(|| AnthropicThinkingBlockState {
+                                    kind: "thinking".to_string(),
+                                    ..Default::default()
+                                })
+                                .text
+                                .push_str(text);
+                            // Surface to OpenAI clients as `reasoning_content`,
+                            // matching the DeepSeek-reasoner streaming shape
+                            // most clients already understand.
+                            self.emit_role_if_needed(output);
+                            output.push_str(&openai_sse_chunk(
+                                &self.id,
+                                self.created,
+                                self.model_name(),
+                                json!({ "reasoning_content": text }),
+                                Value::Null,
+                                None,
+                            ));
+                        }
+                    }
+                    "signature_delta" => {
+                        // Capture the cryptographic signature for the open
+                        // thinking block. Must be echoed back on the next
+                        // turn or Anthropic returns 400 on missing signature.
+                        if let Some(sig) = delta.get("signature").and_then(|v| v.as_str())
+                            && !sig.is_empty()
+                        {
+                            self.thinking_in_progress
+                                .entry(index)
+                                .or_insert_with(|| AnthropicThinkingBlockState {
+                                    kind: "thinking".to_string(),
+                                    ..Default::default()
+                                })
+                                .signature = Some(sig.to_string());
+                        }
+                    }
                     "input_json_delta" => {
                         if let Some(partial_json) =
                             delta.get("partial_json").and_then(|v| v.as_str())
@@ -271,6 +358,23 @@ impl AnthropicToOpenAIStreamConverter {
                         }
                     }
                     _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(state) = self.thinking_in_progress.remove(&index) {
+                    let mut entry = json!({"type": state.kind});
+                    if state.kind == "thinking" {
+                        entry["thinking"] = json!(state.text);
+                        if let Some(sig) = state.signature {
+                            entry["signature"] = json!(sig);
+                        }
+                    } else if state.kind == "redacted_thinking"
+                        && let Some(data) = state.data
+                    {
+                        entry["data"] = json!(data);
+                    }
+                    self.thinking_blocks.push(entry);
                 }
             }
             "message_delta" => {
@@ -345,11 +449,20 @@ impl AnthropicToOpenAIStreamConverter {
             self.cache_read_input_tokens,
             self.cache_creation_input_tokens,
         ));
+        // Attach captured thinking blocks (with signatures) to the final delta
+        // so a client merging deltas can reconstruct the message-level
+        // `_anthropic_thinking_blocks` extension. The next turn's
+        // request-side converter then reattaches them to Anthropic's content.
+        let final_delta = if self.thinking_blocks.is_empty() {
+            json!({})
+        } else {
+            json!({ ANTHROPIC_THINKING_EXT: std::mem::take(&mut self.thinking_blocks) })
+        };
         output.push_str(&openai_sse_chunk(
             &self.id,
             self.created,
             self.model_name(),
-            json!({}),
+            final_delta,
             json!(finish_reason),
             usage,
         ));
@@ -665,6 +778,67 @@ mod tests {
         assert!(output.contains("\"cache_read_input_tokens\":90"));
         assert!(output.contains("\"cache_creation_input_tokens\":30"));
         assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn anthropic_thinking_block_signature_round_trips_through_stream() {
+        // Claude 4 streams `thinking_delta` events for the running thought
+        // text and a closing `signature_delta` event with the cryptographic
+        // signature. aivo must accumulate both and surface them on the final
+        // delta as `_anthropic_thinking_blocks` so the next turn can echo
+        // the signature back without a 400 from Anthropic.
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-opus-4-7");
+        let input = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t1\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":5}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me check\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" the data.\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIG_THINK_42\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Done.\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        // Streamed reasoning_content reaches OpenAI clients the same way
+        // DeepSeek-reasoner already streams thinking text.
+        assert!(output.contains("\"reasoning_content\":\"Let me check\""));
+        assert!(output.contains("\"reasoning_content\":\" the data.\""));
+        // Final delta carries the full block (text + signature) so the
+        // client can echo it back next turn.
+        assert!(
+            output.contains("\"_anthropic_thinking_blocks\""),
+            "final delta must carry the thinking-blocks extension; got: {output}"
+        );
+        assert!(output.contains("\"signature\":\"SIG_THINK_42\""));
+        assert!(output.contains("\"thinking\":\"Let me check the data.\""));
+        assert!(output.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[test]
+    fn anthropic_redacted_thinking_block_carries_data_through_stream() {
+        // For omitted/redacted thinking the `data` blob arrives on the
+        // start event and there are no body deltas. Capture and surface it
+        // so the next turn can replay the block intact.
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-opus-4-7");
+        let input = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t2\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":4}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"BLOB_42\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"_anthropic_thinking_blocks\""));
+        assert!(output.contains("\"type\":\"redacted_thinking\""));
+        assert!(output.contains("\"data\":\"BLOB_42\""));
     }
 
     #[test]

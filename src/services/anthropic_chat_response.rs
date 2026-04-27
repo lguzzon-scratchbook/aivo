@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 
+use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
 use crate::services::openai_models::OpenAIChatResponseView;
 
 pub enum UsageValueMode {
@@ -23,13 +24,35 @@ pub fn convert_openai_to_anthropic_message(
     let mut content: Vec<Value> = Vec::new();
     let mut final_finish_reason = "stop";
 
-    for choice in &response.choices {
+    for (choice_index, choice) in response.choices.iter().enumerate() {
         let finish_reason = choice.finish_reason.as_deref().unwrap_or("stop");
 
         if finish_reason == "tool_calls" {
             final_finish_reason = "tool_calls";
         } else if final_finish_reason != "tool_calls" {
             final_finish_reason = finish_reason;
+        }
+
+        // Restore thinking / redacted_thinking blocks (with signatures) from
+        // the OpenAI extension field. They must come first in the Anthropic
+        // content array — that's the order Anthropic emitted them, and the
+        // signature is validated against that order on continuation turns.
+        // The typed `OpenAIChatResponseView` doesn't carry unknown fields, so
+        // pull from the raw response.
+        if let Some(thinking_blocks) = resp
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.get(choice_index))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get(ANTHROPIC_THINKING_EXT))
+            .and_then(|v| v.as_array())
+        {
+            for block in thinking_blocks {
+                match block.get("type").and_then(|v| v.as_str()) {
+                    Some("thinking") | Some("redacted_thinking") => content.push(block.clone()),
+                    _ => {}
+                }
+            }
         }
 
         if let Some(text) = choice.message.content.as_deref()
@@ -269,6 +292,48 @@ mod tests {
         assert_eq!(result["stop_reason"], "end_turn");
         assert_eq!(content.len(), 1);
         assert_eq!(content[0], json!({"type": "text", "text": ""}));
+    }
+
+    #[test]
+    fn anthropic_thinking_blocks_restored_from_extension_field() {
+        // When an OpenAI-shaped response carries the `_anthropic_thinking_blocks`
+        // extension, the typed converter must lift them back into Anthropic's
+        // content array, ahead of text/tool_use, so the model sees the
+        // signatures in the same order it originally produced them.
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Here it is.",
+                    "_anthropic_thinking_blocks": [
+                        {"type": "thinking", "thinking": "Reasoning step.", "signature": "SIG_RESP"},
+                        {"type": "redacted_thinking", "data": "BLOB_RESP"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg_t",
+                model: "claude-opus-4-7",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "SIG_RESP");
+        assert_eq!(content[1]["type"], "redacted_thinking");
+        assert_eq!(content[1]["data"], "BLOB_RESP");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "Here it is.");
     }
 
     #[test]

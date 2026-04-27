@@ -3,6 +3,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
+use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
+
 pub type ModelTransform = fn(&str) -> String;
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +147,10 @@ fn convert_content_blocks(
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<(String, Value)> = Vec::new();
+    // Full thinking / redacted_thinking blocks (with signature / data) for
+    // round-trip preservation. These travel on an extension field on the
+    // OpenAI assistant message; see ANTHROPIC_THINKING_EXT.
+    let mut anthropic_thinking_blocks: Vec<Value> = Vec::new();
 
     for block in blocks {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -154,14 +160,34 @@ fn convert_content_blocks(
                     text_parts.push(text.to_string());
                 }
             }
-            "thinking" if config.include_reasoning_content => {
-                if let Some(thinking) = block
-                    .get("thinking")
-                    .and_then(|t| t.as_str())
-                    .or_else(|| block.get("text").and_then(|t| t.as_str()))
+            "thinking" => {
+                if config.include_reasoning_content
+                    && let Some(thinking) = block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| block.get("text").and_then(|t| t.as_str()))
                 {
                     thinking_parts.push(thinking.to_string());
                 }
+                // Capture the full block (with signature) regardless of
+                // whether reasoning_content is being surfaced. Without this,
+                // a continuation through this bridge loses the cryptographic
+                // signature and Anthropic 400s on the next turn.
+                let mut entry = json!({"type": "thinking"});
+                if let Some(text) = block.get("thinking").cloned() {
+                    entry["thinking"] = text;
+                }
+                if let Some(sig) = block.get("signature").cloned() {
+                    entry["signature"] = sig;
+                }
+                anthropic_thinking_blocks.push(entry);
+            }
+            "redacted_thinking" => {
+                let mut entry = json!({"type": "redacted_thinking"});
+                if let Some(data) = block.get("data").cloned() {
+                    entry["data"] = data;
+                }
+                anthropic_thinking_blocks.push(entry);
             }
             "tool_use" => {
                 let id = block
@@ -234,11 +260,17 @@ fn convert_content_blocks(
                 msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
             }
         }
+        if role == "assistant" && !anthropic_thinking_blocks.is_empty() {
+            msg[ANTHROPIC_THINKING_EXT] = Value::Array(anthropic_thinking_blocks);
+        }
         messages.push(msg);
     } else {
         let mut msg = json!({"role": role, "content": text_parts.join("\n")});
         if config.include_reasoning_content && !thinking_parts.is_empty() {
             msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
+        }
+        if role == "assistant" && !anthropic_thinking_blocks.is_empty() {
+            msg[ANTHROPIC_THINKING_EXT] = Value::Array(anthropic_thinking_blocks);
         }
         messages.push(msg);
     }
@@ -506,6 +538,57 @@ mod tests {
         });
         let req = convert_anthropic_to_openai_request(&body, &config);
         assert_eq!(req["messages"][0]["content"], "Screenshot taken");
+    }
+
+    #[test]
+    fn anthropic_thinking_blocks_round_trip_through_typed_path() {
+        // Even when the bridge isn't the typed `openai_anthropic_bridge` path,
+        // thinking signatures must survive the round trip — otherwise routes
+        // that go through anthropic_chat_request.rs lose them and break
+        // multi-turn extended thinking on Claude 4.
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Pondering.", "signature": "SIG_TYPED"},
+                    {"type": "redacted_thinking", "data": "BLOB_TYPED"},
+                    {"type": "text", "text": "Here we go."}
+                ]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let assistant = &req["messages"][0];
+        let blocks = assistant[ANTHROPIC_THINKING_EXT]
+            .as_array()
+            .expect("typed-path must surface thinking blocks on assistant message");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["signature"], "SIG_TYPED");
+        assert_eq!(blocks[0]["thinking"], "Pondering.");
+        assert_eq!(blocks[1]["data"], "BLOB_TYPED");
+    }
+
+    #[test]
+    fn anthropic_thinking_blocks_not_attached_for_non_assistant_role() {
+        // User-role messages can technically include `thinking` blocks in
+        // synthetic histories, but propagating them onto a `role: user`
+        // OpenAI message would confuse providers. Only assistant gets the
+        // extension.
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "thinking", "thinking": "stray", "signature": "x"},
+                    {"type": "text", "text": "hi"}
+                ]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert!(
+            req["messages"][0].get(ANTHROPIC_THINKING_EXT).is_none(),
+            "extension must only attach to assistant messages"
+        );
     }
 
     #[test]
