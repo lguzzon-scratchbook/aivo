@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
 use crate::services::device_fingerprint;
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self, router_http_client};
 
 #[derive(Clone)]
@@ -240,7 +241,7 @@ async fn forward_request(
         client.post(&url).headers(headers).json(&body),
         is_starter,
     )
-    .send()
+    .send_logged()
     .await?;
 
     // Detect beta header rejection: on 400, check if the provider rejected
@@ -264,7 +265,7 @@ async fn forward_request(
                 client.post(&url).headers(retry_headers).json(&body),
                 is_starter,
             )
-            .send()
+            .send_logged()
             .await?;
 
             return classify_upstream_response(retry_response).await;

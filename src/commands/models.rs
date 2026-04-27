@@ -15,6 +15,7 @@ use crate::services::ai_launcher::AIToolType;
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID, CopilotTokenManager,
 };
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::provider_profile::{
@@ -671,7 +672,7 @@ async fn fetch_models_detailed_filtered(
                     .get(&url)
                     .header("Authorization", format!("Bearer {}", key.key.as_str())),
             )
-            .send()
+            .send_logged()
             .await?;
 
             if !response.status().is_success() {
@@ -698,7 +699,7 @@ async fn fetch_models_detailed_filtered(
                 .header("Editor-Version", COPILOT_EDITOR_VERSION)
                 .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
                 .header("X-GitHub-Api-Version", "2025-10-01")
-                .send()
+                .send_logged()
                 .await?;
 
             if !response.status().is_success() {
@@ -720,7 +721,7 @@ async fn fetch_models_detailed_filtered(
             let response = client
                 .get(&url)
                 .header("x-goog-api-key", key.key.as_str())
-                .send()
+                .send_logged()
                 .await?;
 
             if !response.status().is_success() {
@@ -761,7 +762,7 @@ async fn fetch_models_detailed_filtered(
                 .get(&url)
                 .header("x-api-key", key.key.as_str())
                 .header("anthropic-version", "2023-06-01")
-                .send()
+                .send_logged()
                 .await?;
 
             if !response.status().is_success() {
@@ -789,7 +790,7 @@ async fn fetch_models_detailed_filtered(
                 let response = client
                     .get(&url)
                     .header("Authorization", &auth)
-                    .send()
+                    .send_logged()
                     .await?;
 
                 if !response.status().is_success() {
@@ -834,7 +835,7 @@ async fn fetch_models_detailed_filtered(
                 let response = client
                     .get(url)
                     .header("Authorization", &auth)
-                    .send()
+                    .send_logged()
                     .await?;
 
                 if !response.status().is_success() {

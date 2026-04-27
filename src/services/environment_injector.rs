@@ -122,6 +122,16 @@ impl EnvironmentInjector {
     /// on its own bypass the router, since the router is where protocol fallback
     /// runs for generic OpenAI-compatible hosts.
     fn use_direct_anthropic_for_claude(key: &ApiKey) -> bool {
+        // When the HTTP debug logger is initialized, force the bridge so the
+        // outbound translation/forward call is observable. The bridge's
+        // existing forward sites are instrumented (`.send_logged()`); routing
+        // through them is what makes `--debug` capture native-Anthropic
+        // upstreams (e.g. minimax/deepseek configured with `/anthropic` base
+        // URLs). The override returns `false` so the caller falls into the
+        // routed branch.
+        if crate::services::http_debug::is_debug_active() {
+            return false;
+        }
         if !is_anthropic_endpoint(&key.base_url) {
             return false;
         }
@@ -132,6 +142,12 @@ impl EnvironmentInjector {
     }
 
     fn use_direct_openai_for_codex(key: &ApiKey) -> bool {
+        // See `use_direct_anthropic_for_claude`: under `--debug`, force the
+        // bridge so outbound traffic flows through `responses_to_chat_router`
+        // (which is instrumented with `.send_logged()`).
+        if crate::services::http_debug::is_debug_active() {
+            return false;
+        }
         match key.codex_mode {
             Some(OpenAICompatibilityMode::Direct) => true,
             Some(OpenAICompatibilityMode::Router) => false,
@@ -140,6 +156,12 @@ impl EnvironmentInjector {
     }
 
     fn use_google_native_for_gemini(key: &ApiKey) -> bool {
+        // See `use_direct_anthropic_for_claude`: under `--debug`, force the
+        // bridge so outbound traffic flows through `gemini_router` (which is
+        // instrumented with `.send_logged()`).
+        if crate::services::http_debug::is_debug_active() {
+            return false;
+        }
         // Same invariant as use_direct_anthropic_for_claude: only a genuinely
         // Google-native endpoint may skip the router.
         if !is_google_endpoint(&key.base_url) {
@@ -152,6 +174,12 @@ impl EnvironmentInjector {
     }
 
     fn use_router_for_opencode(key: &ApiKey) -> bool {
+        // OpenCode already routes through the local bridge whenever
+        // `opencode_mode == Router`. Under `--debug`, force the bridge for
+        // direct-mode keys too so outbound traffic is visible.
+        if crate::services::http_debug::is_debug_active() {
+            return true;
+        }
         matches!(key.opencode_mode, Some(OpenAICompatibilityMode::Router))
     }
 
@@ -833,7 +861,6 @@ impl EnvironmentInjector {
         &self,
         tool_env: &HashMap<String, String>,
         manual_env: Option<&HashMap<String, String>>,
-        debug: bool,
     ) -> HashMap<String, String> {
         // Start with current environment
         let mut merged: HashMap<String, String> = std::env::vars().collect();
@@ -847,31 +874,6 @@ impl EnvironmentInjector {
         if let Some(manual) = manual_env {
             for (key, value) in manual {
                 merged.insert(key.clone(), value.clone());
-            }
-        }
-
-        // Debug output if requested
-        if debug {
-            eprintln!("[aivo] Injecting environment variables:");
-            let mut keys: Vec<_> = tool_env.keys().collect();
-            keys.sort();
-            for key in keys {
-                let value = &tool_env[key];
-                let display = redact_env_value(key, value);
-                eprintln!("  {}={}", key, display);
-            }
-
-            if let Some(manual) = manual_env
-                && !manual.is_empty()
-            {
-                eprintln!("[aivo] Manual environment overrides:");
-                let mut keys: Vec<_> = manual.keys().collect();
-                keys.sort();
-                for key in keys {
-                    let value = &manual[key];
-                    let display = redact_env_value(key, value);
-                    eprintln!("  {}={}", key, display);
-                }
             }
         }
 
@@ -1150,6 +1152,13 @@ mod tests {
 
     #[test]
     fn test_for_claude_minimax_anthropic_endpoint_direct() {
+        // Defensive: ensure no other test left FORCE_DEBUG_ACTIVE on, which
+        // would force the bridge and bust the direct-mode assertions below.
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.minimax.io/anthropic".to_string();
@@ -1169,10 +1178,76 @@ mod tests {
 
     #[test]
     fn test_for_claude_minimax_anthropic_v1_endpoint_direct() {
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.minimax.io/anthropic/v1".to_string();
         let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&"https://api.minimax.io/anthropic".to_string())
+        );
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_claude_minimax_routes_through_bridge_under_debug() {
+        // When `--debug` is active, native-Anthropic upstreams must route
+        // through the local bridge so the bridge's `.send_logged()` sites
+        // capture the outbound translation/forward call. Without this, claude
+        // execs straight to upstream and `--debug` produces an empty log.
+        // The override is `is_debug_active() => use_direct_*` returns false,
+        // which falls into the routed branch.
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(true);
+
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.minimax.io/anthropic".to_string();
+        let env = injector.for_claude(&key, Some("MiniMax-M1"));
+
+        // Routed mode: ANTHROPIC_BASE_URL points at the loopback placeholder
+        // (launch_runtime patches it with the actual port at exec time), and
+        // the AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER flag plus base URL env var
+        // are set so the bridge knows where to forward.
+        assert_eq!(
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string()),
+            "expected router flag under --debug; got env keys: {:?}",
+            env.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL"),
+            Some(&"https://api.minimax.io/anthropic".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
+
+        crate::services::http_debug::set_test_debug_active(false);
+    }
+
+    #[test]
+    fn test_for_claude_minimax_direct_when_debug_inactive() {
+        // With `--debug` off, behavior is unchanged — minimax
+        // anthropic-protocol endpoints stay in direct mode.
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.minimax.io/anthropic".to_string();
+        let env = injector.for_claude(&key, Some("MiniMax-M1"));
 
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
@@ -2151,7 +2226,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let key = test_key();
         let tool_env = injector.for_claude(&key, None);
-        let merged = injector.merge(&tool_env, None, false);
+        let merged = injector.merge(&tool_env, None);
 
         // Should contain all the tool env vars
         assert!(merged.contains_key("ANTHROPIC_BASE_URL"));

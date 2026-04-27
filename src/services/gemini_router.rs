@@ -8,6 +8,7 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
@@ -229,7 +230,7 @@ async fn forward_to_provider(
                         .json(&anthropic_req),
                     config.is_starter,
                 )
-                .send()
+                .send_logged()
                 .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
@@ -264,7 +265,7 @@ async fn forward_to_provider(
                         .json(&google_body),
                     config.is_starter,
                 )
-                .send()
+                .send_logged()
                 .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
@@ -296,7 +297,7 @@ async fn forward_to_provider(
                     req.json(&req_body),
                     config.is_starter,
                 )
-                .send()
+                .send_logged()
                 .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
@@ -325,7 +326,7 @@ async fn forward_to_provider(
                     req.json(&responses_body),
                     config.is_starter,
                 )
-                .send()
+                .send_logged()
                 .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;

@@ -6,6 +6,7 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::model_names::{copilot_model_name, transform_model_for_openrouter};
 use crate::services::openai_anthropic_bridge::{
@@ -100,7 +101,7 @@ pub(crate) async fn send_anthropic_chat(
                 .header("Content-Type", CONTENT_TYPE_JSON),
         )
         .json(&anthropic_req)
-        .send()
+        .send_logged()
         .await?;
 
     finalize_anthropic_response(response, client_wants_stream, &fallback_model).await
@@ -138,7 +139,7 @@ pub(crate) async fn send_gemini_chat(
                 .header("Content-Type", CONTENT_TYPE_JSON),
         )
         .json(&gemini_req)
-        .send()
+        .send_logged()
         .await?;
 
     finalize_gemini_response(response, client_wants_stream, &model).await
@@ -166,7 +167,11 @@ pub(crate) async fn send_openai_chat(
     )
     .await?;
 
-    let response = context.with_device_headers(req).json(&*body).send().await?;
+    let response = context
+        .with_device_headers(req)
+        .json(&*body)
+        .send_logged()
+        .await?;
     finalize_openai_response(response, client_wants_stream).await
 }
 
@@ -184,7 +189,11 @@ pub(crate) async fn send_openai_embeddings(
     )
     .await?;
 
-    let response = context.with_device_headers(req).json(body).send().await?;
+    let response = context
+        .with_device_headers(req)
+        .json(body)
+        .send_logged()
+        .await?;
     let status = response.status().as_u16();
     let content_type = http_utils::response_content_type(&response);
     let body_bytes = response.bytes().await?.to_vec();

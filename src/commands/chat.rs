@@ -23,6 +23,7 @@ use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INITIATOR_HEADER, COPILOT_INTEGRATION_ID,
     COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::copilot_initiator_from_openai;
 use crate::services::http_utils::sse_data_payload;
 use crate::services::model_names;
@@ -1083,7 +1084,7 @@ where
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_REQUEST_ATTEMPTS {
-        match build_request().send().await {
+        match build_request().send_logged().await {
             Ok(response) => {
                 if should_retry_status(response.status()) && attempt < MAX_REQUEST_ATTEMPTS {
                     let delay = retry_delay(

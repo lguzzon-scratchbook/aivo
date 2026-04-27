@@ -41,7 +41,7 @@ fn run_with_tool() {
     let cli = Cli::try_parse_from(["aivo", "run", "claude"]).unwrap();
     if let Some(Commands::Run(args)) = cli.command {
         assert_eq!(args.tool, Some("claude".to_string()));
-        assert!(!args.debug);
+        assert!(args.debug.is_none());
         assert!(!args.dry_run);
     } else {
         panic!("Expected Run command");
@@ -85,7 +85,7 @@ fn tool_alias_gemini() {
     let cli = Cli::try_parse_from(&args).unwrap();
     if let Some(Commands::Run(run_args)) = cli.command {
         assert_eq!(run_args.tool, Some("gemini".to_string()));
-        assert!(run_args.debug);
+        assert_eq!(run_args.debug, Some(String::new()));
     } else {
         panic!("Expected Run command");
     }

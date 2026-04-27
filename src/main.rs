@@ -61,6 +61,27 @@ fn fast_crypto_guard() {
 #[cfg(not(feature = "test-fast-crypto"))]
 fn fast_crypto_guard() {}
 
+/// If `--debug` was passed on the CLI, resolve its path (default vs explicit)
+/// and initialize the global HTTP debug logger so subsequent `.send_logged()`
+/// calls capture request/response details. Prints the resolved log path to
+/// stderr; on open failure, warns and continues without logging.
+async fn maybe_init_http_debug(value: &Option<String>) {
+    let Some(raw) = value else {
+        return;
+    };
+    let path = if raw.is_empty() {
+        crate::services::http_debug::default_log_path()
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    match crate::services::http_debug::init(path).await {
+        Ok(p) => eprintln!("[aivo] HTTP debug log → {}", p.display()),
+        Err(e) => {
+            eprintln!("[aivo] failed to open debug log: {e}; HTTP requests will not be logged")
+        }
+    }
+}
+
 /// Main entry point for the CLI
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -146,6 +167,7 @@ async fn main() {
         }
 
         Commands::Chat(chat_args) => {
+            maybe_init_http_debug(&chat_args.debug).await;
             let key_explicit = chat_args.key.is_some();
             let key_override = key_or_exit(
                 resolve_key_override(
@@ -249,6 +271,9 @@ async fn main() {
                 run_args.envs,
                 &run_args.args,
             );
+            // After extract_aivo_flags so `--debug` after the tool name
+            // (recovered from passthrough) activates the logger too.
+            maybe_init_http_debug(&extracted.debug).await;
             // Resolve aliases for main + 6 slot models against a single
             // in-memory snapshot of the alias map, instead of paying one disk
             // read per call (worst case 7).
@@ -263,7 +288,6 @@ async fn main() {
                 opus: resolve(extracted.slots.opus),
             };
             let key_flag = extracted.key_flag;
-            let debug = extracted.debug;
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;
             let as_name = extracted.as_name;
@@ -291,7 +315,6 @@ async fn main() {
                         model,
                         key: key_flag,
                         tool: None,
-                        debug,
                         dry_run,
                         refresh,
                         yes: false,
@@ -369,7 +392,6 @@ async fn main() {
                     .execute(
                         run_args.tool.as_deref(),
                         remaining_args,
-                        debug,
                         dry_run,
                         refresh,
                         model,
@@ -750,7 +772,9 @@ struct ExtractedFlags {
     model: Option<String>,
     slots: ClaudeSlotFlags,
     key_flag: Option<String>,
-    debug: bool,
+    /// `None` = flag absent. `Some("")` = bare `--debug` (default path).
+    /// `Some("/path/to.jsonl")` = explicit log path.
+    debug: Option<String>,
     dry_run: bool,
     refresh: bool,
     as_name: Option<String>,
@@ -771,7 +795,7 @@ fn extract_aivo_flags(
     initial_model: Option<String>,
     initial_slots: ClaudeSlotFlags,
     initial_key: Option<String>,
-    initial_debug: bool,
+    initial_debug: Option<String>,
     initial_dry_run: bool,
     initial_refresh: bool,
     initial_as_name: Option<String>,
@@ -871,7 +895,18 @@ fn extract_aivo_flags(
                 key_flag = Some(String::new());
             }
         } else if arg == "--debug" {
-            debug = true;
+            // Bare passthrough --debug → default path (empty string sentinel).
+            if debug.is_none() {
+                debug = Some(String::new());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if let Some(value) = arg.strip_prefix("--debug=") {
+            if debug.is_none() {
+                debug = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
         } else if arg == "--dry-run" {
             dry_run = true;
         } else if arg == "--refresh" || arg == "-r" {
@@ -1008,7 +1043,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1025,7 +1060,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1042,7 +1077,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1059,7 +1094,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1076,7 +1111,7 @@ mod tests {
             Some("--resume".to_string()),
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1094,7 +1129,7 @@ mod tests {
             Some("gpt-4o".to_string()),
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1111,7 +1146,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1127,7 +1162,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1143,7 +1178,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1159,7 +1194,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             Some("--something".to_string()),
-            false,
+            None,
             false,
             false,
             None,
@@ -1176,7 +1211,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1192,14 +1227,14 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
             vec![],
             &args(&["--debug", "file.ts"]),
         );
-        assert!(r.debug);
+        assert_eq!(r.debug, Some(String::new()));
         assert_eq!(r.remaining_args, args(&["file.ts"]));
     }
 
@@ -1209,14 +1244,14 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            true,
+            Some(String::new()),
             false,
             false,
             None,
             vec![],
             &[],
         );
-        assert!(r.debug);
+        assert_eq!(r.debug, Some(String::new()));
     }
 
     #[test]
@@ -1225,7 +1260,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1241,7 +1276,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1257,7 +1292,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1273,7 +1308,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1289,7 +1324,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1305,7 +1340,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1321,7 +1356,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1338,7 +1373,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1353,7 +1388,7 @@ mod tests {
             ]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
-        assert!(r.debug);
+        assert_eq!(r.debug, Some(String::new()));
         assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "file.ts"]));
     }
 
@@ -1395,7 +1430,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1412,7 +1447,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,
@@ -1429,7 +1464,7 @@ mod tests {
             None,
             ClaudeSlotFlags::default(),
             None,
-            false,
+            None,
             false,
             false,
             None,

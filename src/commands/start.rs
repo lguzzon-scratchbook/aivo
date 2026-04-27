@@ -20,7 +20,6 @@ pub struct StartFlowArgs {
     pub model: Option<String>,
     pub key: Option<String>,
     pub tool: Option<String>,
-    pub debug: bool,
     pub dry_run: bool,
     pub refresh: bool,
     pub yes: bool,
@@ -114,7 +113,6 @@ impl StartCommand {
                 .prepare_launch(&LaunchOptions {
                     tool: tool.value,
                     args: Vec::new(),
-                    debug: args.debug,
                     model: launch_model,
                     claude_overrides: Default::default(),
                     env: (!env.is_empty()).then_some(env),
@@ -146,7 +144,6 @@ impl StartCommand {
             .launch(&LaunchOptions {
                 tool: tool.value,
                 args: Vec::new(),
-                debug: args.debug,
                 model: launch_model,
                 claude_overrides: Default::default(),
                 env: (!env.is_empty()).then_some(env),

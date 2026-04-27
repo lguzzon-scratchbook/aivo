@@ -116,7 +116,6 @@ impl AIToolType {
 pub struct LaunchOptions {
     pub tool: AIToolType,
     pub args: Vec<String>,
-    pub debug: bool,
     pub model: Option<String>,
     /// Claude-only per-slot model overrides for the six addressable slots.
     /// Ignored — with a single stderr warning per set slot — when `tool` is
@@ -181,11 +180,9 @@ impl AILauncher {
 
         self.output_key_info(&resolved.key);
 
-        let env = self.env_injector.merge(
-            &resolved.tool_config.env_vars,
-            options.env.as_ref(),
-            options.debug,
-        );
+        let env = self
+            .env_injector
+            .merge(&resolved.tool_config.env_vars, options.env.as_ref());
         let mut runtime = prepare_runtime_env(options.tool, env).await?;
 
         let mut runtime_args = build_runtime_args(
@@ -335,7 +332,6 @@ impl AILauncher {
                 payload_json: Some(serde_json::json!({
                     "command": resolved.tool_config.command,
                     "args": log_args,
-                    "debug": options.debug,
                 })),
                 ..base_event()
             })
@@ -413,7 +409,6 @@ impl AILauncher {
                 payload_json: Some(serde_json::json!({
                     "command": resolved.tool_config.command,
                     "args": runtime_args.args,
-                    "debug": options.debug,
                 })),
                 ..base_event()
             })

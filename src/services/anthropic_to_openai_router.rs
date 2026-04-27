@@ -27,6 +27,7 @@ use crate::services::anthropic_chat_response::{
 use crate::services::anthropic_route_pipeline::{
     CacheControlPatch, RequestContext, RequestPatch, inject_chat_completions_cache_control,
 };
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::model_names::{
     infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_provider_attempt,
@@ -363,7 +364,7 @@ async fn send_native_anthropic(
         client.post(url).headers(headers).json(native_body),
         is_starter,
     )
-    .send()
+    .send_logged()
     .await?;
 
     let status_code = response.status().as_u16();
@@ -386,7 +387,7 @@ async fn send_native_anthropic(
                 client.post(url).headers(retry_headers).json(native_body),
                 is_starter,
             )
-            .send()
+            .send_logged()
             .await?;
 
             let retry_status = retry_response.status().as_u16();
@@ -601,7 +602,7 @@ async fn handle_anthropic_to_upstream(
                         .json(&google_body),
                     config.is_starter,
                 )
-                .send()
+                .send_logged()
                 .await?;
 
                 let status_code = response.status().as_u16();
@@ -632,7 +633,7 @@ async fn handle_anthropic_to_upstream(
                         .json(&responses_body),
                     config.is_starter,
                 )
-                .send()
+                .send_logged()
                 .await?;
 
                 let status_code = response.status().as_u16();
@@ -664,7 +665,7 @@ async fn handle_anthropic_to_upstream(
                         .json(&req_body),
                     config.is_starter,
                 )
-                .send()
+                .send_logged()
                 .await?;
 
                 let status_code = response.status().as_u16();

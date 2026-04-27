@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::services::codex_oauth::{PkcePair, generate_state, redact_oauth_body};
+use crate::services::http_debug::LoggedSend;
 
 /// Public OAuth client id shared with the native `gemini` CLI.
 pub const CLIENT_ID: &str = concat!(
@@ -155,7 +156,7 @@ pub async fn exchange_code(
             ("code_verifier", pkce_verifier),
             ("redirect_uri", redirect_uri),
         ])
-        .send()
+        .send_logged()
         .await
         .context("POST /token (authorization_code)")?;
 
@@ -200,7 +201,7 @@ pub async fn fetch_email(access_token: &str) -> Result<Option<String>> {
     let resp = client
         .get(USERINFO_URL)
         .bearer_auth(access_token)
-        .send()
+        .send_logged()
         .await
         .context("GET /userinfo")?;
 
@@ -228,7 +229,7 @@ pub async fn refresh(creds: &mut GeminiOAuthCredential) -> Result<()> {
             ("client_secret", CLIENT_SECRET),
             ("refresh_token", creds.refresh_token.as_str()),
         ])
-        .send()
+        .send_logged()
         .await
         .context("POST /token (refresh_token)")?;
 

@@ -194,9 +194,11 @@ pub struct RunArgs {
     #[arg(short = 'r', long)]
     pub refresh: bool,
 
-    /// Enable debug output
-    #[arg(long)]
-    pub debug: bool,
+    /// Log all aivo HTTP requests/responses to a JSONL file (default:
+    /// ~/.config/aivo/logs/debug-<ts>-<pid>.jsonl). Sensitive headers and
+    /// URL query params are redacted.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    pub debug: Option<String>,
 
     /// Print the resolved command and environment without launching
     #[arg(long)]
@@ -493,6 +495,12 @@ pub struct ChatArgs {
     /// Attach a file or image to the next chat message (repeatable)
     #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]
     pub attachments: Vec<String>,
+
+    /// Log all aivo HTTP requests/responses to a JSONL file (default:
+    /// ~/.config/aivo/logs/debug-<ts>-<pid>.jsonl). Sensitive headers and
+    /// URL query params are redacted.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    pub debug: Option<String>,
 }
 
 /// Arguments for the image command
@@ -592,7 +600,7 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "run", "claude", "--debug"]).unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.tool, Some("claude".to_string()));
-            assert!(run_args.debug);
+            assert_eq!(run_args.debug, Some(String::new()));
             assert!(!run_args.dry_run);
             assert!(!run_args.args.contains(&"--debug".to_string()));
         } else {
@@ -606,7 +614,7 @@ mod tests {
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.tool, None);
             assert_eq!(run_args.model, Some("gpt-5".to_string()));
-            assert!(run_args.debug);
+            assert_eq!(run_args.debug, Some(String::new()));
             assert!(!run_args.dry_run);
         } else {
             panic!("Expected Run command");
@@ -684,7 +692,7 @@ mod tests {
         ])
         .unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
-            assert!(run_args.debug);
+            assert_eq!(run_args.debug, Some(String::new()));
             assert!(run_args.args.contains(&"--some-tool-flag".to_string()));
             assert!(run_args.args.contains(&"value".to_string()));
         } else {
@@ -806,7 +814,7 @@ mod tests {
         let cli = Cli::try_parse_from(&args).unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
             assert_eq!(run_args.tool, Some("gemini".to_string()));
-            assert!(run_args.debug);
+            assert_eq!(run_args.debug, Some(String::new()));
         } else {
             panic!("Expected Run command");
         }

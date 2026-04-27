@@ -18,6 +18,7 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self};
 use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
@@ -329,7 +330,7 @@ async fn try_responses_api_passthrough(
     .ok()?;
     let response =
         device_fingerprint::maybe_with_starter_headers(req.json(&body), config.is_starter)
-            .send()
+            .send_logged()
             .await
             .ok()?;
 
@@ -486,7 +487,7 @@ async fn stream_chat_completions(
     .await?;
     let response =
         device_fingerprint::maybe_with_starter_headers(req.json(&body), config.is_starter)
-            .send()
+            .send_logged()
             .await?;
 
     let status = response.status().as_u16();
@@ -582,7 +583,7 @@ async fn forward_request(
     }
 
     let response = device_fingerprint::maybe_with_starter_headers(req, config.is_starter)
-        .send()
+        .send_logged()
         .await?;
     http_utils::buffered_reqwest_to_http_response(response).await
 }
@@ -668,7 +669,7 @@ async fn forward_openai_protocol(
     .await?;
     let response =
         device_fingerprint::maybe_with_starter_headers(req.json(body), config.is_starter)
-            .send()
+            .send_logged()
             .await?;
 
     let status = response.status().as_u16();
@@ -720,7 +721,7 @@ async fn try_copilot_responses_fallback(
         req.json(&responses_body),
         config.is_starter,
     )
-    .send()
+    .send_logged()
     .await?;
 
     let status = response.status().as_u16();
@@ -777,7 +778,7 @@ async fn forward_anthropic_protocol(
             .json(&anthropic_body),
         config.is_starter,
     )
-    .send()
+    .send_logged()
     .await?;
 
     let status_code = response.status().as_u16();
@@ -817,7 +818,7 @@ async fn forward_google_protocol(
             .json(&google_body),
         config.is_starter,
     )
-    .send()
+    .send_logged()
     .await?;
 
     let status_code = response.status().as_u16();

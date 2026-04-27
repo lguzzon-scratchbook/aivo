@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::services::http_debug::LoggedSend;
 use crate::services::system_env;
 
 static OLLAMA_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
@@ -122,7 +123,7 @@ fn health_client() -> reqwest::Client {
 
 async fn check_health(client: &reqwest::Client) -> bool {
     let url = format!("{}/api/tags", ollama_host());
-    client.get(&url).send().await.is_ok()
+    client.get(&url).send_logged().await.is_ok()
 }
 
 /// Returns `true` if Ollama is responding to API requests.
@@ -219,7 +220,7 @@ pub async fn list_models() -> Result<Vec<String>> {
     let url = format!("{}/api/tags", ollama_host());
     let response = local_client(Duration::from_secs(10))
         .get(&url)
-        .send()
+        .send_logged()
         .await
         .context("Failed to connect to Ollama")?;
     let text = response
@@ -252,7 +253,7 @@ pub async fn pull_model(name: &str) -> Result<()> {
     let mut resp = client
         .post(&url)
         .json(&serde_json::json!({ "name": name, "stream": true }))
-        .send()
+        .send_logged()
         .await
         .context("Failed to connect to Ollama for model pull")?;
 

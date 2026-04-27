@@ -19,6 +19,7 @@ use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INITIATOR_HEADER, COPILOT_INTEGRATION_ID,
     COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 
 #[derive(Clone)]
@@ -144,7 +145,7 @@ async fn copilot_post(
         .header("Openai-Intent", COPILOT_OPENAI_INTENT)
         .header(COPILOT_INITIATOR_HEADER, initiator)
         .json(body)
-        .send()
+        .send_logged()
         .await?;
     let status = resp.status().as_u16();
     let body = resp.text().await?;

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::constants::CONTENT_TYPE_JSON;
+use crate::services::http_debug::LoggedSend;
 
 /// VS Code Copilot OAuth client ID (same as OpenCode uses)
 const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -105,7 +106,7 @@ impl CopilotTokenManager {
             .header("Authorization", format!("token {}", self.github_token))
             .header("Accept", CONTENT_TYPE_JSON)
             .header("User-Agent", "aivo")
-            .send()
+            .send_logged()
             .await
             .context("Failed to exchange GitHub token for Copilot token")?;
 
@@ -155,7 +156,7 @@ pub async fn device_flow_login() -> Result<String> {
         .post(DEVICE_CODE_URL)
         .header("Accept", CONTENT_TYPE_JSON)
         .form(&[("client_id", COPILOT_CLIENT_ID), ("scope", "copilot")])
-        .send()
+        .send_logged()
         .await
         .context("Failed to request device code from GitHub")?;
 
@@ -210,7 +211,7 @@ async fn poll_for_token(
                 ("device_code", device_code),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
-            .send()
+            .send_logged()
             .await?;
 
         let token_resp: AccessTokenResponse = resp.json().await?;

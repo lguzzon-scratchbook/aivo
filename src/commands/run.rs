@@ -187,7 +187,6 @@ impl RunCommand {
         &self,
         tool: Option<&str>,
         args: Vec<String>,
-        debug: bool,
         dry_run: bool,
         refresh: bool,
         model: Option<String>,
@@ -202,7 +201,6 @@ impl RunCommand {
             .execute_internal(
                 tool,
                 args,
-                debug,
                 dry_run,
                 refresh,
                 model,
@@ -228,7 +226,6 @@ impl RunCommand {
         &self,
         tool: Option<&str>,
         args: Vec<String>,
-        debug: bool,
         dry_run: bool,
         refresh: bool,
         model: Option<String>,
@@ -421,7 +418,6 @@ impl RunCommand {
         let options = LaunchOptions {
             tool: ai_tool,
             args,
-            debug,
             model: launch_model,
             claude_overrides,
             env,
