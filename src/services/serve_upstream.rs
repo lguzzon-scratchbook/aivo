@@ -8,7 +8,9 @@ use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
-use crate::services::model_names::{copilot_model_name, transform_model_for_openrouter};
+use crate::services::model_names::{
+    copilot_model_name, requires_max_completion_tokens, transform_model_for_openrouter,
+};
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
     convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
@@ -151,6 +153,7 @@ pub(crate) async fn send_openai_chat(
     context: &UpstreamRequestContext,
 ) -> Result<RouterResponse> {
     normalize_openai_request_model(body, context.is_openrouter, context.is_copilot);
+    migrate_max_tokens_for_reasoning_models(body);
 
     let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/chat/completions");
     let initiator = if context.is_copilot {
@@ -228,6 +231,31 @@ fn build_anthropic_request(body: &Value, client_wants_stream: bool) -> (String, 
     anthropic_req["stream"] = json!(client_wants_stream);
 
     (fallback_model, anthropic_req)
+}
+
+/// Rename the legacy `max_tokens` field to `max_completion_tokens` when the
+/// target model is in OpenAI's reasoning family (o-series / GPT-5+ / Codex).
+/// The Chat Completions API rejects `max_tokens` on those models with a 400.
+/// If `max_completion_tokens` is already present, the legacy field is removed
+/// to avoid the upstream rejecting both being set.
+fn migrate_max_tokens_for_reasoning_models(body: &mut Value) {
+    let model = match body.get("model").and_then(|v| v.as_str()) {
+        Some(m) => m.to_string(),
+        None => return,
+    };
+    if !requires_max_completion_tokens(&model) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let legacy = obj.remove("max_tokens");
+    if obj.contains_key("max_completion_tokens") {
+        return;
+    }
+    if let Some(value) = legacy {
+        obj.insert("max_completion_tokens".to_string(), value);
+    }
 }
 
 fn normalize_openai_request_model(body: &mut Value, is_openrouter: bool, is_copilot: bool) {
@@ -640,5 +668,57 @@ mod tests {
         normalize_openai_request_model(&mut body, true, false);
         // No crash, and no model field is inserted
         assert!(body.get("model").is_none());
+    }
+
+    #[test]
+    fn migrate_max_tokens_renames_for_reasoning_model() {
+        let mut body = json!({"model": "gpt-5", "max_tokens": 4096});
+        migrate_max_tokens_for_reasoning_models(&mut body);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 4096);
+    }
+
+    #[test]
+    fn migrate_max_tokens_renames_for_o_series() {
+        let mut body = json!({"model": "o3-mini", "max_tokens": 2048});
+        migrate_max_tokens_for_reasoning_models(&mut body);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 2048);
+    }
+
+    #[test]
+    fn migrate_max_tokens_preserves_non_reasoning_field() {
+        let mut body = json!({"model": "gpt-4o", "max_tokens": 4096});
+        migrate_max_tokens_for_reasoning_models(&mut body);
+        assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn migrate_max_tokens_does_not_overwrite_existing_new_field() {
+        let mut body = json!({
+            "model": "gpt-5",
+            "max_tokens": 4096,
+            "max_completion_tokens": 8192,
+        });
+        migrate_max_tokens_for_reasoning_models(&mut body);
+        // Drop the legacy field, keep the explicit new field intact.
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 8192);
+    }
+
+    #[test]
+    fn migrate_max_tokens_handles_prefixed_reasoning_model_name() {
+        let mut body = json!({"model": "openai/gpt-5-codex", "max_tokens": 1024});
+        migrate_max_tokens_for_reasoning_models(&mut body);
+        assert_eq!(body["max_completion_tokens"], 1024);
+    }
+
+    #[test]
+    fn migrate_max_tokens_no_op_when_field_absent() {
+        let mut body = json!({"model": "gpt-5"});
+        migrate_max_tokens_for_reasoning_models(&mut body);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
     }
 }
