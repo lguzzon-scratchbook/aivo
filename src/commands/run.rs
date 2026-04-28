@@ -496,6 +496,12 @@ impl RunCommand {
                 "--opus-model <m>",
                 "Claude only: what `/model opus` resolves to (bare = picker)",
             );
+            print_opt(
+                "--max-context <size>",
+                "Claude only: opt every model slot into 1m/2m context window",
+            );
+            print_opt("--1m", "Claude only: shorthand for --max-context=1m");
+            print_opt("--2m", "Claude only: shorthand for --max-context=2m");
         }
         print_opt(
             "-k, --key <id|name>",

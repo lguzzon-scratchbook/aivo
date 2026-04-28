@@ -2118,10 +2118,6 @@ impl KeysCommand {
         print_row("add [name]", "Add an API key");
         print_row("edit [id|name]", "Edit an API key");
         print_row("ping [id|name]", "Health-check API keys (or: aivo ping)");
-        print_row(
-            "reset-route [id|name]",
-            "Clear learned protocol/path routing so the next launch re-probes",
-        );
         println!();
         println!("{}", style::bold("Add Flags:"));
         print_row("--name <name>", "Set key name");
