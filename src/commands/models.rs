@@ -6,7 +6,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::commands::normalize_base_url;
@@ -17,7 +17,7 @@ use crate::services::copilot_auth::{
 };
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
-use crate::services::models_cache::ModelsCache;
+use crate::services::models_cache::{ModelMetadata, ModelsCache, full_catalog_key};
 use crate::services::provider_profile::{
     ModelListingStrategy, cloudflare_ai_base, is_aivo_starter_base, provider_profile_for_base_url,
     provider_profile_for_key,
@@ -37,6 +37,9 @@ pub(crate) struct ModelInfo {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// Raw context window; not exposed via `--json`.
+    #[serde(skip)]
+    pub context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,6 +55,7 @@ impl ModelInfo {
         Self {
             id,
             context: None,
+            context_tokens: None,
             max_output: None,
             input_price: None,
             output_price: None,
@@ -77,13 +81,15 @@ struct OpenAIModel {
 
 impl OpenAIModel {
     fn into_model_info(self) -> ModelInfo {
-        let context = self.find_context().map(format_token_count);
+        let context_tokens = self.find_context();
+        let context = context_tokens.map(format_token_count);
         let max_output = self.find_max_output().map(format_token_count);
         let (input_price, output_price) = self.find_pricing();
         let multiplier = self.find_multiplier();
         ModelInfo {
             id: self.id,
             context,
+            context_tokens,
             max_output,
             input_price,
             output_price,
@@ -295,7 +301,7 @@ impl ModelsCommand {
 
         let client = http_utils::router_http_client();
         let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
-        let all_cache_key = all_models_cache_key(&key.base_url);
+        let all_cache_key = full_catalog_key(&key.base_url);
         let cache_warm = !refresh && self.cache.get(&all_cache_key).await.is_some();
 
         // `aivo models` shows the provider's full catalog, including image,
@@ -318,9 +324,15 @@ impl ModelsCommand {
 
         // Cache the full list (including image/audio/embed) under the `#all`
         // namespace so `aivo image` and future broad pickers can share it.
+        // Also persist per-model context-window metadata so `aivo run claude`
+        // can default `--max-context` for known 1M/2M models without making
+        // its own network call.
         if !is_ollama {
             let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-            self.cache.set(&all_cache_key, ids).await;
+            let metadata = build_metadata_map(&models);
+            self.cache
+                .set_with_metadata(&all_cache_key, ids, metadata)
+                .await;
         }
 
         let is_starter = is_aivo_starter_base(&key.base_url);
@@ -599,12 +611,23 @@ pub(crate) async fn fetch_all_models(client: &Client, key: &ApiKey) -> Result<Ve
         .map(|v| v.into_iter().map(|m| m.id).collect())
 }
 
-/// Cache key for the unfiltered model list. Separate namespace from the
-/// chat picker's cache (`key.base_url`) so a broad fetch by `aivo models`
-/// or `aivo image` doesn't pollute chat pickers with image / embedding
-/// entries on their next cache hit.
-pub(crate) fn all_models_cache_key(base_url: &str) -> String {
-    format!("{base_url}#all")
+/// Pulls per-model context-window metadata out of a detailed model list
+/// so it can be persisted alongside the cached name list. Skips entries
+/// where the provider didn't return a context window.
+fn build_metadata_map(models: &[ModelInfo]) -> HashMap<String, ModelMetadata> {
+    models
+        .iter()
+        .filter_map(|m| {
+            m.context_tokens.map(|ctx| {
+                (
+                    m.id.clone(),
+                    ModelMetadata {
+                        context_window: Some(ctx),
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 /// Cached variant of `fetch_all_models`.
@@ -615,7 +638,7 @@ pub(crate) async fn fetch_all_models_cached(
     bypass_cache: bool,
 ) -> Result<Vec<String>> {
     let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
-    let cache_key = all_models_cache_key(&key.base_url);
+    let cache_key = full_catalog_key(&key.base_url);
     if !bypass_cache
         && !is_ollama
         && let Some(cached) = cache.get(&cache_key).await
@@ -747,6 +770,7 @@ async fn fetch_models_detailed_filtered(
                         .to_string();
                     ModelInfo {
                         context: m.input_token_limit.map(format_token_count),
+                        context_tokens: m.input_token_limit,
                         max_output: m.output_token_limit.map(format_token_count),
                         input_price: None,
                         output_price: None,

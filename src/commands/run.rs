@@ -354,7 +354,13 @@ impl RunCommand {
             }
         };
 
-        claude_overrides.max_context = resolve_max_context(resolved_model.as_deref(), max_context);
+        claude_overrides.max_context = resolve_max_context(
+            &self.cache,
+            key_override.as_ref().map(|k| k.base_url.as_str()),
+            resolved_model.as_deref(),
+            max_context,
+        )
+        .await;
 
         let launch_model = resolve_model_placeholder(resolved_model);
 
@@ -784,13 +790,29 @@ fn inject_codex(rendered: &RenderedContext, mut args: Vec<String>) -> Vec<String
     }
 }
 
-/// The `aivo/starter` model already supports 1M context; default the flag so
-/// the status bar reflects it without the user having to remember
-/// `--max-context`. Matches on the resolved model name — the starter key's
-/// gateway also serves other models that don't have a 1M window.
-fn resolve_max_context(model: Option<&str>, explicit: Option<String>) -> Option<String> {
-    explicit
-        .or_else(|| (model == Some(crate::constants::AIVO_STARTER_MODEL)).then(|| "1m".to_string()))
+/// Default `--max-context` based on the resolved model.
+/// Precedence: explicit flag → cached `context_window` (≥2M→2m, ≥1M→1m)
+/// → hardcoded `aivo/starter` fallback (which ships before the user can
+/// have run `aivo models` to warm the cache).
+async fn resolve_max_context(
+    cache: &ModelsCache,
+    base_url: Option<&str>,
+    model: Option<&str>,
+    explicit: Option<String>,
+) -> Option<String> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let starter_default =
+        || (model == Some(crate::constants::AIVO_STARTER_MODEL)).then(|| "1m".to_string());
+    let (Some(url), Some(m)) = (base_url, model) else {
+        return starter_default();
+    };
+    match cache.get_context_window(url, m).await {
+        Some(ctx) if ctx >= 2_000_000 => Some("2m".to_string()),
+        Some(ctx) if ctx >= 1_000_000 => Some("1m".to_string()),
+        _ => starter_default(),
+    }
 }
 
 #[cfg(test)]
@@ -881,32 +903,134 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_max_context_defaults_to_1m_for_starter_model() {
+    use crate::services::models_cache::{ModelMetadata, full_catalog_key};
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    const TEST_BASE_URL: &str = "https://api.example.com";
+
+    /// TempDir is returned so the cache file outlives the test body.
+    fn empty_cache() -> (TempDir, ModelsCache) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        (dir, cache)
+    }
+
+    async fn cache_with_context(model: &str, ctx_tokens: u64) -> (TempDir, ModelsCache) {
+        let (dir, cache) = empty_cache();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            model.to_string(),
+            ModelMetadata {
+                context_window: Some(ctx_tokens),
+            },
+        );
+        cache
+            .set_with_metadata(
+                &full_catalog_key(TEST_BASE_URL),
+                vec![model.to_string()],
+                metadata,
+            )
+            .await;
+        (dir, cache)
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_defaults_to_1m_for_starter_model() {
+        let (_dir, cache) = empty_cache();
         assert_eq!(
-            resolve_max_context(Some(crate::constants::AIVO_STARTER_MODEL), None),
+            resolve_max_context(
+                &cache,
+                None,
+                Some(crate::constants::AIVO_STARTER_MODEL),
+                None
+            )
+            .await,
             Some("1m".to_string())
         );
     }
 
-    #[test]
-    fn resolve_max_context_user_override_wins_for_starter_model() {
+    #[tokio::test]
+    async fn resolve_max_context_user_override_wins_for_starter_model() {
+        let (_dir, cache) = empty_cache();
         assert_eq!(
             resolve_max_context(
+                &cache,
+                None,
                 Some(crate::constants::AIVO_STARTER_MODEL),
                 Some("2m".to_string())
-            ),
+            )
+            .await,
             Some("2m".to_string())
         );
     }
 
-    #[test]
-    fn resolve_max_context_no_default_for_non_starter_model() {
-        assert_eq!(resolve_max_context(Some("claude-sonnet-4-5"), None), None);
+    #[tokio::test]
+    async fn resolve_max_context_no_default_for_non_starter_model() {
+        let (_dir, cache) = empty_cache();
+        assert_eq!(
+            resolve_max_context(&cache, None, Some("claude-sonnet-4-5"), None).await,
+            None
+        );
     }
 
-    #[test]
-    fn resolve_max_context_no_default_when_model_missing() {
-        assert_eq!(resolve_max_context(None, None), None);
+    #[tokio::test]
+    async fn resolve_max_context_no_default_when_model_missing() {
+        let (_dir, cache) = empty_cache();
+        assert_eq!(resolve_max_context(&cache, None, None, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_uses_cache_for_1m_model() {
+        let (_dir, cache) = cache_with_context("gpt-4.1", 1_000_000).await;
+        assert_eq!(
+            resolve_max_context(&cache, Some(TEST_BASE_URL), Some("gpt-4.1"), None).await,
+            Some("1m".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_uses_cache_for_2m_model() {
+        let (_dir, cache) = cache_with_context("huge-context-model", 2_000_000).await;
+        assert_eq!(
+            resolve_max_context(
+                &cache,
+                Some(TEST_BASE_URL),
+                Some("huge-context-model"),
+                None,
+            )
+            .await,
+            Some("2m".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_cache_below_1m_returns_none() {
+        let (_dir, cache) = cache_with_context("small-context-model", 200_000).await;
+        assert_eq!(
+            resolve_max_context(
+                &cache,
+                Some(TEST_BASE_URL),
+                Some("small-context-model"),
+                None,
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_explicit_wins_over_cached_metadata() {
+        let (_dir, cache) = cache_with_context("gpt-4.1", 1_000_000).await;
+        assert_eq!(
+            resolve_max_context(
+                &cache,
+                Some(TEST_BASE_URL),
+                Some("gpt-4.1"),
+                Some("2m".to_string()),
+            )
+            .await,
+            Some("2m".to_string())
+        );
     }
 }

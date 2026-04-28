@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,10 +9,21 @@ use tokio::sync::{OnceCell, RwLock};
 
 const CACHE_TTL_SECS: u64 = 3600; // 1 hour
 
+/// Per-model metadata harvested from `aivo models`. Treated as long-lived:
+/// returned regardless of `fetched_at` TTL because a model's context window
+/// doesn't change once published.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ModelMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CacheEntry {
     models: Vec<String>,
     fetched_at: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    metadata: HashMap<String, ModelMetadata>,
 }
 
 /// Disk cache for model lists keyed by base_url.
@@ -80,9 +92,29 @@ impl ModelsCache {
         state.get(base_url).and_then(Self::fresh_models)
     }
 
-    /// Writes models for `base_url` into the cache file.
-    /// Silently ignores write errors.
+    /// Writes models for `base_url`. Plain `set` preserves any existing
+    /// metadata so a chat-picker refresh doesn't wipe what `aivo models`
+    /// harvested.
     pub async fn set(&self, base_url: &str, models: Vec<String>) {
+        self.write_entry(base_url, models, None).await;
+    }
+
+    /// Writes models and per-model metadata in one pass. Used by `aivo models`.
+    pub async fn set_with_metadata(
+        &self,
+        base_url: &str,
+        models: Vec<String>,
+        metadata: HashMap<String, ModelMetadata>,
+    ) {
+        self.write_entry(base_url, models, Some(metadata)).await;
+    }
+
+    async fn write_entry(
+        &self,
+        base_url: &str,
+        models: Vec<String>,
+        metadata: Option<HashMap<String, ModelMetadata>>,
+    ) {
         let entries = self.entries().await;
 
         let now = SystemTime::now()
@@ -91,13 +123,23 @@ impl ModelsCache {
             .unwrap_or(0);
         let json = {
             let mut state = entries.write().await;
-            state.insert(
-                base_url.to_string(),
-                CacheEntry {
-                    models,
-                    fetched_at: now,
-                },
-            );
+            match state.entry(base_url.to_string()) {
+                Entry::Occupied(mut o) => {
+                    let e = o.get_mut();
+                    e.models = models;
+                    e.fetched_at = now;
+                    if let Some(m) = metadata {
+                        e.metadata = m;
+                    }
+                }
+                Entry::Vacant(v) => {
+                    v.insert(CacheEntry {
+                        models,
+                        fetched_at: now,
+                        metadata: metadata.unwrap_or_default(),
+                    });
+                }
+            }
             serde_json::to_string_pretty(&*state).ok()
         };
 
@@ -108,6 +150,28 @@ impl ModelsCache {
             let _ = tokio::fs::write(&self.cache_path, json).await;
         }
     }
+
+    /// Lower-level: returns metadata stored under `cache_key`, ignoring TTL.
+    pub async fn get_metadata(&self, cache_key: &str, model_id: &str) -> Option<ModelMetadata> {
+        let entries = self.entries().await;
+        let state = entries.read().await;
+        state.get(cache_key)?.metadata.get(model_id).cloned()
+    }
+
+    /// Returns the cached context window (in tokens) for `model_id` served by
+    /// `base_url`. Ignores TTL — context windows are stable once published.
+    pub async fn get_context_window(&self, base_url: &str, model_id: &str) -> Option<u64> {
+        self.get_metadata(&full_catalog_key(base_url), model_id)
+            .await?
+            .context_window
+    }
+}
+
+/// Cache key for the unfiltered catalog stored by `aivo models`. A separate
+/// namespace from the chat picker's key (`base_url`) so a broad fetch doesn't
+/// pollute chat pickers with image / embedding entries.
+pub fn full_catalog_key(base_url: &str) -> String {
+    format!("{base_url}#all")
 }
 
 impl Default for ModelsCache {
@@ -169,6 +233,104 @@ mod tests {
         .await
         .unwrap();
         assert!(cache.get("https://api.example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let cache = make_cache(&dir);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "gpt-4.1".to_string(),
+            ModelMetadata {
+                context_window: Some(1_000_000),
+            },
+        );
+        cache
+            .set_with_metadata(
+                &full_catalog_key("https://api.example.com"),
+                vec!["gpt-4.1".to_string()],
+                metadata,
+            )
+            .await;
+        // High-level accessor mirrors `aivo run claude`'s lookup path.
+        assert_eq!(
+            cache
+                .get_context_window("https://api.example.com", "gpt-4.1")
+                .await,
+            Some(1_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_ignores_ttl() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models-cache.json");
+        let entry = serde_json::json!({
+            "https://api.example.com": {
+                "models": ["gpt-4.1"],
+                "fetched_at": 0u64,
+                "metadata": {
+                    "gpt-4.1": { "context_window": 1_000_000u64 }
+                }
+            }
+        });
+        tokio::fs::write(&path, serde_json::to_string(&entry).unwrap())
+            .await
+            .unwrap();
+        let cache = ModelsCache::with_path(path);
+        // Models list is expired and returns None…
+        assert!(cache.get("https://api.example.com").await.is_none());
+        // …but metadata is still served.
+        let meta = cache
+            .get_metadata("https://api.example.com", "gpt-4.1")
+            .await
+            .unwrap();
+        assert_eq!(meta.context_window, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn set_preserves_existing_metadata() {
+        let dir = TempDir::new().unwrap();
+        let cache = make_cache(&dir);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "gpt-4.1".to_string(),
+            ModelMetadata {
+                context_window: Some(1_000_000),
+            },
+        );
+        cache
+            .set_with_metadata(
+                "https://api.example.com",
+                vec!["gpt-4.1".to_string()],
+                metadata,
+            )
+            .await;
+        // Plain set() — e.g. by the chat picker — must not wipe metadata.
+        cache
+            .set("https://api.example.com", vec!["gpt-4.1".to_string()])
+            .await;
+        let got = cache
+            .get_metadata("https://api.example.com", "gpt-4.1")
+            .await
+            .unwrap();
+        assert_eq!(got.context_window, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn metadata_missing_for_unknown_model() {
+        let dir = TempDir::new().unwrap();
+        let cache = make_cache(&dir);
+        cache
+            .set("https://api.example.com", vec!["gpt-4o".to_string()])
+            .await;
+        assert!(
+            cache
+                .get_metadata("https://api.example.com", "gpt-4o")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
