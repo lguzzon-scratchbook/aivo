@@ -70,6 +70,12 @@ impl ClaudeSlotFlags {
 /// whatever the main `model` argument fanned out". `Some(value)` replaces
 /// that slot's env var. The deprecated `ANTHROPIC_SMALL_FAST_MODEL` slot is
 /// intentionally absent; users override haiku-class routing via `haiku`.
+///
+/// `max_context` is the `--max-context` runtime flag, piggybacked here to
+/// avoid a parallel parameter on every launch path. `Some("1m")` / `Some("2m")`
+/// append the canonical `[1m]` / `[2m]` suffix Claude Code parses to opt into
+/// the matching context window; only the fanned-out default slots get it,
+/// per-slot overrides stay verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeModelOverrides {
     pub reasoning: Option<String>,
@@ -77,7 +83,22 @@ pub struct ClaudeModelOverrides {
     pub haiku: Option<String>,
     pub sonnet: Option<String>,
     pub opus: Option<String>,
+    pub max_context: Option<String>,
 }
+
+/// Slots Claude Code reads to pick the model for each routing class. aivo
+/// fans the user's `--model` value out to all of them so the chosen model
+/// wins everywhere. `ANTHROPIC_SMALL_FAST_MODEL` is intentionally absent —
+/// it's deprecated in favor of `ANTHROPIC_DEFAULT_HAIKU_MODEL`.
+/// See https://code.claude.com/docs/en/env-vars.md.
+const CLAUDE_DEFAULT_MODEL_SLOTS: [&str; 6] = [
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_REASONING_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
 
 /// Strips the API version suffix (`/v1beta`, `/v1`) and trailing slashes from
 /// a Google base URL.  Tools whose SDKs append their own `apiVersion` path
@@ -405,35 +426,18 @@ impl EnvironmentInjector {
         );
         env.insert("API_TIMEOUT_MS".to_string(), "30000000".to_string());
         if let Some(model) = model {
-            let anthropic_model = if matches!(mode, ConnectionMode::Direct { .. }) {
+            let normalized = if matches!(mode, ConnectionMode::Direct { .. }) {
                 anthropic_native_model_name(model)
             } else {
                 model.to_string()
             };
-            env.insert("ANTHROPIC_MODEL".to_string(), anthropic_model.clone());
-            // ANTHROPIC_SMALL_FAST_MODEL is intentionally omitted: it's
-            // deprecated in favor of ANTHROPIC_DEFAULT_HAIKU_MODEL (set below).
-            // See https://code.claude.com/docs/en/env-vars.md.
-            env.insert(
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-                anthropic_model.clone(),
-            );
-            env.insert(
-                "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
-                anthropic_model.clone(),
-            );
-            env.insert(
-                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
-                anthropic_model.clone(),
-            );
-            env.insert(
-                "ANTHROPIC_REASONING_MODEL".to_string(),
-                anthropic_model.clone(),
-            );
-            env.insert(
-                "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
-                anthropic_model.clone(),
-            );
+            let anthropic_model = match overrides.max_context.as_deref() {
+                Some(tag @ ("1m" | "2m")) => format!("{normalized}[{tag}]"),
+                _ => normalized,
+            };
+            for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+                env.insert(slot.to_string(), anthropic_model.clone());
+            }
         }
 
         // Per-slot overrides win over the fan-out from `model`. Each slot is
@@ -1522,6 +1526,99 @@ mod tests {
             env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
             Some(&"custom-sonnet".to_string()),
         );
+    }
+
+    #[test]
+    fn for_claude_max_context_1m_appends_suffix_to_default_slots() {
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.deepseek.com/anthropic".to_string();
+        let overrides = ClaudeModelOverrides {
+            max_context: Some("1m".to_string()),
+            ..Default::default()
+        };
+
+        let env = injector.for_claude_with_overrides(&key, Some("deepseek-v4-flash"), &overrides);
+
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            assert_eq!(
+                env.get(slot),
+                Some(&"deepseek-v4-flash[1m]".to_string()),
+                "slot {slot} must carry the model with the [1m] suffix appended",
+            );
+        }
+        // Direct mode for the Anthropic-shaped upstream is preserved —
+        // max_context is a model-name annotation, not a routing knob.
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").map(|s| s.as_str()),
+            Some("https://api.deepseek.com/anthropic"),
+        );
+    }
+
+    #[test]
+    fn for_claude_max_context_2m_appends_2m_suffix_to_default_slots() {
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.deepseek.com/anthropic".to_string();
+        let overrides = ClaudeModelOverrides {
+            max_context: Some("2m".to_string()),
+            ..Default::default()
+        };
+
+        let env = injector.for_claude_with_overrides(&key, Some("deepseek-v4-flash"), &overrides);
+
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            assert_eq!(
+                env.get(slot),
+                Some(&"deepseek-v4-flash[2m]".to_string()),
+                "slot {slot} must carry the model with the [2m] suffix appended",
+            );
+        }
+    }
+
+    #[test]
+    fn for_claude_max_context_1m_leaves_slot_overrides_verbatim() {
+        // Per-slot overrides may name a model that doesn't support 1M
+        // context, so the suffix must not be auto-appended there.
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.deepseek.com/anthropic".to_string();
+        let overrides = ClaudeModelOverrides {
+            max_context: Some("1m".to_string()),
+            haiku: Some("small-fast-model".to_string()),
+            ..Default::default()
+        };
+
+        let env = injector.for_claude_with_overrides(&key, Some("deepseek-v4-flash"), &overrides);
+
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"small-fast-model".to_string()),
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&"deepseek-v4-flash[1m]".to_string()),
+        );
+    }
+
+    #[test]
+    fn for_claude_max_context_unset_omits_suffix() {
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.deepseek.com/anthropic".to_string();
+        let env = injector.for_claude(&key, Some("deepseek-v4-pro"));
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            assert_eq!(
+                env.get(slot),
+                Some(&"deepseek-v4-pro".to_string()),
+                "without --max-context, slot {slot} must keep the user's model unchanged",
+            );
+        }
     }
 
     #[test]

@@ -97,6 +97,20 @@ pub fn anthropic_native_model_name(model: &str) -> String {
     stripped.to_string()
 }
 
+/// Strip the `[1m]` / `[2m]` UI-hint suffix aivo's env injector appends
+/// when `--max-context=1m` (or `--1m`/`--2m`) is set. The suffix is
+/// meaningful to Claude Code's status-bar logic but not to the upstream
+/// API; bridges should drop it before forwarding so non-Claude providers
+/// don't see an unrecognized model name.
+pub fn strip_context_suffix(model: &str) -> &str {
+    for tag in ["1m", "2m"] {
+        if let Some(stripped) = model.strip_suffix(["[", tag, "]"].concat().as_str()) {
+            return stripped;
+        }
+    }
+    model
+}
+
 pub fn is_gateway_style_endpoint(base_url: &str) -> bool {
     let lower = base_url.trim().to_ascii_lowercase();
     lower.contains("/endpoint") || lower.contains("gateway")
@@ -361,6 +375,20 @@ mod tests {
             "gemini-2.5-pro"
         );
         assert_eq!(google_native_model_name("gemini-2.5-pro"), "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn test_strip_context_suffix() {
+        assert_eq!(strip_context_suffix("hello[1m]"), "hello");
+        assert_eq!(strip_context_suffix("hello[2m]"), "hello");
+        assert_eq!(
+            strip_context_suffix("deepseek-v4-flash[1m]"),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(strip_context_suffix("hello"), "hello");
+        assert_eq!(strip_context_suffix("hello[3m]"), "hello[3m]");
+        assert_eq!(strip_context_suffix("[1m]"), "");
+        assert_eq!(strip_context_suffix("[2m]"), "");
     }
 
     #[test]

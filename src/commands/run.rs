@@ -178,6 +178,7 @@ impl RunCommand {
             haiku,
             sonnet,
             opus,
+            max_context: None,
         }))
     }
 
@@ -196,6 +197,7 @@ impl RunCommand {
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
         as_name: Option<String>,
+        max_context: Option<String>,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -210,6 +212,7 @@ impl RunCommand {
                 key_override,
                 context_selector,
                 as_name,
+                max_context,
             )
             .await
         {
@@ -235,6 +238,7 @@ impl RunCommand {
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
         as_name: Option<String>,
+        max_context: Option<String>,
     ) -> anyhow::Result<ExitCode> {
         let tool = match tool {
             Some(t) => t,
@@ -328,7 +332,7 @@ impl RunCommand {
                 .await;
         }
 
-        let claude_overrides = match ai_tool {
+        let mut claude_overrides = match ai_tool {
             AIToolType::Claude if slots.any_set() => {
                 let key = key_override
                     .as_ref()
@@ -349,6 +353,8 @@ impl RunCommand {
                 ClaudeModelOverrides::default()
             }
         };
+
+        claude_overrides.max_context = max_context;
 
         let launch_model = resolve_model_placeholder(resolved_model);
 

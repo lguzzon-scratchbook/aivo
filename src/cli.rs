@@ -220,6 +220,24 @@ pub struct RunArgs {
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     pub envs: Vec<String>,
 
+    /// Claude only: append the canonical `[<size>]` suffix to the model name
+    /// in every default slot env var (`ANTHROPIC_MODEL`,
+    /// `ANTHROPIC_DEFAULT_SONNET_MODEL`, etc.) so Claude Code opts into the
+    /// matching context window. Equivalent to passing
+    /// `--model your-model[<size>]` directly, but fans out to every slot.
+    /// Per-slot overrides (`--haiku-model`, `--sonnet-model`, …) are left
+    /// verbatim. Accepted values: `1m`, `2m`.
+    #[arg(long = "max-context", value_name = "SIZE")]
+    pub max_context: Option<String>,
+
+    /// Shorthand for `--max-context=1m`.
+    #[arg(long = "1m")]
+    pub one_m: bool,
+
+    /// Shorthand for `--max-context=2m`.
+    #[arg(long = "2m")]
+    pub two_m: bool,
+
     /// Additional arguments to pass through to the AI tool
     #[arg(
         value_name = "ARGS",

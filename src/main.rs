@@ -269,6 +269,12 @@ async fn main() {
                 run_args.refresh,
                 run_args.as_name,
                 run_args.envs,
+                // `--1m`/`--2m` shorthands collapsed into max_context up
+                // front so every downstream consumer sees a single signal.
+                run_args
+                    .max_context
+                    .or_else(|| run_args.one_m.then(|| "1m".to_string()))
+                    .or_else(|| run_args.two_m.then(|| "2m".to_string())),
                 &run_args.args,
             );
             // After extract_aivo_flags so `--debug` after the tool name
@@ -279,7 +285,7 @@ async fn main() {
             // read per call (worst case 7).
             let aliases = session_store.get_aliases().await.unwrap_or_default();
             let resolve = |m: Option<String>| resolve_alias_in_memory(&aliases, m);
-            let model = resolve(extracted.model);
+            let resolved_model = resolve(extracted.model);
             let slots = ClaudeSlotFlags {
                 reasoning: resolve(extracted.slots.reasoning),
                 subagent: resolve(extracted.slots.subagent),
@@ -287,6 +293,39 @@ async fn main() {
                 sonnet: resolve(extracted.slots.sonnet),
                 opus: resolve(extracted.slots.opus),
             };
+            // Normalize `-m foo[1m]`/`-m foo[2m]` (and any alias that expands
+            // to one) into the same internal state as `-m foo --1m`/`--2m`.
+            // Without this, mixing the two — `-m foo[1m] --1m` — would
+            // double-append the suffix and the env injector would emit
+            // `foo[1m][1m]`.
+            let (model, max_context) = lift_context_suffix(resolved_model, extracted.max_context);
+            // Validate --max-context before any picker UI runs (key picker,
+            // model picker). Otherwise the user picks a key + model and
+            // *then* gets told their flag is invalid.
+            if let Some(value) = max_context.as_deref() {
+                if !matches!(value, "1m" | "2m") {
+                    eprintln!(
+                        "{} --max-context only accepts '1m' or '2m' (got {:?}).",
+                        style::red("Error:"),
+                        value
+                    );
+                    process::exit(ExitCode::UserError.code());
+                }
+                let tool_is_claude = run_args
+                    .tool
+                    .as_deref()
+                    .and_then(AIToolType::parse)
+                    .is_some_and(|t| matches!(t, AIToolType::Claude));
+                if !tool_is_claude {
+                    let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
+                    eprintln!(
+                        "{} --max-context only applies to `aivo run claude`. {} doesn't have a context-bar issue.",
+                        style::red("Error:"),
+                        tool_name
+                    );
+                    process::exit(ExitCode::UserError.code());
+                }
+            }
             let key_flag = extracted.key_flag;
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;
@@ -401,6 +440,7 @@ async fn main() {
                         key_override,
                         context_selector,
                         as_name,
+                        max_context,
                     )
                     .await
             }
@@ -783,6 +823,31 @@ struct ExtractedFlags {
     /// `None` = flag absent. `Some("")` = bare flag (interactive picker).
     /// `Some("id")` = explicit session id prefix.
     context: Option<String>,
+    /// `None` = flag absent. `Some("1m")` = activate the 1M-context spoof.
+    max_context: Option<String>,
+}
+
+/// Strip a trailing `[1m]` or `[2m]` from the model name and lift it into
+/// `max_context`, so `-m foo[1m]`, `-m foo --1m`, and `-m foo --max-context=1m`
+/// all collapse into the same internal state (and likewise for 2m). Without
+/// this, mixing the suffix and the flag would produce a double `[Nm][Nm]`
+/// after fan-out. `max_context` is left alone if it was already set —
+/// validation downstream rejects mismatches.
+fn lift_context_suffix(
+    model: Option<String>,
+    max_context: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(m) = model else {
+        return (None, max_context);
+    };
+    for tag in ["1m", "2m"] {
+        let suffix_with_brackets = ["[", tag, "]"].concat();
+        if let Some(stripped) = m.strip_suffix(&suffix_with_brackets) {
+            let new_max_context = max_context.or_else(|| Some(tag.to_string()));
+            return (Some(stripped.to_string()), new_max_context);
+        }
+    }
+    (Some(m), max_context)
 }
 
 /// Extracts aivo-owned flags (`--model`/`-m`, `--key`/`-k`, `--debug`, `--dry-run`, `--refresh`/`-r`, `--env`/`-e`) from
@@ -800,6 +865,7 @@ fn extract_aivo_flags(
     initial_refresh: bool,
     initial_as_name: Option<String>,
     initial_envs: Vec<String>,
+    initial_max_context: Option<String>,
     passthrough_args: &[String],
 ) -> ExtractedFlags {
     // Clap may have consumed a following flag as the value of -m/-k (e.g. `-m --resume`
@@ -824,6 +890,7 @@ fn extract_aivo_flags(
     let mut refresh = initial_refresh;
     let mut as_name = initial_as_name;
     let mut context: Option<String> = None;
+    let mut max_context: Option<String> = initial_max_context;
     let mut env_strings = initial_envs;
     let ClaudeSlotFlags {
         reasoning: mut reasoning_model,
@@ -1003,6 +1070,27 @@ fn extract_aivo_flags(
             } else {
                 opus_model = Some(String::new());
             }
+        } else if let Some(value) = arg.strip_prefix("--max-context=") {
+            if !value.is_empty() && max_context.is_none() {
+                max_context = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--max-context" && max_context.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                max_context = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--1m" {
+            if max_context.is_none() {
+                max_context = Some("1m".to_string());
+            }
+        } else if arg == "--2m" {
+            if max_context.is_none() {
+                max_context = Some("2m".to_string());
+            }
         } else {
             remaining_args.push(arg.clone());
         }
@@ -1026,6 +1114,7 @@ fn extract_aivo_flags(
         env_strings,
         remaining_args,
         context,
+        max_context,
     }
 }
 
@@ -1048,6 +1137,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--model=gpt-4o", "file.ts"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -1065,6 +1155,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--model", "gpt-4o", "file.ts"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -1082,6 +1173,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["-m", "gpt-4o"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -1099,6 +1191,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--model"]),
         );
         assert_eq!(r.model, Some(String::new()));
@@ -1116,6 +1209,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &[],
         );
         assert_eq!(r.model, Some(String::new())); // picker triggered
@@ -1134,6 +1228,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--model", "other"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -1151,6 +1246,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--key=mykey"]),
         );
         assert_eq!(r.key_flag, Some("mykey".to_string()));
@@ -1167,6 +1263,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--key", "mykey"]),
         );
         assert_eq!(r.key_flag, Some("mykey".to_string()));
@@ -1183,6 +1280,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["-k", "mykey"]),
         );
         assert_eq!(r.key_flag, Some("mykey".to_string()));
@@ -1199,6 +1297,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &[],
         );
         assert_eq!(r.key_flag, Some(String::new()));
@@ -1216,6 +1315,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["-k"]),
         );
         assert_eq!(r.key_flag, Some(String::new()));
@@ -1232,6 +1332,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--debug", "file.ts"]),
         );
         assert_eq!(r.debug, Some(String::new()));
@@ -1249,6 +1350,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &[],
         );
         assert_eq!(r.debug, Some(String::new()));
@@ -1265,6 +1367,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--dry-run"]),
         );
         assert!(r.dry_run);
@@ -1281,6 +1384,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--env=FOO=bar"]),
         );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
@@ -1297,6 +1401,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["-e=FOO=bar"]),
         );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
@@ -1313,6 +1418,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--env", "FOO=bar"]),
         );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
@@ -1329,6 +1435,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["-e", "FOO=bar"]),
         );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
@@ -1345,9 +1452,135 @@ mod tests {
             false,
             None,
             vec!["PRE=1".to_string()],
+            None,
             &args(&["-e", "POST=2"]),
         );
         assert_eq!(r.env_strings, vec!["PRE=1", "POST=2"]);
+    }
+
+    #[test]
+    fn max_context_inline_form() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            None,
+            &args(&["--max-context=1m", "file.ts"]),
+        );
+        assert_eq!(r.max_context, Some("1m".to_string()));
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn max_context_space_form() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            None,
+            &args(&["--max-context", "1m"]),
+        );
+        assert_eq!(r.max_context, Some("1m".to_string()));
+        assert!(r.remaining_args.is_empty());
+    }
+
+    #[test]
+    fn max_context_initial_preserved() {
+        // clap parsed --max-context up front; passthrough stays as-is.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            Some("1m".to_string()),
+            &args(&["file.ts"]),
+        );
+        assert_eq!(r.max_context, Some("1m".to_string()));
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn lift_context_suffix_strips_and_sets_max_context() {
+        let (m, mc) = lift_context_suffix(Some("deepseek[1m]".to_string()), None);
+        assert_eq!(m, Some("deepseek".to_string()));
+        assert_eq!(mc, Some("1m".to_string()));
+
+        let (m, mc) = lift_context_suffix(Some("deepseek[2m]".to_string()), None);
+        assert_eq!(m, Some("deepseek".to_string()));
+        assert_eq!(mc, Some("2m".to_string()));
+    }
+
+    #[test]
+    fn lift_context_suffix_strips_when_max_context_already_set() {
+        // Both `-m X[1m]` and `--1m` together: strip the redundant suffix so
+        // the env injector doesn't double-append.
+        let (m, mc) = lift_context_suffix(Some("deepseek[1m]".to_string()), Some("1m".to_string()));
+        assert_eq!(m, Some("deepseek".to_string()));
+        assert_eq!(mc, Some("1m".to_string()));
+    }
+
+    #[test]
+    fn lift_context_suffix_passes_through_when_no_suffix() {
+        let (m, mc) = lift_context_suffix(Some("deepseek".to_string()), None);
+        assert_eq!(m, Some("deepseek".to_string()));
+        assert_eq!(mc, None);
+    }
+
+    #[test]
+    fn lift_context_suffix_handles_no_model() {
+        let (m, mc) = lift_context_suffix(None, Some("1m".to_string()));
+        assert_eq!(m, None);
+        assert_eq!(mc, Some("1m".to_string()));
+    }
+
+    #[test]
+    fn one_m_shorthand_resolves_to_max_context() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            None,
+            &args(&["--1m", "file.ts"]),
+        );
+        assert_eq!(r.max_context, Some("1m".to_string()));
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn two_m_shorthand_resolves_to_max_context() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            None,
+            vec![],
+            None,
+            &args(&["--2m", "file.ts"]),
+        );
+        assert_eq!(r.max_context, Some("2m".to_string()));
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
     }
 
     #[test]
@@ -1361,6 +1594,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--agent-name", "foo", "--resume"]),
         );
         assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "--resume"]));
@@ -1378,6 +1612,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&[
                 "--agent-name",
                 "foo",
@@ -1435,6 +1670,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["fix the login bug"]),
         );
         assert_eq!(r.remaining_args, args(&["fix the login bug"]));
@@ -1452,6 +1688,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["--model", "gpt-4o", "fix the login bug"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -1469,6 +1706,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             &args(&["fix", "the", "bug"]),
         );
         assert_eq!(r.remaining_args, args(&["fix", "the", "bug"]));

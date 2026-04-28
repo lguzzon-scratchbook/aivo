@@ -31,6 +31,7 @@ use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self, router_http_client};
 use crate::services::model_names::{
     infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_provider_attempt,
+    strip_context_suffix,
 };
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::{
@@ -587,7 +588,20 @@ async fn handle_anthropic_to_upstream(
     }
     let body_str = http_utils::extract_request_body(request)?;
 
-    let body: Value = serde_json::from_str(body_str)?;
+    let mut body: Value = serde_json::from_str(body_str)?;
+    // Drop the `[1m]`/`[2m]` UI-hint suffix Claude Code carries through from
+    // its env vars. The upstream (real Anthropic, OpenAI Chat, Gemini) doesn't
+    // know about it; native Anthropic is in Direct mode where the bridge
+    // isn't in the path, so seeing the suffix here means we're forwarding to
+    // something that won't recognize it.
+    if let Some(model) = body.get_mut("model")
+        && let Some(s) = model.as_str()
+    {
+        let stripped = strip_context_suffix(s);
+        if stripped.len() != s.len() {
+            *model = Value::String(stripped.to_string());
+        }
+    }
 
     let model_is_claude = body
         .get("model")
