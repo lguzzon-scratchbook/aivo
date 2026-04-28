@@ -171,6 +171,12 @@ pub(crate) async fn send_openai_chat(
         return Ok(RouterResponse::buffered(400, "application/json", body));
     }
 
+    // Inception Mercury doesn't reliably stream `tool_calls`; the model narrates
+    // tool intent in `delta.content` instead. Force a non-streamed upstream call
+    // when tools are present — `finalize_openai_response` will buffer the JSON
+    // and re-emit it as SSE so the inbound client still sees a stream.
+    disable_stream_for_inception_with_tools(body, &context.upstream_base_url);
+
     let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/chat/completions");
     let initiator = if context.is_copilot {
         Some(http_utils::copilot_initiator_from_openai(body))
@@ -271,6 +277,28 @@ fn migrate_max_tokens_for_reasoning_models(body: &mut Value) {
     }
     if let Some(value) = legacy {
         obj.insert("max_completion_tokens".to_string(), value);
+    }
+}
+
+pub(crate) fn disable_stream_for_inception_with_tools(body: &mut Value, upstream_base_url: &str) {
+    let url_matches = upstream_base_url.contains("inceptionlabs.ai");
+    let model_matches = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("mercury"));
+    if !url_matches && !model_matches {
+        return;
+    }
+    let has_tools = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if !has_tools {
+        return;
+    }
+    body["stream"] = json!(false);
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("stream_options");
     }
 }
 
@@ -736,5 +764,65 @@ mod tests {
         migrate_max_tokens_for_reasoning_models(&mut body);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn disable_stream_for_inception_flips_stream_when_tools_present() {
+        let mut body = json!({
+            "model": "mercury-2",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "tools": [{"type": "function", "function": {"name": "Bash"}}]
+        });
+        disable_stream_for_inception_with_tools(&mut body, "https://api.inceptionlabs.ai/v1/");
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn disable_stream_for_inception_no_op_for_other_providers() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "tools": [{"type": "function", "function": {"name": "Bash"}}]
+        });
+        disable_stream_for_inception_with_tools(&mut body, "https://api.openai.com/v1/");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn disable_stream_for_inception_no_op_when_no_tools_field() {
+        let mut body = json!({"model": "mercury-2", "stream": true});
+        disable_stream_for_inception_with_tools(&mut body, "https://api.inceptionlabs.ai/v1/");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn disable_stream_for_inception_no_op_when_tools_empty() {
+        let mut body = json!({"model": "mercury-2", "stream": true, "tools": []});
+        disable_stream_for_inception_with_tools(&mut body, "https://api.inceptionlabs.ai/v1/");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn disable_stream_for_inception_matches_by_model_name() {
+        let mut body = json!({
+            "model": "inception/mercury",
+            "stream": true,
+            "tools": [{"type": "function", "function": {"name": "Bash"}}]
+        });
+        disable_stream_for_inception_with_tools(&mut body, "https://openrouter.ai/api/v1/");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn disable_stream_for_inception_matches_mercury_edit() {
+        let mut body = json!({
+            "model": "Mercury-Coder-Small",
+            "stream": true,
+            "tools": [{"type": "function", "function": {"name": "Bash"}}]
+        });
+        disable_stream_for_inception_with_tools(&mut body, "https://example.com/v1/");
+        assert_eq!(body["stream"], false);
     }
 }

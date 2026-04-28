@@ -52,6 +52,7 @@ use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, decode_route, is_endpoint_missing, is_protocol_mismatch,
     is_terminal_upstream_error,
 };
+use crate::services::serve_upstream::disable_stream_for_inception_with_tools;
 
 #[derive(Clone)]
 pub struct AnthropicToOpenAIRouterConfig {
@@ -783,6 +784,7 @@ async fn handle_anthropic_to_upstream(
                     &config.target_base_url,
                     variant.apply("/v1/chat/completions"),
                 );
+                disable_stream_for_inception_with_tools(&mut req_body, &config.target_base_url);
                 let mut response = device_fingerprint::maybe_with_starter_headers(
                     client
                         .post(&url)
@@ -844,6 +846,12 @@ async fn handle_anthropic_to_upstream(
                             content_type: "text/event-stream".to_string(),
                             body: anthropic_sse.into_bytes(),
                         }
+                    } else if status_code == 200 && requested_stream {
+                        // Upstream returned JSON (Inception with tools forces
+                        // stream:false) but the inbound client asked for SSE —
+                        // re-frame as a one-shot stream.
+                        let openai_resp: Value = serde_json::from_str(&response_body)?;
+                        openai_chat_response_to_anthropic_router(&openai_resp, true)?
                     } else {
                         let anthropic_response =
                             convert_openai_to_anthropic(&response_body, status_code)?;
