@@ -218,13 +218,6 @@ impl ChatTuiApp {
                 self.open_model_picker(None, ModelSelectionTarget::CurrentChat, false);
                 true
             }
-            KeyCode::Char('t')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.loading_resume.is_none() =>
-            {
-                self.toggle_reasoning_visibility();
-                true
-            }
             _ => false,
         };
 
@@ -375,17 +368,5 @@ impl ChatTuiApp {
         }
 
         Ok(false)
-    }
-
-    pub(super) fn toggle_reasoning_visibility(&mut self) {
-        self.show_reasoning = !self.show_reasoning;
-        self.notice = Some((
-            MUTED,
-            if self.show_reasoning {
-                "Thinking blocks shown".to_string()
-            } else {
-                "Thinking blocks hidden".to_string()
-            },
-        ));
     }
 }

@@ -45,8 +45,7 @@ use super::chat_response_parser::{
     parse_openai_usage_chunk, parse_responses_chunk, parse_responses_usage_chunk, parse_sse_chunk,
 };
 
-// Re-export for submodules (chat_tui uses ThinkTagParser, chat_tui_format uses TokenUsage)
-pub(crate) use super::chat_response_parser::ThinkTagParser;
+// Re-export for submodules (chat_tui_format uses TokenUsage)
 pub(crate) use super::chat_response_parser::TokenUsage;
 pub(crate) use chat_tui_format::format_time_ago_short;
 
@@ -539,7 +538,6 @@ impl ChatCommand {
         print_key("Ctrl+R / F1", "Open resume picker / show help");
         print_key("Ctrl+P / Ctrl+N", "Previous / next input");
         print_key("Ctrl+M", "Change model");
-        print_key("Ctrl+T", "Show / hide thinking blocks");
         print_key("AIVO_REDUCE_MOTION=1", "Disable chat TUI motion effects");
         println!();
         println!("{}", style::bold("Examples:"));

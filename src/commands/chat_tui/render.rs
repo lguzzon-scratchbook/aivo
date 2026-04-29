@@ -118,15 +118,20 @@ pub(super) fn render_user_message(
     render_user_attachment_lines(lines, attachments);
 }
 
-pub(super) fn render_reasoning_block(
+pub(super) fn extend_without_leading_blank(
     lines: &mut Vec<StyledLine>,
-    reasoning: &str,
-    show_reasoning: bool,
+    mut rendered: Vec<StyledLine>,
 ) {
-    if !show_reasoning {
-        return;
+    while rendered
+        .first()
+        .is_some_and(|line| line.plain.trim().is_empty())
+    {
+        rendered.remove(0);
     }
+    lines.extend(rendered);
+}
 
+pub(super) fn render_reasoning_block(lines: &mut Vec<StyledLine>, reasoning: &str) {
     lines.push(line_with_plain(vec![Span::styled(
         "Thinking".to_string(),
         Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
@@ -167,28 +172,14 @@ pub(super) fn normalized_reasoning_lines(reasoning: &str) -> Vec<String> {
     lines
 }
 
-pub(super) fn extend_without_leading_blank(
-    lines: &mut Vec<StyledLine>,
-    mut rendered: Vec<StyledLine>,
-) {
-    while rendered
-        .first()
-        .is_some_and(|line| line.plain.trim().is_empty())
-    {
-        rendered.remove(0);
-    }
-    lines.extend(rendered);
-}
-
 pub(super) fn render_assistant_message(
     lines: &mut Vec<StyledLine>,
-    show_reasoning: bool,
     reasoning: Option<&str>,
     content: &str,
 ) {
     if let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) {
-        render_reasoning_block(lines, reasoning, show_reasoning);
-        if show_reasoning && !content.is_empty() {
+        render_reasoning_block(lines, reasoning);
+        if !content.is_empty() {
             push_styled_line(lines, "", Style::default());
         }
     }

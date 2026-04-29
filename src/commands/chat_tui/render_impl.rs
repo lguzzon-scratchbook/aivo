@@ -33,7 +33,6 @@ impl ChatTuiApp {
                 "user" => render_user_message(&mut lines, &message.content, &message.attachments),
                 "assistant" => render_assistant_message(
                     &mut lines,
-                    self.show_reasoning,
                     message.reasoning_content.as_deref(),
                     &message.content,
                 ),
@@ -42,8 +41,8 @@ impl ChatTuiApp {
             previous_role = Some(message.role.as_str());
         }
 
-        let has_visible_streaming = !self.pending_response.is_empty()
-            || (!self.pending_reasoning.is_empty() && self.show_reasoning);
+        let has_visible_streaming =
+            !self.pending_response.is_empty() || !self.pending_reasoning.is_empty();
         if self.sending && !has_visible_streaming {
             if should_add_message_spacing(previous_role, "assistant") {
                 push_message_spacing(&mut lines);
@@ -62,12 +61,7 @@ impl ChatTuiApp {
             }
             render_assistant_message(
                 &mut lines,
-                self.show_reasoning,
-                if self.pending_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(self.pending_reasoning.as_str())
-                },
+                (!self.pending_reasoning.is_empty()).then_some(self.pending_reasoning.as_str()),
                 &self.pending_response,
             );
         }
@@ -374,11 +368,6 @@ impl ChatTuiApp {
                 Span::styled("Resume loading…", Style::default().fg(FAINT))
             } else if self.sending {
                 Span::styled("", Style::default())
-            } else if self.has_reasoning_content() {
-                Span::styled(
-                    " Ask anything · / for commands · Ctrl+T toggle think",
-                    Style::default().fg(FAINT),
-                )
             } else {
                 Span::styled(" Ask anything · / for commands", Style::default().fg(FAINT))
             };
@@ -430,16 +419,6 @@ impl ChatTuiApp {
             format_token_count(self.context_tokens, self.last_usage),
             MUTED,
         )
-    }
-
-    pub(super) fn has_reasoning_content(&self) -> bool {
-        !self.pending_reasoning.trim().is_empty()
-            || self.history.iter().any(|message| {
-                message
-                    .reasoning_content
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty())
-            })
     }
 
     pub(super) fn composer_height(&self) -> u16 {

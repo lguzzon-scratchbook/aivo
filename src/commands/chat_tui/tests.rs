@@ -534,7 +534,6 @@ fn make_test_app(
         session_id: String::new(),
         overlay: Overlay::None,
         notice: None,
-        show_reasoning: true,
         pending_response: String::new(),
         pending_reasoning: String::new(),
         pending_submit: None,
@@ -635,7 +634,7 @@ fn test_markdown_renderer_formats_code_and_lists() {
 #[test]
 fn test_render_assistant_streaming_does_not_append_cursor_glyph() {
     let mut lines = Vec::new();
-    render_assistant_message(&mut lines, true, None, "- item");
+    render_assistant_message(&mut lines, None, "- item");
 
     let plain = lines
         .into_iter()
@@ -644,6 +643,24 @@ fn test_render_assistant_streaming_does_not_append_cursor_glyph() {
         .join("\n");
     assert!(!plain.contains('▋'));
     assert!(plain.contains("• item"));
+}
+
+#[test]
+fn test_build_transcript_shows_pending_status_without_visible_stream() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+
+    let transcript = app.build_transcript();
+    let plain = transcript
+        .text
+        .lines
+        .iter()
+        .map(|line| plain_text_from_spans(&line.spans))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("esc to interrupt"));
 }
 
 #[test]
@@ -668,28 +685,7 @@ fn test_build_transcript_shows_streaming_reasoning_before_content() {
 }
 
 #[test]
-fn test_build_transcript_hides_reasoning_when_hidden() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.sending = true;
-    app.show_reasoning = false;
-    app.pending_reasoning = "Inspecting the request".to_string();
-
-    let transcript = app.build_transcript();
-    let plain = transcript
-        .text
-        .lines
-        .iter()
-        .map(|line| plain_text_from_spans(&line.spans))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert!(!plain.contains("Inspecting the request"));
-    assert!(!plain.contains("Thinking hidden"));
-}
-
-#[test]
-fn test_hidden_reasoning_hint_moves_to_composer_placeholder() {
+fn test_composer_placeholder_stays_plain_when_history_has_reasoning() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
@@ -702,10 +698,7 @@ fn test_hidden_reasoning_hint_moves_to_composer_placeholder() {
     let line = app.render_composer_text().lines[0].clone();
     let plain = plain_text_from_spans(&line.spans);
 
-    assert_eq!(
-        plain,
-        ">  Ask anything · / for commands · Ctrl+T toggle think"
-    );
+    assert_eq!(plain, ">  Ask anything · / for commands");
 }
 
 #[test]

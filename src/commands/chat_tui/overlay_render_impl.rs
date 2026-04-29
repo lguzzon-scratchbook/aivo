@@ -331,7 +331,6 @@ impl ChatTuiApp {
             ("Ctrl+K", "kill to end of line"),
             ("Ctrl+L", "clear prompt"),
             ("Ctrl+C", "exit (press twice to confirm)"),
-            ("Ctrl+T", "toggle thinking blocks"),
             ("Tab", "complete command or path"),
             ("PgUp/PgDn", "scroll half page"),
             ("Ctrl+↑/↓", "scroll 3 lines"),

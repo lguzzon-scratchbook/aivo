@@ -40,7 +40,6 @@ impl ChatTuiApp {
         self.draft_history_stash = state.draft_history_stash;
         self.session_id = state.session_id;
         self.notice = state.notice;
-        self.show_reasoning = state.show_reasoning;
         self.pending_response = state.pending_response;
         self.pending_reasoning = state.pending_reasoning;
         self.pending_submit = state.pending_submit;

@@ -106,7 +106,6 @@ impl ChatTuiApp {
             session_id: params.initial_session,
             overlay: Overlay::None,
             notice: startup_notice,
-            show_reasoning: true,
             pending_response: String::new(),
             pending_reasoning: String::new(),
             pending_submit: None,
