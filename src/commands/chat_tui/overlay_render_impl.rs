@@ -334,8 +334,8 @@ impl ChatTuiApp {
             ("Tab", "complete command or path"),
             ("PgUp/PgDn", "scroll half page"),
             ("Ctrl+↑/↓", "scroll 3 lines"),
-            ("Mouse wheel", "scroll 3 lines"),
-            ("Shift+mouse", "select and copy text"),
+            ("Mouse wheel", "scroll transcript"),
+            ("Mouse drag", "select and copy text"),
             ("Ctrl+Home/End", "jump to top/bottom"),
             ("Esc", "cancel / close overlay"),
         ];

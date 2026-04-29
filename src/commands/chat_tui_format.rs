@@ -102,6 +102,7 @@ fn footer_cwd_label(cwd: &str) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
 pub(super) fn wrapped_text_line_count(text: impl Into<Text<'static>>, width: u16) -> usize {
     if width == 0 {
         return 0;

@@ -545,6 +545,11 @@ fn make_test_app(
         transcript_scroll: 0,
         transcript_width: 0,
         transcript_view_height: 0,
+        transcript_hitbox: None,
+        transcript_selection: None,
+        transcript_drag_active: false,
+        scroll_speed: DEFAULT_CHAT_SCROLL_SPEED,
+        copy_toast: None,
         tx,
         rx,
         response_task: None,
@@ -919,12 +924,375 @@ fn test_picker_visible_items_respect_single_line_session_rows() {
 }
 
 #[test]
+fn test_session_picker_header_targets_newest_session() {
+    let newest = SessionPreview {
+        key_id: "key-1".to_string(),
+        key_name: "prod".to_string(),
+        base_url: "https://api.example.com".to_string(),
+        session_id: "newest".to_string(),
+        raw_model: "claude".to_string(),
+        updated_at: Utc::now().to_rfc3339(),
+        title: "Newest".to_string(),
+        preview_text: "Newest chat".to_string(),
+    };
+    let older = SessionPreview {
+        key_id: "key-1".to_string(),
+        key_name: "prod".to_string(),
+        base_url: "https://api.example.com".to_string(),
+        session_id: "older".to_string(),
+        raw_model: "claude".to_string(),
+        updated_at: (Utc::now() - ChronoDuration::days(2)).to_rfc3339(),
+        title: "Older".to_string(),
+        preview_text: "Older chat".to_string(),
+    };
+    let picker = PickerState::ready(
+        "Sessions",
+        String::new(),
+        vec![
+            PickerEntry {
+                label: newest.title.clone(),
+                search_text: newest.search_text(),
+                value: PickerValue::Session(newest),
+            },
+            PickerEntry {
+                label: older.title.clone(),
+                search_text: older.search_text(),
+                value: PickerValue::Session(older),
+            },
+        ],
+        PickerKind::Session,
+    );
+
+    let (lines, row_map) = render_session_picker_rows(&picker, 8, 48);
+    let first = plain_text_from_spans(&lines[0].spans);
+
+    assert_eq!(row_map.first().copied(), Some(Some(0)));
+    assert!(!first.contains("Newest chat"));
+    assert_eq!(row_map.get(1).copied(), Some(Some(0)));
+}
+
+#[test]
+fn test_grouped_session_picker_short_view_shows_selected_session_row() {
+    let newest = SessionPreview {
+        key_id: "key-1".to_string(),
+        key_name: "prod".to_string(),
+        base_url: "https://api.example.com".to_string(),
+        session_id: "newest".to_string(),
+        raw_model: "claude".to_string(),
+        updated_at: Utc::now().to_rfc3339(),
+        title: "Newest".to_string(),
+        preview_text: "Newest chat".to_string(),
+    };
+    let older = SessionPreview {
+        key_id: "key-1".to_string(),
+        key_name: "prod".to_string(),
+        base_url: "https://api.example.com".to_string(),
+        session_id: "older".to_string(),
+        raw_model: "claude".to_string(),
+        updated_at: (Utc::now() - ChronoDuration::days(2)).to_rfc3339(),
+        title: "Older".to_string(),
+        preview_text: "Older chat".to_string(),
+    };
+    let picker = PickerState::ready(
+        "Sessions",
+        String::new(),
+        vec![
+            PickerEntry {
+                label: newest.title.clone(),
+                search_text: newest.search_text(),
+                value: PickerValue::Session(newest),
+            },
+            PickerEntry {
+                label: older.title.clone(),
+                search_text: older.search_text(),
+                value: PickerValue::Session(older),
+            },
+        ],
+        PickerKind::Session,
+    );
+
+    let (lines, row_map) = render_session_picker_rows(&picker, 1, 48);
+    let only = plain_text_from_spans(&lines[0].spans);
+
+    assert!(only.contains("Newest chat"));
+    assert_eq!(row_map, vec![Some(0)]);
+}
+
+#[test]
 fn test_rect_contains() {
     let area = Rect::new(10, 4, 8, 3);
     assert!(rect_contains(area, (10, 4)));
     assert!(rect_contains(area, (17, 6)));
     assert!(!rect_contains(area, (18, 6)));
     assert!(!rect_contains(area, (17, 7)));
+}
+
+#[test]
+fn test_render_main_keeps_composer_near_short_empty_transcript() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let backend = TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut composer_area = Rect::default();
+
+    terminal
+        .draw(|frame| {
+            composer_area = app.render_main(frame, frame.area());
+        })
+        .unwrap();
+
+    assert!(composer_area.y + composer_area.height < 11);
+    assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.y, 0);
+    assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.width, 80);
+    assert_eq!(app.transcript_width, 80);
+}
+
+#[test]
+fn test_render_main_uses_full_height_for_long_transcript() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: (0..40)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let backend = TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut composer_area = Rect::default();
+
+    terminal
+        .draw(|frame| {
+            composer_area = app.render_main(frame, frame.area());
+        })
+        .unwrap();
+
+    assert_eq!(composer_area.y + composer_area.height, 11);
+    assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.y, 0);
+    assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.width, 80);
+    assert_eq!(app.transcript_width, 79);
+}
+
+#[tokio::test]
+async fn test_mouse_wheel_scrolls_only_inside_transcript_hitbox() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: (0..40)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.transcript_width = 80;
+    app.transcript_view_height = 6;
+    app.transcript_hitbox = Some(TranscriptHitbox {
+        area: Rect::new(0, 0, 80, 6),
+        first_row: 0,
+        rows: wrap_plain_lines(&app.build_transcript().plain_lines, 80),
+    });
+    app.follow_output = false;
+    app.scroll_speed = 4;
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 10,
+        row: 8,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.transcript_scroll, 0);
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 10,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.transcript_scroll, 4);
+}
+
+#[test]
+fn test_chat_scroll_speed_clamps_to_safe_range() {
+    assert_eq!(DEFAULT_CHAT_SCROLL_SPEED.clamp(1, MAX_CHAT_SCROLL_SPEED), 3);
+    assert_eq!(0usize.clamp(1, MAX_CHAT_SCROLL_SPEED), 1);
+    assert_eq!(
+        999usize.clamp(1, MAX_CHAT_SCROLL_SPEED),
+        MAX_CHAT_SCROLL_SPEED
+    );
+}
+
+#[test]
+fn test_selected_text_normalizes_drag_direction_and_preserves_lines() {
+    let rows = vec![
+        "alpha beta".to_string(),
+        "second line".to_string(),
+        "third".to_string(),
+    ];
+    let selection = TranscriptSelection {
+        anchor: TranscriptPoint { row: 2, column: 2 },
+        focus: TranscriptPoint { row: 0, column: 6 },
+    };
+
+    assert_eq!(
+        selected_text_from_rows(&rows, selection).unwrap(),
+        "beta\nsecond line\nth"
+    );
+}
+
+#[test]
+fn test_zero_length_selection_is_not_rendered_as_selection() {
+    let selection = TranscriptSelection {
+        anchor: TranscriptPoint { row: 1, column: 4 },
+        focus: TranscriptPoint { row: 1, column: 4 },
+    };
+
+    assert!(selection.is_empty());
+    assert!(selected_text_from_rows(&["alpha".to_string()], selection).is_none());
+}
+
+#[test]
+fn test_selection_highlight_preserves_rendered_text_and_foreground() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn rendered_cells(app: &mut ChatTuiApp) -> Vec<(String, Color)> {
+        let backend = TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_main(frame, frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut cells = Vec::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                let cell = buffer.cell((x, y)).unwrap();
+                cells.push((cell.symbol().to_string(), cell.fg));
+            }
+        }
+        cells
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut normal = make_test_app(tx, rx);
+    normal.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "A **styled** answer with enough words to wrap across multiple visual lines."
+            .to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut selected = make_test_app(tx, rx);
+    selected.history = normal.history.clone();
+    selected.transcript_selection = Some(TranscriptSelection {
+        anchor: TranscriptPoint { row: 3, column: 2 },
+        focus: TranscriptPoint { row: 4, column: 10 },
+    });
+
+    assert_eq!(rendered_cells(&mut normal), rendered_cells(&mut selected));
+}
+
+#[test]
+fn test_copy_toast_expires_without_touching_transcript_notice() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.notice = None;
+    app.copy_toast = Some(CopyToast {
+        text: "Copied selection".to_string(),
+        created_at: Instant::now() - COPY_TOAST_DURATION,
+        expires_at: Instant::now() - Duration::from_millis(1),
+    });
+    let backend = TestBackend::new(40, 8);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| app.render_copy_toast(frame, frame.area()))
+        .unwrap();
+
+    assert!(app.copy_toast.is_none());
+    assert!(app.notice.is_none());
+}
+
+#[tokio::test]
+async fn test_mouse_drag_coordinates_map_to_transcript_rows() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.transcript_hitbox = Some(TranscriptHitbox {
+        area: Rect::new(4, 2, 20, 4),
+        first_row: 10,
+        rows: vec!["a".to_string(); 20],
+    });
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 7,
+        row: 3,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 12,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        app.transcript_selection,
+        Some(TranscriptSelection {
+            anchor: TranscriptPoint { row: 11, column: 3 },
+            focus: TranscriptPoint { row: 13, column: 8 },
+        })
+    );
+}
+
+#[test]
+fn test_clipboard_command_candidates_are_platform_specific() {
+    assert_eq!(
+        clipboard_command_candidates(ClipboardOs::Macos)
+            .into_iter()
+            .map(|command| command.program)
+            .collect::<Vec<_>>(),
+        vec!["pbcopy"]
+    );
+    assert_eq!(
+        clipboard_command_candidates(ClipboardOs::Linux)
+            .into_iter()
+            .map(|command| command.program)
+            .collect::<Vec<_>>(),
+        vec!["wl-copy", "xclip", "xsel"]
+    );
+    assert_eq!(
+        clipboard_command_candidates(ClipboardOs::Windows)[0].program,
+        "powershell.exe"
+    );
+    assert!(clipboard_command_candidates(ClipboardOs::Other).is_empty());
 }
 
 #[test]
@@ -1307,6 +1675,53 @@ async fn test_begin_resume_load_clears_transcript_before_result() {
             .map(|loading| loading.preview.title.clone()),
         Some(preview.title)
     );
+}
+
+#[tokio::test]
+async fn test_open_resume_picker_saves_current_unsaved_session() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key;
+    app.cwd = "/tmp/demo".to_string();
+    app.session_id = "fresh-session".to_string();
+    app.raw_model = "claude".to_string();
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "hello from a new chat".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    app.open_resume_picker(None).await.unwrap();
+
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected session picker");
+    };
+    assert!(
+        picker.items.iter().any(|item| {
+            matches!(
+                &item.value,
+                PickerValue::Session(session) if session.session_id == "fresh-session"
+            )
+        }),
+        "current unsaved session should be listed"
+    );
+
+    let saved = store
+        .get_chat_session("fresh-session")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.session_id, "fresh-session");
 }
 
 #[tokio::test]

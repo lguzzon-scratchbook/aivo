@@ -23,6 +23,12 @@ impl ChatTuiApp {
             self.notice = None;
         }
 
+        if matches!(key.code, KeyCode::Esc) && self.transcript_selection.is_some() {
+            self.transcript_selection = None;
+            self.transcript_drag_active = false;
+            return Ok(false);
+        }
+
         if let Some(should_exit) = self.handle_overlay_key(key).await? {
             return Ok(should_exit);
         }

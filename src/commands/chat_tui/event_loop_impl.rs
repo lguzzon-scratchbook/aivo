@@ -215,7 +215,7 @@ impl ChatTuiApp {
     }
 
     pub(super) async fn run(&mut self) -> Result<()> {
-        let mut terminal = setup_terminal()?;
+        let mut terminal = setup_terminal(chat_mouse_enabled())?;
         let run_result = loop {
             self.frame_tick = self.frame_tick.wrapping_add(1);
 
@@ -287,12 +287,104 @@ impl ChatTuiApp {
         }
 
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_up_lines(3),
-            MouseEventKind::ScrollDown => self.scroll_down_lines(3),
+            MouseEventKind::ScrollUp if self.mouse_over_transcript(mouse) => {
+                self.scroll_up_lines(self.scroll_speed)
+            }
+            MouseEventKind::ScrollDown if self.mouse_over_transcript(mouse) => {
+                self.scroll_down_lines(self.scroll_speed)
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(point) = self.transcript_point_for_mouse(mouse, false) {
+                    self.transcript_selection = Some(TranscriptSelection {
+                        anchor: point,
+                        focus: point,
+                    });
+                    self.transcript_drag_active = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.transcript_drag_active => {
+                if let Some(point) = self.transcript_point_for_mouse(mouse, true)
+                    && let Some(selection) = &mut self.transcript_selection
+                {
+                    selection.focus = point;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.transcript_drag_active => {
+                self.transcript_drag_active = false;
+                if let Some(point) = self.transcript_point_for_mouse(mouse, true)
+                    && let Some(selection) = &mut self.transcript_selection
+                {
+                    selection.focus = point;
+                }
+                match self
+                    .selected_transcript_text()
+                    .filter(|text| !text.is_empty())
+                {
+                    Some(selected) => match write_system_clipboard(&selected) {
+                        Ok(()) => {
+                            self.show_copy_toast("Copied selection");
+                        }
+                        Err(err) => {
+                            self.notice = Some((ERROR, format!("Copy failed: {err}")));
+                        }
+                    },
+                    None => {
+                        self.transcript_selection = None;
+                    }
+                }
+            }
             _ => {}
         }
 
         Ok(false)
+    }
+
+    fn show_copy_toast(&mut self, text: impl Into<String>) {
+        let created_at = Instant::now();
+        self.copy_toast = Some(CopyToast {
+            text: text.into(),
+            created_at,
+            expires_at: created_at + COPY_TOAST_DURATION,
+        });
+    }
+
+    fn mouse_over_transcript(&self, mouse: MouseEvent) -> bool {
+        self.transcript_hitbox
+            .as_ref()
+            .is_some_and(|hitbox| rect_contains(hitbox.area, (mouse.column, mouse.row)))
+    }
+
+    fn transcript_point_for_mouse(
+        &self,
+        mouse: MouseEvent,
+        clamp_to_hitbox: bool,
+    ) -> Option<TranscriptPoint> {
+        let hitbox = self.transcript_hitbox.as_ref()?;
+        let point = (mouse.column, mouse.row);
+        if !clamp_to_hitbox && !rect_contains(hitbox.area, point) {
+            return None;
+        }
+
+        let max_x = hitbox
+            .area
+            .x
+            .saturating_add(hitbox.area.width.saturating_sub(1));
+        let max_y = hitbox
+            .area
+            .y
+            .saturating_add(hitbox.area.height.saturating_sub(1));
+        let column = mouse
+            .column
+            .clamp(hitbox.area.x, max_x)
+            .saturating_sub(hitbox.area.x);
+        let visible_row = mouse
+            .row
+            .clamp(hitbox.area.y, max_y)
+            .saturating_sub(hitbox.area.y);
+        Some(TranscriptPoint {
+            row: hitbox.first_row + usize::from(visible_row),
+            column,
+        })
     }
 
     async fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {

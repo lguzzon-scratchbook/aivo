@@ -36,7 +36,7 @@ use super::chat_tui_format::{
     build_footer_text, display_width, estimate_context_tokens, footer_host_label,
     format_picker_match_count, format_request_elapsed, format_session_group_label,
     format_session_match_count, format_session_time, format_time_ago_short, format_token_count,
-    truncate_for_display_width, truncate_for_width, wrapped_text_line_count,
+    truncate_for_display_width, truncate_for_width,
 };
 use super::*;
 
@@ -117,6 +117,11 @@ impl ChatTuiApp {
             transcript_scroll: 0,
             transcript_width: 0,
             transcript_view_height: 0,
+            transcript_hitbox: None,
+            transcript_selection: None,
+            transcript_drag_active: false,
+            scroll_speed: chat_scroll_speed(),
+            copy_toast: None,
             tx,
             rx,
             response_task: None,
@@ -151,16 +156,14 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
     result
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn setup_terminal(mouse_enabled: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let result: Result<_> = (|| {
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture
-        )?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        if mouse_enabled {
+            execute!(stdout, EnableMouseCapture)?;
+        }
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -184,6 +187,21 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn chat_scroll_speed() -> usize {
+    env::var("AIVO_CHAT_SCROLL_SPEED")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CHAT_SCROLL_SPEED)
+        .clamp(1, MAX_CHAT_SCROLL_SPEED)
+}
+
+fn chat_mouse_enabled() -> bool {
+    env::var("AIVO_CHAT_DISABLE_MOUSE")
+        .ok()
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

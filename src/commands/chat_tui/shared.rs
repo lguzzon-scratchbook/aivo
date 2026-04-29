@@ -13,10 +13,14 @@ pub(super) const WARNING: Color = Color::Rgb(230, 184, 107);
 pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 1;
 pub(super) const TRANSCRIPT_BOTTOM_PADDING: u16 = 1;
 pub(super) const COMPOSER_PREFIX_WIDTH: u16 = 2;
+pub(super) const DEFAULT_CHAT_SCROLL_SPEED: usize = 3;
+pub(super) const MAX_CHAT_SCROLL_SPEED: usize = 50;
+pub(super) const COPY_TOAST_DURATION: Duration = Duration::from_secs(3);
+pub(super) const COPY_TOAST_FADE_AFTER: Duration = Duration::from_secs(2);
 
 pub(super) const COMMAND_MENU_MAX_ROWS: usize = 7;
 pub(super) const PICKER_ROW_PREFIX_WIDTH: usize = 2;
-pub(super) const SELECT_WARM: Color = Color::Rgb(255, 228, 194);
+pub(super) const SELECT_WARM: Color = Color::Rgb(54, 74, 84);
 
 #[derive(Clone, Copy)]
 pub(super) struct SlashCommandSpec {
@@ -559,6 +563,38 @@ pub(super) enum ClipboardPayload {
     Empty,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TranscriptPoint {
+    pub(super) row: usize,
+    pub(super) column: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TranscriptSelection {
+    pub(super) anchor: TranscriptPoint,
+    pub(super) focus: TranscriptPoint,
+}
+
+impl TranscriptSelection {
+    pub(super) fn is_empty(self) -> bool {
+        self.anchor == self.focus
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TranscriptHitbox {
+    pub(super) area: Rect,
+    pub(super) first_row: usize,
+    pub(super) rows: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CopyToast {
+    pub(super) text: String,
+    pub(super) created_at: Instant,
+    pub(super) expires_at: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SlashCommand {
     New,
@@ -616,6 +652,11 @@ pub(super) struct ChatTuiApp {
     pub(super) transcript_scroll: usize,
     pub(super) transcript_width: u16,
     pub(super) transcript_view_height: u16,
+    pub(super) transcript_hitbox: Option<TranscriptHitbox>,
+    pub(super) transcript_selection: Option<TranscriptSelection>,
+    pub(super) transcript_drag_active: bool,
+    pub(super) scroll_speed: usize,
+    pub(super) copy_toast: Option<CopyToast>,
     pub(super) tx: UnboundedSender<RuntimeEvent>,
     pub(super) rx: UnboundedReceiver<RuntimeEvent>,
     pub(super) response_task: Option<JoinHandle<()>>,

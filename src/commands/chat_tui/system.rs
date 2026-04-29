@@ -1,7 +1,8 @@
 use super::*;
 
-#[cfg(target_os = "macos")]
 use std::process::Command;
+use std::process::Stdio;
+use std::{fmt, io::Write};
 
 pub(super) fn read_system_clipboard() -> Result<ClipboardPayload> {
     #[cfg(target_os = "macos")]
@@ -118,6 +119,122 @@ pub(super) fn reduce_motion_requested() -> bool {
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClipboardOs {
+    Macos,
+    Linux,
+    Windows,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ClipboardCommand {
+    pub(super) program: &'static str,
+    pub(super) args: &'static [&'static str],
+}
+
+impl fmt::Display for ClipboardCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.args.is_empty() {
+            write!(f, "{}", self.program)
+        } else {
+            write!(f, "{} {}", self.program, self.args.join(" "))
+        }
+    }
+}
+
+pub(super) fn current_clipboard_os() -> ClipboardOs {
+    if cfg!(target_os = "macos") {
+        ClipboardOs::Macos
+    } else if cfg!(target_os = "linux") {
+        ClipboardOs::Linux
+    } else if cfg!(target_os = "windows") {
+        ClipboardOs::Windows
+    } else {
+        ClipboardOs::Other
+    }
+}
+
+pub(super) fn clipboard_command_candidates(os: ClipboardOs) -> Vec<ClipboardCommand> {
+    match os {
+        ClipboardOs::Macos => vec![ClipboardCommand {
+            program: "pbcopy",
+            args: &[],
+        }],
+        ClipboardOs::Linux => vec![
+            ClipboardCommand {
+                program: "wl-copy",
+                args: &[],
+            },
+            ClipboardCommand {
+                program: "xclip",
+                args: &["-selection", "clipboard"],
+            },
+            ClipboardCommand {
+                program: "xsel",
+                args: &["--clipboard", "--input"],
+            },
+        ],
+        ClipboardOs::Windows => vec![ClipboardCommand {
+            program: "powershell.exe",
+            args: &["-NoProfile", "-Command", "Set-Clipboard"],
+        }],
+        ClipboardOs::Other => Vec::new(),
+    }
+}
+
+pub(super) fn write_system_clipboard(text: &str) -> Result<()> {
+    let mut errors = Vec::new();
+    for candidate in clipboard_command_candidates(current_clipboard_os()) {
+        match write_clipboard_command(&candidate, text) {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(format!("{candidate}: {err}")),
+        }
+    }
+
+    write_osc52_clipboard(text).map_err(|osc_err| {
+        let detail = if errors.is_empty() {
+            osc_err.to_string()
+        } else {
+            format!("{}; OSC52: {osc_err}", errors.join("; "))
+        };
+        anyhow::anyhow!(detail)
+    })
+}
+
+fn write_clipboard_command(candidate: &ClipboardCommand, text: &str) -> Result<()> {
+    let mut child = Command::new(candidate.program)
+        .args(candidate.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    if let Some(stdin) = &mut child.stdin {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        anyhow::bail!("exited with {}", output.status);
+    }
+    anyhow::bail!("{stderr}");
+}
+
+fn write_osc52_clipboard(text: &str) -> Result<()> {
+    let encoded =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes());
+    let mut stderr = std::io::stderr();
+    write!(stderr, "\x1b]52;c;{encoded}\x07")?;
+    stderr.flush()?;
+    Ok(())
 }
 
 pub(super) fn is_help_shortcut(key: KeyEvent) -> bool {

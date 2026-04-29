@@ -179,10 +179,6 @@ pub(super) fn plain_text_from_spans(spans: &[Span<'static>]) -> String {
     plain
 }
 
-pub(super) fn plain_lines_to_text(lines: Vec<String>) -> Text<'static> {
-    Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>())
-}
-
 pub(super) fn resume_metadata_values(
     preview: &SessionPreview,
     width: u16,

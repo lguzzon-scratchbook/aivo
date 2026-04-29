@@ -1,11 +1,6 @@
 use super::*;
 
 impl ChatTuiApp {
-    pub(super) fn estimated_transcript_height(&self, width: u16) -> usize {
-        let transcript = self.build_transcript();
-        wrapped_text_line_count(transcript.text, width.max(1))
-    }
-
     pub(super) fn is_transcript_empty(&self) -> bool {
         self.history.is_empty()
             && self.pending_response.is_empty()
@@ -83,25 +78,10 @@ impl ChatTuiApp {
         ]
     }
 
-    pub(super) fn empty_state_plain_lines(&self, width: u16) -> Vec<String> {
-        if let Some(loading) = &self.loading_resume {
-            vec![
-                "Loading saved chat…".to_string(),
-                loading.preview.title.clone(),
-                plain_text_from_spans(&resume_metadata_spans(
-                    &loading.preview,
-                    width.saturating_sub(2).max(1),
-                )),
-                self.cwd.clone(),
-            ]
-        } else {
-            self.transcript_intro_lines()
-        }
-    }
-
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
         let outer = frame.area();
         self.picker_hitbox = None;
+        self.transcript_hitbox = None;
         let composer_area = self.render_main(frame, outer);
         if let Some(menu) = self.visible_command_menu() {
             let (area, placement) = command_menu_area(
@@ -124,6 +104,8 @@ impl ChatTuiApp {
             }
             Overlay::None => {}
         }
+
+        self.render_copy_toast(frame, outer);
     }
 
     pub(super) fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {
@@ -135,17 +117,14 @@ impl ChatTuiApp {
             .max(1);
         let is_empty = self.is_transcript_empty();
         let transcript = self.build_transcript();
-        let transcript_total_lines =
-            wrapped_text_line_count(transcript.text.clone(), area.width.max(1));
-        let transcript_height = {
-            let min_height = self
-                .empty_state_height(area.width.max(1))
-                .clamp(1, max_transcript_height);
-            if is_empty {
-                min_height
-            } else {
-                (transcript_total_lines as u16).clamp(min_height, max_transcript_height)
-            }
+        let visual_rows = wrap_plain_lines(&transcript.plain_lines, area.width.max(1));
+        let min_transcript_height = self
+            .empty_state_height(area.width.max(1))
+            .clamp(1, max_transcript_height);
+        let transcript_height = if is_empty {
+            min_transcript_height
+        } else {
+            (visual_rows.len() as u16).clamp(min_transcript_height, max_transcript_height)
         };
         let stack_height = transcript_height
             .saturating_add(composer_height)
@@ -166,6 +145,7 @@ impl ChatTuiApp {
             .split(stack[0]);
 
         let transcript_area = chunks[0];
+        let transcript_total_lines = visual_rows.len();
         let transcript_line_height = transcript_total_lines as u16;
         let transcript_padding =
             if transcript_area.height > 2 && transcript_line_height > transcript_area.height {
@@ -173,7 +153,7 @@ impl ChatTuiApp {
             } else {
                 0
             };
-        let transcript_content_area = Rect {
+        let transcript_view_area = Rect {
             x: transcript_area.x,
             y: transcript_area.y,
             width: transcript_area.width,
@@ -182,7 +162,27 @@ impl ChatTuiApp {
                 .saturating_sub(transcript_padding)
                 .max(1),
         };
-        let view_height = transcript_content_area.height.max(1);
+        let view_height = transcript_view_area.height.max(1);
+        let needs_scrollbar = transcript_total_lines > usize::from(view_height);
+        let transcript_content_area = Rect {
+            x: transcript_view_area.x,
+            y: transcript_view_area.y,
+            width: if needs_scrollbar {
+                transcript_view_area.width.saturating_sub(1).max(1)
+            } else {
+                transcript_view_area.width
+            },
+            height: transcript_view_area.height,
+        };
+        let visual_rows = if needs_scrollbar {
+            wrap_plain_lines(
+                &transcript.plain_lines,
+                transcript_content_area.width.max(1),
+            )
+        } else {
+            visual_rows
+        };
+        let transcript_total_lines = visual_rows.len();
         let width = transcript_content_area.width.max(1);
         self.transcript_width = width;
         self.transcript_view_height = view_height;
@@ -192,6 +192,11 @@ impl ChatTuiApp {
         } else {
             self.transcript_scroll = self.transcript_scroll.min(max_scroll);
         }
+        self.transcript_hitbox = Some(TranscriptHitbox {
+            area: transcript_view_area,
+            first_row: self.transcript_scroll,
+            rows: visual_rows.clone(),
+        });
 
         frame.render_widget(Clear, chunks[0]);
 
@@ -203,6 +208,7 @@ impl ChatTuiApp {
                 .scroll(((self.transcript_scroll.min(u16::MAX as usize)) as u16, 0))
                 .wrap(Wrap { trim: false });
             frame.render_widget(transcript_widget, transcript_content_area);
+            self.render_transcript_selection_highlight(frame, transcript_content_area);
             let total_lines = transcript_total_lines;
             if total_lines > usize::from(view_height) {
                 let mut scrollbar_state =
@@ -213,11 +219,7 @@ impl ChatTuiApp {
                     .track_style(Style::default().fg(Color::Rgb(50, 54, 56)))
                     .begin_symbol(None)
                     .end_symbol(None);
-                frame.render_stateful_widget(
-                    scrollbar,
-                    transcript_content_area,
-                    &mut scrollbar_state,
-                );
+                frame.render_stateful_widget(scrollbar, transcript_view_area, &mut scrollbar_state);
             }
         }
 
@@ -226,9 +228,9 @@ impl ChatTuiApp {
                 Clear,
                 Rect {
                     x: transcript_area.x,
-                    y: transcript_content_area
+                    y: transcript_view_area
                         .y
-                        .saturating_add(transcript_content_area.height),
+                        .saturating_add(transcript_view_area.height),
                     width: transcript_area.width,
                     height: transcript_padding,
                 },
@@ -274,18 +276,115 @@ impl ChatTuiApp {
 
     pub(super) fn empty_state_height(&self, width: u16) -> u16 {
         let content_width = width.saturating_sub(1).max(1);
-        let intro_height = wrapped_text_line_count(
-            plain_lines_to_text(self.empty_state_plain_lines(width)),
-            content_width,
-        ) as u16;
+        let mut height = if let Some(loading) = &self.loading_resume {
+            let mut rows = vec![
+                "Loading saved chat…".to_string(),
+                loading.preview.title.clone(),
+                plain_text_from_spans(&resume_metadata_spans(
+                    &loading.preview,
+                    content_width.saturating_sub(1).max(1),
+                )),
+                self.cwd.clone(),
+            ];
+            rows.extend(self.notice_plain_lines(content_width));
+            wrap_plain_lines(&rows, content_width).len() as u16
+        } else {
+            let mut rows = self.transcript_intro_lines();
+            rows.extend(self.notice_plain_lines(content_width));
+            wrap_plain_lines(&rows, content_width).len() as u16
+        };
+        height = height.saturating_add(EMPTY_STATE_BOTTOM_GAP);
+        height.max(1)
+    }
 
-        let notice_height = notice_display(self.notice.as_ref())
-            .map(|(_, text)| wrapped_text_line_count(text.into_owned(), content_width) as u16 + 1)
-            .unwrap_or(0);
+    fn notice_plain_lines(&self, width: u16) -> Vec<String> {
+        notice_display(self.notice.as_ref())
+            .map(|(_, text)| {
+                let mut lines = vec![String::new()];
+                lines.extend(wrap_plain_lines(&[text.into_owned()], width));
+                lines
+            })
+            .unwrap_or_default()
+    }
 
-        intro_height
-            .saturating_add(EMPTY_STATE_BOTTOM_GAP)
-            .saturating_add(notice_height)
+    fn render_transcript_selection_highlight(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(selection) = self
+            .transcript_selection
+            .filter(|selection| !selection.is_empty())
+        else {
+            return;
+        };
+        let Some(hitbox) = &self.transcript_hitbox else {
+            return;
+        };
+
+        let (start, end) = normalized_selection(selection);
+        let visible_start = hitbox.first_row;
+        let visible_end = visible_start.saturating_add(usize::from(area.height));
+        let row_start = start.row.max(visible_start);
+        let row_end = end.row.min(visible_end.saturating_sub(1));
+        if row_start > row_end {
+            return;
+        }
+
+        let buffer = frame.buffer_mut();
+        for row in row_start..=row_end {
+            let local_y = row.saturating_sub(visible_start) as u16;
+            let start_col = if row == start.row { start.column } else { 0 };
+            let end_col = if row == end.row {
+                end.column
+            } else {
+                area.width
+            };
+            let start_col = start_col.min(area.width);
+            let end_col = end_col.min(area.width);
+            if start_col >= end_col {
+                continue;
+            }
+
+            for column in start_col..end_col {
+                if let Some(cell) = buffer.cell_mut((area.x + column, area.y + local_y)) {
+                    cell.set_bg(SELECT_WARM);
+                }
+            }
+        }
+    }
+
+    pub(super) fn render_copy_toast(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(toast) = self.copy_toast.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= toast.expires_at {
+            self.copy_toast = None;
+            return;
+        }
+
+        let text_width = display_width(&toast.text).min(usize::from(area.width));
+        let toast_width = (text_width as u16).saturating_add(4).min(area.width.max(1));
+        let toast_area = Rect {
+            x: area
+                .x
+                .saturating_add(area.width.saturating_sub(toast_width)),
+            y: area.y,
+            width: toast_width,
+            height: 1,
+        };
+        let color = if now.duration_since(toast.created_at) >= COPY_TOAST_FADE_AFTER {
+            FAINT
+        } else {
+            ACCENT
+        };
+        frame.render_widget(Clear, toast_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(&toast.text, Style::default().fg(color)),
+                Span::raw(" "),
+            ]))
+            .style(Style::default().bg(Color::Rgb(24, 26, 27))),
+            toast_area,
+        );
     }
 
     pub(super) fn render_empty_state(&self, frame: &mut Frame<'_>, area: Rect) {

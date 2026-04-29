@@ -8,13 +8,107 @@ pub(super) struct StyledLine {
 
 pub(super) struct RenderedTranscript {
     pub(super) text: Text<'static>,
+    pub(super) plain_lines: Vec<String>,
 }
 
 impl From<Vec<StyledLine>> for RenderedTranscript {
     fn from(lines: Vec<StyledLine>) -> Self {
-        let text = Text::from(lines.into_iter().map(|line| line.line).collect::<Vec<_>>());
-        Self { text }
+        let mut text_lines = Vec::with_capacity(lines.len());
+        let mut plain_lines = Vec::with_capacity(lines.len());
+        for line in lines {
+            plain_lines.push(line.plain);
+            text_lines.push(line.line);
+        }
+        let text = Text::from(text_lines);
+        Self { text, plain_lines }
     }
+}
+
+pub(super) fn wrap_plain_lines(lines: &[String], width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut wrapped = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in line.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+            if current_width > 0 && current_width + ch_width > width {
+                wrapped.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        wrapped.push(current);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
+}
+
+pub(super) fn normalized_selection(
+    selection: TranscriptSelection,
+) -> (TranscriptPoint, TranscriptPoint) {
+    if (selection.anchor.row, selection.anchor.column)
+        <= (selection.focus.row, selection.focus.column)
+    {
+        (selection.anchor, selection.focus)
+    } else {
+        (selection.focus, selection.anchor)
+    }
+}
+
+pub(super) fn selected_text_from_rows(
+    rows: &[String],
+    selection: TranscriptSelection,
+) -> Option<String> {
+    let (start, end) = normalized_selection(selection);
+    if (start.row, start.column) == (end.row, end.column) || start.row >= rows.len() {
+        return None;
+    }
+
+    let end_row = end.row.min(rows.len().saturating_sub(1));
+    let mut selected = Vec::new();
+    for (row_index, row) in rows.iter().enumerate().take(end_row + 1).skip(start.row) {
+        let text = if start.row == end_row {
+            slice_display_columns(row, start.column, end.column)
+        } else if row_index == start.row {
+            slice_display_columns(row, start.column, u16::MAX)
+        } else if row_index == end_row {
+            slice_display_columns(row, 0, end.column)
+        } else {
+            row.clone()
+        };
+        selected.push(text);
+    }
+
+    Some(selected.join("\n"))
+}
+
+pub(super) fn slice_display_columns(text: &str, start: u16, end: u16) -> String {
+    let start = usize::from(start);
+    let end = usize::from(end);
+    let mut result = String::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        let next = col + width;
+        if next > start && col < end {
+            result.push(ch);
+        }
+        col = next;
+        if col >= end {
+            break;
+        }
+    }
+    result
 }
 
 pub(super) fn push_message_spacing(lines: &mut Vec<StyledLine>) {

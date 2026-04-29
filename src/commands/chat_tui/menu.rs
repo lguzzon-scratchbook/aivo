@@ -427,7 +427,7 @@ pub(super) fn render_session_picker_rows(
         );
     }
 
-    let mut all_rows: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+    let mut all_rows: Vec<(Line<'static>, Option<usize>, bool)> = Vec::new();
     let mut previous_group = String::new();
     for (filtered_index, (_, item)) in filtered.iter().enumerate() {
         let PickerValue::Session(preview) = &item.value else {
@@ -436,39 +436,47 @@ pub(super) fn render_session_picker_rows(
         let group = format_session_group_label(&preview.updated_at);
         if group != previous_group {
             if !all_rows.is_empty() {
-                all_rows.push((Line::from(""), None));
+                all_rows.push((Line::from(""), None, false));
             }
             all_rows.push((
                 Line::from(Span::styled(
                     group.clone(),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )),
-                None,
+                Some(filtered_index),
+                false,
             ));
             previous_group = group;
         }
         let selected = filtered_index == picker.selected;
         let armed_delete = selected && picker.delete_is_armed_for_session(preview);
         for line in session_picker_item_lines(preview, selected, armed_delete, width) {
-            all_rows.push((line, Some(filtered_index)));
+            all_rows.push((line, Some(filtered_index), true));
         }
     }
 
     if all_rows.len() <= max_rows {
-        let (lines, row_map): (Vec<_>, Vec<_>) = all_rows.into_iter().unzip();
+        let (lines, row_map): (Vec<_>, Vec<_>) = all_rows
+            .into_iter()
+            .map(|(line, index, _)| (line, index))
+            .unzip();
         return (lines, row_map);
     }
 
     let selected_row = all_rows
         .iter()
-        .position(|(_, index)| *index == Some(picker.selected))
+        .rposition(|(_, index, is_item)| *is_item && *index == Some(picker.selected))
         .unwrap_or(0);
     let mut start = selected_row.saturating_sub(max_rows / 2);
     let mut end = (start + max_rows).min(all_rows.len());
     if end - start < max_rows {
         start = end.saturating_sub(max_rows);
     }
-    while start > 0 && all_rows[start].1 == all_rows[start - 1].1 {
+    while start > 0
+        && all_rows[start].2
+        && all_rows[start - 1].2
+        && all_rows[start].1 == all_rows[start - 1].1
+    {
         start -= 1;
         end = (start + max_rows).min(all_rows.len());
     }
@@ -477,7 +485,11 @@ pub(super) fn render_session_picker_rows(
         end = (start + max_rows).min(all_rows.len());
     }
 
-    let (lines, row_map): (Vec<_>, Vec<_>) = all_rows[start..end].iter().cloned().unzip();
+    let (lines, row_map): (Vec<_>, Vec<_>) = all_rows[start..end]
+        .iter()
+        .cloned()
+        .map(|(line, index, _)| (line, index))
+        .unzip();
     (lines, row_map)
 }
 

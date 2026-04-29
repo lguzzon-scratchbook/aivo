@@ -125,7 +125,15 @@ impl ChatTuiApp {
     }
 
     pub(super) async fn open_resume_picker(&mut self, query: Option<String>) -> Result<()> {
-        let sessions = load_resume_snapshots(&self.session_store, &self.cwd).await?;
+        let mut sessions = load_resume_snapshots(&self.session_store, &self.cwd).await?;
+        if !self.history.is_empty()
+            && !sessions
+                .iter()
+                .any(|session| session.session_id == self.session_id)
+        {
+            self.persist_history().await?;
+            sessions = load_resume_snapshots(&self.session_store, &self.cwd).await?;
+        }
 
         if let Some(query) = &query
             && let Some(snapshot) = sessions.iter().find(|session| session.session_id == *query)
@@ -412,8 +420,15 @@ impl ChatTuiApp {
     }
 
     pub(super) fn max_scroll(&self) -> usize {
-        let total = self.estimated_transcript_height(self.transcript_width);
+        let transcript = self.build_transcript();
+        let total = wrap_plain_lines(&transcript.plain_lines, self.transcript_width).len();
         total.saturating_sub(usize::from(self.transcript_view_height))
+    }
+
+    pub(super) fn selected_transcript_text(&self) -> Option<String> {
+        let selection = self.transcript_selection?;
+        let rows = &self.transcript_hitbox.as_ref()?.rows;
+        selected_text_from_rows(rows, selection)
     }
 }
 
