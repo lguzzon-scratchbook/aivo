@@ -43,14 +43,11 @@ pub enum Commands {
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
     Keys(KeysArgs),
 
-    /// Start the interactive chat TUI
-    Chat(ChatArgs),
-
-    /// Generate images from a text prompt (OpenAI-compatible providers)
-    Image(ImageArgs),
-
     /// List available models from the active provider
     Models(ModelsArgs),
+
+    /// Start the interactive chat TUI
+    Chat(ChatArgs),
 
     /// Serve an OpenAI-compatible API that proxies to the active provider
     Serve(ServeArgs),
@@ -67,6 +64,9 @@ pub enum Commands {
 
     /// Show usage statistics (tokens, requests, breakdowns)
     Stats(StatsArgs),
+
+    /// Generate images from a text prompt (OpenAI-compatible providers)
+    Image(ImageArgs),
 
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),

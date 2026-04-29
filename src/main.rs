@@ -741,15 +741,15 @@ fn print_help() {
         println!("  {}{}", style::cyan(&padded), style::dim(desc));
     };
     print_cmd("run", "Launch AI tool, or use the saved start flow");
-    print_cmd("chat", "Start the interactive chat TUI");
-    print_cmd("image", "Generate images from a text prompt");
-    print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
     print_cmd("models", "List available models from the active provider");
+    print_cmd("chat", "Start the interactive chat TUI");
+    print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
+    print_cmd("image", "Generate images from a text prompt");
     print_cmd(
         "context",
         "Cross-CLI context — recent activity shared between tools",
