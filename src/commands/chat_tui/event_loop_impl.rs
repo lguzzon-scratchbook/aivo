@@ -214,6 +214,34 @@ impl ChatTuiApp {
         Ok(())
     }
 
+    pub(super) async fn flush_for_exit(&mut self) {
+        // Drain any runtime events that landed between the last poll and the
+        // exit keypress (e.g. a Finished that completed while the user was
+        // pressing Ctrl-C) so a just-finished turn is captured in history.
+        let _ = self.handle_runtime_events().await;
+
+        // If the response was still streaming at exit, salvage the partial
+        // assistant text the same way an explicit interrupt does — otherwise
+        // the user's prompt and any visible reply would be lost.
+        if self.sending && (!self.pending_response.is_empty() || !self.pending_reasoning.is_empty())
+        {
+            let partial = std::mem::take(&mut self.pending_response);
+            let reasoning = std::mem::take(&mut self.pending_reasoning);
+            self.history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: partial,
+                reasoning_content: normalize_reasoning_content(reasoning),
+                attachments: vec![],
+            });
+        }
+
+        // Persist whatever history we have so /resume can find this session
+        // even when the user exits before a successful Finished event.
+        if !self.history.is_empty() {
+            let _ = self.persist_history().await;
+        }
+    }
+
     pub(super) async fn run(&mut self) -> Result<()> {
         let mut terminal = setup_terminal(chat_mouse_enabled())?;
         let run_result = loop {
@@ -244,6 +272,8 @@ impl ChatTuiApp {
 
             tokio::time::sleep(Duration::from_millis(16)).await;
         };
+
+        self.flush_for_exit().await;
 
         // Abort in-flight tasks and await them so their futures are actually
         // dropped (closing any open HTTP connections) before we return. On the

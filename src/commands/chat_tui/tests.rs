@@ -1925,3 +1925,108 @@ async fn test_resume_loaded_failure_restores_previous_state() {
         Some("boom")
     );
 }
+
+#[tokio::test]
+async fn test_flush_for_exit_persists_partial_response_when_streaming() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key;
+    app.cwd = "/tmp/demo".to_string();
+    app.session_id = "exit-session".to_string();
+    app.raw_model = "claude".to_string();
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "tell me a story".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.sending = true;
+    app.pending_response = "Once upon a time".to_string();
+
+    app.flush_for_exit().await;
+
+    let saved = store
+        .get_chat_session("exit-session")
+        .await
+        .unwrap()
+        .expect("session should be persisted on exit");
+    let messages = saved.decrypt_messages().unwrap();
+    assert_eq!(messages.len(), 2, "user prompt + partial reply should save");
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content, "tell me a story");
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[1].content, "Once upon a time");
+}
+
+#[tokio::test]
+async fn test_flush_for_exit_persists_user_only_history() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key;
+    app.cwd = "/tmp/demo".to_string();
+    app.session_id = "user-only-session".to_string();
+    app.raw_model = "claude".to_string();
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "tell me a story".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    app.flush_for_exit().await;
+
+    let saved = store
+        .get_chat_session("user-only-session")
+        .await
+        .unwrap()
+        .expect("session with only a user message should still persist on exit");
+    let messages = saved.decrypt_messages().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content, "tell me a story");
+}
+
+#[tokio::test]
+async fn test_flush_for_exit_skips_persist_for_empty_history() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key;
+    app.cwd = "/tmp/demo".to_string();
+    app.session_id = "empty-session".to_string();
+    app.raw_model = "claude".to_string();
+
+    app.flush_for_exit().await;
+
+    let saved = store.get_chat_session("empty-session").await.unwrap();
+    assert!(
+        saved.is_none(),
+        "empty history should not produce a session"
+    );
+}
