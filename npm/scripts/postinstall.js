@@ -30,25 +30,11 @@ async function main(options = {}) {
 
   let checksumText, binary;
 
-  if (overrideBaseUrl) {
-    [checksumText, binary] = await Promise.all([
-      downloadText(`${overrideBaseUrl}/${assetName}.sha256`),
-      downloadBuffer(`${overrideBaseUrl}/${assetName}`)
-    ]);
-  } else {
-    const githubBaseUrl = getReleaseBaseUrl(version);
-    const mirrorBaseUrl = getMirrorBaseUrl(version);
-    [checksumText, binary] = await Promise.all([
-      downloadTextWithFallback(
-        `${githubBaseUrl}/${assetName}.sha256`,
-        `${mirrorBaseUrl}/${assetName}.sha256`
-      ),
-      downloadBufferWithFallback(
-        `${githubBaseUrl}/${assetName}`,
-        `${mirrorBaseUrl}/${assetName}`
-      )
-    ]);
-  }
+  const baseUrl = overrideBaseUrl || getReleaseBaseUrl(version);
+  [checksumText, binary] = await Promise.all([
+    downloadText(`${baseUrl}/${assetName}.sha256`),
+    downloadBuffer(`${baseUrl}/${assetName}`)
+  ]);
 
   const expectedSha = parseChecksumText(checksumText, assetName);
   if (!expectedSha) {
@@ -80,21 +66,7 @@ function downloadText(url) {
   return downloadBuffer(url).then((buffer) => buffer.toString("utf8"));
 }
 
-function downloadBufferWithFallback(primaryUrl, fallbackUrl) {
-  return downloadBuffer(primaryUrl, 0, 10_000).catch(() => {
-    return downloadBuffer(fallbackUrl);
-  });
-}
-
-function downloadTextWithFallback(primaryUrl, fallbackUrl) {
-  return downloadBufferWithFallback(primaryUrl, fallbackUrl).then((buffer) => buffer.toString("utf8"));
-}
-
 function getReleaseBaseUrl(version) {
-  return `https://github.com/yuanchuan/aivo/releases/download/v${version}`;
-}
-
-function getMirrorBaseUrl(version) {
   return `https://getaivo.dev/dl/v${version}`;
 }
 
@@ -199,11 +171,8 @@ if (require.main === module) {
 module.exports = {
   REPAIR_COMMAND,
   downloadBuffer,
-  downloadBufferWithFallback,
   downloadText,
-  downloadTextWithFallback,
   formatInstallError,
-  getMirrorBaseUrl,
   getReleaseBaseUrl,
   installBinary,
   main

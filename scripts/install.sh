@@ -1,7 +1,6 @@
 #!/bin/sh
 set -e
 
-REPO="yuanchuan/aivo"
 BINARY="aivo"
 INSTALL_DIR="${AIVO_INSTALL_DIR:-/usr/local/bin}"
 
@@ -29,42 +28,16 @@ esac
 
 ARTIFACT="${BINARY}-${PLATFORM}-${ARCH}"
 
-GITHUB_BASE="https://github.com/${REPO}/releases/latest/download"
-MIRROR_BASE="https://getaivo.dev/dl/latest"
-
-USE_MIRROR=0
+BASE_URL="${AIVO_INSTALL_BASE_URL:-https://getaivo.dev/dl/latest}"
 
 download_file() {
   url="$1"
   output="$2"
-  fallback="$3"
 
   if command -v curl >/dev/null 2>&1; then
-    if [ "$USE_MIRROR" -eq 0 ] && curl -fSL --connect-timeout 8 --max-time 30 --progress-bar "$url" -o "$output" 2>/dev/null; then
-      return 0
-    fi
-    if [ -n "$fallback" ]; then
-      if [ "$USE_MIRROR" -eq 0 ]; then
-        echo "  Falling back to mirror..."
-        USE_MIRROR=1
-      fi
-      curl -fSL --progress-bar "$fallback" -o "$output"
-      return $?
-    fi
-    return 1
+    curl -fSL --progress-bar "$url" -o "$output"
   elif command -v wget >/dev/null 2>&1; then
-    if [ "$USE_MIRROR" -eq 0 ] && wget --connect-timeout=8 --timeout=30 -q --show-progress "$url" -O "$output" 2>/dev/null; then
-      return 0
-    fi
-    if [ -n "$fallback" ]; then
-      if [ "$USE_MIRROR" -eq 0 ]; then
-        echo "  Falling back to mirror..."
-        USE_MIRROR=1
-      fi
-      wget -q --show-progress "$fallback" -O "$output"
-      return $?
-    fi
-    return 1
+    wget -q --show-progress "$url" -O "$output"
   else
     echo "Error: curl or wget is required"
     exit 1
@@ -77,8 +50,8 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Download
 echo "Downloading ${ARTIFACT}..."
-download_file "${GITHUB_BASE}/${ARTIFACT}" "${TMP_DIR}/${BINARY}" "${MIRROR_BASE}/${ARTIFACT}"
-download_file "${GITHUB_BASE}/${ARTIFACT}.sha256" "${TMP_DIR}/${ARTIFACT}.sha256" "${MIRROR_BASE}/${ARTIFACT}.sha256"
+download_file "${BASE_URL}/${ARTIFACT}" "${TMP_DIR}/${BINARY}"
+download_file "${BASE_URL}/${ARTIFACT}.sha256" "${TMP_DIR}/${ARTIFACT}.sha256"
 
 EXPECTED_SHA="$(awk '{print $1}' "${TMP_DIR}/${ARTIFACT}.sha256" | tr -d '\r\n')"
 if ! printf '%s' "$EXPECTED_SHA" | grep -Eq '^[A-Fa-f0-9]{64}$'; then

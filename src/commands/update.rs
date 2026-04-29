@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use reqwest::{Client, RequestBuilder};
+use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -15,46 +15,16 @@ use crate::errors::ExitCode;
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::style;
 
-const GITHUB_API: &str = "https://api.github.com/repos/yuanchuan/aivo/releases/latest";
-const GITHUB_RELEASES_LATEST: &str = "https://github.com/yuanchuan/aivo/releases/latest";
-const GITHUB_LATEST_DOWNLOAD_BASE: &str =
-    "https://github.com/yuanchuan/aivo/releases/latest/download";
-const MIRROR_DOWNLOAD_BASE: &str = "https://getaivo.dev/dl/latest";
+const DOWNLOAD_BASE: &str = "https://getaivo.dev/dl";
 const NPM_UPDATE_COMMAND: &str = "npm install -g @yuanchuan/aivo@latest";
 #[cfg(not(windows))]
 const NPM_UPDATE_ARGS: [&str; 3] = ["install", "-g", "@yuanchuan/aivo@latest"];
 
-/// UpdateCommand handles CLI self-update via GitHub Releases
 pub struct UpdateCommand {
     client: Client,
-    /// Separate client for binary downloads: no total deadline, but a per-read
-    /// timeout so genuine stalls fail fast while slow-but-progressing
-    /// connections (common in regions with poor GitHub connectivity) survive.
+    /// Separate client for binary downloads: no total deadline, only a
+    /// per-read timeout so slow-but-progressing connections finish.
     download_client: Client,
-}
-
-/// GitHub Release asset from the API
-#[derive(Debug, Clone, serde::Deserialize)]
-struct GitHubAsset {
-    name: String,
-    #[serde(rename = "browser_download_url")]
-    browser_download_url: String,
-    #[serde(default)]
-    digest: Option<String>,
-}
-
-/// GitHub Release response from the API
-#[derive(Debug, Clone, serde::Deserialize)]
-struct GitHubRelease {
-    #[serde(rename = "tag_name")]
-    tag_name: String,
-    assets: Vec<GitHubAsset>,
-}
-
-impl GitHubRelease {
-    fn version(&self) -> &str {
-        self.tag_name.trim_start_matches('v')
-    }
 }
 
 impl UpdateCommand {
@@ -166,20 +136,9 @@ impl UpdateCommand {
         println!("{} Checking for updates...", style::arrow_symbol());
 
         let current_version = crate::version::VERSION;
-        let release = self.get_latest_release().await?;
-        let latest_version = release.version();
+        let latest_version = self.get_latest_version().await?;
 
-        let binary_name = get_binary_name()?;
-        let asset = release
-            .assets
-            .iter()
-            .find(|a| a.name == binary_name)
-            .ok_or_else(|| anyhow::anyhow!("No binary found for {}", binary_name))?;
-        let expected_sha256 = self
-            .resolve_expected_sha256(&release, &binary_name, asset)
-            .await?;
-
-        if !self.is_newer_version(latest_version, current_version) {
+        if !self.is_newer_version(&latest_version, current_version) {
             println!(
                 "{} Already up to date {}",
                 style::success_symbol(),
@@ -189,11 +148,17 @@ impl UpdateCommand {
         }
 
         println!("  Current: {}", style::dim(current_version));
-        println!("  Latest:  {}", style::green(latest_version));
-        println!("{} Downloading update...", style::arrow_symbol());
+        println!("  Latest:  {}", style::green(&latest_version));
 
-        self.install_update(&asset.browser_download_url, &expected_sha256, &binary_name)
-            .await?;
+        let binary_name = get_binary_name()?;
+        let base_url = format!("{}/v{}", DOWNLOAD_BASE, latest_version);
+        let binary_url = format!("{}/{}", base_url, binary_name);
+        let sha256_url = format!("{}/{}.sha256", base_url, binary_name);
+
+        let expected_sha256 = self.fetch_sha256(&sha256_url, &binary_name).await?;
+
+        println!("{} Downloading update...", style::arrow_symbol());
+        self.install_update(&binary_url, &expected_sha256).await?;
 
         println!(
             "{} Updated to version {}",
@@ -204,207 +169,74 @@ impl UpdateCommand {
         Ok(ExitCode::Success)
     }
 
-    /// Fetches the latest release from GitHub API
-    async fn get_latest_release(&self) -> Result<GitHubRelease> {
+    /// Fetches the latest version string from the R2-backed `/dl/latest` endpoint.
+    async fn get_latest_version(&self) -> Result<String> {
+        let url = format!("{}/latest", DOWNLOAD_BASE);
         let response = self
-            .github_request(GITHUB_API)
-            .header("Accept", "application/vnd.github.v3+json")
+            .client
+            .get(&url)
+            .header("User-Agent", "aivo-cli")
             .send()
             .await
-            .context("Failed to fetch latest release")?;
-
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            if status.as_u16() == 404 {
-                return Err(anyhow::anyhow!("No releases found"));
-            }
-            if (status.as_u16() == 403 || status.as_u16() == 429)
-                && let Ok(release) = self.get_latest_release_fallback().await
-            {
-                eprintln!(
-                    "{} GitHub API returned {}. Falling back to GitHub Releases web endpoint.",
-                    style::yellow("Warning:"),
-                    status
-                );
-                return Ok(release);
-            }
-            if let Some(message) = parse_github_error_message(&text) {
-                return Err(anyhow::anyhow!(
-                    "GitHub API returned {}: {}",
-                    status,
-                    message
-                ));
-            }
-            return Err(anyhow::anyhow!("GitHub API returned {}", status));
-        }
-
-        serde_json::from_str(&text).context("Failed to parse release response")
-    }
-
-    async fn get_latest_release_fallback(&self) -> Result<GitHubRelease> {
-        let response = self
-            .github_request(GITHUB_RELEASES_LATEST)
-            .send()
-            .await
-            .context("Failed to resolve latest release via web endpoint")?;
+            .context("Failed to fetch latest version")?;
 
         let status = response.status();
         if !status.is_success() {
             return Err(anyhow::anyhow!(
-                "Fallback latest release lookup failed: HTTP {}",
+                "Failed to fetch latest version: HTTP {}",
                 status
             ));
         }
 
-        let tag_name = parse_release_tag_from_url(response.url()).ok_or_else(|| {
-            anyhow::anyhow!("Could not determine latest release tag from redirect URL")
-        })?;
-
-        let mut assets = Vec::new();
-        for binary_name in supported_binary_asset_names() {
-            assets.push(GitHubAsset {
-                name: binary_name.to_string(),
-                browser_download_url: format!("{}/{}", GITHUB_LATEST_DOWNLOAD_BASE, binary_name),
-                digest: None,
-            });
-            assets.push(GitHubAsset {
-                name: format!("{}.sha256", binary_name),
-                browser_download_url: format!(
-                    "{}/{}.sha256",
-                    GITHUB_LATEST_DOWNLOAD_BASE, binary_name
-                ),
-                digest: None,
-            });
+        let text = response
+            .text()
+            .await
+            .context("Failed to read latest version response")?;
+        let version = text.trim().trim_start_matches('v').to_string();
+        if version.is_empty() {
+            return Err(anyhow::anyhow!("Empty latest version response"));
         }
-        assets.push(GitHubAsset {
-            name: "checksums.txt".to_string(),
-            browser_download_url: format!("{}/checksums.txt", GITHUB_LATEST_DOWNLOAD_BASE),
-            digest: None,
-        });
-
-        Ok(GitHubRelease { tag_name, assets })
-    }
-
-    /// Resolves the expected SHA-256 checksum for the binary.
-    /// Refuses update when no checksum source is available.
-    async fn resolve_expected_sha256(
-        &self,
-        release: &GitHubRelease,
-        binary_name: &str,
-        binary_asset: &GitHubAsset,
-    ) -> Result<String> {
-        if let Some(digest) = binary_asset.digest.as_deref()
-            && let Some(sha256) = parse_digest_sha256(digest)
+        if !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
         {
-            return Ok(sha256);
+            return Err(anyhow::anyhow!("Invalid latest version: {}", version));
         }
-
-        let sha256_name = format!("{}.sha256", binary_name);
-        if let Some(asset) = release.assets.iter().find(|a| a.name == sha256_name) {
-            let checksum_text = self
-                .fetch_text_with_mirror(&asset.browser_download_url, &sha256_name)
-                .await?;
-            if let Some(sha256) = parse_checksum_text(&checksum_text, binary_name) {
-                return Ok(sha256);
-            }
-            return Err(anyhow::anyhow!(
-                "Checksum asset '{}' could not be parsed",
-                sha256_name
-            ));
-        }
-
-        if let Some(asset) = release.assets.iter().find(|a| a.name == "checksums.txt") {
-            let checksum_text = self
-                .fetch_text_with_mirror(&asset.browser_download_url, "checksums.txt")
-                .await?;
-            if let Some(sha256) = parse_checksum_text(&checksum_text, binary_name) {
-                return Ok(sha256);
-            }
-            return Err(anyhow::anyhow!(
-                "checksums.txt does not contain an entry for {}",
-                binary_name
-            ));
-        }
-
-        Err(anyhow::anyhow!(
-            "No checksum available for {}. Refusing insecure update.",
-            binary_name
-        ))
+        Ok(version)
     }
 
-    async fn fetch_text(&self, url: &str) -> Result<String> {
+    async fn fetch_sha256(&self, url: &str, binary_name: &str) -> Result<String> {
         let response = self
-            .github_request(url)
+            .client
+            .get(url)
+            .header("User-Agent", "aivo-cli")
             .send()
             .await
-            .context("Failed to fetch checksum asset")?;
+            .context("Failed to fetch checksum")?;
 
         let status = response.status();
         if !status.is_success() {
             return Err(anyhow::anyhow!("Checksum download failed: HTTP {}", status));
         }
 
-        response
+        let text = response
             .text()
             .await
-            .context("Failed to read checksum asset response")
-    }
-
-    /// Fetch text with mirror fallback when primary download fails.
-    async fn fetch_text_with_mirror(&self, url: &str, asset_name: &str) -> Result<String> {
-        match self.fetch_text(url).await {
-            Ok(text) => Ok(text),
-            Err(_) => {
-                let mirror_url = format!("{}/{}", MIRROR_DOWNLOAD_BASE, asset_name);
-                eprintln!("  Falling back to mirror...");
-                let response = self
-                    .client
-                    .get(&mirror_url)
-                    .header("User-Agent", "aivo-cli")
-                    .send()
-                    .await
-                    .context("Failed to fetch from mirror")?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(anyhow::anyhow!("Mirror download failed: HTTP {}", status));
-                }
-                response
-                    .text()
-                    .await
-                    .context("Failed to read mirror response")
-            }
-        }
+            .context("Failed to read checksum response")?;
+        parse_checksum_text(&text, binary_name)
+            .ok_or_else(|| anyhow::anyhow!("Could not parse checksum for {}", binary_name))
     }
 
     /// Downloads and installs the update
-    async fn install_update(
-        &self,
-        download_url: &str,
-        expected_sha256: &str,
-        binary_name: &str,
-    ) -> Result<()> {
-        // Determine install path
+    async fn install_update(&self, download_url: &str, expected_sha256: &str) -> Result<()> {
         let exec_path = get_install_path()?;
         let tmp_path = exec_path.with_extension("tmp");
 
-        // Try GitHub first; if anything fails (initial connect OR mid-stream),
-        // wipe the partial file and retry the full download from the mirror.
         let actual_sha256 = match self.download_to_file(download_url, &tmp_path).await {
             Ok(sha) => sha,
-            Err(primary_err) => {
+            Err(err) => {
                 tokio::fs::remove_file(&tmp_path).await.ok();
-                eprintln!(
-                    "  {} {}",
-                    style::yellow("Primary download failed:"),
-                    style::dim(format!("{:#}", primary_err))
-                );
-                eprintln!("  Falling back to mirror...");
-                let mirror_url = format!("{}/{}", MIRROR_DOWNLOAD_BASE, binary_name);
-                self.download_to_file(&mirror_url, &tmp_path)
-                    .await
-                    .context("Failed to download update")?
+                return Err(err).context("Failed to download update");
             }
         };
 
@@ -504,14 +336,13 @@ impl UpdateCommand {
     /// only a per-read stall timeout) so slow connections that keep delivering
     /// bytes finish instead of being killed mid-stream.
     async fn download_to_file(&self, url: &str, tmp_path: &Path) -> Result<String> {
-        let mut req = self
+        let mut response = self
             .download_client
             .get(url)
-            .header("User-Agent", "aivo-cli");
-        if let Some(token) = github_token_from_env() {
-            req = req.bearer_auth(token);
-        }
-        let mut response = req.send().await.context("Failed to start download")?;
+            .header("User-Agent", "aivo-cli")
+            .send()
+            .await
+            .context("Failed to start download")?;
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
                 "Download failed: HTTP {}",
@@ -608,30 +439,10 @@ impl UpdateCommand {
     fn handle_error(&self, error: anyhow::Error) {
         eprintln!("{} {}", style::red("Error:"), error);
         eprintln!();
-        let msg = format!("{:#}", error);
-        if msg.contains("GitHub API returned 403") || msg.contains("GitHub API returned 429") {
-            eprintln!(
-                "{} GitHub may be rate-limiting anonymous API requests from your IP.",
-                style::yellow("Hint:")
-            );
-            eprintln!(
-                "  {}",
-                style::dim("Set GITHUB_TOKEN (or GH_TOKEN/AIVO_GITHUB_TOKEN) and retry.")
-            );
-            eprintln!();
-        }
         eprintln!(
             "{} Check your internet connection and try again.",
             style::yellow("Suggestion:")
         );
-    }
-
-    fn github_request(&self, url: &str) -> RequestBuilder {
-        let mut req = self.client.get(url).header("User-Agent", "aivo-cli");
-        if let Some(token) = github_token_from_env() {
-            req = req.bearer_auth(token);
-        }
-        req
     }
 
     /// Delegates update to Homebrew
@@ -701,49 +512,6 @@ impl UpdateCommand {
             })
         }
     }
-}
-
-fn parse_digest_sha256(digest: &str) -> Option<String> {
-    let value = digest.trim();
-    let raw = value.strip_prefix("sha256:").unwrap_or(value);
-    normalize_sha256(raw)
-}
-
-fn parse_github_error_message(text: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct GitHubErrorBody {
-        message: Option<String>,
-    }
-
-    serde_json::from_str::<GitHubErrorBody>(text)
-        .ok()
-        .and_then(|body| body.message)
-        .filter(|message| !message.trim().is_empty())
-}
-
-fn parse_release_tag_from_url(url: &reqwest::Url) -> Option<String> {
-    let path = url.path();
-    path.strip_prefix("/yuanchuan/aivo/releases/tag/")
-        .filter(|tag| !tag.is_empty())
-        .map(ToString::to_string)
-}
-
-fn github_token_from_env() -> Option<String> {
-    ["AIVO_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
-        .iter()
-        .find_map(|key| env::var(key).ok())
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-}
-
-fn supported_binary_asset_names() -> &'static [&'static str] {
-    &[
-        "aivo-darwin-arm64",
-        "aivo-darwin-x64",
-        "aivo-linux-arm64",
-        "aivo-linux-x64",
-        "aivo-windows-x64.exe",
-    ]
 }
 
 fn normalize_sha256(value: &str) -> Option<String> {
@@ -1006,16 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_digest_sha256() {
-        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert_eq!(
-            parse_digest_sha256(digest),
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string())
-        );
-        assert_eq!(parse_digest_sha256("invalid"), None);
-    }
-
-    #[test]
     fn test_parse_checksum_text_variants() {
         let artifact = "aivo-darwin-arm64";
         let plain = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
@@ -1036,41 +794,6 @@ mod tests {
             parse_checksum_text(bsd, artifact),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string())
         );
-    }
-
-    #[test]
-    fn test_parse_github_error_message() {
-        let json = r#"{"message":"API rate limit exceeded for 1.2.3.4"}"#;
-        assert_eq!(
-            parse_github_error_message(json),
-            Some("API rate limit exceeded for 1.2.3.4".to_string())
-        );
-        assert_eq!(parse_github_error_message("{}"), None);
-        assert_eq!(parse_github_error_message("not-json"), None);
-    }
-
-    #[test]
-    fn test_parse_release_tag_from_url() {
-        let release_url =
-            reqwest::Url::parse("https://github.com/yuanchuan/aivo/releases/tag/v0.5.0").unwrap();
-        assert_eq!(
-            parse_release_tag_from_url(&release_url),
-            Some("v0.5.0".to_string())
-        );
-
-        let latest_url =
-            reqwest::Url::parse("https://github.com/yuanchuan/aivo/releases/latest").unwrap();
-        assert_eq!(parse_release_tag_from_url(&latest_url), None);
-    }
-
-    #[test]
-    fn test_supported_binary_asset_names() {
-        let assets = supported_binary_asset_names();
-        assert!(assets.contains(&"aivo-darwin-arm64"));
-        assert!(assets.contains(&"aivo-darwin-x64"));
-        assert!(assets.contains(&"aivo-linux-arm64"));
-        assert!(assets.contains(&"aivo-linux-x64"));
-        assert!(assets.contains(&"aivo-windows-x64.exe"));
     }
 
     #[test]

@@ -60,28 +60,6 @@ echo ""
 echo "Built artifacts:"
 ls -lh "$DIST/"
 
-# Sync to aivo-releases repo
-echo ""
-echo "→ Syncing install.sh & LICENSE to aivo-releases..."
-TMPDIR=$(mktemp -d)
-git clone git@github.com:yuanchuan/aivo.git "$TMPDIR/aivo-releases"
-cp scripts/install.sh LICENSE "$TMPDIR/aivo-releases/"
-cd "$TMPDIR/aivo-releases"
-git add -A
-git diff --cached --quiet || git commit -m "sync from aivo $VERSION"
-git push
-cd -
-
-# Create GitHub release
-echo "→ Creating release $VERSION on aivo-releases..."
-gh release create "$VERSION" \
-  --repo yuanchuan/aivo \
-  --title "$VERSION" \
-  --notes "Release $VERSION" \
-  "$DIST"/*
-
-rm -rf "$TMPDIR"
-
 # Upload to R2
 echo ""
 echo "→ Uploading to Cloudflare R2..."
@@ -128,4 +106,4 @@ else
 fi
 
 echo ""
-echo "Done! Release $VERSION published to yuanchuan/aivo"
+echo "Done! $VERSION binaries on R2; homebrew updated. Tag and npm publish still manual."
