@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.19.7
+
+### Improvements
+
+- `aivo update` and `install.sh` now fetch binaries from `getaivo.dev` (R2) instead of GitHub Releases — faster in regions with poor GitHub connectivity
+- Fixed text selection and session list in chat TUI
+- Bridge: filter Anthropic server-side tools (`web_search_*`, `code_execution_*`, etc.)
+- Bridge: propagate `input_tokens` via `message_delta` on OpenAI streams — fixes Claude Code status-line percent stuck at 0%
+- Router: apply learned `requires_reasoning_content` to in-flight requests, eliminating per-request 400 + retry until relaunch
+- MCP: stabilize session discovery and nickname mapping
+- Removed Chat TUI thinking toggle and think-tag detection
+
+
 ## v0.19.6
 
 ### Fixes
