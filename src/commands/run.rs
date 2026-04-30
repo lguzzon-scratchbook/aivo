@@ -16,10 +16,8 @@ use crate::services::context_render::{RenderedContext, render_single_session};
 use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags};
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
-use crate::services::nickname_registry;
 use crate::services::project_id::Thread;
 use crate::services::session_store::{ApiKey, SessionStore};
-use crate::services::share_config::{ShareCleanup, maybe_enable_share};
 use crate::services::system_env;
 use crate::style;
 
@@ -196,7 +194,6 @@ impl RunCommand {
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
-        as_name: Option<String>,
         max_context: Option<String>,
     ) -> ExitCode {
         match self
@@ -211,7 +208,6 @@ impl RunCommand {
                 env,
                 key_override,
                 context_selector,
-                as_name,
                 max_context,
             )
             .await
@@ -237,7 +233,6 @@ impl RunCommand {
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
-        as_name: Option<String>,
         max_context: Option<String>,
     ) -> anyhow::Result<ExitCode> {
         let tool = match tool {
@@ -371,61 +366,6 @@ impl RunCommand {
             args
         };
 
-        // Cross-tool MCP wiring: always enabled. Each tool gets a nickname
-        // (explicit via `--as reviewer`, or auto-derived from the tool name)
-        // and an aivo MCP server so peers can call list_sessions / get_session.
-        let (args, _share_cleanup) = {
-            let cwd = system_env::current_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            let registry_root = nickname_registry::registry_dir_for_cwd(&cwd);
-
-            // Register: explicit --as name, or auto-name from tool (claude, codex, …)
-            let (nickname, registry_guard) = if let Some(ref root) = registry_root {
-                if let Some(ref explicit) = as_name {
-                    match nickname_registry::register(explicit, ai_tool.as_str(), root).await {
-                        Ok(guard) => (explicit.clone(), Some(guard)),
-                        Err(e) => {
-                            eprintln!(
-                                "  {} --as: {}; launching without nickname.",
-                                style::yellow("!"),
-                                e
-                            );
-                            (explicit.clone(), None)
-                        }
-                    }
-                } else {
-                    match nickname_registry::register_auto(ai_tool.as_str(), root).await {
-                        Ok((name, guard)) => (name, Some(guard)),
-                        Err(_) => (ai_tool.as_str().to_string(), None),
-                    }
-                }
-            } else {
-                (
-                    as_name
-                        .clone()
-                        .unwrap_or_else(|| ai_tool.as_str().to_string()),
-                    None,
-                )
-            };
-
-            let fallback = args.clone();
-            match maybe_enable_share(ai_tool, args, &cwd, &nickname).await {
-                Ok((new_args, mut cleanup)) => {
-                    if let Some(guard) = registry_guard {
-                        cleanup.set_registry_guard(guard);
-                    }
-                    (new_args, cleanup)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  {} MCP wiring failed: {}; launching without cross-tool context.",
-                        style::yellow("!"),
-                        e
-                    );
-                    (fallback, ShareCleanup::empty())
-                }
-            }
-        };
-
         // Launch the AI tool
         let options = LaunchOptions {
             tool: ai_tool,
@@ -517,10 +457,6 @@ impl RunCommand {
         print_opt(
             "-c, --context[=<id>]",
             "Inject one past session (bare = picker; id from `aivo context`)",
-        );
-        print_opt(
-            "--as <name>",
-            "Name this tool for cross-tool MCP communication",
         );
         print_opt(
             "--dry-run",

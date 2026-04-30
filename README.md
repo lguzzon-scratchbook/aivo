@@ -185,7 +185,7 @@ aivo claude --debug=/tmp/aivo-http.jsonl
 
 #### `--context, -c`
 
-Inject a past session from another CLI as background context for this launch. Bridges cross-tool handoffs that each tool's native `--resume` can't span — e.g. pick up in Claude where Codex left off:
+Inject a past session from another CLI as background context for this launch. Bridges handoffs that each tool's native `--resume` can't span — e.g. pick up in Claude where Codex left off:
 
 ```bash
 aivo claude --context                    # opens session picker
@@ -193,17 +193,6 @@ aivo claude --context=abc123             # specific session (prefix match)
 ```
 
 Use `aivo context` to see available session IDs.
-
-#### `--as <name>`
-
-Give this launch a nickname so other tools in the same directory can query its live session by name instead of juggling session IDs:
-
-```bash
-aivo claude --as reviewer
-aivo codex --as coder
-```
-
-Cross-tool MCP is enabled by default — each tool auto-registers under its CLI name (`claude`, `codex`, etc.), incrementing on collision (`claude-2`, `claude-3`). Use `--as` only to override. Claude and Codex can call each other via `list_sessions` / `get_session`; Pi, Gemini, and OpenCode are read-only peers (queryable, but they can't query others).
 
 #### `aivo run`
 

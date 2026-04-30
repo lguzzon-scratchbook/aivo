@@ -19,8 +19,8 @@ mod version;
 use cli::{Cli, Commands};
 use commands::{
     AliasCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand, KeysCommand, LogsCommand,
-    McpServeCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand,
-    StartFlowArgs, StatsCommand, UpdateCommand,
+    ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand, StartFlowArgs,
+    StatsCommand, UpdateCommand,
 };
 use constants::{KNOWN_TOOLS, RESERVED_ALIAS_NAMES};
 use errors::ExitCode;
@@ -126,14 +126,6 @@ async fn main() {
             Commands::Stats(_) => StatsCommand::print_help(),
             Commands::Update(_) => UpdateCommand::print_help(),
             Commands::Context(_) => ContextCommand::print_help(),
-            Commands::McpServe(_) => {
-                eprintln!(
-                    "aivo mcp-serve is an internal stdio MCP server launched by Claude/Codex via --as."
-                );
-                eprintln!(
-                    "Usage: aivo mcp-serve --cwd <PATH>  (run by the host tool, not by users)"
-                );
-            }
         }
         process::exit(0);
     }
@@ -275,7 +267,6 @@ async fn main() {
                 run_args.debug,
                 run_args.dry_run,
                 run_args.refresh,
-                run_args.as_name,
                 run_args.envs,
                 // `--1m`/`--2m` shorthands collapsed into max_context up
                 // front so every downstream consumer sees a single signal.
@@ -337,7 +328,6 @@ async fn main() {
             let key_flag = extracted.key_flag;
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;
-            let as_name = extracted.as_name;
             // Context selector: prefer clap-parsed value, fall back to passthrough-recovered.
             let context_selector = run_args.context.or(extracted.context);
             let env_strings = extracted.env_strings;
@@ -447,7 +437,6 @@ async fn main() {
                         env,
                         key_override,
                         context_selector,
-                        as_name,
                         max_context,
                     )
                     .await
@@ -538,11 +527,6 @@ async fn main() {
         Commands::Context(context_args) => {
             let command = ContextCommand::new();
             command.execute(context_args).await
-        }
-
-        Commands::McpServe(mcp_args) => {
-            let command = McpServeCommand::new();
-            command.execute(mcp_args).await
         }
 
         Commands::Update(update_args) if update_args.rollback => {
@@ -949,7 +933,6 @@ struct ExtractedFlags {
     debug: Option<String>,
     dry_run: bool,
     refresh: bool,
-    as_name: Option<String>,
     env_strings: Vec<String>,
     remaining_args: Vec<String>,
     /// `None` = flag absent. `Some("")` = bare flag (interactive picker).
@@ -995,7 +978,6 @@ fn extract_aivo_flags(
     initial_debug: Option<String>,
     initial_dry_run: bool,
     initial_refresh: bool,
-    initial_as_name: Option<String>,
     initial_envs: Vec<String>,
     initial_max_context: Option<String>,
     passthrough_args: &[String],
@@ -1020,7 +1002,6 @@ fn extract_aivo_flags(
     let mut debug = initial_debug;
     let mut dry_run = initial_dry_run;
     let mut refresh = initial_refresh;
-    let mut as_name = initial_as_name;
     let mut context: Option<String> = None;
     let mut max_context: Option<String> = initial_max_context;
     let mut env_strings = initial_envs;
@@ -1110,13 +1091,6 @@ fn extract_aivo_flags(
             dry_run = true;
         } else if arg == "--refresh" || arg == "-r" {
             refresh = true;
-        } else if arg == "--as" && i + 1 < passthrough_args.len() {
-            as_name = Some(passthrough_args[i + 1].clone());
-            i += 1;
-        } else if let Some(value) = arg.strip_prefix("--as=") {
-            if !value.is_empty() {
-                as_name = Some(value.to_string());
-            }
         } else if let Some(value) = arg
             .strip_prefix("--context=")
             .or_else(|| arg.strip_prefix("-c="))
@@ -1242,7 +1216,6 @@ fn extract_aivo_flags(
         debug,
         dry_run,
         refresh,
-        as_name,
         env_strings,
         remaining_args,
         context,
@@ -1267,7 +1240,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--model=gpt-4o", "file.ts"]),
@@ -1285,7 +1257,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--model", "gpt-4o", "file.ts"]),
@@ -1303,7 +1274,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["-m", "gpt-4o"]),
@@ -1321,7 +1291,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--model"]),
@@ -1339,7 +1308,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &[],
@@ -1358,7 +1326,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--model", "other"]),
@@ -1376,7 +1343,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--key=mykey"]),
@@ -1393,7 +1359,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--key", "mykey"]),
@@ -1410,7 +1375,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["-k", "mykey"]),
@@ -1427,7 +1391,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &[],
@@ -1445,7 +1408,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["-k"]),
@@ -1462,7 +1424,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--debug", "file.ts"]),
@@ -1480,7 +1441,6 @@ mod tests {
             Some(String::new()),
             false,
             false,
-            None,
             vec![],
             None,
             &[],
@@ -1497,7 +1457,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--dry-run"]),
@@ -1514,7 +1473,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--env=FOO=bar"]),
@@ -1531,7 +1489,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["-e=FOO=bar"]),
@@ -1548,7 +1505,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--env", "FOO=bar"]),
@@ -1565,7 +1521,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["-e", "FOO=bar"]),
@@ -1582,7 +1537,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec!["PRE=1".to_string()],
             None,
             &args(&["-e", "POST=2"]),
@@ -1599,7 +1553,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--max-context=1m", "file.ts"]),
@@ -1617,7 +1570,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--max-context", "1m"]),
@@ -1636,7 +1588,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             Some("1m".to_string()),
             &args(&["file.ts"]),
@@ -1688,7 +1639,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--1m", "file.ts"]),
@@ -1706,7 +1656,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--2m", "file.ts"]),
@@ -1724,7 +1673,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--agent-name", "foo", "--resume"]),
@@ -1742,7 +1690,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&[
@@ -1943,7 +1890,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["fix the login bug"]),
@@ -1961,7 +1907,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["--model", "gpt-4o", "fix the login bug"]),
@@ -1979,7 +1924,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             vec![],
             None,
             &args(&["fix", "the", "bug"]),
