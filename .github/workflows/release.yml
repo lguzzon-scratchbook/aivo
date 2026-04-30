@@ -5,9 +5,6 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-
 jobs:
   test:
     uses: ./.github/workflows/test.yml
@@ -63,7 +60,7 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      - name: Rename artifact
+      - name: Rename artifact and generate checksum
         shell: bash
         run: |
           mkdir -p dist
@@ -72,100 +69,26 @@ jobs:
           else
             cp target/${{ matrix.target }}/release/aivo dist/${{ matrix.artifact }}
           fi
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          fi
 
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}*
 
-  release:
+  upload-r2:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
       - uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
-
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          for f in aivo-*; do sha256sum "$f" > "$f.sha256"; done
-
-      - name: Extract changelog
-        id: changelog
-        run: |
-          TAG="${{ github.ref_name }}"
-          VER="${TAG#v}"
-
-          # Try CHANGELOG.md first
-          BODY=""
-          if [ -f CHANGELOG.md ]; then
-            BODY=$(awk "/^## v?${VER}/{found=1; next} /^## v/{if(found) exit} found" CHANGELOG.md)
-            BODY=$(echo "$BODY" | sed -e '/./,$!d' -e :a -e '/^\s*$/{ $d; N; ba; }')
-          fi
-
-          # Fallback: auto-generate from commits
-          if [ -z "$BODY" ]; then
-            PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1)
-            if [ -z "$PREV_TAG" ]; then
-              RANGE="$TAG"
-            else
-              RANGE="${PREV_TAG}..${TAG}"
-            fi
-
-            FEATS=$(git log "$RANGE" --oneline --grep="^feat:" --format="- %s" | sed 's/^- feat: /- /')
-            FIXES=$(git log "$RANGE" --oneline --grep="^fix:" --format="- %s" | sed 's/^- fix: /- /')
-            REFACTORS=$(git log "$RANGE" --oneline --grep="^refactor:" --format="- %s" | sed 's/^- refactor: /- /')
-            OTHER=$(git log "$RANGE" --oneline --format="%s" | grep -v -E "^(feat|fix|refactor|style|chore|docs|test|ci):" | sed 's/^/- /')
-
-            if [ -n "$FEATS" ]; then BODY="${BODY}### Features\n${FEATS}\n\n"; fi
-            if [ -n "$FIXES" ]; then BODY="${BODY}### Fixes\n${FIXES}\n\n"; fi
-            if [ -n "$REFACTORS" ]; then BODY="${BODY}### Refactoring\n${REFACTORS}\n\n"; fi
-            if [ -n "$OTHER" ]; then BODY="${BODY}### Other\n${OTHER}\n\n"; fi
-
-            if [ -z "$BODY" ]; then
-              BODY="Release ${TAG}"
-            fi
-          fi
-
-          {
-            echo "body<<CHANGELOG_EOF"
-            echo -e "$BODY"
-            echo "CHANGELOG_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Write release notes
-        env:
-          NOTES: ${{ steps.changelog.outputs.body }}
-        run: printf '%s\n' "$NOTES" > /tmp/release-notes.md
-
-      - name: Publish release
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --notes-file /tmp/release-notes.md \
-            artifacts/*
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: release-artifacts
-          path: artifacts/*
-
-  upload-r2:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          name: release-artifacts
-          path: artifacts
 
       - name: Install wrangler
         run: npm install -g wrangler@4
@@ -186,7 +109,7 @@ jobs:
           echo -n "${VERSION#v}" | wrangler r2 object put "aivo-releases/latest" --pipe --remote
 
   update-npm:
-    needs: release
+    needs: upload-r2
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -212,7 +135,7 @@ jobs:
         run: cd npm && npm publish --access public
 
   update-homebrew:
-    needs: release
+    needs: upload-r2
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
