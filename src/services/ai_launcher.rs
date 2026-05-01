@@ -109,6 +109,43 @@ impl AIToolType {
             Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
         }
     }
+
+    /// Directories the tool's installer is known to drop its binary into,
+    /// outside of the typical `$PATH`. Used as a fallback after a fresh
+    /// install when PATH lookup fails (e.g. the Claude installer writes to
+    /// `~/.local/bin`, which isn't on PATH for the current shell yet).
+    pub fn well_known_install_dirs(&self) -> Vec<std::path::PathBuf> {
+        use std::path::PathBuf;
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        if let Some(home) = crate::services::system_env::home_dir() {
+            // Common locations across installers (curl scripts, user-level
+            // npm prefixes, bun).
+            for sub in [".local/bin", ".npm-global/bin", ".bun/bin"] {
+                dirs.push(home.join(sub));
+            }
+            // Tool-specific installer paths.
+            match self {
+                Self::Claude => dirs.push(home.join(".claude/local")),
+                Self::Opencode => dirs.push(home.join(".opencode/bin")),
+                _ => {}
+            }
+            #[cfg(windows)]
+            {
+                if let Some(appdata) = std::env::var_os("APPDATA") {
+                    dirs.push(PathBuf::from(appdata).join("npm"));
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            dirs.push(PathBuf::from("/usr/local/bin"));
+            dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        }
+
+        dirs
+    }
 }
 
 /// Launch options for AI tools
@@ -168,7 +205,7 @@ impl AILauncher {
 
     /// Spawns an AI tool with configured environment and stdio passthrough
     pub async fn launch(&self, options: &LaunchOptions) -> Result<i32> {
-        let resolved = self.resolve_launch_context(options, true).await?;
+        let mut resolved = self.resolve_launch_context(options, true).await?;
 
         // Ollama lifecycle: ensure server is running and model is pulled
         if is_ollama_base(&resolved.key.base_url) {
@@ -293,12 +330,27 @@ impl AILauncher {
                 None => collect_path_dirs(),
             };
             if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
-                eprintln!(
-                    "  {} '{}' was installed but not found on PATH. You may need to restart your shell.",
-                    crate::style::yellow("!"),
-                    tool.as_str()
-                );
-                anyhow::bail!("tool '{}' not found on PATH after install", tool.as_str());
+                // PATH still doesn't see the binary (e.g. the installer wrote
+                // to `~/.local/bin` and added an `export PATH=...` line to a
+                // shell profile that this non-login shell hasn't sourced).
+                // Try the installer's well-known drop locations and, if found,
+                // exec the binary by absolute path so the launch can proceed.
+                let fallback_dirs = tool.well_known_install_dirs();
+                if let Some(found) = find_in_dirs(&resolved.tool_config.command, &fallback_dirs) {
+                    eprintln!(
+                        "  {} Found at {}",
+                        crate::style::arrow_symbol(),
+                        crate::style::dim(found.display().to_string())
+                    );
+                    resolved.tool_config.command = found.to_string_lossy().into_owned();
+                } else {
+                    eprintln!(
+                        "  {} '{}' was installed but not found on PATH. You may need to restart your shell.",
+                        crate::style::yellow("!"),
+                        tool.as_str()
+                    );
+                    anyhow::bail!("tool '{}' not found on PATH after install", tool.as_str());
+                }
             }
 
             eprintln!(
@@ -882,6 +934,38 @@ mod tests {
         assert_eq!(AIToolType::parse("opencode"), Some(AIToolType::Opencode));
         assert_eq!(AIToolType::parse("pi"), Some(AIToolType::Pi));
         assert_eq!(AIToolType::parse("unknown"), None);
+    }
+
+    #[test]
+    fn well_known_install_dirs_includes_claude_native_installer_path() {
+        // The Claude native installer drops the binary in `~/.local/bin`.
+        // If that's not on PATH, the post-install fallback lookup must still
+        // find it — this test pins that contract.
+        let dirs = AIToolType::Claude.well_known_install_dirs();
+        let home = crate::services::system_env::home_dir().expect("HOME set in test env");
+        assert!(
+            dirs.contains(&home.join(".local/bin")),
+            "expected ~/.local/bin among Claude fallback dirs, got {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&home.join(".claude/local")),
+            "expected ~/.claude/local among Claude fallback dirs, got {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn well_known_install_dirs_includes_user_npm_global_for_npm_tools() {
+        // Codex/Gemini/Pi install via `npm install -g`. Users who set their
+        // npm prefix to `~/.npm-global` (a common rootless pattern) need that
+        // dir as a fallback when the installer ran but PATH wasn't refreshed.
+        let home = crate::services::system_env::home_dir().expect("HOME set in test env");
+        for tool in [AIToolType::Codex, AIToolType::Gemini, AIToolType::Pi] {
+            let dirs = tool.well_known_install_dirs();
+            assert!(
+                dirs.contains(&home.join(".npm-global/bin")),
+                "{tool:?} fallback dirs missing ~/.npm-global/bin: {dirs:?}"
+            );
+        }
     }
 
     #[test]
