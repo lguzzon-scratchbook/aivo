@@ -568,6 +568,7 @@ fn get_binary_name() -> Result<String> {
         ("linux", "aarch64") => "aivo-linux-arm64",
         ("linux", "x86_64") => "aivo-linux-x64",
         ("windows", "x86_64") => "aivo-windows-x64.exe",
+        ("windows", "aarch64") => "aivo-windows-arm64.exe",
         _ => {
             return Err(anyhow::anyhow!(
                 "Unsupported platform: {}-{}",

@@ -10,6 +10,7 @@ const PLATFORM_ASSETS = {
     x64: "aivo-linux-x64"
   },
   win32: {
+    arm64: "aivo-windows-arm64.exe",
     x64: "aivo-windows-x64.exe"
   }
 };
@@ -21,7 +22,7 @@ function resolvePlatformAsset(platform = process.platform, arch = process.arch) 
   if (!assetName) {
     throw new Error(
       `Unsupported platform: ${platform}-${arch}. ` +
-        "Supported targets: darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-x64."
+        "Supported targets: darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-arm64, win32-x64."
     );
   }
 

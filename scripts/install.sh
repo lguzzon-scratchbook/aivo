@@ -2,18 +2,18 @@
 set -e
 
 BINARY="aivo"
+EXT=""
 INSTALL_DIR="${AIVO_INSTALL_DIR:-/usr/local/bin}"
 
 # Detect platform
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-# Handle Windows (Git Bash, WSL, or Cygwin)
+# Handle Windows (Git Bash, MSYS, or Cygwin)
 case "$OS" in
   MINGW*|MSYS*|CYGWIN*)
     PLATFORM="windows"
-    BINARY="${BINARY}.exe"
-    ARCH="x64"
+    EXT=".exe"
     ;;
   Linux)  PLATFORM="linux" ;;
   Darwin) PLATFORM="darwin" ;;
@@ -26,7 +26,8 @@ case "$ARCH" in
   *)             echo "Error: Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-ARTIFACT="${BINARY}-${PLATFORM}-${ARCH}"
+BINARY="${BINARY}${EXT}"
+ARTIFACT="aivo-${PLATFORM}-${ARCH}${EXT}"
 
 BASE_URL="${AIVO_INSTALL_BASE_URL:-https://getaivo.dev/dl/latest}"
 

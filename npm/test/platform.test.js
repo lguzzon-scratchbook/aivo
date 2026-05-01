@@ -18,6 +18,13 @@ test("resolvePlatformAsset maps win32 x64", () => {
   });
 });
 
+test("resolvePlatformAsset maps win32 arm64", () => {
+  assert.deepEqual(resolvePlatformAsset("win32", "arm64"), {
+    assetName: "aivo-windows-arm64.exe",
+    binaryName: "aivo.exe"
+  });
+});
+
 test("resolvePlatformAsset rejects unsupported targets", () => {
   assert.throws(() => resolvePlatformAsset("linux", "ppc64"), /Unsupported platform/);
 });

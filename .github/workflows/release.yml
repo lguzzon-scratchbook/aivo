@@ -30,6 +30,9 @@ jobs:
           - target: x86_64-pc-windows-msvc
             runs-on: windows-latest
             artifact: aivo-windows-x64.exe
+          - target: aarch64-pc-windows-msvc
+            runs-on: windows-latest
+            artifact: aivo-windows-arm64.exe
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v5
