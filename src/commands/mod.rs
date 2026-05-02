@@ -1,8 +1,14 @@
 //! Command handlers module for the aivo CLI.
 //! Provides implementations for all CLI commands.
 
+use std::path::{Path, PathBuf};
+
 use crate::services::ai_launcher::PreparedLaunch;
 use crate::services::environment_injector::redact_env_value;
+use crate::services::media_io::{
+    OverwriteDecision, OverwritePolicy, apply_overwrite_policy, prompt_overwrite,
+};
+use crate::services::session_store::{LastSelection, SessionStore};
 use crate::style;
 
 /// Shown (only on explicit picker requests) when the selected key has no
@@ -34,6 +40,67 @@ pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Decides the final write path for media commands (`image`/`audio`/
+/// `video`). Reads the `force`/`json`-derived `policy`, prompts on
+/// existing files when interactive, and prints the standard
+/// "exists, pass -f to overwrite" error in non-interactive mode.
+/// Returns `None` when the user (or non-TTY) aborts.
+pub(crate) fn resolve_final_path(initial: &Path, policy: OverwritePolicy) -> Option<PathBuf> {
+    let answer = if !policy.force && policy.interactive && initial.exists() {
+        Some(prompt_overwrite(initial))
+    } else {
+        None
+    };
+    match apply_overwrite_policy(initial, policy, answer) {
+        OverwriteDecision::Write(p) => Some(p),
+        OverwriteDecision::Abort => {
+            if !policy.interactive {
+                eprintln!(
+                    "{} '{}' already exists (pass -f to overwrite).",
+                    style::red("Error:"),
+                    initial.display()
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Renders the `Active key:` footer used by `aivo image` / `aivo audio` /
+/// `aivo video` help screens. Each command reads its own modality's
+/// `last_*_selection` slot and hands the result here.
+pub(crate) async fn print_active_selection_for(
+    session_store: &SessionStore,
+    selection: Option<LastSelection>,
+) {
+    let Some(sel) = selection else {
+        return;
+    };
+    // Load the config directly to surface the key's display name without
+    // triggering PBKDF2 decryption — same trick as the root help footer.
+    let key_label = session_store
+        .load()
+        .await
+        .ok()
+        .and_then(|c| {
+            c.api_keys
+                .into_iter()
+                .find(|k| k.id == sel.key_id)
+                .map(|k| k.display_name().to_string())
+        })
+        .unwrap_or_else(|| sel.key_id.clone());
+    let model_display = models::model_display_label(sel.model.as_deref());
+
+    println!();
+    println!("{}", style::bold("Active key:"));
+    println!(
+        "  {} {}  {}",
+        style::bullet_symbol(),
+        key_label,
+        style::dim(model_display),
+    );
+}
+
 /// Truncates a URL for display while preserving both the prefix and suffix.
 pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     let char_count = url.chars().count();
@@ -48,6 +115,7 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
 }
 
 pub mod alias;
+pub mod audio;
 pub mod chat;
 pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
@@ -64,8 +132,10 @@ pub mod serve;
 pub mod start;
 pub mod stats;
 pub mod update;
+pub mod video;
 
 pub use alias::AliasCommand;
+pub use audio::AudioCommand;
 pub use chat::ChatCommand;
 pub use context::ContextCommand;
 pub use image::ImageCommand;
@@ -78,6 +148,7 @@ pub use serve::{ServeCommand, ServeParams};
 pub use start::{StartCommand, StartFlowArgs};
 pub use stats::StatsCommand;
 pub use update::UpdateCommand;
+pub use video::VideoCommand;
 
 pub(crate) fn print_launch_preview(plan: &PreparedLaunch) {
     println!(

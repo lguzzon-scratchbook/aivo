@@ -19,23 +19,34 @@ pub(crate) enum KeyLookupMode {
     PreferActiveAllowNone,
 }
 
-/// Which last-used record drives the key picker default. `Image` is isolated
-/// from the chat/run record so an image session can't pre-select an
-/// image-only key for the next chat session and vice-versa.
+/// Which last-used record drives the key picker default. The media scopes
+/// (`Image`, `Audio`, `Video`) are isolated from the chat/run record so a
+/// media session can't pre-select a media-only key for the next chat
+/// session and vice-versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LastSelectionView {
     Default,
     Image,
+    Audio,
+    Video,
 }
 
 impl LastSelectionView {
     /// Reads the last-used record for this view, falling back to the default
-    /// scope so a fresh image session can still inherit a chat-resolved key
+    /// scope so a fresh media session can still inherit a chat-resolved key
     /// (the picker downstream can swap if it isn't compatible).
     async fn read(&self, store: &SessionStore) -> Option<LastSelection> {
         match self {
             LastSelectionView::Default => store.get_last_selection().await.ok().flatten(),
             LastSelectionView::Image => match store.get_last_image_selection().await {
+                Ok(Some(sel)) => Some(sel),
+                _ => store.get_last_selection().await.ok().flatten(),
+            },
+            LastSelectionView::Audio => match store.get_last_audio_selection().await {
+                Ok(Some(sel)) => Some(sel),
+                _ => store.get_last_selection().await.ok().flatten(),
+            },
+            LastSelectionView::Video => match store.get_last_video_selection().await {
                 Ok(Some(sel)) => Some(sel),
                 _ => store.get_last_selection().await.ok().flatten(),
             },
@@ -85,6 +96,42 @@ pub(crate) async fn resolve_image_key_override(
         mode,
         compat,
         LastSelectionView::Image,
+    )
+    .await
+}
+
+/// Audio-aware variant: prefers `last_audio_selection` for picker defaults
+/// before falling back to the shared `last_selection`. Used by `aivo audio`.
+pub(crate) async fn resolve_audio_key_override(
+    session_store: &SessionStore,
+    key_flag: Option<&str>,
+    mode: KeyLookupMode,
+    compat: KeyCompatContext,
+) -> anyhow::Result<KeyResolution> {
+    resolve_key_override_scoped(
+        session_store,
+        key_flag,
+        mode,
+        compat,
+        LastSelectionView::Audio,
+    )
+    .await
+}
+
+/// Video-aware variant: prefers `last_video_selection` for picker defaults
+/// before falling back to the shared `last_selection`. Used by `aivo video`.
+pub(crate) async fn resolve_video_key_override(
+    session_store: &SessionStore,
+    key_flag: Option<&str>,
+    mode: KeyLookupMode,
+    compat: KeyCompatContext,
+) -> anyhow::Result<KeyResolution> {
+    resolve_key_override_scoped(
+        session_store,
+        key_flag,
+        mode,
+        compat,
+        LastSelectionView::Video,
     )
     .await
 }

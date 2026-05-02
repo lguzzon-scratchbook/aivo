@@ -26,6 +26,12 @@ pub enum KeyCompatContext {
     /// `aivo image` — OAuth, Copilot, Ollama, and the starter key are all
     /// incompatible (none expose an image-generation endpoint).
     Image,
+    /// `aivo audio` — same incompatibility set as image; no provider in
+    /// this group exposes a TTS endpoint.
+    Audio,
+    /// `aivo video` — same incompatibility set as image and audio; no
+    /// provider in this group exposes a video-generation endpoint.
+    Video,
 }
 
 impl KeyCompatContext {
@@ -37,6 +43,8 @@ impl KeyCompatContext {
             KeyCompatContext::Tool(tool) => tool.oauth_incompat_reason(key),
             KeyCompatContext::Chat => key.oauth_run_requirement(),
             KeyCompatContext::Image => image_incompat_reason(key),
+            KeyCompatContext::Audio => audio_incompat_reason(key),
+            KeyCompatContext::Video => video_incompat_reason(key),
         }
     }
 
@@ -65,6 +73,40 @@ fn image_incompat_reason(key: &ApiKey) -> Option<&'static str> {
     }
     match detect_provider_protocol(&key.base_url) {
         ProviderProtocol::Anthropic => Some("Anthropic has no image API"),
+        _ => None,
+    }
+}
+
+/// TTS rejects the same set as image generation: every provider in this
+/// group either lacks a `/v1/audio/speech` (or equivalent) endpoint, or
+/// the protocol family doesn't expose audio generation at all.
+fn audio_incompat_reason(key: &ApiKey) -> Option<&'static str> {
+    const NO_TTS: &str = "no TTS";
+    if key.is_any_oauth() || is_copilot_base(&key.base_url) || is_ollama_base(&key.base_url) {
+        return Some(NO_TTS);
+    }
+    if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
+        return Some("starter key: no TTS");
+    }
+    match detect_provider_protocol(&key.base_url) {
+        ProviderProtocol::Anthropic => Some("Anthropic has no TTS API"),
+        _ => None,
+    }
+}
+
+/// Video generation rejects the same set as image and audio: no OAuth-bundled
+/// provider, Copilot, Ollama, the starter key, or Anthropic protocol exposes
+/// a `/v1/videos`-style endpoint.
+fn video_incompat_reason(key: &ApiKey) -> Option<&'static str> {
+    const NO_VIDEO: &str = "no video generation";
+    if key.is_any_oauth() || is_copilot_base(&key.base_url) || is_ollama_base(&key.base_url) {
+        return Some(NO_VIDEO);
+    }
+    if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
+        return Some("starter key: no video gen");
+    }
+    match detect_provider_protocol(&key.base_url) {
+        ProviderProtocol::Anthropic => Some("Anthropic has no video API"),
         _ => None,
     }
 }

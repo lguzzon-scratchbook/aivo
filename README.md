@@ -80,6 +80,8 @@ aivo claude --model llama3.2
 | [alias](#alias) | Create short names for models |
 | [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
 | [image](#image) | Generate images from a text prompt |
+| [video](#video) | Generate videos from a text prompt (async) |
+| [audio](#audio) | Generate speech (TTS); `aivo speak` plays through speakers |
 | [serve](#serve) | Local OpenAI-compatible API server |
 | [info](#info) | Show system info, keys, tools, and directory state |
 | [logs](#logs) | Query local SQLite logs for chat, run, and serve |
@@ -427,6 +429,52 @@ aivo image "..." --size 1792x1024 --quality hd
 aivo image "..." --url                              # print provider URL, skip download
 aivo image "..." --json                             # machine-readable
 ```
+
+## video
+
+Generate video from a text prompt against the active provider's video API (e.g. OpenAI's `sora-2`, Google's `veo-3.0-generate-preview`, xAI's `grok-imagine-video`, ByteDance's `bytedance/seedance-2.0` via Vercel AI Gateway). Experimental.
+
+Generation is async: `aivo video` submits the job, prints its ID, polls, then downloads. Recover an interrupted run with `aivo video --job-id <id>`.
+
+```bash
+aivo video "a corgi running on a beach at sunset"
+aivo video "city timelapse" -m sora-2 --seconds 8 -s 1920x1080
+aivo video --job-id video_abc123              # attach to a job after a Ctrl+C
+```
+
+#### Common flags
+
+```bash
+aivo video "..." --model sora-2
+aivo video "..." --output ./out/{ts}-{model}.mp4
+aivo video "..." --size 1280x720                    # WxH or W:H aspect ratio
+aivo video "..." --seconds 8 --seed 12345
+aivo video "..." --timeout 1200                     # default 600s
+aivo video "..." --json                             # machine-readable
+```
+
+## audio
+
+Generate speech (TTS) from a text prompt against the active provider's TTS endpoint (e.g. OpenAI's `tts-1` / `gpt-4o-mini-tts`, Gemini TTS). `aivo speak` is the same command with `--play` defaulted on — without `-o` it plays through speakers and discards the file. Experimental.
+
+```bash
+aivo audio "hello world" -o out.mp3
+aivo speak "narration line" -m tts-1-hd --voice nova
+aivo speak "..." --no-play -o out.mp3              # save without playing
+```
+
+#### Common flags
+
+```bash
+aivo audio "..." --model tts-1
+aivo audio "..." --voice alloy                      # provider-specific
+aivo audio "..." --format wav                       # mp3 (default) | wav | opus | aac | flac
+aivo audio "..." --speed 1.25                       # 0.25–4.0
+aivo audio "..." --play                             # save and play
+aivo audio "..." --json                             # machine-readable
+```
+
+Playback uses `afplay` on macOS, PowerShell on Windows, and `paplay` / `aplay` / `ffplay` / `mpv` / `mpg123` on Linux (whichever is installed).
 
 ## serve
 

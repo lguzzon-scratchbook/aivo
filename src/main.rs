@@ -18,14 +18,15 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    AliasCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand, KeysCommand, LogsCommand,
-    ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand, StartFlowArgs,
-    StatsCommand, UpdateCommand,
+    AliasCommand, AudioCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand,
+    KeysCommand, LogsCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand,
+    StartFlowArgs, StatsCommand, UpdateCommand, VideoCommand,
 };
 use constants::{KNOWN_TOOLS, RESERVED_ALIAS_NAMES};
 use errors::ExitCode;
 use key_resolution::{
-    KeyLookupMode, KeyResolution, key_or_exit, resolve_image_key_override, resolve_key_override,
+    KeyLookupMode, KeyResolution, key_or_exit, resolve_audio_key_override,
+    resolve_image_key_override, resolve_key_override, resolve_video_key_override,
 };
 use services::ai_launcher::AIToolType;
 use services::environment_injector::ClaudeSlotFlags;
@@ -117,6 +118,18 @@ async fn main() {
             Commands::Image(_) => {
                 ImageCommand::print_help();
                 ImageCommand::print_active_selection(&session_store).await;
+            }
+            Commands::Audio(_) => {
+                AudioCommand::print_help();
+                AudioCommand::print_active_selection(&session_store).await;
+            }
+            Commands::Speak(_) => {
+                AudioCommand::print_speak_help();
+                AudioCommand::print_active_selection(&session_store).await;
+            }
+            Commands::Video(_) => {
+                VideoCommand::print_help();
+                VideoCommand::print_active_selection(&session_store).await;
             }
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
@@ -238,12 +251,43 @@ async fn main() {
             // last-used / explicit `--key` paths bypass the annotation, so
             // we have to re-check compat here and offer a swap if the
             // resolved key can't actually talk to /v1/images/generations.
-            let key = match ensure_image_compatible_key(&session_store, initial_key).await {
+            let key = match ensure_compatible_key(
+                &session_store,
+                initial_key,
+                KeyCompatContext::Image,
+                "image generation",
+            )
+            .await
+            {
                 Some(k) => k,
                 None => process::exit(ExitCode::UserError.code()),
             };
             let command = ImageCommand::new(session_store, models_cache.clone());
             command.execute(image_args, key).await
+        }
+
+        Commands::Audio(audio_args) => {
+            audio_dispatch(
+                &session_store,
+                &models_cache,
+                audio_args,
+                /* default_play = */ false,
+            )
+            .await
+        }
+
+        Commands::Speak(audio_args) => {
+            audio_dispatch(
+                &session_store,
+                &models_cache,
+                audio_args,
+                /* default_play = */ true,
+            )
+            .await
+        }
+
+        Commands::Video(video_args) => {
+            video_dispatch(&session_store, &models_cache, video_args).await
         }
 
         Commands::Run(run_args) => {
@@ -759,6 +803,9 @@ fn print_help() {
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
     print_cmd("image", "Generate images from a text prompt");
+    print_cmd("video", "Generate videos from a text prompt (async)");
+    print_cmd("audio", "Generate speech (TTS) from a text prompt");
+    print_cmd("speak", "Speak a text prompt aloud (TTS + play)");
     print_cmd(
         "context",
         "Cross-CLI context — recent activity shared between tools",
@@ -837,20 +884,25 @@ fn print_version() {
     );
 }
 
-/// Re-checks `KeyCompatContext::Image` compatibility against a concrete key
+/// Re-checks media-modality key compatibility against a concrete key
 /// *after* `resolve_key_override` returns. The picker path already annotates
 /// incompatible entries, but the active-key and explicit-`--key` paths skip
-/// that, so a user with an OAuth / Copilot / Ollama / Anthropic / Google
-/// active key can reach this command. Returns the original key if already
-/// compatible, or prompts the user to pick a compatible one. Returns `None`
-/// when the user cancels or no compatible keys exist.
-async fn ensure_image_compatible_key(
+/// that, so a user with an OAuth / Copilot / Ollama / Anthropic key can
+/// reach the command. Returns the original key if already compatible, or
+/// prompts for a compatible one. Returns `None` when the user cancels or
+/// no compatible keys exist.
+///
+/// `label` is the user-visible activity name ("image generation",
+/// "audio generation", "video generation") interpolated into the
+/// rejection messages.
+async fn ensure_compatible_key(
     session_store: &SessionStore,
     key: services::session_store::ApiKey,
+    compat: KeyCompatContext,
+    label: &str,
 ) -> Option<services::session_store::ApiKey> {
     use std::io::IsTerminal;
 
-    let compat = KeyCompatContext::Image;
     let reason = match compat.incompat_reason(&key) {
         Some(r) => r,
         None => return Some(key),
@@ -868,9 +920,10 @@ async fn ensure_image_compatible_key(
 
     if !has_eligible {
         eprintln!(
-            "{} Key '{}' can't be used for image generation ({}).",
+            "{} Key '{}' can't be used for {} ({}).",
             style::red("Error:"),
             key.display_name(),
+            label,
             reason
         );
         eprintln!(
@@ -882,18 +935,20 @@ async fn ensure_image_compatible_key(
 
     if !std::io::stderr().is_terminal() {
         eprintln!(
-            "{} Key '{}' can't be used for image generation ({}). Pass `--key <id|name>` to pick another.",
+            "{} Key '{}' can't be used for {} ({}). Pass `--key <id|name>` to pick another.",
             style::red("Error:"),
             key.display_name(),
+            label,
             reason
         );
         return None;
     }
 
     eprintln!(
-        "{} Key '{}' can't be used for image generation ({}) — pick a compatible key.",
+        "{} Key '{}' can't be used for {} ({}) — pick a compatible key.",
         style::yellow("Note:"),
         key.display_name(),
+        label,
         reason
     );
     match commands::keys::prompt_pick_key_without_activation(
@@ -909,6 +964,121 @@ async fn ensure_image_compatible_key(
             None
         }
     }
+}
+
+/// Shared dispatch for `Commands::Audio` (`default_play = false`) and
+/// `Commands::Speak` (`default_play = true`). Both arms differ only in
+/// the play-by-default decision and which help screen they print on the
+/// no-prompt path; everything else (key resolution, compat re-check,
+/// command instantiation) is identical.
+async fn audio_dispatch(
+    session_store: &SessionStore,
+    models_cache: &services::ModelsCache,
+    audio_args: cli::AudioArgs,
+    default_play: bool,
+) -> ExitCode {
+    if audio_args
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        if default_play {
+            AudioCommand::print_speak_help();
+        } else {
+            AudioCommand::print_help();
+        }
+        AudioCommand::print_active_selection(session_store).await;
+        process::exit(ExitCode::Success.code());
+    }
+
+    let key_override = key_or_exit(
+        resolve_audio_key_override(
+            session_store,
+            audio_args.key.as_deref(),
+            KeyLookupMode::RequireActiveOrPrompt,
+            KeyCompatContext::Audio,
+        )
+        .await,
+    );
+    let initial_key = match key_override {
+        Some(k) => k,
+        None => {
+            eprintln!(
+                "{} No API key available for audio generation.",
+                style::red("Error:")
+            );
+            process::exit(ExitCode::AuthError.code());
+        }
+    };
+    let key = match ensure_compatible_key(
+        session_store,
+        initial_key,
+        KeyCompatContext::Audio,
+        "audio generation",
+    )
+    .await
+    {
+        Some(k) => k,
+        None => process::exit(ExitCode::UserError.code()),
+    };
+    let command = AudioCommand::new(session_store.clone(), models_cache.clone());
+    command.execute(audio_args, key, default_play).await
+}
+
+/// Dispatch for `Commands::Video`. Mirrors `audio_dispatch` but does *not*
+/// short-circuit on empty prompt when `--job-id` is set — that's the
+/// recovery path and a prompt isn't required for it.
+async fn video_dispatch(
+    session_store: &SessionStore,
+    models_cache: &services::ModelsCache,
+    video_args: cli::VideoArgs,
+) -> ExitCode {
+    let has_prompt = video_args
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if !has_prompt && video_args.job_id.is_none() {
+        VideoCommand::print_help();
+        VideoCommand::print_active_selection(session_store).await;
+        process::exit(ExitCode::Success.code());
+    }
+
+    let key_override = key_or_exit(
+        resolve_video_key_override(
+            session_store,
+            video_args.key.as_deref(),
+            KeyLookupMode::RequireActiveOrPrompt,
+            KeyCompatContext::Video,
+        )
+        .await,
+    );
+    let initial_key = match key_override {
+        Some(k) => k,
+        None => {
+            eprintln!(
+                "{} No API key available for video generation.",
+                style::red("Error:")
+            );
+            process::exit(ExitCode::AuthError.code());
+        }
+    };
+    let key = match ensure_compatible_key(
+        session_store,
+        initial_key,
+        KeyCompatContext::Video,
+        "video generation",
+    )
+    .await
+    {
+        Some(k) => k,
+        None => process::exit(ExitCode::UserError.code()),
+    };
+    let command = VideoCommand::new(session_store.clone(), models_cache.clone());
+    command.execute(video_args, key).await
 }
 
 /// Resolves a model alias if the model is a non-empty Some value.

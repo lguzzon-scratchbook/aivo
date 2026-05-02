@@ -67,6 +67,15 @@ pub enum Commands {
     /// Generate images from a text prompt (OpenAI-compatible providers)
     Image(ImageArgs),
 
+    /// Generate videos from a text prompt (OpenAI-compatible providers, async)
+    Video(VideoArgs),
+
+    /// Generate speech audio (TTS) from a text prompt (OpenAI-compatible providers)
+    Audio(AudioArgs),
+
+    /// Speak a text prompt aloud — `aivo audio` with `--play` defaulted on
+    Speak(AudioArgs),
+
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
 
@@ -544,6 +553,139 @@ pub struct ImageArgs {
     pub url: bool,
 
     /// Emit a JSON object with the result (path, bytes, url, model, size)
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for the video command. Video generation is async on every
+/// supported provider (Sora 2, Veo 3): we submit a job, poll until done,
+/// then download. Use `--job-id` to recover after a Ctrl+C.
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoArgs {
+    /// Text prompt. When omitted (and no `--job-id`), `aivo video` prints
+    /// help and the active key/model instead of generating anything.
+    #[arg(value_name = "PROMPT", value_parser = non_empty())]
+    pub prompt: Option<String>,
+
+    /// Video model (e.g. sora-2, veo-3.0-generate-preview)
+    #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub model: Option<String>,
+
+    /// Select API key by ID or name
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "ID|NAME",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub key: Option<String>,
+
+    /// Output path: file (`clip.mp4`), directory (`out/`), or template
+    /// with `{ts}`/`{model}` tokens. Default: `./aivo-<timestamp>.mp4`.
+    #[arg(short = 'o', long, value_name = "PATH", value_parser = non_empty())]
+    pub output: Option<String>,
+
+    /// Overwrite existing files without prompting
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Frame size as WxH (e.g. 1280x720, 720x1280) or aspect ratio (16:9)
+    #[arg(short = 's', long, value_name = "WxH", value_parser = non_empty())]
+    pub size: Option<String>,
+
+    /// Clip length in seconds (provider-dependent bounds, typically 4–20)
+    #[arg(long, value_name = "SECS")]
+    pub seconds: Option<u32>,
+
+    /// Random seed for reproducibility (provider-dependent)
+    #[arg(long, value_name = "SEED")]
+    pub seed: Option<u64>,
+
+    /// How long to wait before giving up on the polling loop (default 600s).
+    /// On timeout, the job keeps running on the provider — recover with
+    /// `--job-id <id>`.
+    #[arg(long, value_name = "SECS", default_value_t = 600)]
+    pub timeout: u32,
+
+    /// Attach to an existing job and wait for its result instead of
+    /// submitting a new one. Use after a previous run was Ctrl+C'd or
+    /// timed out — the job ID is printed at submit time.
+    #[arg(long, value_name = "ID", value_parser = non_empty())]
+    pub job_id: Option<String>,
+
+    /// Bypass cache and fetch fresh model list for the model picker
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
+
+    /// Emit a JSON object with the result (path, bytes, model, job_id)
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for the audio (TTS) command.
+///
+/// `Eq` is intentionally not derived because of `Option<f32>` for `speed`;
+/// `PartialEq` is sufficient for clap and tests.
+#[derive(Args, Debug, Clone, Default, PartialEq)]
+pub struct AudioArgs {
+    /// Text prompt to read aloud. When omitted, `aivo audio` prints help
+    /// and the active key/model instead of generating anything.
+    #[arg(value_name = "PROMPT", value_parser = non_empty())]
+    pub prompt: Option<String>,
+
+    /// Audio model (e.g. tts-1, tts-1-hd, gpt-4o-mini-tts)
+    #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub model: Option<String>,
+
+    /// Select API key by ID or name
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "ID|NAME",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub key: Option<String>,
+
+    /// Output path: file (`hello.mp3`), directory (`out/`), or template
+    /// with `{ts}`/`{model}` tokens. Default: `./aivo-<timestamp>.mp3`.
+    #[arg(short = 'o', long, value_name = "PATH", value_parser = non_empty())]
+    pub output: Option<String>,
+
+    /// Overwrite existing files without prompting
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Voice (provider-specific: alloy/echo/fable/onyx/nova/shimmer for
+    /// OpenAI; Aoede/Charon/Kore/etc. for Gemini TTS)
+    #[arg(long, value_name = "VOICE", value_parser = non_empty())]
+    pub voice: Option<String>,
+
+    /// Audio format: mp3 (default) | wav | opus | aac | flac
+    #[arg(long, value_name = "FORMAT", value_parser = non_empty())]
+    pub format: Option<String>,
+
+    /// Playback speed, typically 0.25–4.0 (provider-dependent)
+    #[arg(long, value_name = "SPEED")]
+    pub speed: Option<f32>,
+
+    /// Bypass cache and fetch fresh model list for the model picker
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
+
+    /// Play the audio through speakers after generation. With no `-o`, plays
+    /// from a temp file and discards. With `-o`, saves the file *and* plays.
+    /// Defaults on for `aivo speak`, off for `aivo audio`.
+    #[arg(long, conflicts_with = "no_play")]
+    pub play: bool,
+
+    /// Suppress playback even when invoked as `aivo speak`. Useful for
+    /// scripting where a `speak` invocation should just save a file.
+    #[arg(long)]
+    pub no_play: bool,
+
+    /// Emit a JSON object with the result (path, bytes, model, voice)
     #[arg(long)]
     pub json: bool,
 }

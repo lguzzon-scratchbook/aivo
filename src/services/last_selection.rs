@@ -11,19 +11,23 @@ fn has_valid_key(record: &LastSelection, keys: &[ApiKey]) -> bool {
 }
 
 /// Selects which last-used record we're operating on. `Default` covers chat,
-/// run, codex, etc. — anything that shares the chat/run mental model. `Image`
-/// is isolated so picking an image key/model doesn't pollute the chat default
-/// and vice-versa.
+/// run, codex, etc. — anything that shares the chat/run mental model. The
+/// media scopes (`Image`, `Audio`, `Video`) are isolated so picking a media
+/// key/model doesn't pollute the chat default and vice-versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectionScope {
     Default,
     Image,
+    Audio,
+    Video,
 }
 
 fn scope_record(config: &StoredConfig, scope: SelectionScope) -> &Option<LastSelection> {
     match scope {
         SelectionScope::Default => &config.last_selection,
         SelectionScope::Image => &config.last_image_selection,
+        SelectionScope::Audio => &config.last_audio_selection,
+        SelectionScope::Video => &config.last_video_selection,
     }
 }
 
@@ -34,6 +38,8 @@ fn scope_record_mut(
     match scope {
         SelectionScope::Default => &mut config.last_selection,
         SelectionScope::Image => &mut config.last_image_selection,
+        SelectionScope::Audio => &mut config.last_audio_selection,
+        SelectionScope::Video => &mut config.last_video_selection,
     }
 }
 

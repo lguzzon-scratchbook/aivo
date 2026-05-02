@@ -7,7 +7,6 @@
 //! as the top-level `aivo` command.
 
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -17,9 +16,8 @@ use tokio::task::JoinHandle;
 use crate::cli::ImageArgs;
 use crate::errors::ExitCode;
 use crate::services::http_utils::router_http_client;
-use crate::services::image_gen::{
-    self, ImageArtifact, ImageRequest, OutputTarget, OverwriteDecision, OverwritePolicy,
-};
+use crate::services::image_gen::{self, ImageArtifact, ImageRequest};
+use crate::services::media_io::{OutputTarget, OverwritePolicy, human_bytes};
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -85,43 +83,15 @@ impl ImageCommand {
     }
 
     /// Prints the image-scope active key and model at the bottom of the help
-    /// output. Mirrors the shape of `aivo`'s root help footer but reads the
-    /// image-only `last_image_selection` slot so it doesn't surface a chat key
-    /// the user picked for `aivo chat`.
+    /// output. Reads the image-only `last_image_selection` slot so it doesn't
+    /// surface a chat key the user picked for `aivo chat`.
     pub async fn print_active_selection(session_store: &SessionStore) {
-        let sel = match session_store
+        let sel = session_store
             .get_last_image_selection()
             .await
             .ok()
-            .flatten()
-        {
-            Some(sel) => sel,
-            None => return,
-        };
-
-        // Load config directly to get the display name without triggering
-        // PBKDF2 decryption — same pattern as the root help footer.
-        let key_label = session_store
-            .load()
-            .await
-            .ok()
-            .and_then(|c| {
-                c.api_keys
-                    .into_iter()
-                    .find(|k| k.id == sel.key_id)
-                    .map(|k| k.display_name().to_string())
-            })
-            .unwrap_or(sel.key_id.clone());
-        let model_display = crate::commands::models::model_display_label(sel.model.as_deref());
-
-        println!();
-        println!("{}", style::bold("Active key:"));
-        println!(
-            "  {} {}  {}",
-            style::bullet_symbol(),
-            key_label,
-            style::dim(model_display),
-        );
+            .flatten();
+        crate::commands::print_active_selection_for(session_store, sel).await;
     }
 
     pub async fn execute(self, args: ImageArgs, key: ApiKey) -> ExitCode {
@@ -160,13 +130,14 @@ impl ImageCommand {
         // generation isn't wasted on an unwritable path.
         let target = OutputTarget::parse(args.output.as_deref());
         let ext = default_extension(args.size.as_deref());
-        let initial_path = match image_gen::resolve_output_path(&target, &model, &ext) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                return ExitCode::UserError;
-            }
-        };
+        let initial_path =
+            match crate::services::media_io::resolve_output_path(&target, &model, &ext) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{} {}", style::red("Error:"), e);
+                    return ExitCode::UserError;
+                }
+            };
 
         // Apply overwrite policy up front so we fail fast on collisions in
         // non-TTY / --json mode.
@@ -175,7 +146,7 @@ impl ImageCommand {
             // --url means no download, so no path to resolve against disk.
             None
         } else {
-            match resolve_final_path(&initial_path, policy) {
+            match crate::commands::resolve_final_path(&initial_path, policy) {
                 Some(p) => Some(p),
                 None => return ExitCode::UserError,
             }
@@ -304,27 +275,6 @@ fn default_extension(size: Option<&str>) -> String {
     "png".into()
 }
 
-fn resolve_final_path(initial: &Path, policy: OverwritePolicy) -> Option<PathBuf> {
-    let answer = if !policy.force && policy.interactive && initial.exists() {
-        Some(image_gen::prompt_overwrite(initial))
-    } else {
-        None
-    };
-    match image_gen::apply_overwrite_policy(initial, policy, answer) {
-        OverwriteDecision::Write(p) => Some(p),
-        OverwriteDecision::Abort => {
-            if !policy.interactive {
-                eprintln!(
-                    "{} '{}' already exists (pass -f to overwrite).",
-                    style::red("Error:"),
-                    initial.display()
-                );
-            }
-            None
-        }
-    }
-}
-
 fn start_spinner_if_tty(model: &str) -> Option<(Arc<AtomicBool>, JoinHandle<()>)> {
     if std::io::stderr().is_terminal() {
         Some(style::start_spinner(Some(&format!(
@@ -378,27 +328,9 @@ fn print_json(
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
 
-fn human_bytes(b: u64) -> String {
-    const K: u64 = 1024;
-    if b < K {
-        format!("{b}B")
-    } else if b < K * K {
-        format!("{:.1}KB", b as f64 / K as f64)
-    } else {
-        format!("{:.1}MB", b as f64 / (K * K) as f64)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn human_bytes_formats_ranges() {
-        assert_eq!(human_bytes(500), "500B");
-        assert_eq!(human_bytes(1024), "1.0KB");
-        assert_eq!(human_bytes(1024 * 1024), "1.0MB");
-    }
 
     #[test]
     fn default_extension_is_png() {
