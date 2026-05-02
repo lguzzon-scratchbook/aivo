@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.19.9
+
+### Fixes
+
+- Build: statically link the MSVC C runtime for Windows targets so `aivo.exe` no longer depends on `VCRUNTIME140.dll` — fixes silent load failure (`STATUS_DLL_NOT_FOUND`) on Windows ARM64 systems without the Visual C++ Redistributable installed, where `aivo --version` printed nothing
+
+
 ## v0.19.8
 
 ### Improvements
