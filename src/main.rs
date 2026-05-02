@@ -802,14 +802,6 @@ fn print_help() {
     print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
-    print_cmd("image", "Generate images from a text prompt");
-    print_cmd("video", "Generate videos from a text prompt (async)");
-    print_cmd("audio", "Generate speech (TTS) from a text prompt");
-    print_cmd("speak", "Speak a text prompt aloud (TTS + play)");
-    print_cmd(
-        "context",
-        "Cross-CLI context — recent activity shared between tools",
-    );
     print_cmd("update", "Update to the latest version");
     println!();
     println!("{}", style::bold("Shortcuts:"));

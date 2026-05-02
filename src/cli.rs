@@ -65,21 +65,26 @@ pub enum Commands {
     Stats(StatsArgs),
 
     /// Generate images from a text prompt (OpenAI-compatible providers)
+    #[command(hide = true)]
     Image(ImageArgs),
 
     /// Generate videos from a text prompt (OpenAI-compatible providers, async)
+    #[command(hide = true)]
     Video(VideoArgs),
 
     /// Generate speech audio (TTS) from a text prompt (OpenAI-compatible providers)
+    #[command(hide = true)]
     Audio(AudioArgs),
 
     /// Speak a text prompt aloud — `aivo audio` with `--play` defaulted on
+    #[command(hide = true)]
     Speak(AudioArgs),
 
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
 
     /// Cross-CLI context — auto-extracted from your sessions; bare command shows your last activity
+    #[command(hide = true)]
     Context(ContextArgs),
 }
 
