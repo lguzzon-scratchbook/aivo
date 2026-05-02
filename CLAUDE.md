@@ -26,11 +26,15 @@ cargo fmt                               # Format (run before committing)
 
 ## Release Process
 
+> [!IMPORTANT]
+> **Tag only after CI is green on main.** `test.yml` runs on every `main` push. Tagging before tests pass burns the version number — a failed release can't be re-cut on the same tag, and any `chore: release vX.Y.Z` commit becomes a zombie. Push main, wait for the green check, then tag.
+
 1. Bump version in `Cargo.toml` and `npm/package.json` first — never tag without updating.
 2. Run `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`.
 3. `cargo build --release && cargo install --path .` to verify.
-4. Commit: `git add -A && git commit -m "chore: release vX.Y.Z"`
-5. Tag and push: `git tag vX.Y.Z && git push origin main --tags`
+4. Commit: `git add -A && git commit -m "chore: release vX.Y.Z"` and `git push origin main`.
+5. Wait for the test workflow on the release commit to pass on **all three runners** (Linux, macOS, Windows). `#[cfg(windows)]` code is invisible to Linux/macOS clippy; Windows-only lint failures only surface on the Windows runner.
+6. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z` (this triggers `release.yml`).
 
 ## CLI / UX Conventions
 

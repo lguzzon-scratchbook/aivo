@@ -133,10 +133,14 @@ mod tests {
 
     #[cfg(windows)]
     fn assert_resolves_to(actual: Option<PathBuf>, expected: &Path) {
-        // PATHEXT casing leaks into the returned path on Windows (it returns
-        // `claude.CMD` when PATHEXT spells the extension uppercase), but the
-        // filesystem is case-insensitive. Compare with case folding so the
-        // assertion matches what the OS actually treats as the same path.
+        // PATHEXT casing varies by environment — `windows-latest` GitHub
+        // runners ship `PATHEXT="...;.CMD;..."` (uppercase), while a typical
+        // local Windows install has `.cmd`. `find_in_dirs` builds the
+        // candidate path using whatever casing PATHEXT contains, so the
+        // returned PathBuf may differ from the on-disk filename in case.
+        // Windows treats both as the same file; PathBuf compares bytes.
+        // Case-fold both sides so the assertion matches OS semantics, not
+        // the bytes of whichever PATHEXT the runner happens to have set.
         let actual = actual.expect("expected a match");
         assert_eq!(
             actual.to_string_lossy().to_lowercase(),

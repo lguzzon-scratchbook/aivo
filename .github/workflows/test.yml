@@ -2,6 +2,13 @@ name: Test
 
 on:
   workflow_call:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
