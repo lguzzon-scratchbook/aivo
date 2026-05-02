@@ -14,52 +14,54 @@ pub fn collect_path_dirs_from(path_var: Option<std::ffi::OsString>) -> Vec<PathB
 }
 
 pub fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let exts: Vec<String> = std::env::var_os("PATHEXT")
-            .map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(';')
-                    .filter(|ext| !ext.is_empty())
-                    .map(|ext| ext.to_string())
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![".EXE".to_string(), ".BAT".to_string(), ".CMD".to_string()]);
+    find_in_dirs_impl(program, dirs)
+}
 
-        // On Windows, CreateProcessW only spawns files with a recognized
-        // executable extension. Skip the bare-name probe when the program has
-        // no extension, otherwise we'd return e.g. npm's bash-style `claude`
-        // shim (no extension) instead of the spawnable `claude.cmd` sibling.
-        let has_explicit_ext = Path::new(program).extension().is_some();
-        for dir in dirs {
-            if has_explicit_ext {
-                let candidate = dir.join(program);
-                if is_executable(&candidate) {
-                    return Some(candidate);
-                }
-                continue;
-            }
-            for ext in &exts {
-                let candidate = dir.join(format!("{}{}", program, ext));
-                if is_executable(&candidate) {
-                    return Some(candidate);
-                }
-            }
-        }
-        return None;
-    }
+#[cfg(windows)]
+fn find_in_dirs_impl(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let exts: Vec<String> = std::env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter(|ext| !ext.is_empty())
+                .map(|ext| ext.to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![".EXE".to_string(), ".BAT".to_string(), ".CMD".to_string()]);
 
-    #[cfg(not(windows))]
-    {
-        for dir in dirs {
+    // On Windows, CreateProcessW only spawns files with a recognized
+    // executable extension. Skip the bare-name probe when the program has no
+    // extension, otherwise we'd return e.g. npm's bash-style `claude` shim
+    // (no extension) instead of the spawnable `claude.cmd` sibling.
+    let has_explicit_ext = Path::new(program).extension().is_some();
+    for dir in dirs {
+        if has_explicit_ext {
             let candidate = dir.join(program);
             if is_executable(&candidate) {
                 return Some(candidate);
             }
+            continue;
         }
-        None
+        for ext in &exts {
+            let candidate = dir.join(format!("{}{}", program, ext));
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
     }
+    None
+}
+
+#[cfg(not(windows))]
+fn find_in_dirs_impl(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in dirs {
+        let candidate = dir.join(program);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
