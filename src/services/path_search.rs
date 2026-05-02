@@ -130,6 +130,19 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn assert_resolves_to(actual: Option<PathBuf>, expected: &Path) {
+        // PATHEXT casing leaks into the returned path on Windows (it returns
+        // `claude.CMD` when PATHEXT spells the extension uppercase), but the
+        // filesystem is case-insensitive. Compare with case folding so the
+        // assertion matches what the OS actually treats as the same path.
+        let actual = actual.expect("expected a match");
+        assert_eq!(
+            actual.to_string_lossy().to_lowercase(),
+            expected.to_string_lossy().to_lowercase(),
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn find_in_dirs_prefers_pathext_over_bare_name_on_windows() {
         // npm on Windows drops THREE shims for each global binary:
@@ -146,7 +159,7 @@ mod tests {
         std::fs::write(&cmd, "@echo off\r\n").unwrap();
 
         let dirs = vec![dir.path().to_path_buf()];
-        assert_eq!(find_in_dirs("claude", &dirs), Some(cmd));
+        assert_resolves_to(find_in_dirs("claude", &dirs), &cmd);
     }
 
     #[cfg(windows)]
@@ -171,6 +184,6 @@ mod tests {
         std::fs::write(&cmd, "@echo off\r\n").unwrap();
 
         let dirs = vec![dir.path().to_path_buf()];
-        assert_eq!(find_in_dirs("claude.cmd", &dirs), Some(cmd));
+        assert_resolves_to(find_in_dirs("claude.cmd", &dirs), &cmd);
     }
 }
