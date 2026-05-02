@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.19.12
+
+### Fixes
+
+- Launcher: skip extension-less PATH entries when looking up tool binaries on Windows — npm drops both `claude.cmd` and a bash-style `claude` (no extension) into `%APPDATA%\npm`; the lookup matched the unspawnable bash shim first. `aivo claude` / `aivo codex` / `aivo gemini` now resolve to the `.cmd` shim and spawn correctly even when the tool was already installed
+
+
 ## v0.19.11
 
 ### Fixes
