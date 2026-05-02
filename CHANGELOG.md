@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.19.8
+
+### Improvements
+
+- Bridge: propagate cached input tokens from OpenAI-shape upstreams — Claude Code now records `cache_read_input_tokens` correctly so cached usage shows up in `aivo stats` instead of being silently dropped
+- Bridge: coalesce parallel function_calls into one assistant message
+- Run: skip model picker on first run when only the starter key exists
+- Launcher: fall back to installer drop dirs when PATH lookup misses
+- MCP/router: pin nickname session resolution; trust proven route on attempt 0
+- Removed cross-tool MCP peer awareness
+- Build: add `win32-arm64` target
+
+
 ## v0.19.7
 
 ### Improvements
