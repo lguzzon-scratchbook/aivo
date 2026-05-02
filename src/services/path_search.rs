@@ -15,25 +15,31 @@ pub fn collect_path_dirs_from(path_var: Option<std::ffi::OsString>) -> Vec<PathB
 
 pub fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     #[cfg(windows)]
-    let exts: Vec<String> = std::env::var_os("PATHEXT")
-        .map(|value| {
-            value
-                .to_string_lossy()
-                .split(';')
-                .filter(|ext| !ext.is_empty())
-                .map(|ext| ext.to_string())
-                .collect()
-        })
-        .unwrap_or_else(|| vec![".EXE".to_string(), ".BAT".to_string(), ".CMD".to_string()]);
+    {
+        let exts: Vec<String> = std::env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|ext| !ext.is_empty())
+                    .map(|ext| ext.to_string())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![".EXE".to_string(), ".BAT".to_string(), ".CMD".to_string()]);
 
-    for dir in dirs {
-        let candidate = dir.join(program);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-
-        #[cfg(windows)]
-        {
+        // On Windows, CreateProcessW only spawns files with a recognized
+        // executable extension. Skip the bare-name probe when the program has
+        // no extension, otherwise we'd return e.g. npm's bash-style `claude`
+        // shim (no extension) instead of the spawnable `claude.cmd` sibling.
+        let has_explicit_ext = Path::new(program).extension().is_some();
+        for dir in dirs {
+            if has_explicit_ext {
+                let candidate = dir.join(program);
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
+                continue;
+            }
             for ext in &exts {
                 let candidate = dir.join(format!("{}{}", program, ext));
                 if is_executable(&candidate) {
@@ -41,9 +47,19 @@ pub fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
                 }
             }
         }
+        return None;
     }
 
-    None
+    #[cfg(not(windows))]
+    {
+        for dir in dirs {
+            let candidate = dir.join(program);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -113,14 +129,48 @@ mod tests {
         assert_eq!(find_in_dirs("codex", &dirs), None);
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     #[test]
-    fn find_in_dirs_matches_existing_file_on_non_unix() {
+    fn find_in_dirs_prefers_pathext_over_bare_name_on_windows() {
+        // npm on Windows drops THREE shims for each global binary:
+        //   `<name>`      — bash script for Cygwin/Git Bash
+        //   `<name>.cmd`  — cmd.exe shim
+        //   `<name>.ps1`  — PowerShell shim
+        // CreateProcessW can only spawn the .cmd one. The bare-name file
+        // exists too, so a naive lookup that returns the extensionless path
+        // breaks `aivo claude` / `aivo codex`. This test pins that contract.
         let dir = tempfile::TempDir::new().unwrap();
-        let program = dir.path().join("claude");
-        std::fs::write(&program, "binary").unwrap();
+        let bare = dir.path().join("claude");
+        let cmd = dir.path().join("claude.cmd");
+        std::fs::write(&bare, "bash shim").unwrap();
+        std::fs::write(&cmd, "@echo off\r\n").unwrap();
 
         let dirs = vec![dir.path().to_path_buf()];
-        assert_eq!(find_in_dirs("claude", &dirs), Some(program));
+        assert_eq!(find_in_dirs("claude", &dirs), Some(cmd));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_in_dirs_skips_extensionless_files_on_windows() {
+        // Same logic but without a .cmd sibling — must NOT match the bare
+        // name, since CreateProcessW would refuse to spawn it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("claude");
+        std::fs::write(&bare, "bash shim").unwrap();
+
+        let dirs = vec![dir.path().to_path_buf()];
+        assert_eq!(find_in_dirs("claude", &dirs), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_in_dirs_uses_explicit_extension_when_program_has_one() {
+        // If the caller passes `claude.cmd`, look up that exact filename.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cmd = dir.path().join("claude.cmd");
+        std::fs::write(&cmd, "@echo off\r\n").unwrap();
+
+        let dirs = vec![dir.path().to_path_buf()];
+        assert_eq!(find_in_dirs("claude.cmd", &dirs), Some(cmd));
     }
 }
