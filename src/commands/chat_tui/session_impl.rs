@@ -1,5 +1,6 @@
 use super::*;
 use crate::commands::models::fetch_models_for_select;
+use crate::services::session_store::SessionTokens;
 
 impl ChatTuiApp {
     pub(super) fn open_model_picker(
@@ -290,6 +291,8 @@ impl ChatTuiApp {
         let stored = to_stored_messages(&self.history);
         let title = session_title_from_messages(&self.history, &self.raw_model);
         let preview = session_preview_text_from_messages(&self.history, &self.raw_model);
+        // No TUI-side per-turn token accumulator yet; `aivo stats --since`
+        // will under-report TUI chat tokens until that lands.
         self.session_store
             .save_chat_session_with_id(
                 &self.key.id,
@@ -300,6 +303,7 @@ impl ChatTuiApp {
                 &stored,
                 &title,
                 &preview,
+                SessionTokens::default(),
             )
             .await
     }

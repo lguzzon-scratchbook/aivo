@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use crate::services::atomic_write::atomic_write_secure;
 use crate::services::session_crypto::encrypt;
 use crate::services::session_store::{
-    ChatSessionState, ConfigContext, ConfigLockGuard, SessionIndex, SessionIndexEntry,
-    StoredChatMessage,
+    ChatSessionState, ChatTokenWindow, ConfigContext, ConfigLockGuard, SessionIndex,
+    SessionIndexEntry, SessionTokens, StoredChatMessage,
 };
 
 #[derive(Debug, Clone)]
@@ -183,6 +183,10 @@ impl ChatSessionStore {
                 created_at: session.created_at.clone(),
                 title,
                 preview,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             };
             if let Some(i) = pos {
                 index.entries[i] = entry;
@@ -298,6 +302,10 @@ impl ChatSessionStore {
                     created_at: state.created_at.clone(),
                     title,
                     preview,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 });
             }
         }
@@ -380,6 +388,7 @@ impl ChatSessionStore {
         messages: &[StoredChatMessage],
         title: &str,
         preview: &str,
+        tokens: SessionTokens,
     ) -> Result<()> {
         self.migrate_sessions_if_needed().await?;
         let _lock = self.acquire_session_lock()?;
@@ -427,6 +436,10 @@ impl ChatSessionStore {
             created_at,
             title: title.to_string(),
             preview: preview.to_string(),
+            prompt_tokens: tokens.prompt_tokens,
+            completion_tokens: tokens.completion_tokens,
+            cache_read_tokens: tokens.cache_read_tokens,
+            cache_write_tokens: tokens.cache_write_tokens,
         };
 
         if let Some(pos) = index
@@ -450,18 +463,39 @@ impl ChatSessionStore {
             .unwrap_or(0)
     }
 
-    pub(crate) async fn count_chat_sessions_since(
+    /// Walks the session index once, returning the count of entries inside
+    /// the window and per-model token totals across them.
+    ///
+    /// Index entries written before token tracking deserialize with zero
+    /// token fields, so they're skipped from `per_model` (no empty rows in
+    /// the model breakdown) but still contribute to `count`.
+    pub(crate) async fn aggregate_chat_window_since(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> u64 {
+    ) -> ChatTokenWindow {
         let Ok(idx) = self.load_index().await else {
-            return 0;
+            return ChatTokenWindow::default();
         };
         let cutoff_str = cutoff.to_rfc3339();
-        idx.entries
-            .iter()
-            .filter(|e| e.updated_at.as_str() >= cutoff_str.as_str())
-            .count() as u64
+        let mut window = ChatTokenWindow::default();
+        for e in &idx.entries {
+            if e.updated_at.as_str() < cutoff_str.as_str() {
+                continue;
+            }
+            window.count += 1;
+            let entry_tokens = SessionTokens {
+                prompt_tokens: e.prompt_tokens,
+                completion_tokens: e.completion_tokens,
+                cache_read_tokens: e.cache_read_tokens,
+                cache_write_tokens: e.cache_write_tokens,
+            };
+            if entry_tokens.total() == 0 {
+                continue;
+            }
+            let model_entry = window.per_model.entry(e.model.clone()).or_default();
+            *model_entry = model_entry.merge(entry_tokens);
+        }
+        window
     }
 
     pub(crate) async fn delete_chat_session(&self, session_id: &str) -> Result<bool> {
@@ -583,6 +617,7 @@ mod tests {
                 &sample_messages(),
                 "hello world",
                 "hello world",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -612,6 +647,7 @@ mod tests {
                 &sample_messages(),
                 "hello",
                 "hello",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -645,6 +681,7 @@ mod tests {
                     &sample_messages(),
                     "title",
                     "preview",
+                    SessionTokens::default(),
                 )
                 .await
                 .unwrap();
@@ -673,6 +710,7 @@ mod tests {
                 &sample_messages(),
                 "title-a",
                 "preview-a",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -688,6 +726,7 @@ mod tests {
                 &sample_messages(),
                 "title-b",
                 "preview-b",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -715,6 +754,7 @@ mod tests {
                 &sample_messages(),
                 "title",
                 "preview",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -734,6 +774,7 @@ mod tests {
                 &sample_messages(),
                 "title2",
                 "preview2",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -760,6 +801,7 @@ mod tests {
                 &sample_messages(),
                 "title",
                 "preview",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -877,6 +919,10 @@ mod tests {
                     created_at: old.to_rfc3339(),
                     title: "old".to_string(),
                     preview: "old".to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 },
                 SessionIndexEntry {
                     session_id: "recent".to_string(),
@@ -888,6 +934,10 @@ mod tests {
                     created_at: recent.to_rfc3339(),
                     title: "recent".to_string(),
                     preview: "recent".to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 },
             ],
         };
@@ -895,6 +945,66 @@ mod tests {
 
         assert_eq!(store.count_chat_sessions().await, 2);
         let cutoff = now - chrono::Duration::days(7);
-        assert_eq!(store.count_chat_sessions_since(cutoff).await, 1);
+        assert_eq!(store.aggregate_chat_window_since(cutoff).await.count, 1);
+    }
+
+    #[tokio::test]
+    async fn aggregate_chat_window_since_sums_per_model_and_filters_by_cutoff() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(30);
+        let recent_a = now - chrono::Duration::minutes(30);
+        let recent_b = now - chrono::Duration::minutes(10);
+
+        let mk_entry =
+            |id: &str, ts: chrono::DateTime<chrono::Utc>, model: &str, p: u64, c: u64| {
+                SessionIndexEntry {
+                    session_id: id.to_string(),
+                    key_id: "k".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    cwd: "/tmp".to_string(),
+                    model: model.to_string(),
+                    updated_at: ts.to_rfc3339(),
+                    created_at: ts.to_rfc3339(),
+                    title: id.to_string(),
+                    preview: id.to_string(),
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                }
+            };
+
+        let index = SessionIndex {
+            entries: vec![
+                mk_entry("old", old, "gpt-4o", 999_999, 999_999), // outside window
+                mk_entry("a1", recent_a, "minimax-m2.7", 100, 200),
+                mk_entry("a2", recent_a, "minimax-m2.7", 50, 70), // same model, sums
+                mk_entry("b1", recent_b, "claude-opus-4.7", 10, 5),
+                mk_entry("zero", recent_b, "kimi", 0, 0), // skipped: no tokens
+            ],
+        };
+        store.save_index(&index).await.unwrap();
+
+        let cutoff = now - chrono::Duration::hours(1);
+        let window = store.aggregate_chat_window_since(cutoff).await;
+        let total = window.total();
+
+        assert_eq!(window.count, 4, "old is filtered; zero-token still counts");
+        assert_eq!(total.prompt_tokens, 160);
+        assert_eq!(total.completion_tokens, 275);
+        assert_eq!(
+            window.per_model.len(),
+            2,
+            "kimi entry has zero tokens; old is filtered"
+        );
+        let minimax = &window.per_model["minimax-m2.7"];
+        assert_eq!(minimax.prompt_tokens, 150);
+        assert_eq!(minimax.completion_tokens, 270);
+        let claude = &window.per_model["claude-opus-4.7"];
+        assert_eq!(claude.prompt_tokens, 10);
+        assert_eq!(claude.completion_tokens, 5);
     }
 }

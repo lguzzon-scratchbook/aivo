@@ -1759,6 +1759,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
             ],
             "hello",
             "hello · hi there",
+            crate::services::session_store::SessionTokens::default(),
         )
         .await
         .unwrap();
@@ -1829,6 +1830,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
             }],
             "hello",
             "hello",
+            crate::services::session_store::SessionTokens::default(),
         )
         .await
         .unwrap();

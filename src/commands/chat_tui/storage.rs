@@ -112,7 +112,7 @@ pub(super) fn restore_cancelled_submission(
     }
 }
 
-pub(super) fn session_title_from_messages(messages: &[ChatMessage], raw_model: &str) -> String {
+pub(crate) fn session_title_from_messages(messages: &[ChatMessage], raw_model: &str) -> String {
     let last_user = messages
         .iter()
         .rev()
@@ -136,7 +136,7 @@ pub(super) fn session_title_from_messages(messages: &[ChatMessage], raw_model: &
         .unwrap_or_else(|| raw_model.to_string())
 }
 
-pub(super) fn session_preview_text_from_messages(
+pub(crate) fn session_preview_text_from_messages(
     messages: &[ChatMessage],
     raw_model: &str,
 ) -> String {

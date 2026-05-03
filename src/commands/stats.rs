@@ -7,7 +7,7 @@ use crate::errors::ExitCode;
 use crate::services::SessionStore;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::global_stats::{self, NativeSessionSummary, normalize_model_for_display};
-use crate::services::session_store::UsageStats;
+use crate::services::session_store::{ChatTokenWindow, UsageStats};
 use crate::style;
 
 /// Per-model totals shown in the `By model` table.
@@ -118,13 +118,19 @@ impl StatsCommand {
                 }
             }
         }
-        // Add chat — use actual session file count, not record_selection count
-        // (record_selection is called on every model/key switch, inflating the count)
-        let chat_sessions = match cutoff {
-            Some(c) => self.store.count_chat_sessions_since(c).await,
-            None => self.store.count_chat_sessions().await,
+        // Chat sessions go through the index (timestamped), not the per-key
+        // counters (lifetime-only). One walk yields both count and tokens.
+        let (chat_sessions, chat_window) = match cutoff {
+            Some(c) => {
+                let w = self.store.aggregate_chat_window_since(c).await;
+                (w.count, w)
+            }
+            None => (
+                self.store.count_chat_sessions().await,
+                ChatTokenWindow::default(),
+            ),
         };
-        let chat_tokens = chat_tokens_for_window(&stats, &key_ids, cutoff);
+        let chat_tokens = chat_tokens_for_summary(&stats, &key_ids, cutoff, &chat_window);
         if chat_tokens.total_tokens() > 0 || chat_sessions > 0 {
             tool_tokens.insert(
                 "chat".to_string(),
@@ -150,7 +156,15 @@ impl StatsCommand {
         let show_cache = total_cache > 0;
         let total_sessions: u64 = tool_tokens.values().map(|t| t.sessions).sum();
 
-        let aivo_model_usage = aivo_model_usage_for_window(&stats, &key_ids, cutoff);
+        let mut aivo_model_usage = aivo_model_usage_for_window(&stats, &key_ids, cutoff);
+        for (model, tokens) in &chat_window.per_model {
+            let key = global_stats::normalize_model_for_display(model);
+            let entry = aivo_model_usage.entry(key).or_default();
+            entry.input = entry.input.saturating_add(tokens.prompt_tokens);
+            entry.output = entry.output.saturating_add(tokens.completion_tokens);
+            entry.cache_read = entry.cache_read.saturating_add(tokens.cache_read_tokens);
+            entry.cache_write = entry.cache_write.saturating_add(tokens.cache_write_tokens);
+        }
         let model_tokens = combine_model_tokens(&global, &aivo_model_usage);
         let total_models = model_tokens
             .values()
@@ -748,38 +762,34 @@ impl ToolTokenSummary {
     }
 }
 
-/// Chat token totals scoped to the requested window.
+/// Chat token totals for the stats `By tool` row.
 ///
-/// Aivo's per-key counters (`UsageCounter::prompt_tokens` etc.) are
-/// lifetime-cumulative with no per-event timestamps, so they cannot be
-/// filtered to a `--since` window. Under cutoff we therefore return zeros
-/// — the chat session count is filtered separately via
-/// `count_chat_sessions_since` and stands on its own. Same suppression
-/// pattern as the per-tool aivo-proxy fallback in `show()`.
-fn chat_tokens_for_window(
+/// Lifetime path uses per-key counters; windowed path uses pre-aggregated
+/// per-session totals from the index — per-key counters are lifetime-only
+/// and would over-attribute to the window.
+fn chat_tokens_for_summary(
     stats: &UsageStats,
     key_ids: &HashSet<&str>,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    chat_window: &ChatTokenWindow,
 ) -> ToolTokenSummary {
     if cutoff.is_some() {
+        let total = chat_window.total();
         return ToolTokenSummary {
             sessions: 0,
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
+            input: total.prompt_tokens,
+            output: total.completion_tokens,
+            cache_read: total.cache_read_tokens,
+            cache_write: total.cache_write_tokens,
         };
     }
     tool_token_totals(stats, "chat", key_ids)
 }
 
-/// Per-model usage from aivo-tracked counters scoped to the requested window.
-///
-/// `per_model_usage` is lifetime-cumulative (same caveat as
-/// `chat_tokens_for_window`), so under cutoff we return an empty map and
-/// the model table renders only window-filtered global data. Without this
-/// guard, models that have *ever* been used through aivo would appear in
-/// every `--since` view with their lifetime totals.
+/// Per-model usage from aivo-tracked counters, scoped to the requested
+/// window. Lifetime-cumulative under the hood, so under cutoff we return an
+/// empty map and the model table renders only window-filtered data — the
+/// chat session index covers windowed chat models separately.
 fn aivo_model_usage_for_window(
     stats: &UsageStats,
     key_ids: &HashSet<&str>,
@@ -1833,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_tokens_for_window_returns_lifetime_without_cutoff() {
+    fn chat_tokens_for_summary_returns_lifetime_without_cutoff() {
         let mut stats = UsageStats::default();
         let mut counter = UsageCounter::default();
         counter.per_tool.insert("chat".to_string(), 5);
@@ -1844,7 +1854,7 @@ mod tests {
         stats.key_usage.insert("k1".to_string(), counter);
         let keys: HashSet<&str> = ["k1"].into_iter().collect();
 
-        let result = chat_tokens_for_window(&stats, &keys, None);
+        let result = chat_tokens_for_summary(&stats, &keys, None, &ChatTokenWindow::default());
         assert_eq!(result.input, 1_000_000);
         assert_eq!(result.output, 200_000);
         assert_eq!(result.cache_read, 50_000);
@@ -1852,10 +1862,10 @@ mod tests {
     }
 
     #[test]
-    fn chat_tokens_for_window_zeroes_under_cutoff() {
-        // Reproduces the "0 sessions / 8.0M tokens" footgun: lifetime per-key
-        // counters have no per-event timestamps, so reporting them under a
-        // --since window misattributes old usage to the current window.
+    fn chat_tokens_for_summary_uses_window_under_cutoff() {
+        use crate::services::session_store::SessionTokens;
+
+        // Lifetime per-key counters set high — must be ignored under cutoff.
         let mut stats = UsageStats::default();
         let mut counter = UsageCounter::default();
         counter.per_tool.insert("chat".to_string(), 5);
@@ -1864,13 +1874,23 @@ mod tests {
         stats.key_usage.insert("k1".to_string(), counter);
         let keys: HashSet<&str> = ["k1"].into_iter().collect();
 
+        let mut window = ChatTokenWindow::default();
+        window.per_model.insert(
+            "minimax-m2.7".to_string(),
+            SessionTokens {
+                prompt_tokens: 12,
+                completion_tokens: 34,
+                cache_read_tokens: 5,
+                cache_write_tokens: 0,
+            },
+        );
+
         let cutoff = Some(chrono::Utc::now() - chrono::Duration::hours(1));
-        let result = chat_tokens_for_window(&stats, &keys, cutoff);
-        assert_eq!(result.input, 0);
-        assert_eq!(result.output, 0);
-        assert_eq!(result.cache_read, 0);
+        let result = chat_tokens_for_summary(&stats, &keys, cutoff, &window);
+        assert_eq!(result.input, 12);
+        assert_eq!(result.output, 34);
+        assert_eq!(result.cache_read, 5);
         assert_eq!(result.cache_write, 0);
-        assert_eq!(result.total_tokens(), 0);
     }
 
     #[test]

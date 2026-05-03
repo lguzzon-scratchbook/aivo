@@ -29,7 +29,7 @@ use crate::services::http_utils::sse_data_payload;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{
-    ApiKey, AttachmentStorage, MessageAttachment, SessionStore, StoredChatMessage,
+    ApiKey, AttachmentStorage, MessageAttachment, SessionStore, SessionTokens, StoredChatMessage,
 };
 use crate::style;
 
@@ -397,6 +397,32 @@ impl ChatCommand {
                         &usage,
                     )
                     .await;
+                    let (session_id, stored, title, preview) = build_one_shot_persist_inputs(
+                        &history,
+                        turn.content.clone(),
+                        turn.reasoning_content.clone(),
+                        &raw_model,
+                    );
+                    let session_tokens = SessionTokens {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        cache_read_tokens: usage.cache_read_input_tokens,
+                        cache_write_tokens: usage.cache_creation_input_tokens,
+                    };
+                    let _ = self
+                        .session_store
+                        .save_chat_session_with_id(
+                            &key.id,
+                            &key.base_url,
+                            &cwd,
+                            &session_id,
+                            &raw_model,
+                            &stored,
+                            &title,
+                            &preview,
+                            session_tokens,
+                        )
+                        .await;
                     if json {
                         let body = turn.raw_body.ok_or_else(|| {
                             anyhow::anyhow!(
@@ -913,6 +939,28 @@ async fn materialize_attachment(attachment: &MessageAttachment) -> Result<Messag
             })
         }
     }
+}
+
+/// Returns `(session_id, stored_messages, title, preview)` for a completed
+/// one-shot turn — the persistence inputs `save_chat_session_with_id` needs.
+fn build_one_shot_persist_inputs(
+    user_history: &[ChatMessage],
+    assistant_content: String,
+    assistant_reasoning: Option<String>,
+    raw_model: &str,
+) -> (String, Vec<StoredChatMessage>, String, String) {
+    let mut full_history = user_history.to_vec();
+    full_history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: assistant_content,
+        reasoning_content: assistant_reasoning.and_then(normalize_reasoning_content),
+        attachments: vec![],
+    });
+    let session_id = new_chat_session_id();
+    let stored = to_stored_messages(&full_history);
+    let title = chat_tui::session_title_from_messages(&full_history, raw_model);
+    let preview = chat_tui::session_preview_text_from_messages(&full_history, raw_model);
+    (session_id, stored, title, preview)
 }
 
 fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
@@ -2266,6 +2314,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_one_shot_persist_inputs_includes_assistant_turn() {
+        let user_history = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello world".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        }];
+        let (session_id, stored, title, preview) = build_one_shot_persist_inputs(
+            &user_history,
+            "hi there".to_string(),
+            Some("brief greeting".to_string()),
+            "gpt-test",
+        );
+
+        assert!(!session_id.is_empty(), "session id must be generated");
+        assert_eq!(stored.len(), 2, "user message + assistant response stored");
+        assert_eq!(stored[0].role, "user");
+        assert_eq!(stored[0].content, "hello world");
+        assert_eq!(stored[1].role, "assistant");
+        assert_eq!(stored[1].content, "hi there");
+        assert_eq!(
+            stored[1].reasoning_content.as_deref(),
+            Some("brief greeting")
+        );
+
+        // Title comes from the user prompt (first non-empty line); preview
+        // composes the last two non-empty messages. Both must be derived
+        // from history, not fall back to the raw model name.
+        assert_eq!(title, "hello world");
+        assert!(
+            preview.contains("hello world") && preview.contains("hi there"),
+            "preview should compose user + assistant snippets, got: {preview}"
+        );
+    }
+
+    #[test]
+    fn build_one_shot_persist_inputs_drops_empty_reasoning() {
+        let user_history = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "ping".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        }];
+        let (_, stored, _, _) = build_one_shot_persist_inputs(
+            &user_history,
+            "pong".to_string(),
+            Some("   \n\t  ".to_string()),
+            "gpt-test",
+        );
+        assert_eq!(stored[1].reasoning_content, None);
+    }
 
     #[test]
     fn test_compose_one_shot_prompt_without_stdin() {

@@ -74,6 +74,7 @@ use self::render::*;
 pub(crate) use self::shared::ChatTuiParams;
 use self::shared::*;
 use self::storage::*;
+pub(crate) use self::storage::{session_preview_text_from_messages, session_title_from_messages};
 use self::system::*;
 
 impl ChatTuiApp {

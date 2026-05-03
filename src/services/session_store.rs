@@ -751,6 +751,67 @@ pub struct SessionIndexEntry {
     pub created_at: String,
     pub title: String,
     pub preview: String,
+    /// Cumulative tokens for this session. Long TUI sessions over-attribute
+    /// to a `--since` window (entire session counts if `updated_at` lands
+    /// inside it); one-shots are exact.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub prompt_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub completion_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+
+/// Token usage for a single chat turn or accumulated across a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionTokens {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+impl SessionTokens {
+    pub fn merge(self, other: SessionTokens) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_add(other.completion_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_add(other.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_add(other.cache_write_tokens),
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens
+            .saturating_add(self.completion_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+}
+
+/// Chat activity inside a `--since` window: how many sessions were touched
+/// and the per-model token totals across them. `total()` derives the top line
+/// so it can't drift from `per_model`.
+#[derive(Debug, Clone, Default)]
+pub struct ChatTokenWindow {
+    pub count: u64,
+    pub per_model: std::collections::HashMap<String, SessionTokens>,
+}
+
+impl ChatTokenWindow {
+    pub fn total(&self) -> SessionTokens {
+        self.per_model
+            .values()
+            .fold(SessionTokens::default(), |acc, t| acc.merge(*t))
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -1615,10 +1676,11 @@ impl SessionStore {
         messages: &[StoredChatMessage],
         title: &str,
         preview: &str,
+        tokens: SessionTokens,
     ) -> Result<()> {
         self.sessions
             .save_chat_session_with_id(
-                key_id, base_url, cwd, session_id, model, messages, title, preview,
+                key_id, base_url, cwd, session_id, model, messages, title, preview, tokens,
             )
             .await
     }
@@ -1631,8 +1693,11 @@ impl SessionStore {
         self.sessions.count_chat_sessions().await
     }
 
-    pub async fn count_chat_sessions_since(&self, cutoff: chrono::DateTime<chrono::Utc>) -> u64 {
-        self.sessions.count_chat_sessions_since(cutoff).await
+    pub async fn aggregate_chat_window_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> ChatTokenWindow {
+        self.sessions.aggregate_chat_window_since(cutoff).await
     }
 
     /// Removes session files for all sessions belonging to a key.
@@ -2137,6 +2202,7 @@ mod tests {
                 }],
                 "hello",
                 "hello",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
@@ -2172,6 +2238,7 @@ mod tests {
                 }],
                 "second",
                 "second",
+                SessionTokens::default(),
             )
             .await
             .unwrap();
