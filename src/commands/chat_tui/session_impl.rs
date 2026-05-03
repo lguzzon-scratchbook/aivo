@@ -51,6 +51,7 @@ impl ChatTuiApp {
 
         self.raw_model = raw_model.clone();
         self.model = ChatCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
+        self.billed_model = None;
         self.draft_history_index = None;
         self.draft_history_stash = None;
         self.notice = None;
@@ -69,6 +70,7 @@ impl ChatTuiApp {
         self.key = key;
         self.raw_model = raw_model.clone();
         self.model = ChatCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
+        self.billed_model = None;
         self.copilot_tm = copilot_token_manager_for_key(&self.key);
         self.persist_model_selection(&raw_model).await?;
 
@@ -300,6 +302,7 @@ impl ChatTuiApp {
                 &self.cwd,
                 &self.session_id,
                 &self.raw_model,
+                self.billed_model.as_deref(),
                 &stored,
                 &title,
                 &preview,
@@ -362,6 +365,7 @@ impl ChatTuiApp {
         self.raw_model = session.raw_model.clone();
         self.model =
             ChatCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
+        self.billed_model = None;
         self.persist_model_selection(&session.raw_model).await?;
         Ok(())
     }

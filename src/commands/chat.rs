@@ -38,11 +38,14 @@ use super::chat_request_builder::{
     build_responses_request,
 };
 use super::chat_response_parser::{
-    ChatResponseChunk, ChatTurnResult, extract_anthropic_usage, extract_google_message,
-    extract_google_usage, extract_openai_message, extract_openai_usage, extract_responses_message,
+    ChatResponseChunk, ChatTurnResult, capture_model, extract_anthropic_usage,
+    extract_google_message, extract_google_model, extract_google_usage, extract_openai_message,
+    extract_openai_usage, extract_response_model, extract_responses_message,
     extract_responses_usage, merge_token_usage, normalize_reasoning_content, parse_anthropic_chunk,
-    parse_anthropic_usage_chunk, parse_google_chunk, parse_google_usage_chunk,
-    parse_openai_usage_chunk, parse_responses_chunk, parse_responses_usage_chunk, parse_sse_chunk,
+    parse_anthropic_model_chunk, parse_anthropic_usage_chunk, parse_google_chunk,
+    parse_google_usage_chunk, parse_openai_model_chunk, parse_openai_usage_chunk,
+    parse_responses_chunk, parse_responses_model_chunk, parse_responses_usage_chunk,
+    parse_sse_chunk,
 };
 
 // Re-export for submodules (chat_tui_format uses TokenUsage)
@@ -375,10 +378,12 @@ impl ChatCommand {
                 Ok(turn) => {
                     let prompt_text: String = history.iter().map(|m| m.content.as_str()).collect();
                     let usage = turn.usage_or_estimate(&prompt_text);
+                    let billed_model = turn.model.as_deref();
+                    let stats_model = billed_model.unwrap_or(&raw_model);
                     self.session_store
                         .record_tokens(
                             &key.id,
-                            Some(&raw_model),
+                            Some(stats_model),
                             usage.prompt_tokens,
                             usage.completion_tokens,
                             usage.cache_read_input_tokens,
@@ -417,6 +422,7 @@ impl ChatCommand {
                             &cwd,
                             &session_id,
                             &raw_model,
+                            billed_model,
                             &stored,
                             &title,
                             &preview,
@@ -1207,6 +1213,7 @@ where
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
     let mut usage = None;
+    let mut response_model: Option<String> = None;
     let mut line_buf = String::new();
     let mut done = false;
 
@@ -1237,6 +1244,7 @@ where
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
+                capture_model(&mut response_model, parse_openai_model_chunk, data);
                 if let Some(chunk) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
                     match &chunk {
@@ -1257,6 +1265,7 @@ where
             if let Some(tokens) = parse_openai_usage_chunk(data) {
                 merge_token_usage(&mut usage, tokens);
             }
+            capture_model(&mut response_model, parse_openai_model_chunk, data);
             if data.trim() != "[DONE]"
                 && let Some(chunk) = parse_sse_chunk(data)
             {
@@ -1270,6 +1279,7 @@ where
         } else if full_content.is_empty()
             && let Ok(resp) = serde_json::from_str::<serde_json::Value>(tail)
         {
+            response_model = response_model.or_else(|| extract_response_model(&resp));
             let response = extract_openai_message(&resp);
             if !response.content.is_empty() || response.reasoning_content.is_some() {
                 style::stop_spinner(spinning);
@@ -1293,6 +1303,7 @@ where
         content: full_content,
         reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
+        model: response_model,
         raw_body: None,
     })
 }
@@ -1329,6 +1340,7 @@ where
     let body: serde_json::Value = response.json().await?;
     let response = extract_openai_message(&body);
     let usage = extract_openai_usage(&body);
+    let response_model = extract_response_model(&body);
 
     if response.content.is_empty() && response.reasoning_content.is_none() {
         style::stop_spinner(spinning);
@@ -1347,6 +1359,7 @@ where
         content: response.content,
         reasoning_content: response.reasoning_content,
         usage,
+        model: response_model,
         raw_body: Some(body),
     })
 }
@@ -1420,6 +1433,7 @@ where
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
     let mut usage = None;
+    let mut response_model: Option<String> = None;
     let mut line_buf = String::new();
     let mut done = false;
 
@@ -1450,6 +1464,7 @@ where
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
+                capture_model(&mut response_model, parse_openai_model_chunk, data);
                 if let Some(chunk) = parse_sse_chunk(data) {
                     style::stop_spinner(spinning);
                     match &chunk {
@@ -1470,6 +1485,7 @@ where
             if let Some(tokens) = parse_openai_usage_chunk(data) {
                 merge_token_usage(&mut usage, tokens);
             }
+            capture_model(&mut response_model, parse_openai_model_chunk, data);
             if data.trim() != "[DONE]"
                 && let Some(chunk) = parse_sse_chunk(data)
             {
@@ -1483,6 +1499,7 @@ where
         } else if full_content.is_empty()
             && let Ok(resp) = serde_json::from_str::<serde_json::Value>(tail)
         {
+            response_model = response_model.or_else(|| extract_response_model(&resp));
             let response = extract_openai_message(&resp);
             if !response.content.is_empty() || response.reasoning_content.is_some() {
                 style::stop_spinner(spinning);
@@ -1515,6 +1532,7 @@ where
         content: full_content,
         reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
+        model: response_model,
         raw_body: None,
     })
 }
@@ -1557,6 +1575,7 @@ where
     let body: serde_json::Value = response.json().await?;
     let response = extract_openai_message(&body);
     let usage = extract_openai_usage(&body);
+    let response_model = extract_response_model(&body);
 
     if response.content.is_empty() && response.reasoning_content.is_none() {
         style::stop_spinner(spinning);
@@ -1575,6 +1594,7 @@ where
         content: response.content,
         reasoning_content: response.reasoning_content,
         usage,
+        model: response_model,
         raw_body: Some(body),
     })
 }
@@ -1645,6 +1665,7 @@ where
 
     let mut full_content = String::new();
     let mut usage = None;
+    let mut response_model: Option<String> = None;
     let mut line_buf = String::new();
 
     while let Some(chunk) = response.chunk().await? {
@@ -1659,6 +1680,7 @@ where
                 if let Some(tokens) = parse_responses_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
+                capture_model(&mut response_model, parse_responses_model_chunk, data);
                 if let Some(chunk) = parse_responses_chunk(data) {
                     style::stop_spinner(spinning);
                     if let ChatResponseChunk::Content(ref content) = chunk {
@@ -1677,6 +1699,7 @@ where
         if let Some(tokens) = parse_responses_usage_chunk(data) {
             merge_token_usage(&mut usage, tokens);
         }
+        capture_model(&mut response_model, parse_responses_model_chunk, data);
         if let Some(chunk) = parse_responses_chunk(data) {
             style::stop_spinner(spinning);
             if let ChatResponseChunk::Content(ref content) = chunk {
@@ -1703,6 +1726,7 @@ where
         content: full_content,
         reasoning_content: None,
         usage,
+        model: response_model,
         raw_body: None,
     })
 }
@@ -1744,6 +1768,7 @@ where
     let body: serde_json::Value = response.json().await?;
     let response = extract_responses_message(&body);
     let usage = extract_responses_usage(&body);
+    let response_model = extract_response_model(&body);
 
     if response.content.is_empty() {
         style::stop_spinner(spinning);
@@ -1757,6 +1782,7 @@ where
         content: response.content,
         reasoning_content: None,
         usage,
+        model: response_model,
         raw_body: Some(body),
     })
 }
@@ -1858,6 +1884,7 @@ where
 
     let mut full_content = String::new();
     let mut usage = None;
+    let mut response_model: Option<String> = None;
     let mut line_buf = String::new();
 
     while let Some(chunk) = response.chunk().await? {
@@ -1872,6 +1899,7 @@ where
                 if let Some(tokens) = parse_responses_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
+                capture_model(&mut response_model, parse_responses_model_chunk, data);
                 if let Some(chunk) = parse_responses_chunk(data) {
                     style::stop_spinner(spinning);
                     if let ChatResponseChunk::Content(ref content) = chunk {
@@ -1890,6 +1918,7 @@ where
         if let Some(tokens) = parse_responses_usage_chunk(data) {
             merge_token_usage(&mut usage, tokens);
         }
+        capture_model(&mut response_model, parse_responses_model_chunk, data);
         if let Some(chunk) = parse_responses_chunk(data) {
             style::stop_spinner(spinning);
             if let ChatResponseChunk::Content(ref content) = chunk {
@@ -1910,6 +1939,7 @@ where
         content: full_content,
         reasoning_content: None,
         usage,
+        model: response_model,
         raw_body: None,
     })
 }
@@ -1946,6 +1976,7 @@ where
     let body: serde_json::Value = response.json().await?;
     let response = extract_responses_message(&body);
     let usage = extract_responses_usage(&body);
+    let response_model = extract_response_model(&body);
 
     if response.content.is_empty() {
         style::stop_spinner(spinning);
@@ -1959,6 +1990,7 @@ where
         content: response.content,
         reasoning_content: None,
         usage,
+        model: response_model,
         raw_body: Some(body),
     })
 }
@@ -2015,6 +2047,7 @@ where
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
     let mut usage = None;
+    let mut response_model: Option<String> = None;
     let mut line_buf = String::new();
 
     while let Some(chunk) = response.chunk().await? {
@@ -2029,6 +2062,7 @@ where
                 if let Some(tokens) = parse_anthropic_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
                 }
+                capture_model(&mut response_model, parse_anthropic_model_chunk, data);
                 if let Some(chunk) = parse_anthropic_chunk(data) {
                     style::stop_spinner(spinning);
                     match &chunk {
@@ -2049,6 +2083,7 @@ where
             if let Some(tokens) = parse_anthropic_usage_chunk(data) {
                 merge_token_usage(&mut usage, tokens);
             }
+            capture_model(&mut response_model, parse_anthropic_model_chunk, data);
             if let Some(chunk) = parse_anthropic_chunk(data) {
                 style::stop_spinner(spinning);
                 match &chunk {
@@ -2072,6 +2107,7 @@ where
         content: full_content,
         reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
+        model: response_model,
         raw_body: None,
     })
 }
@@ -2108,6 +2144,7 @@ where
 
     let body: serde_json::Value = response.json().await?;
     let usage = extract_anthropic_usage(&body);
+    let response_model = extract_response_model(&body);
 
     let mut content_parts = Vec::new();
     let mut reasoning_parts = Vec::new();
@@ -2151,6 +2188,7 @@ where
         content,
         reasoning_content,
         usage,
+        model: response_model,
         raw_body: Some(body),
     })
 }
@@ -2253,6 +2291,10 @@ where
         content: full_content,
         reasoning_content: None,
         usage,
+        // Google's stream chunks don't include the model name; the request
+        // model was already substituted into the URL. Recording falls back
+        // to the user-typed alias.
+        model: None,
         raw_body: None,
     })
 }
@@ -2294,6 +2336,7 @@ where
     let body: serde_json::Value = response.json().await?;
     let google_response = extract_google_message(&body);
     let usage = extract_google_usage(&body);
+    let response_model = extract_google_model(&body);
 
     if google_response.content.is_empty() {
         style::stop_spinner(spinning);
@@ -2307,6 +2350,7 @@ where
         content: google_response.content,
         reasoning_content: None,
         usage,
+        model: response_model,
         raw_body: Some(body),
     })
 }

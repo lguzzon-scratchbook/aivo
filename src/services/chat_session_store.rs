@@ -179,6 +179,7 @@ impl ChatSessionStore {
                 base_url: session.base_url.clone(),
                 cwd: session.cwd.clone(),
                 model: session.model.clone(),
+                billed_model: None,
                 updated_at: session.updated_at.clone(),
                 created_at: session.created_at.clone(),
                 title,
@@ -298,6 +299,7 @@ impl ChatSessionStore {
                     base_url: state.base_url.clone(),
                     cwd: state.cwd.clone(),
                     model: state.model.clone(),
+                    billed_model: None,
                     updated_at: state.updated_at.clone(),
                     created_at: state.created_at.clone(),
                     title,
@@ -385,6 +387,7 @@ impl ChatSessionStore {
         cwd: &str,
         session_id: &str,
         model: &str,
+        billed_model: Option<&str>,
         messages: &[StoredChatMessage],
         title: &str,
         preview: &str,
@@ -426,12 +429,23 @@ impl ChatSessionStore {
             Err(_) => self.rebuild_index().await?,
         };
 
+        let existing_pos = index
+            .entries
+            .iter()
+            .position(|e| e.session_id == session_id);
+        // A heartbeat save (no fresh turn) passes None; preserve the
+        // previous turn's upstream model rather than clearing it.
+        let preserved_billed = billed_model
+            .map(str::to_string)
+            .or_else(|| existing_pos.and_then(|pos| index.entries[pos].billed_model.clone()));
+
         let new_entry = SessionIndexEntry {
             session_id: session_id.to_string(),
             key_id: key_id.to_string(),
             base_url: base_url.to_string(),
             cwd: cwd.to_string(),
             model: model.to_string(),
+            billed_model: preserved_billed,
             updated_at: now,
             created_at,
             title: title.to_string(),
@@ -442,14 +456,9 @@ impl ChatSessionStore {
             cache_write_tokens: tokens.cache_write_tokens,
         };
 
-        if let Some(pos) = index
-            .entries
-            .iter()
-            .position(|e| e.session_id == session_id)
-        {
-            index.entries[pos] = new_entry;
-        } else {
-            index.entries.push(new_entry);
+        match existing_pos {
+            Some(pos) => index.entries[pos] = new_entry,
+            None => index.entries.push(new_entry),
         }
 
         self.evict_old_sessions(&mut index).await?;
@@ -492,7 +501,10 @@ impl ChatSessionStore {
             if entry_tokens.total() == 0 {
                 continue;
             }
-            let model_entry = window.per_model.entry(e.model.clone()).or_default();
+            // Prefer billed_model so aliases (`aivo/starter` → `deepseek-v4-flash`)
+            // collapse onto the same key claude-code records.
+            let key = e.billed_model.clone().unwrap_or_else(|| e.model.clone());
+            let model_entry = window.per_model.entry(key).or_default();
             *model_entry = model_entry.merge(entry_tokens);
         }
         window
@@ -614,6 +626,7 @@ mod tests {
                 "/tmp/test",
                 "sess1",
                 "gpt-4o",
+                None,
                 &sample_messages(),
                 "hello world",
                 "hello world",
@@ -644,6 +657,7 @@ mod tests {
                 "/tmp/test",
                 "sess1",
                 "gpt-4o",
+                None,
                 &sample_messages(),
                 "hello",
                 "hello",
@@ -678,6 +692,7 @@ mod tests {
                     "/tmp/test",
                     sid,
                     "gpt-4o",
+                    None,
                     &sample_messages(),
                     "title",
                     "preview",
@@ -707,6 +722,7 @@ mod tests {
                 "/tmp/a",
                 "sess-a",
                 "gpt-4o",
+                None,
                 &sample_messages(),
                 "title-a",
                 "preview-a",
@@ -723,6 +739,7 @@ mod tests {
                 "/tmp/b",
                 "sess-b",
                 "gpt-4o",
+                None,
                 &sample_messages(),
                 "title-b",
                 "preview-b",
@@ -751,6 +768,7 @@ mod tests {
                 "/tmp/test",
                 "sess1",
                 "gpt-4o",
+                None,
                 &sample_messages(),
                 "title",
                 "preview",
@@ -771,6 +789,7 @@ mod tests {
                 "/tmp/test",
                 "sess1",
                 "gpt-4o",
+                None,
                 &sample_messages(),
                 "title2",
                 "preview2",
@@ -798,6 +817,7 @@ mod tests {
                 "/tmp/test",
                 "sess1",
                 "gpt-4o",
+                None,
                 &sample_messages(),
                 "title",
                 "preview",
@@ -915,6 +935,7 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     cwd: "/tmp".to_string(),
                     model: "gpt-4o".to_string(),
+                    billed_model: None,
                     updated_at: old.to_rfc3339(),
                     created_at: old.to_rfc3339(),
                     title: "old".to_string(),
@@ -930,6 +951,7 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     cwd: "/tmp".to_string(),
                     model: "gpt-4o".to_string(),
+                    billed_model: None,
                     updated_at: recent.to_rfc3339(),
                     created_at: recent.to_rfc3339(),
                     title: "recent".to_string(),
@@ -966,6 +988,7 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     cwd: "/tmp".to_string(),
                     model: model.to_string(),
+                    billed_model: None,
                     updated_at: ts.to_rfc3339(),
                     created_at: ts.to_rfc3339(),
                     title: id.to_string(),
@@ -1006,5 +1029,136 @@ mod tests {
         let claude = &window.per_model["claude-opus-4.7"];
         assert_eq!(claude.prompt_tokens, 10);
         assert_eq!(claude.completion_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn aggregate_chat_window_since_prefers_billed_model_over_alias() {
+        // `aivo/starter` is an alias that resolves upstream to a real model
+        // like `deepseek-v4-flash`. Stats prefers the billed name so chat
+        // lines up with claude-code (which records model from the upstream
+        // response). Entries without `billed_model` (legacy / non-aliased
+        // providers) keep using `model` as the per-model key.
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let now = Utc::now();
+        let recent = now - chrono::Duration::minutes(5);
+
+        let index = SessionIndex {
+            entries: vec![
+                SessionIndexEntry {
+                    session_id: "starter-session".to_string(),
+                    key_id: "k".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    cwd: "/tmp".to_string(),
+                    model: "aivo/starter".to_string(),
+                    billed_model: Some("deepseek-v4-flash".to_string()),
+                    updated_at: recent.to_rfc3339(),
+                    created_at: recent.to_rfc3339(),
+                    title: "starter".to_string(),
+                    preview: "starter".to_string(),
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                SessionIndexEntry {
+                    session_id: "legacy-session".to_string(),
+                    key_id: "k".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    cwd: "/tmp".to_string(),
+                    model: "gpt-4o".to_string(),
+                    billed_model: None,
+                    updated_at: recent.to_rfc3339(),
+                    created_at: recent.to_rfc3339(),
+                    title: "legacy".to_string(),
+                    preview: "legacy".to_string(),
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            ],
+        };
+        store.save_index(&index).await.unwrap();
+
+        let cutoff = now - chrono::Duration::hours(1);
+        let window = store.aggregate_chat_window_since(cutoff).await;
+
+        assert_eq!(window.per_model.len(), 2);
+        let billed = &window.per_model["deepseek-v4-flash"];
+        assert_eq!(billed.prompt_tokens, 100);
+        assert_eq!(billed.completion_tokens, 50);
+        assert!(
+            !window.per_model.contains_key("aivo/starter"),
+            "billed_model should replace, not duplicate, the alias"
+        );
+        let legacy = &window.per_model["gpt-4o"];
+        assert_eq!(legacy.prompt_tokens, 7);
+        assert_eq!(legacy.completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn save_chat_session_records_and_preserves_billed_model() {
+        // First save carries a billed_model from the turn; a follow-up save
+        // (e.g. TUI heartbeat with no fresh turn) passes None and must keep
+        // the previously-recorded billed_model on the index entry.
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "aivo/starter",
+                Some("deepseek-v4-flash"),
+                &sample_messages(),
+                "title",
+                "preview",
+                SessionTokens {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let idx = store.load_index().await.unwrap();
+        let entry = idx
+            .entries
+            .iter()
+            .find(|e| e.session_id == "sess1")
+            .unwrap();
+        assert_eq!(entry.billed_model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(entry.model, "aivo/starter");
+
+        // Heartbeat-style save without a fresh billed_model preserves it.
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "aivo/starter",
+                None,
+                &sample_messages(),
+                "title",
+                "preview",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+
+        let idx = store.load_index().await.unwrap();
+        let entry = idx
+            .entries
+            .iter()
+            .find(|e| e.session_id == "sess1")
+            .unwrap();
+        assert_eq!(entry.billed_model.as_deref(), Some("deepseek-v4-flash"));
     }
 }

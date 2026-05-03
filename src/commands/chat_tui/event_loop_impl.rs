@@ -78,10 +78,15 @@ impl ChatTuiApp {
             .map(|m| m.content.as_str())
             .collect();
         let usage = turn.usage_or_estimate(&prompt_text);
+        // Cache for subsequent heartbeat saves, which run without a turn.
+        if let Some(ref model) = turn.model {
+            self.billed_model = Some(model.clone());
+        }
+        let stats_model = self.billed_model.as_deref().unwrap_or(&self.raw_model);
         self.session_store
             .record_tokens(
                 &self.key.id,
-                Some(&self.raw_model),
+                Some(stats_model),
                 usage.prompt_tokens,
                 usage.completion_tokens,
                 usage.cache_read_input_tokens,

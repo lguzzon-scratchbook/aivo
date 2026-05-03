@@ -747,6 +747,14 @@ pub struct SessionIndexEntry {
     pub base_url: String,
     pub cwd: String,
     pub model: String,
+    /// Upstream-resolved model from the provider response (e.g. `aivo/starter`
+    /// resolves to `deepseek-v4-flash`). Stats prefers this over `model` so
+    /// the chat per-model breakdown matches what claude-code records — and
+    /// the user's typed alias is still used for display via `model`.
+    /// `None` for legacy entries written before this was tracked, or when
+    /// the provider didn't return a model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billed_model: Option<String>,
     pub updated_at: String,
     pub created_at: String,
     pub title: String,
@@ -800,6 +808,11 @@ impl SessionTokens {
 /// Chat activity inside a `--since` window: how many sessions were touched
 /// and the per-model token totals across them. `total()` derives the top line
 /// so it can't drift from `per_model`.
+///
+/// `per_model` keys are `billed_model` when known (the upstream-resolved
+/// name), falling back to `model` (the user-typed alias) for legacy
+/// entries — so aliases like `aivo/starter` collapse onto the upstream
+/// they resolve to.
 #[derive(Debug, Clone, Default)]
 pub struct ChatTokenWindow {
     pub count: u64,
@@ -1673,6 +1686,7 @@ impl SessionStore {
         cwd: &str,
         session_id: &str,
         model: &str,
+        billed_model: Option<&str>,
         messages: &[StoredChatMessage],
         title: &str,
         preview: &str,
@@ -1680,7 +1694,16 @@ impl SessionStore {
     ) -> Result<()> {
         self.sessions
             .save_chat_session_with_id(
-                key_id, base_url, cwd, session_id, model, messages, title, preview, tokens,
+                key_id,
+                base_url,
+                cwd,
+                session_id,
+                model,
+                billed_model,
+                messages,
+                title,
+                preview,
+                tokens,
             )
             .await
     }
@@ -2192,6 +2215,7 @@ mod tests {
                 "/tmp/demo",
                 "legacy",
                 "gpt-4o",
+                None,
                 &[StoredChatMessage {
                     role: "user".to_string(),
                     content: "hello".to_string(),
@@ -2228,6 +2252,7 @@ mod tests {
                 "/tmp/demo",
                 "session-2",
                 "gpt-4o-mini",
+                None,
                 &[StoredChatMessage {
                     role: "user".to_string(),
                     content: "second".to_string(),

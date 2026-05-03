@@ -522,6 +522,7 @@ fn make_test_app(
         cwd: String::new(),
         raw_model: String::new(),
         model: String::new(),
+        billed_model: None,
         format: ChatFormat::OpenAI,
         history: Vec::new(),
         draft: String::new(),
@@ -1739,6 +1740,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
             "/tmp/demo",
             "session-1234",
             "claude",
+            None,
             &[
                 crate::services::session_store::StoredChatMessage {
                     role: "user".to_string(),
@@ -1820,6 +1822,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
             "/tmp/demo",
             "session-1234",
             "claude",
+            None,
             &[crate::services::session_store::StoredChatMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),

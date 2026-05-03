@@ -996,8 +996,8 @@ fn render_default_model_table(
         println!(
             "{} {} {}",
             style::bold(format!("{:<name_w$}", "By model")),
-            style::dim(format!("{:>tok_w$}", "tokens")),
             style::dim(format!("{:>cache_w$}", "cached")),
+            style::dim(format!("{:>tok_w$}", "tokens")),
         );
     } else {
         println!(
@@ -1016,12 +1016,12 @@ fn render_default_model_table(
                 println!(
                     "{} {} {} {}",
                     style::cyan(&pn),
-                    pt,
                     pc,
+                    pt,
                     style::cyan(bar(m.tokens(), max_tok)),
                 );
             } else {
-                println!("{} {} {}", style::cyan(&pn), pt, pc);
+                println!("{} {} {}", style::cyan(&pn), pc, pt);
             }
         } else if show_bar {
             println!(

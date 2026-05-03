@@ -95,6 +95,7 @@ impl ChatTuiApp {
             cwd: params.cwd,
             raw_model: params.raw_model,
             model: params.model,
+            billed_model: None,
             format: initial_format,
             history: params.initial_history,
             draft: String::new(),

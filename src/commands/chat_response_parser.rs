@@ -72,6 +72,12 @@ pub(crate) struct ChatTurnResult {
     pub content: String,
     pub reasoning_content: Option<String>,
     pub usage: Option<TokenUsage>,
+    /// Upstream model echoed by the provider's response. `None` when the
+    /// response didn't carry a `model` field (e.g. Google streaming, where
+    /// the model is in the URL). Stats prefers this over the user-typed
+    /// alias so `aivo/starter` collapses into the upstream `deepseek-v4-flash`
+    /// — same key claude-code records.
+    pub model: Option<String>,
     /// Raw upstream response body, populated for non-streaming handlers.
     /// Surfaced by `aivo chat --json` so scripts can consume the
     /// provider-native shape.
@@ -245,6 +251,88 @@ pub(crate) fn parse_openai_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
 pub(crate) fn parse_anthropic_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
     let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
     extract_anthropic_usage_update(&value)
+}
+
+/// Extract the upstream `model` field from a non-streaming response body.
+/// Works uniformly for OpenAI Chat Completions, Anthropic, Copilot, and any
+/// other format that exposes `body["model"]` at the top level.
+pub(crate) fn extract_response_model(body: &serde_json::Value) -> Option<String> {
+    body.get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Run `parser` on `data` and assign to `slot` only if `slot` is still
+/// `None`. Streaming handlers call this on every SSE chunk to capture the
+/// upstream model from whichever chunk carries it (OpenAI: every chunk;
+/// Anthropic: only `message_start`; Responses: `response.created`/
+/// `response.completed`), without re-parsing once known.
+pub(crate) fn capture_model(
+    slot: &mut Option<String>,
+    parser: fn(&str) -> Option<String>,
+    data: &str,
+) {
+    if slot.is_none()
+        && let Some(m) = parser(data)
+    {
+        *slot = Some(m);
+    }
+}
+
+/// Extract `model` from an OpenAI Chat Completions SSE chunk. Each chunk
+/// carries `{"id":..., "model":..., "choices":[...]}`, so any non-empty
+/// chunk works as a source.
+pub(crate) fn parse_openai_model_chunk(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    extract_response_model(&value)
+}
+
+/// Extract `model` from an Anthropic SSE event. Only `message_start`
+/// carries `message.model`; later deltas/usage events don't repeat it.
+pub(crate) fn parse_anthropic_model_chunk(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    if value.get("type").and_then(|t| t.as_str()) != Some("message_start") {
+        return None;
+    }
+    value
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extract the upstream model from a non-streaming Google Gemini body.
+/// Gemini uses `modelVersion`; gateway-style endpoints sometimes echo
+/// `model` instead, so accept either.
+pub(crate) fn extract_google_model(body: &serde_json::Value) -> Option<String> {
+    body.get("modelVersion")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| extract_response_model(body))
+}
+
+/// Extract `model` from a Responses API SSE event. Both `response.created`
+/// and `response.completed` echo `response.model`; either is fine as a
+/// source. Other events (text deltas, etc.) don't carry it.
+pub(crate) fn parse_responses_model_chunk(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let event_type = value.get("type").and_then(|t| t.as_str())?;
+    if event_type != "response.created" && event_type != "response.completed" {
+        return None;
+    }
+    value
+        .get("response")
+        .and_then(|r| r.get("model"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub(crate) fn merge_token_usage(usage: &mut Option<TokenUsage>, update: TokenUsageUpdate) {
@@ -483,6 +571,64 @@ pub(crate) fn parse_anthropic_chunk(data: &str) -> Option<ChatResponseChunk> {
 mod tests {
     use super::*;
     use crate::services::http_utils::sse_data_payload;
+
+    #[test]
+    fn extract_response_model_reads_top_level_field() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "deepseek-v4-flash",
+            "choices": [],
+        });
+        assert_eq!(
+            extract_response_model(&body).as_deref(),
+            Some("deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn extract_response_model_returns_none_when_missing_or_blank() {
+        let missing = serde_json::json!({"id": "x"});
+        assert_eq!(extract_response_model(&missing), None);
+        let blank = serde_json::json!({"model": "   "});
+        assert_eq!(extract_response_model(&blank), None);
+    }
+
+    #[test]
+    fn parse_openai_model_chunk_reads_streaming_chunk() {
+        let chunk = r#"{"id":"chatcmpl-x","model":"deepseek-v4-flash","choices":[{"delta":{"content":"hi"}}]}"#;
+        assert_eq!(
+            parse_openai_model_chunk(chunk).as_deref(),
+            Some("deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_model_chunk_only_message_start() {
+        let start = r#"{"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6"}}"#;
+        assert_eq!(
+            parse_anthropic_model_chunk(start).as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        // Other event types must not surface a model name.
+        let delta = r#"{"type":"content_block_delta","delta":{"text":"hi"}}"#;
+        assert_eq!(parse_anthropic_model_chunk(delta), None);
+    }
+
+    #[test]
+    fn parse_responses_model_chunk_handles_created_and_completed() {
+        let created = r#"{"type":"response.created","response":{"model":"gpt-5"}}"#;
+        let completed = r#"{"type":"response.completed","response":{"model":"gpt-5"}}"#;
+        let other = r#"{"type":"response.output_text.delta","delta":"x"}"#;
+        assert_eq!(
+            parse_responses_model_chunk(created).as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            parse_responses_model_chunk(completed).as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(parse_responses_model_chunk(other), None);
+    }
 
     #[test]
     fn test_parse_sse_chunk_with_content() {

@@ -629,6 +629,10 @@ pub(super) struct ChatTuiApp {
     pub(super) cwd: String,
     pub(super) raw_model: String,
     pub(super) model: String,
+    /// Upstream model captured from the most recent turn so heartbeat
+    /// saves (no fresh turn in scope) can still write `billed_model` to
+    /// the session index. Cleared on key/model switch and resume.
+    pub(super) billed_model: Option<String>,
     pub(super) format: ChatFormat,
     pub(super) history: Vec<ChatMessage>,
     pub(super) draft: String,
