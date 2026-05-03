@@ -348,6 +348,10 @@ pub struct StatsArgs {
     #[arg(short = 'a', long)]
     pub all: bool,
 
+    /// Expand the per-model table to input/output/cached/total columns
+    #[arg(short = 'd', long)]
+    pub detailed: bool,
+
     /// Show the heaviest native session files for supported tools
     #[arg(long)]
     pub top_sessions: bool,

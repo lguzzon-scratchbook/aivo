@@ -336,6 +336,34 @@ pub struct DirectoryStartRecord {
     pub updated_at: String,
 }
 
+/// Per-model accumulator stored under `UsageCounter::per_model_usage`.
+/// Mirrors the four token dimensions that providers report.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCounter {
+    #[serde(rename = "promptTokens", default, skip_serializing_if = "is_zero")]
+    pub prompt_tokens: u64,
+    #[serde(rename = "completionTokens", default, skip_serializing_if = "is_zero")]
+    pub completion_tokens: u64,
+    #[serde(
+        rename = "cacheReadInputTokens",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub cache_read_input_tokens: u64,
+    #[serde(
+        rename = "cacheCreationInputTokens",
+        default,
+        skip_serializing_if = "is_zero"
+    )]
+    pub cache_creation_input_tokens: u64,
+}
+
+impl ModelCounter {
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct UsageCounter {
     #[serde(rename = "promptTokens", default, skip_serializing_if = "is_zero")]
@@ -359,16 +387,118 @@ pub struct UsageCounter {
     /// Per-tool selection counts (only populated in key_usage entries).
     #[serde(rename = "perTool", default, skip_serializing_if = "HashMap::is_empty")]
     pub per_tool: HashMap<String, u64>,
-    /// Per-model total token counts (only populated in key_usage entries).
+    /// Per-model accumulator (only populated in key_usage entries).
+    #[serde(
+        rename = "perModelUsage",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_model_usage: HashMap<String, ModelCounter>,
+    /// Legacy per-model total tokens. Read by the migration helper, never written
+    /// after this version. Kept on the type for forward/backward compatibility
+    /// with on-disk data recorded before the schema collapse.
     #[serde(
         rename = "perModelTokens",
         default,
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub per_model_tokens: HashMap<String, u64>,
+    /// Legacy per-model prompt tokens. See `per_model_tokens` for context.
+    #[serde(
+        rename = "perModelPromptTokens",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_model_prompt_tokens: HashMap<String, u64>,
+    /// Legacy per-model completion tokens.
+    #[serde(
+        rename = "perModelCompletionTokens",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_model_completion_tokens: HashMap<String, u64>,
+    /// Legacy per-model cache-read tokens.
+    #[serde(
+        rename = "perModelCacheReadTokens",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_model_cache_read_tokens: HashMap<String, u64>,
+    /// Legacy per-model cache-creation (write) tokens.
+    #[serde(
+        rename = "perModelCacheCreationTokens",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_model_cache_creation_tokens: HashMap<String, u64>,
 }
 
 impl UsageCounter {
+    /// Folds all four legacy `per_model_*` maps and the legacy `per_model_tokens`
+    /// total into the canonical `per_model_usage` map, then clears the legacy maps.
+    /// Idempotent: calling on already-migrated data is a no-op.
+    fn migrate_legacy_per_model(&mut self) {
+        if self.per_model_tokens.is_empty()
+            && self.per_model_prompt_tokens.is_empty()
+            && self.per_model_completion_tokens.is_empty()
+            && self.per_model_cache_read_tokens.is_empty()
+            && self.per_model_cache_creation_tokens.is_empty()
+        {
+            return;
+        }
+        let mut models: std::collections::HashSet<String> = std::collections::HashSet::new();
+        models.extend(self.per_model_usage.keys().cloned());
+        models.extend(self.per_model_tokens.keys().cloned());
+        models.extend(self.per_model_prompt_tokens.keys().cloned());
+        models.extend(self.per_model_completion_tokens.keys().cloned());
+        models.extend(self.per_model_cache_read_tokens.keys().cloned());
+        models.extend(self.per_model_cache_creation_tokens.keys().cloned());
+        for model in models {
+            let prompt = self
+                .per_model_prompt_tokens
+                .get(&model)
+                .copied()
+                .unwrap_or(0);
+            let completion = self
+                .per_model_completion_tokens
+                .get(&model)
+                .copied()
+                .unwrap_or(0);
+            let cache_read = self
+                .per_model_cache_read_tokens
+                .get(&model)
+                .copied()
+                .unwrap_or(0);
+            let cache_create = self
+                .per_model_cache_creation_tokens
+                .get(&model)
+                .copied()
+                .unwrap_or(0);
+            // Pre-split residue: portion of the legacy total not covered by
+            // recorded prompt/completion. Fold into completion so the row
+            // total stays accurate even when we don't know the input/output split.
+            let split_total = prompt.saturating_add(completion);
+            let legacy_total = self.per_model_tokens.get(&model).copied().unwrap_or(0);
+            let residue = legacy_total.saturating_sub(split_total);
+            let counter = self.per_model_usage.entry(model).or_default();
+            counter.prompt_tokens = counter.prompt_tokens.saturating_add(prompt);
+            counter.completion_tokens = counter
+                .completion_tokens
+                .saturating_add(completion)
+                .saturating_add(residue);
+            counter.cache_read_input_tokens =
+                counter.cache_read_input_tokens.saturating_add(cache_read);
+            counter.cache_creation_input_tokens = counter
+                .cache_creation_input_tokens
+                .saturating_add(cache_create);
+        }
+        self.per_model_tokens.clear();
+        self.per_model_prompt_tokens.clear();
+        self.per_model_completion_tokens.clear();
+        self.per_model_cache_read_tokens.clear();
+        self.per_model_cache_creation_tokens.clear();
+    }
+
     fn add_tokens(
         &mut self,
         prompt_tokens: u64,
@@ -417,6 +547,14 @@ impl UsageStats {
         self == &Self::default()
     }
 
+    /// Folds the four legacy `per_model_*` maps and the legacy `per_model_tokens`
+    /// total on every key into the canonical `per_model_usage` field. Idempotent.
+    pub(crate) fn migrate_legacy_per_model(&mut self) {
+        for entry in self.key_usage.values_mut() {
+            entry.migrate_legacy_per_model();
+        }
+    }
+
     /// Removes stats linked to a key by subtracting its known contributions from globals.
     /// Uses subtraction instead of recomputing to preserve legacy global data that
     /// predates per-key model/tool tracking.
@@ -432,6 +570,18 @@ impl UsageStats {
                 }
             }
         }
+        for (model, mc) in &removed.per_model_usage {
+            let tok = mc.total_tokens();
+            if let Some(mu) = self.model_usage.get_mut(model) {
+                mu.total_tokens = mu.total_tokens.saturating_sub(tok);
+                if mu.total_tokens == 0 {
+                    self.model_usage.remove(model);
+                }
+            }
+        }
+        // Defensive: post-migration `per_model_tokens` is empty, so this is a
+        // no-op on normal load paths. Kept for callers that mutate UsageStats
+        // directly without going through `load_with_migration`.
         for (model, tok) in &removed.per_model_tokens {
             if let Some(mu) = self.model_usage.get_mut(model) {
                 mu.total_tokens = mu.total_tokens.saturating_sub(*tok);
@@ -470,13 +620,26 @@ impl UsageStats {
         );
 
         let total = prompt_tokens.saturating_add(completion_tokens);
-        if let Some(model) = model.filter(|value| !value.trim().is_empty() && total > 0) {
-            *key_stats
-                .per_model_tokens
+        let cache_total = cache_read_input_tokens.saturating_add(cache_creation_input_tokens);
+        if let Some(model) =
+            model.filter(|value| !value.trim().is_empty() && (total > 0 || cache_total > 0))
+        {
+            let entry = key_stats
+                .per_model_usage
                 .entry(model.to_string())
-                .or_default() += total;
-            let model_stats = self.model_usage.entry(model.to_string()).or_default();
-            model_stats.total_tokens = model_stats.total_tokens.saturating_add(total);
+                .or_default();
+            entry.prompt_tokens = entry.prompt_tokens.saturating_add(prompt_tokens);
+            entry.completion_tokens = entry.completion_tokens.saturating_add(completion_tokens);
+            entry.cache_read_input_tokens = entry
+                .cache_read_input_tokens
+                .saturating_add(cache_read_input_tokens);
+            entry.cache_creation_input_tokens = entry
+                .cache_creation_input_tokens
+                .saturating_add(cache_creation_input_tokens);
+            if total > 0 {
+                let model_stats = self.model_usage.entry(model.to_string()).or_default();
+                model_stats.total_tokens = model_stats.total_tokens.saturating_add(total);
+            }
         }
     }
 }
@@ -1564,6 +1727,53 @@ mod tests {
     use super::*;
     use crate::services::api_key_store::{KEY_ID_ALPHABET, KEY_ID_LENGTH};
     use tempfile::TempDir;
+
+    #[test]
+    fn migrate_legacy_per_model_is_idempotent() {
+        // First run folds legacy maps into per_model_usage; a second run on the
+        // already-migrated state must be a no-op (legacy maps stay empty,
+        // per_model_usage stays unchanged).
+        let mut counter = UsageCounter::default();
+        counter.per_model_tokens.insert("kimi".to_string(), 450);
+        counter
+            .per_model_prompt_tokens
+            .insert("kimi".to_string(), 200);
+        counter
+            .per_model_completion_tokens
+            .insert("kimi".to_string(), 100);
+        counter
+            .per_model_cache_read_tokens
+            .insert("kimi".to_string(), 25);
+
+        let mut stats = UsageStats::default();
+        stats.key_usage.insert("k1".to_string(), counter);
+
+        stats.migrate_legacy_per_model();
+        let after_first = stats.clone();
+        stats.migrate_legacy_per_model();
+        assert_eq!(stats, after_first);
+    }
+
+    #[test]
+    fn model_counter_serde_round_trip() {
+        // Skip-if-zero: only populated fields should serialize.
+        let mc = ModelCounter {
+            prompt_tokens: 700,
+            completion_tokens: 0,
+            cache_read_input_tokens: 25,
+            cache_creation_input_tokens: 0,
+        };
+        let json = serde_json::to_string(&mc).unwrap();
+        assert!(json.contains("promptTokens"));
+        assert!(!json.contains("completionTokens"));
+        assert!(json.contains("cacheReadInputTokens"));
+        assert!(!json.contains("cacheCreationInputTokens"));
+        let parsed: ModelCounter = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, mc);
+        // Reading data with all zero fields produces a default-valued struct.
+        let empty: ModelCounter = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, ModelCounter::default());
+    }
 
     #[test]
     fn is_claude_oauth_tracks_sentinel() {

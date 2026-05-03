@@ -64,7 +64,15 @@ impl UsageStatsStore {
     }
 
     /// Loads stats, migrating from config.json on first access if needed.
+    /// Also folds any legacy per-model maps into the canonical `per_model_usage`
+    /// field so all downstream code sees a single shape.
     async fn load_with_migration(&self) -> Result<UsageStats> {
+        let mut stats = self.load_raw_with_legacy_config_migration().await?;
+        stats.migrate_legacy_per_model();
+        Ok(stats)
+    }
+
+    async fn load_raw_with_legacy_config_migration(&self) -> Result<UsageStats> {
         if tokio::fs::try_exists(&self.stats_ctx.stats_path).await? {
             return self.stats_ctx.load().await;
         }

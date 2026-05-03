@@ -7,8 +7,34 @@ use crate::errors::ExitCode;
 use crate::services::SessionStore;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::global_stats::{self, NativeSessionSummary, normalize_model_for_display};
-use crate::services::session_store::{UsageCounter, UsageStats};
+use crate::services::session_store::UsageStats;
 use crate::style;
+
+/// Per-model totals shown in the `By model` table.
+///
+/// `input` + `output` is the displayed "tokens" column (fresh I/O).
+/// `cache_read` + `cache_write` is the displayed "cached" column.
+/// `total` (input + output + cache_read + cache_write) matches what most
+/// provider consoles surface as "total tokens".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ModelTotals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+impl ModelTotals {
+    fn tokens(&self) -> u64 {
+        self.input.saturating_add(self.output)
+    }
+    fn cached(&self) -> u64 {
+        self.cache_read.saturating_add(self.cache_write)
+    }
+    fn total(&self) -> u64 {
+        self.tokens().saturating_add(self.cached())
+    }
+}
 
 pub struct StatsCommand {
     store: SessionStore,
@@ -126,7 +152,10 @@ impl StatsCommand {
 
         let aivo_model_usage = aggregate_model_usage(&stats, &key_ids);
         let model_tokens = combine_model_tokens(&global, &aivo_model_usage);
-        let total_models = model_tokens.values().filter(|t| **t > 0).count() as u64;
+        let total_models = model_tokens
+            .values()
+            .filter(|m| m.tokens() > 0 || m.cached() > 0)
+            .count() as u64;
 
         let omitted_sources: &[&str] = if cutoff.is_some() {
             &["aivo-proxy"]
@@ -307,7 +336,17 @@ impl StatsCommand {
                 models: gs
                     .models
                     .iter()
-                    .map(|(name, m)| (name.clone(), m.input_tokens + m.output_tokens))
+                    .map(|(name, m)| {
+                        (
+                            name.clone(),
+                            ModelTotals {
+                                input: m.input_tokens,
+                                output: m.output_tokens,
+                                cache_read: m.cache_read_tokens,
+                                cache_write: m.cache_write_tokens,
+                            },
+                        )
+                    })
                     .collect(),
             };
             // top_sessions ranks by lifetime totals from the per-file cache, so
@@ -392,7 +431,7 @@ impl StatsCommand {
         let launches = tool_counts.get(tool).copied().unwrap_or(0);
         let totals = tool_token_totals(&stats, tool, &key_ids);
 
-        let mut models: HashMap<String, u64> = HashMap::new();
+        let mut models: HashMap<String, ModelTotals> = HashMap::new();
         for (key_id, entry) in &stats.key_usage {
             if !key_ids.contains(key_id.as_str()) {
                 continue;
@@ -400,9 +439,13 @@ impl StatsCommand {
             if entry.per_tool.get(tool).copied().unwrap_or(0) == 0 {
                 continue;
             }
-            for (model, &tok) in &entry.per_model_tokens {
+            for (model, mc) in &entry.per_model_usage {
                 let key = normalize_model_for_display(model);
-                *models.entry(key).or_default() += tok;
+                let m = models.entry(key).or_default();
+                m.input = m.input.saturating_add(mc.prompt_tokens);
+                m.output = m.output.saturating_add(mc.completion_tokens);
+                m.cache_read = m.cache_read.saturating_add(mc.cache_read_input_tokens);
+                m.cache_write = m.cache_write.saturating_add(mc.cache_creation_input_tokens);
             }
         }
 
@@ -445,6 +488,10 @@ impl StatsCommand {
         print_opt("-r, --refresh", "Bypass cache and re-read all data files");
         print_opt("-s, --search <QUERY>", "Search by key, model, or tool name");
         print_opt("-a, --all", "Show all models (default: top 20)");
+        print_opt(
+            "-d, --detailed",
+            "Expand By model to input/output/cached/total columns",
+        );
         print_opt("--top-sessions", "Show the heaviest native session files");
         print_opt(
             "--since <DURATION>",
@@ -468,21 +515,26 @@ impl StatsCommand {
 }
 
 fn filter_models<'a>(
-    models: impl IntoIterator<Item = (&'a String, &'a u64)>,
+    models: impl IntoIterator<Item = (&'a String, &'a ModelTotals)>,
     search: Option<&str>,
-) -> Vec<(String, u64)> {
+) -> Vec<(String, ModelTotals)> {
     let needle = search.map(|s| s.to_lowercase());
-    let mut rows: Vec<(String, u64)> = models
+    let mut rows: Vec<(String, ModelTotals)> = models
         .into_iter()
-        .filter(|(_, tok)| **tok > 0)
+        .filter(|(_, m)| m.tokens() > 0 || m.cached() > 0)
         .filter(|(name, _)| {
             needle
                 .as_ref()
                 .is_none_or(|q| name.to_lowercase().contains(q))
         })
-        .map(|(name, tok)| (name.clone(), *tok))
+        .map(|(name, m)| (name.clone(), *m))
         .collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+    // Rank by fresh I/O first, then cached as tiebreaker.
+    rows.sort_by(|a, b| {
+        b.1.tokens()
+            .cmp(&a.1.tokens())
+            .then_with(|| b.1.cached().cmp(&a.1.cached()))
+    });
     rows
 }
 
@@ -502,7 +554,7 @@ fn print_json(payload: &Value) -> ExitCode {
 #[allow(clippy::too_many_arguments)]
 fn build_overview_json(
     tool_tokens: &HashMap<String, ToolTokenSummary>,
-    model_tokens: &HashMap<String, u64>,
+    model_tokens: &HashMap<String, ModelTotals>,
     (total_input, total_output): (u64, u64),
     (total_cache_read, total_cache_write): (u64, u64),
     total_sessions: u64,
@@ -530,7 +582,18 @@ fn build_overview_json(
 
     let by_model: Vec<Value> = filter_models(model_tokens, search)
         .into_iter()
-        .map(|(name, tok)| json!({ "name": name, "tokens": tok }))
+        .map(|(name, m)| {
+            json!({
+                "name": name,
+                "tokens": m.tokens(),
+                "input_tokens": m.input,
+                "output_tokens": m.output,
+                "cached_tokens": m.cached(),
+                "cache_read_tokens": m.cache_read,
+                "cache_write_tokens": m.cache_write,
+                "total_tokens": m.total(),
+            })
+        })
         .collect();
 
     let mut payload = json!({
@@ -571,10 +634,25 @@ fn build_tool_view_json(
     };
     let by_model: Vec<Value> = filter_models(&view.models, args.search.as_deref())
         .into_iter()
-        .map(|(name, tok)| json!({ "name": name, "tokens": tok }))
+        .map(|(name, m)| {
+            json!({
+                "name": name,
+                "tokens": m.tokens(),
+                "input_tokens": m.input,
+                "output_tokens": m.output,
+                "cached_tokens": m.cached(),
+                "cache_read_tokens": m.cache_read,
+                "cache_write_tokens": m.cache_write,
+                "total_tokens": m.total(),
+            })
+        })
         .collect();
     // Match the human view's count: total models with any tokens, ignoring search filter.
-    let total_models = view.models.values().filter(|t| **t > 0).count() as u64;
+    let total_models = view
+        .models
+        .values()
+        .filter(|m| m.tokens() > 0 || m.cached() > 0)
+        .count() as u64;
     let mut payload = json!({
         "tool": tool,
         "source": source,
@@ -710,7 +788,7 @@ struct ToolView {
     output_tokens: u64,
     cache_read: u64,
     cache_write: u64,
-    models: HashMap<String, u64>,
+    models: HashMap<String, ModelTotals>,
 }
 
 #[derive(Default)]
@@ -720,13 +798,17 @@ struct AivoToolStats {
     completion_tokens: u64,
     cache_read: u64,
     cache_write: u64,
-    models: HashMap<String, u64>,
+    models: HashMap<String, ModelTotals>,
 }
 
 fn print_tool_view(view: &ToolView, fmt: fn(u64) -> String, args: &StatsArgs) {
     let total_tokens = view.input_tokens.saturating_add(view.output_tokens);
     let total_cache = view.cache_read.saturating_add(view.cache_write);
-    let model_count = view.models.values().filter(|t| **t > 0).count() as u64;
+    let model_count = view
+        .models
+        .values()
+        .filter(|m| m.tokens() > 0 || m.cached() > 0)
+        .count() as u64;
 
     let count_label = match view.source {
         StatsSource::Global => "sessions",
@@ -757,9 +839,13 @@ fn print_tool_view(view: &ToolView, fmt: fn(u64) -> String, args: &StatsArgs) {
     render_model_table(&view.models, fmt, args);
 }
 
-fn render_model_table(models: &HashMap<String, u64>, fmt: fn(u64) -> String, args: &StatsArgs) {
+fn render_model_table(
+    models: &HashMap<String, ModelTotals>,
+    fmt: fn(u64) -> String,
+    args: &StatsArgs,
+) {
     let searching = args.search.is_some();
-    let model_rows = filter_models(models, args.search.as_deref());
+    let mut model_rows = filter_models(models, args.search.as_deref());
 
     if model_rows.is_empty() {
         return;
@@ -767,20 +853,68 @@ fn render_model_table(models: &HashMap<String, u64>, fmt: fn(u64) -> String, arg
 
     println!();
 
+    // Detailed view ranks by total (input+output+cached) so the top rows
+    // reflect what the provider console highlights. filter_models sorts by
+    // fresh tokens by default, which suits the 2-column view.
+    if args.detailed {
+        model_rows.sort_by(|a, b| {
+            b.1.total()
+                .cmp(&a.1.total())
+                .then_with(|| b.1.tokens().cmp(&a.1.tokens()))
+        });
+    }
+
     let total_model_count = model_rows.len();
     let max_display = 20;
     let truncated = !args.all && total_model_count > max_display;
 
-    let display_rows: Vec<(String, u64)> = if truncated {
+    let display_rows: Vec<(String, ModelTotals)> = if truncated {
         let others_count = total_model_count - max_display;
-        let others_tokens: u64 = model_rows[max_display..].iter().map(|(_, t)| *t).sum();
-        let mut rows: Vec<(String, u64)> = model_rows[..max_display].to_vec();
-        rows.push((format!("others ({} models)", others_count), others_tokens));
+        let others =
+            model_rows[max_display..]
+                .iter()
+                .fold(ModelTotals::default(), |acc, (_, m)| ModelTotals {
+                    input: acc.input.saturating_add(m.input),
+                    output: acc.output.saturating_add(m.output),
+                    cache_read: acc.cache_read.saturating_add(m.cache_read),
+                    cache_write: acc.cache_write.saturating_add(m.cache_write),
+                });
+        let mut rows: Vec<(String, ModelTotals)> = model_rows[..max_display].to_vec();
+        rows.push((format!("others ({} models)", others_count), others));
         rows
     } else {
         model_rows
     };
 
+    let any_cached = display_rows.iter().any(|(_, m)| m.cached() > 0);
+    let show_bar = !searching && display_rows.len() > 1;
+
+    if args.detailed {
+        render_detailed_model_table(&display_rows, fmt, show_bar);
+    } else {
+        render_default_model_table(&display_rows, fmt, show_bar, any_cached);
+    }
+
+    println!();
+    let mut hints = Vec::new();
+    if truncated {
+        hints.push("-a all models".to_string());
+    }
+    if !args.detailed {
+        hints.push("-d detailed".to_string());
+    }
+    hints.push("-n numbers".to_string());
+    hints.push("-r refresh".to_string());
+    hints.push("-s filter".to_string());
+    println!("{}", style::dim(hints.join(" · ")));
+}
+
+fn render_default_model_table(
+    display_rows: &[(String, ModelTotals)],
+    fmt: fn(u64) -> String,
+    show_bar: bool,
+    any_cached: bool,
+) {
     let name_w = display_rows
         .iter()
         .map(|(n, _)| n.len())
@@ -789,43 +923,136 @@ fn render_model_table(models: &HashMap<String, u64>, fmt: fn(u64) -> String, arg
         .max("By model".len());
     let tok_w = display_rows
         .iter()
-        .map(|(_, t)| fmt(*t).len())
+        .map(|(_, m)| fmt(m.tokens()).len())
         .max()
         .unwrap_or(0)
         .max("tokens".len());
-    let max_tok = display_rows.iter().map(|(_, t)| *t).max().unwrap_or(0);
+    let cache_w = display_rows
+        .iter()
+        .map(|(_, m)| fmt(m.cached()).len())
+        .max()
+        .unwrap_or(0)
+        .max("cached".len());
+    let max_tok = display_rows
+        .iter()
+        .map(|(_, m)| m.tokens())
+        .max()
+        .unwrap_or(0);
 
-    println!(
-        "{} {}",
-        style::bold(format!("{:<name_w$}", "By model")),
-        style::dim(format!("{:>tok_w$}", "tokens")),
-    );
+    if any_cached {
+        println!(
+            "{} {} {}",
+            style::bold(format!("{:<name_w$}", "By model")),
+            style::dim(format!("{:>tok_w$}", "tokens")),
+            style::dim(format!("{:>cache_w$}", "cached")),
+        );
+    } else {
+        println!(
+            "{} {}",
+            style::bold(format!("{:<name_w$}", "By model")),
+            style::dim(format!("{:>tok_w$}", "tokens")),
+        );
+    }
 
-    let show_bar = !searching && display_rows.len() > 1;
-    for (name, tok) in &display_rows {
+    for (name, m) in display_rows {
         let pn = format!("{:<width$}", name, width = name_w);
-        let pt = colorize_unit(&format!("{:>width$}", fmt(*tok), width = tok_w));
-        if show_bar {
+        let pt = colorize_unit(&format!("{:>width$}", fmt(m.tokens()), width = tok_w));
+        if any_cached {
+            let pc = colorize_unit(&format!("{:>width$}", fmt(m.cached()), width = cache_w));
+            if show_bar {
+                println!(
+                    "{} {} {} {}",
+                    style::cyan(&pn),
+                    pt,
+                    pc,
+                    style::cyan(bar(m.tokens(), max_tok)),
+                );
+            } else {
+                println!("{} {} {}", style::cyan(&pn), pt, pc);
+            }
+        } else if show_bar {
             println!(
                 "{} {} {}",
                 style::cyan(&pn),
                 pt,
-                style::cyan(bar(*tok, max_tok)),
+                style::cyan(bar(m.tokens(), max_tok)),
             );
         } else {
             println!("{} {}", style::cyan(&pn), pt);
         }
     }
+}
 
-    println!();
-    let mut hints = Vec::new();
-    if truncated {
-        hints.push("-a all models".to_string());
+fn render_detailed_model_table(
+    display_rows: &[(String, ModelTotals)],
+    fmt: fn(u64) -> String,
+    show_bar: bool,
+) {
+    let name_w = display_rows
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(0)
+        .max("By model".len());
+    let in_w = display_rows
+        .iter()
+        .map(|(_, m)| fmt(m.input).len())
+        .max()
+        .unwrap_or(0)
+        .max("input".len());
+    let out_w = display_rows
+        .iter()
+        .map(|(_, m)| fmt(m.output).len())
+        .max()
+        .unwrap_or(0)
+        .max("output".len());
+    let cache_w = display_rows
+        .iter()
+        .map(|(_, m)| fmt(m.cached()).len())
+        .max()
+        .unwrap_or(0)
+        .max("cached".len());
+    let total_w = display_rows
+        .iter()
+        .map(|(_, m)| fmt(m.total()).len())
+        .max()
+        .unwrap_or(0)
+        .max("total".len());
+    let max_total = display_rows
+        .iter()
+        .map(|(_, m)| m.total())
+        .max()
+        .unwrap_or(0);
+
+    println!(
+        "{} {} {} {} {}",
+        style::bold(format!("{:<name_w$}", "By model")),
+        style::dim(format!("{:>in_w$}", "input")),
+        style::dim(format!("{:>out_w$}", "output")),
+        style::dim(format!("{:>cache_w$}", "cached")),
+        style::dim(format!("{:>total_w$}", "total")),
+    );
+
+    for (name, m) in display_rows {
+        let pn = format!("{:<width$}", name, width = name_w);
+        let pi = colorize_unit(&format!("{:>width$}", fmt(m.input), width = in_w));
+        let po = colorize_unit(&format!("{:>width$}", fmt(m.output), width = out_w));
+        let pc = colorize_unit(&format!("{:>width$}", fmt(m.cached()), width = cache_w));
+        let ptot = colorize_unit(&format!("{:>width$}", fmt(m.total()), width = total_w));
+        if show_bar {
+            println!(
+                "{} {} {} {} {} {}",
+                style::cyan(&pn),
+                pi,
+                po,
+                pc,
+                ptot,
+                style::cyan(bar(m.total(), max_total)),
+            );
+        } else {
+            println!("{} {} {} {} {}", style::cyan(&pn), pi, po, pc, ptot);
+        }
     }
-    hints.push("-n numbers".to_string());
-    hints.push("-r refresh".to_string());
-    hints.push("-s filter".to_string());
-    println!("{}", style::dim(hints.join(" · ")));
 }
 
 fn render_since_footer(since: Option<&str>, omitted_sources: &[&str]) {
@@ -918,27 +1145,41 @@ fn session_label(summary: &NativeSessionSummary) -> String {
     label.strip_suffix(".jsonl").unwrap_or(&label).to_string()
 }
 
-/// Native tool stats and aivo model stats overlap for launched tools, but the
-/// aivo store does not keep per-tool token attribution. To avoid inflated
-/// totals, prefer native tool models whenever any native data exists.
+/// Combines per-model usage from native tool data and aivo-tracked data.
+///
+/// Native (Claude Code, Codex, Gemini, OpenCode, Pi) and aivo-proxy data
+/// overlap for any model launched through aivo. To avoid double-counting,
+/// native wins when both have an entry for the same model name; aivo-only
+/// models (e.g. usage that only flowed through `aivo chat` or a non-native
+/// integration) are added on top so they show up in the overview rather than
+/// being dropped whenever any native data exists.
 fn combine_model_tokens(
     global: &HashMap<String, global_stats::GlobalToolStats>,
-    aivo_model_usage: &HashMap<String, UsageCounter>,
-) -> HashMap<String, u64> {
-    let mut model_tokens: HashMap<String, u64> = HashMap::new();
+    aivo_model_usage: &HashMap<String, ModelTotals>,
+) -> HashMap<String, ModelTotals> {
+    let mut model_tokens: HashMap<String, ModelTotals> = HashMap::new();
     for gs in global.values() {
         for (model, mt) in &gs.models {
             let key = normalize_model_for_display(model);
-            *model_tokens.entry(key).or_default() +=
-                mt.input_tokens.saturating_add(mt.output_tokens);
+            let entry = model_tokens.entry(key).or_default();
+            entry.input = entry.input.saturating_add(mt.input_tokens);
+            entry.output = entry.output.saturating_add(mt.output_tokens);
+            entry.cache_read = entry.cache_read.saturating_add(mt.cache_read_tokens);
+            entry.cache_write = entry.cache_write.saturating_add(mt.cache_write_tokens);
         }
     }
 
-    if model_tokens.is_empty() {
-        for (model, counter) in aivo_model_usage {
-            let key = normalize_model_for_display(model);
-            *model_tokens.entry(key).or_default() += counter.total_tokens;
+    for (model, totals) in aivo_model_usage {
+        let key = normalize_model_for_display(model);
+        if model_tokens.contains_key(&key) {
+            // Native already covers this model; skip to avoid double counting.
+            continue;
         }
+        let entry = model_tokens.entry(key).or_default();
+        entry.input = entry.input.saturating_add(totals.input);
+        entry.output = entry.output.saturating_add(totals.output);
+        entry.cache_read = entry.cache_read.saturating_add(totals.cache_read);
+        entry.cache_write = entry.cache_write.saturating_add(totals.cache_write);
     }
 
     model_tokens
@@ -969,27 +1210,53 @@ fn aggregate_tool_counts(
     result
 }
 
-/// Aggregates model usage from per-key data of existing keys.
-/// Falls back to global model_usage when any existing key lacks per-key breakdowns
-/// (mixed legacy + new data).
+/// Aggregates per-model usage from per-key data of existing keys, reading the
+/// canonical `per_model_usage` field. Loads of legacy data run through
+/// `migrate_legacy_per_model` first, so this function never has to know about
+/// the old per-model maps.
+///
+/// Falls back to the global `model_usage` map (a flat `total_tokens` per model
+/// with no input/output split) when no key has per-model data — i.e. an
+/// install that predates per-key tracking entirely. The fallback assigns the
+/// total to `output` so the row total still renders; the detailed view will
+/// show `input=0` for those rows, which is a knowingly-imperfect attribution
+/// since the legacy data simply doesn't carry the split.
 fn aggregate_model_usage(
     stats: &UsageStats,
     existing_keys: &HashSet<&str>,
-) -> HashMap<String, UsageCounter> {
-    let mut result: HashMap<String, UsageCounter> = HashMap::new();
-    let mut all_have_per_key = true;
+) -> HashMap<String, ModelTotals> {
+    let mut result: HashMap<String, ModelTotals> = HashMap::new();
+    let mut any_per_key = false;
     for (key_id, entry) in &stats.key_usage {
         if existing_keys.contains(key_id.as_str()) {
-            if entry.per_model_tokens.is_empty() {
-                all_have_per_key = false;
+            if !entry.per_model_usage.is_empty() {
+                any_per_key = true;
             }
-            for (model, tok) in &entry.per_model_tokens {
-                result.entry(model.clone()).or_default().total_tokens += tok;
+            for (model, mc) in &entry.per_model_usage {
+                let m = result.entry(model.clone()).or_default();
+                m.input = m.input.saturating_add(mc.prompt_tokens);
+                m.output = m.output.saturating_add(mc.completion_tokens);
+                m.cache_read = m.cache_read.saturating_add(mc.cache_read_input_tokens);
+                m.cache_write = m.cache_write.saturating_add(mc.cache_creation_input_tokens);
             }
         }
     }
-    if !all_have_per_key {
-        return stats.model_usage.clone();
+    if !any_per_key {
+        return stats
+            .model_usage
+            .iter()
+            .map(|(name, c)| {
+                (
+                    name.clone(),
+                    ModelTotals {
+                        input: 0,
+                        output: c.total_tokens,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                )
+            })
+            .collect();
     }
     result
 }
@@ -1088,6 +1355,7 @@ fn colorize_unit(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::session_store::UsageCounter;
 
     #[test]
     fn format_number_small() {
@@ -1199,26 +1467,68 @@ mod tests {
 
     #[test]
     fn aggregate_model_usage_from_per_key() {
+        use crate::services::session_store::ModelCounter;
+
         let mut stats = UsageStats::default();
         let mut counter = UsageCounter::default();
-        counter.per_model_tokens.insert("gpt-4o".to_string(), 1000);
+        counter.per_model_usage.insert(
+            "gpt-4o".to_string(),
+            ModelCounter {
+                prompt_tokens: 700,
+                completion_tokens: 300,
+                cache_read_input_tokens: 800,
+                cache_creation_input_tokens: 200,
+            },
+        );
         stats.key_usage.insert("key1".to_string(), counter);
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
         let result = aggregate_model_usage(&stats, &keys);
-        assert_eq!(result.get("gpt-4o").unwrap().total_tokens, 1000);
+        let m = result.get("gpt-4o").unwrap();
+        assert_eq!(m.input, 700);
+        assert_eq!(m.output, 300);
+        assert_eq!(m.tokens(), 1000);
+        assert_eq!(m.cached(), 1000);
+        assert_eq!(m.cache_read, 800);
+        assert_eq!(m.cache_write, 200);
     }
 
     #[test]
-    fn aggregate_model_usage_falls_back_when_mixed_legacy_and_new() {
+    fn migration_folds_legacy_residue_into_completion() {
+        // Key recorded sessions both before (no split) and after (with split).
+        // After load_with_migration runs, residue (legacy total minus split) lands in completion.
+        let mut counter = UsageCounter::default();
+        counter.per_model_tokens.insert("kimi".to_string(), 450); // 150 legacy + 300 new
+        counter
+            .per_model_prompt_tokens
+            .insert("kimi".to_string(), 200);
+        counter
+            .per_model_completion_tokens
+            .insert("kimi".to_string(), 100);
+        counter
+            .per_model_cache_read_tokens
+            .insert("kimi".to_string(), 25);
+
         let mut stats = UsageStats::default();
-        // Key with per-model data (new)
-        let mut c1 = UsageCounter::default();
-        c1.per_model_tokens.insert("gpt-4o".to_string(), 1000);
-        stats.key_usage.insert("new_key".to_string(), c1);
-        // Key without per-model data (legacy)
-        let c2 = UsageCounter::default();
-        stats.key_usage.insert("legacy_key".to_string(), c2);
+        stats.key_usage.insert("key1".to_string(), counter);
+        stats.migrate_legacy_per_model();
+
+        let entry = &stats.key_usage["key1"];
+        assert!(entry.per_model_tokens.is_empty());
+        assert!(entry.per_model_prompt_tokens.is_empty());
+        let mc = &entry.per_model_usage["kimi"];
+        assert_eq!(mc.prompt_tokens, 200);
+        // 100 (split completion) + 150 (residue) = 250
+        assert_eq!(mc.completion_tokens, 250);
+        assert_eq!(mc.cache_read_input_tokens, 25);
+    }
+
+    #[test]
+    fn aggregate_model_usage_falls_back_when_no_per_key_data() {
+        let mut stats = UsageStats::default();
+        // Legacy install: keys exist but no per-model data anywhere
+        let c = UsageCounter::default();
+        stats.key_usage.insert("legacy_key".to_string(), c);
         // Global model_usage has the full picture
         let global = UsageCounter {
             total_tokens: 500_000,
@@ -1226,10 +1536,12 @@ mod tests {
         };
         stats.model_usage.insert("gpt-4o".to_string(), global);
 
-        let keys: HashSet<&str> = ["new_key", "legacy_key"].into_iter().collect();
+        let keys: HashSet<&str> = ["legacy_key"].into_iter().collect();
         let result = aggregate_model_usage(&stats, &keys);
-        // Should fall back to global since legacy_key lacks per-model data
-        assert_eq!(result.get("gpt-4o").unwrap().total_tokens, 500_000);
+        // Legacy global has no per-model cache or prompt/completion split — it lands in output.
+        let m = result.get("gpt-4o").unwrap();
+        assert_eq!(m.tokens(), 500_000);
+        assert_eq!(m.cached(), 0);
     }
 
     #[test]
@@ -1238,18 +1550,24 @@ mod tests {
         let mut aivo = HashMap::new();
         aivo.insert(
             "gpt-4o".to_string(),
-            UsageCounter {
-                total_tokens: 1234,
-                ..Default::default()
+            ModelTotals {
+                input: 800,
+                output: 434,
+                cache_read: 5000,
+                cache_write: 678,
             },
         );
 
         let result = combine_model_tokens(&global, &aivo);
-        assert_eq!(result.get("gpt-4o"), Some(&1234));
+        let m = result.get("gpt-4o").unwrap();
+        assert_eq!(m.input, 800);
+        assert_eq!(m.output, 434);
+        assert_eq!(m.tokens(), 1234);
+        assert_eq!(m.cached(), 5678);
     }
 
     #[test]
-    fn combine_model_tokens_ignores_overlapping_aivo_data_when_global_exists() {
+    fn combine_model_tokens_skips_aivo_when_native_has_same_model() {
         let mut global = HashMap::new();
         global.insert(
             "codex".to_string(),
@@ -1259,6 +1577,8 @@ mod tests {
                     global_stats::ModelTokens {
                         input_tokens: 100,
                         output_tokens: 25,
+                        cache_read_tokens: 50,
+                        cache_write_tokens: 0,
                     },
                 )]),
                 ..Default::default()
@@ -1267,14 +1587,57 @@ mod tests {
         let mut aivo = HashMap::new();
         aivo.insert(
             "gpt-5.4".to_string(),
-            UsageCounter {
-                total_tokens: 500,
-                ..Default::default()
+            ModelTotals {
+                input: 400,
+                output: 100,
+                cache_read: 999,
+                cache_write: 0,
             },
         );
 
         let result = combine_model_tokens(&global, &aivo);
-        assert_eq!(result.get("gpt-5.4"), Some(&125));
+        let m = result.get("gpt-5.4").unwrap();
+        assert_eq!(m.input, 100);
+        assert_eq!(m.output, 25);
+        assert_eq!(m.tokens(), 125);
+        assert_eq!(m.cached(), 50);
+    }
+
+    #[test]
+    fn combine_model_tokens_includes_aivo_only_models_alongside_native() {
+        // The kimi-via-aivo-chat case: native has Claude data, aivo has kimi,
+        // both should appear in the combined map.
+        let mut global = HashMap::new();
+        global.insert(
+            "claude".to_string(),
+            global_stats::GlobalToolStats {
+                models: HashMap::from([(
+                    "claude-opus".to_string(),
+                    global_stats::ModelTokens {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let mut aivo = HashMap::new();
+        aivo.insert(
+            "kimi-k2.6".to_string(),
+            ModelTotals {
+                input: 132,
+                output: 19,
+                cache_read: 2_500,
+                cache_write: 0,
+            },
+        );
+
+        let result = combine_model_tokens(&global, &aivo);
+        assert!(result.contains_key("claude-opus"));
+        assert!(result.contains_key("kimi-k2.6"));
+        assert_eq!(result.get("kimi-k2.6").unwrap().input, 132);
     }
 
     #[test]
@@ -1315,7 +1678,7 @@ mod tests {
     fn overview_json_includes_window_block_when_since_set() {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
         let tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
-        let model_tokens: HashMap<String, u64> = HashMap::new();
+        let model_tokens: HashMap<String, ModelTotals> = HashMap::new();
         let payload = build_overview_json(
             &tool_tokens,
             &model_tokens,
@@ -1340,7 +1703,7 @@ mod tests {
     #[test]
     fn overview_json_omits_window_block_when_since_unset() {
         let tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
-        let model_tokens: HashMap<String, u64> = HashMap::new();
+        let model_tokens: HashMap<String, ModelTotals> = HashMap::new();
         let payload = build_overview_json(
             &tool_tokens,
             &model_tokens,
@@ -1378,6 +1741,7 @@ mod tests {
             refresh: false,
             search: None,
             all: false,
+            detailed: false,
             top_sessions: false,
             json: true,
             since: Some("24h".to_string()),
@@ -1411,6 +1775,7 @@ mod tests {
             refresh: false,
             search: None,
             all: false,
+            detailed: false,
             top_sessions: false,
             json: true,
             since: None,

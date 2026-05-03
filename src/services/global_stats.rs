@@ -27,6 +27,16 @@ pub struct GlobalToolStats {
 pub struct ModelTokens {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+
+impl ModelTokens {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +61,10 @@ impl NativeSessionSummary {
     }
 }
 
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 // ---------------------------------------------------------------------------
 // Per-file cache: stores stats per file keyed by path, with file size for
 // change detection. Only files whose size changed get re-parsed.
@@ -63,7 +77,7 @@ struct FileEntry {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
-    models: HashMap<String, (u64, u64)>, // model -> (input, output)
+    models: HashMap<String, ModelTokens>,
     has_session: bool,
 }
 
@@ -168,7 +182,7 @@ pub async fn top_sessions(
             let model = entry
                 .models
                 .iter()
-                .max_by_key(|(_, (input, output))| input.saturating_add(*output))
+                .max_by_key(|(_, m)| m.total_tokens())
                 .map(|(model, _)| model.clone());
             Some(NativeSessionSummary {
                 path: PathBuf::from(path),
@@ -318,10 +332,12 @@ fn aggregate_cache(cache: &StatsCache) -> GlobalToolStats {
         if entry.has_session {
             stats.sessions += 1;
         }
-        for (model, (inp, out)) in &entry.models {
+        for (model, mt) in &entry.models {
             let m = stats.models.entry(model.clone()).or_default();
-            m.input_tokens += inp;
-            m.output_tokens += out;
+            m.input_tokens += mt.input_tokens;
+            m.output_tokens += mt.output_tokens;
+            m.cache_read_tokens += mt.cache_read_tokens;
+            m.cache_write_tokens += mt.cache_write_tokens;
         }
     }
     stats
@@ -349,10 +365,12 @@ fn aggregate_cache_filtered(
         if entry.has_session {
             stats.sessions += 1;
         }
-        for (model, (inp, out)) in &entry.models {
+        for (model, mt) in &entry.models {
             let m = stats.models.entry(model.clone()).or_default();
-            m.input_tokens += inp;
-            m.output_tokens += out;
+            m.input_tokens += mt.input_tokens;
+            m.output_tokens += mt.output_tokens;
+            m.cache_read_tokens += mt.cache_read_tokens;
+            m.cache_write_tokens += mt.cache_write_tokens;
         }
     }
     stats
@@ -525,10 +543,12 @@ async fn merge_claude_jsonl_deltas(dir: &Path, cutoff_date: &str, stats: &mut Gl
         if entry.has_session {
             stats.sessions += 1;
         }
-        for (model, (inp, out)) in entry.models {
+        for (model, mt) in entry.models {
             let m = stats.models.entry(model).or_default();
-            m.input_tokens += inp;
-            m.output_tokens += out;
+            m.input_tokens += mt.input_tokens;
+            m.output_tokens += mt.output_tokens;
+            m.cache_read_tokens += mt.cache_read_tokens;
+            m.cache_write_tokens += mt.cache_write_tokens;
         }
     }
 }
@@ -581,6 +601,8 @@ fn parse_claude_stats_cache(v: &Value) -> Option<GlobalToolStats> {
         let m = stats.models.entry(key).or_default();
         m.input_tokens += input;
         m.output_tokens += output;
+        m.cache_read_tokens += cache_read;
+        m.cache_write_tokens += cache_create;
     }
 
     if stats.sessions == 0 && stats.total_tokens() == 0 {
@@ -673,8 +695,10 @@ async fn parse_claude_file_with_cutoff(
         {
             let key = normalize_model_for_display(model);
             let e = entry.models.entry(key).or_default();
-            e.0 += input;
-            e.1 += output;
+            e.input_tokens += input;
+            e.output_tokens += output;
+            e.cache_read_tokens += cache_read;
+            e.cache_write_tokens += cache_write;
         }
     }
 
@@ -775,8 +799,9 @@ async fn parse_codex_file(
         if let Some(ref m) = model {
             let key = normalize_model_for_display(m);
             let e = entry.models.entry(key).or_default();
-            e.0 += fresh_input;
-            e.1 += delta_output;
+            e.input_tokens += fresh_input;
+            e.output_tokens += delta_output;
+            e.cache_read_tokens += delta_cached;
         }
     }
 
@@ -831,8 +856,9 @@ async fn parse_gemini_file(
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
             let key = normalize_model_for_display(model);
             let e = entry.models.entry(key).or_default();
-            e.0 += fresh_input;
-            e.1 += output;
+            e.input_tokens += fresh_input;
+            e.output_tokens += output;
+            e.cache_read_tokens += cached;
         }
     }
 
@@ -922,6 +948,8 @@ fn aggregate_opencode_messages(
             let entry = stats.models.entry(key).or_default();
             entry.input_tokens += input;
             entry.output_tokens += output;
+            entry.cache_read_tokens += cache_read;
+            entry.cache_write_tokens += cache_write;
         }
     }
     stats.sessions = session_ids.len() as u64;
@@ -956,10 +984,12 @@ async fn collect_pi(
             stats.output_tokens += entry.output_tokens;
             stats.cache_read_tokens += entry.cache_read_tokens;
             stats.cache_write_tokens += entry.cache_write_tokens;
-            for (model, (inp, out)) in entry.models {
+            for (model, mt) in entry.models {
                 let m = stats.models.entry(model).or_default();
-                m.input_tokens += inp;
-                m.output_tokens += out;
+                m.input_tokens += mt.input_tokens;
+                m.output_tokens += mt.output_tokens;
+                m.cache_read_tokens += mt.cache_read_tokens;
+                m.cache_write_tokens += mt.cache_write_tokens;
             }
             for id in ids {
                 session_ids.insert(id);
@@ -1038,8 +1068,10 @@ async fn parse_pi_file(
         {
             let key = normalize_model_for_display(model);
             let e = entry.models.entry(key).or_default();
-            e.0 += input;
-            e.1 += output;
+            e.input_tokens += input;
+            e.output_tokens += output;
+            e.cache_read_tokens += cache_read;
+            e.cache_write_tokens += cache_write;
         }
     }
 
@@ -1208,9 +1240,10 @@ mod tests {
         );
         assert_eq!(entry.output_tokens, 11);
         assert_eq!(entry.cache_read_tokens, 7036);
-        let (m_in, m_out) = entry.models.get("gemini-2.5-flash").copied().unwrap();
-        assert_eq!(m_in, 7613 - 7036);
-        assert_eq!(m_out, 11);
+        let m = entry.models.get("gemini-2.5-flash").unwrap();
+        assert_eq!(m.input_tokens, 7613 - 7036);
+        assert_eq!(m.output_tokens, 11);
+        assert_eq!(m.cache_read_tokens, 7036);
     }
 
     #[tokio::test]
@@ -1259,9 +1292,10 @@ mod tests {
         assert_eq!(entry.output_tokens, 23);
         assert_eq!(entry.cache_read_tokens, 5376);
         assert_eq!(entry.cache_write_tokens, 0);
-        let (m_in, m_out) = entry.models.get("pi-coder").copied().unwrap();
-        assert_eq!(m_in, 38);
-        assert_eq!(m_out, 23);
+        let m = entry.models.get("pi-coder").unwrap();
+        assert_eq!(m.input_tokens, 38);
+        assert_eq!(m.output_tokens, 23);
+        assert_eq!(m.cache_read_tokens, 5376);
         assert_eq!(ids, vec!["sess-abc".to_string()]);
     }
 
@@ -1306,10 +1340,11 @@ mod tests {
         );
         assert_eq!(entry.output_tokens, 202);
         assert_eq!(entry.cache_read_tokens, 3968);
-        // Per-model tuple should also store fresh-only input.
-        let (m_in, m_out) = entry.models.get("gpt-5.4").copied().unwrap();
-        assert_eq!(m_in, 13482 - 3968);
-        assert_eq!(m_out, 202);
+        // Per-model entry should store fresh-only input + cached separately.
+        let m = entry.models.get("gpt-5.4").unwrap();
+        assert_eq!(m.input_tokens, 13482 - 3968);
+        assert_eq!(m.output_tokens, 202);
+        assert_eq!(m.cache_read_tokens, 3968);
     }
 
     #[tokio::test]
