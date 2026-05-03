@@ -20,6 +20,7 @@ pub mod codex_oauth;
 pub mod codex_oauth_callback;
 pub mod context_ingest;
 pub mod context_render;
+pub mod context_window;
 pub mod copilot_auth;
 pub mod copilot_router;
 pub mod device_fingerprint;

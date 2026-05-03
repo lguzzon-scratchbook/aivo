@@ -728,8 +728,10 @@ fn inject_codex(rendered: &RenderedContext, mut args: Vec<String>) -> Vec<String
 
 /// Default `--max-context` based on the resolved model.
 /// Precedence: explicit flag → cached `context_window` (≥2M→2m, ≥1M→1m)
-/// → hardcoded `aivo/starter` fallback (which ships before the user can
-/// have run `aivo models` to warm the cache).
+/// → static long-context list from `services::context_window` (covers
+/// providers like Anthropic whose `/v1/models` doesn't expose a context
+/// field, so the cache lookup misses) → hardcoded `aivo/starter`
+/// fallback (which ships before the user can have run `aivo models`).
 async fn resolve_max_context(
     cache: &ModelsCache,
     base_url: Option<&str>,
@@ -741,12 +743,17 @@ async fn resolve_max_context(
     }
     let starter_default =
         || (model == Some(crate::constants::AIVO_STARTER_MODEL)).then(|| "1m".to_string());
-    let (Some(url), Some(m)) = (base_url, model) else {
+    let Some(m) = model else {
         return starter_default();
     };
-    match cache.get_context_window(url, m).await {
-        Some(ctx) if ctx >= 2_000_000 => Some("2m".to_string()),
-        Some(ctx) if ctx >= 1_000_000 => Some("1m".to_string()),
+    let cached = match base_url {
+        Some(url) => cache.get_context_window(url, m).await,
+        None => None,
+    };
+    let ctx = cached.or_else(|| crate::services::context_window::static_context_window(m));
+    match ctx {
+        Some(c) if c >= 2_000_000 => Some("2m".to_string()),
+        Some(c) if c >= 1_000_000 => Some("1m".to_string()),
         _ => starter_default(),
     }
 }
@@ -902,11 +909,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_max_context_no_default_for_non_starter_model() {
+    async fn resolve_max_context_no_default_for_unknown_short_context_model() {
+        // Cache miss + not in the static long-context list → no default.
         let (_dir, cache) = empty_cache();
         assert_eq!(
-            resolve_max_context(&cache, None, Some("claude-sonnet-4-5"), None).await,
+            resolve_max_context(&cache, None, Some("gpt-3.5-turbo"), None).await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_static_fallback_for_known_1m_claude() {
+        // Cache cold → static list still resolves Claude 1M models.
+        // Anthropic's /v1/models doesn't expose context_length, so this
+        // path is the common case for fresh installs.
+        let (_dir, cache) = empty_cache();
+        assert_eq!(
+            resolve_max_context(&cache, None, Some("claude-sonnet-4-6"), None).await,
+            Some("1m".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_static_fallback_for_grok_4_3() {
+        let (_dir, cache) = empty_cache();
+        assert_eq!(
+            resolve_max_context(&cache, Some(TEST_BASE_URL), Some("grok-4.3"), None).await,
+            Some("1m".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_static_fallback_for_grok_4_fast_2m() {
+        let (_dir, cache) = empty_cache();
+        assert_eq!(
+            resolve_max_context(&cache, Some(TEST_BASE_URL), Some("grok-4-fast"), None).await,
+            Some("2m".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_static_fallback_handles_provider_prefix() {
+        let (_dir, cache) = empty_cache();
+        assert_eq!(
+            resolve_max_context(
+                &cache,
+                Some(TEST_BASE_URL),
+                Some("anthropic/claude-opus-4-7"),
+                None,
+            )
+            .await,
+            Some("1m".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_context_explicit_wins_over_static_fallback() {
+        let (_dir, cache) = empty_cache();
+        assert_eq!(
+            resolve_max_context(
+                &cache,
+                None,
+                Some("claude-sonnet-4-6"),
+                Some("200k".to_string()),
+            )
+            .await,
+            Some("200k".to_string())
         );
     }
 
