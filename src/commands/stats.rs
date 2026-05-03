@@ -124,7 +124,7 @@ impl StatsCommand {
             Some(c) => self.store.count_chat_sessions_since(c).await,
             None => self.store.count_chat_sessions().await,
         };
-        let chat_tokens = tool_token_totals(&stats, "chat", &key_ids);
+        let chat_tokens = chat_tokens_for_window(&stats, &key_ids, cutoff);
         if chat_tokens.total_tokens() > 0 || chat_sessions > 0 {
             tool_tokens.insert(
                 "chat".to_string(),
@@ -150,7 +150,7 @@ impl StatsCommand {
         let show_cache = total_cache > 0;
         let total_sessions: u64 = tool_tokens.values().map(|t| t.sessions).sum();
 
-        let aivo_model_usage = aggregate_model_usage(&stats, &key_ids);
+        let aivo_model_usage = aivo_model_usage_for_window(&stats, &key_ids, cutoff);
         let model_tokens = combine_model_tokens(&global, &aivo_model_usage);
         let total_models = model_tokens
             .values()
@@ -746,6 +746,49 @@ impl ToolTokenSummary {
     fn total_tokens(&self) -> u64 {
         self.input.saturating_add(self.output)
     }
+}
+
+/// Chat token totals scoped to the requested window.
+///
+/// Aivo's per-key counters (`UsageCounter::prompt_tokens` etc.) are
+/// lifetime-cumulative with no per-event timestamps, so they cannot be
+/// filtered to a `--since` window. Under cutoff we therefore return zeros
+/// — the chat session count is filtered separately via
+/// `count_chat_sessions_since` and stands on its own. Same suppression
+/// pattern as the per-tool aivo-proxy fallback in `show()`.
+fn chat_tokens_for_window(
+    stats: &UsageStats,
+    key_ids: &HashSet<&str>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> ToolTokenSummary {
+    if cutoff.is_some() {
+        return ToolTokenSummary {
+            sessions: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+    }
+    tool_token_totals(stats, "chat", key_ids)
+}
+
+/// Per-model usage from aivo-tracked counters scoped to the requested window.
+///
+/// `per_model_usage` is lifetime-cumulative (same caveat as
+/// `chat_tokens_for_window`), so under cutoff we return an empty map and
+/// the model table renders only window-filtered global data. Without this
+/// guard, models that have *ever* been used through aivo would appear in
+/// every `--since` view with their lifetime totals.
+fn aivo_model_usage_for_window(
+    stats: &UsageStats,
+    key_ids: &HashSet<&str>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> HashMap<String, ModelTotals> {
+    if cutoff.is_some() {
+        return HashMap::new();
+    }
+    aggregate_model_usage(stats, key_ids)
 }
 
 /// Sum token totals from aivo-tracked stats for keys that used a given tool.
@@ -1787,6 +1830,100 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("omitted_sources array");
         assert!(omitted.is_empty());
+    }
+
+    #[test]
+    fn chat_tokens_for_window_returns_lifetime_without_cutoff() {
+        let mut stats = UsageStats::default();
+        let mut counter = UsageCounter::default();
+        counter.per_tool.insert("chat".to_string(), 5);
+        counter.prompt_tokens = 1_000_000;
+        counter.completion_tokens = 200_000;
+        counter.cache_read_input_tokens = 50_000;
+        counter.cache_creation_input_tokens = 10_000;
+        stats.key_usage.insert("k1".to_string(), counter);
+        let keys: HashSet<&str> = ["k1"].into_iter().collect();
+
+        let result = chat_tokens_for_window(&stats, &keys, None);
+        assert_eq!(result.input, 1_000_000);
+        assert_eq!(result.output, 200_000);
+        assert_eq!(result.cache_read, 50_000);
+        assert_eq!(result.cache_write, 10_000);
+    }
+
+    #[test]
+    fn chat_tokens_for_window_zeroes_under_cutoff() {
+        // Reproduces the "0 sessions / 8.0M tokens" footgun: lifetime per-key
+        // counters have no per-event timestamps, so reporting them under a
+        // --since window misattributes old usage to the current window.
+        let mut stats = UsageStats::default();
+        let mut counter = UsageCounter::default();
+        counter.per_tool.insert("chat".to_string(), 5);
+        counter.prompt_tokens = 7_839_935;
+        counter.completion_tokens = 176_508;
+        stats.key_usage.insert("k1".to_string(), counter);
+        let keys: HashSet<&str> = ["k1"].into_iter().collect();
+
+        let cutoff = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let result = chat_tokens_for_window(&stats, &keys, cutoff);
+        assert_eq!(result.input, 0);
+        assert_eq!(result.output, 0);
+        assert_eq!(result.cache_read, 0);
+        assert_eq!(result.cache_write, 0);
+        assert_eq!(result.total_tokens(), 0);
+    }
+
+    #[test]
+    fn aivo_model_usage_for_window_returns_lifetime_without_cutoff() {
+        use crate::services::session_store::ModelCounter;
+
+        let mut stats = UsageStats::default();
+        let mut counter = UsageCounter::default();
+        counter.per_model_usage.insert(
+            "minimax-m2.7".to_string(),
+            ModelCounter {
+                prompt_tokens: 0,
+                completion_tokens: 6_717_791,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        stats.key_usage.insert("k1".to_string(), counter);
+        let keys: HashSet<&str> = ["k1"].into_iter().collect();
+
+        let result = aivo_model_usage_for_window(&stats, &keys, None);
+        let m = result.get("minimax-m2.7").expect("lifetime model present");
+        assert_eq!(m.output, 6_717_791);
+    }
+
+    #[test]
+    fn aivo_model_usage_for_window_empty_under_cutoff() {
+        // Reproduces the "40 models" footgun: every model ever used through
+        // aivo would otherwise leak into every --since view.
+        use crate::services::session_store::ModelCounter;
+
+        let mut stats = UsageStats::default();
+        let mut counter = UsageCounter::default();
+        for name in ["minimax-m2.7", "deepseek-chat", "claude-sonnet-4.6"] {
+            counter.per_model_usage.insert(
+                name.to_string(),
+                ModelCounter {
+                    prompt_tokens: 100,
+                    completion_tokens: 200,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            );
+        }
+        stats.key_usage.insert("k1".to_string(), counter);
+        let keys: HashSet<&str> = ["k1"].into_iter().collect();
+
+        let cutoff = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let result = aivo_model_usage_for_window(&stats, &keys, cutoff);
+        assert!(
+            result.is_empty(),
+            "lifetime models must not leak under cutoff"
+        );
     }
 
     #[test]
