@@ -186,11 +186,20 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
     } else {
         ""
     };
-    let expected_auth: Option<Arc<str>> = state
+    // Accept both forms Claude Code sends: `Authorization: Bearer <token>`
+    // (when ANTHROPIC_AUTH_TOKEN is set) and `x-api-key: <token>` (when
+    // ANTHROPIC_API_KEY is set). The two Arcs share lifetime with the loop;
+    // both are None when no auth_token is configured.
+    let expected_bearer: Option<Arc<str>> = state
         .config
         .auth_token
         .as_ref()
         .map(|t| Arc::from(format!("Bearer {}", t)));
+    let expected_token: Option<Arc<str>> = state
+        .config
+        .auth_token
+        .as_ref()
+        .map(|t| Arc::from(t.as_str()));
 
     loop {
         let accept = tokio::select! {
@@ -211,7 +220,8 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             Ok(p) => p,
             Err(_) => continue, // semaphore closed during shutdown
         };
-        let expected_auth = expected_auth.clone();
+        let expected_bearer = expected_bearer.clone();
+        let expected_token = expected_token.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -254,17 +264,26 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             let path = http_utils::extract_request_path(&request);
             let path_no_query = path.split('?').next().unwrap_or(&path);
 
-            // Bearer token auth check (skip /health)
-            if let Some(ref expected) = expected_auth
+            // Auth check (skip /health). Claude Code sends `Authorization:
+            // Bearer <token>` for ANTHROPIC_AUTH_TOKEN and `x-api-key: <token>`
+            // for ANTHROPIC_API_KEY; accept either against the configured token.
+            if let (Some(bearer), Some(token)) = (&expected_bearer, &expected_token)
                 && path_no_query != "/health"
             {
                 let headers_end = request.find("\r\n\r\n").unwrap_or(request.len());
-                let provided = http_utils::header_value(&request[..headers_end], "Authorization");
-                if provided != Some(&**expected) {
+                let head = &request[..headers_end];
+                let auth_header = http_utils::header_value(head, "Authorization");
+                let api_key_header = http_utils::header_value(head, "x-api-key");
+                let bearer_match = auth_header == Some(&**bearer);
+                let api_key_match = api_key_header == Some(&**token);
+                if !bearer_match && !api_key_match {
                     let _ = socket
                         .write_all(
-                            http_utils::http_error_response(401, "Invalid or missing bearer token")
-                                .as_bytes(),
+                            http_utils::http_error_response(
+                                401,
+                                "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+                            )
+                            .as_bytes(),
                         )
                         .await;
                     return;
