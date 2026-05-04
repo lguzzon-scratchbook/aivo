@@ -123,8 +123,8 @@ pub fn convert_openai_to_anthropic_message(
 /// `cache_read_input_tokens = 0` for cache-aware OpenAI upstreams, which then
 /// undercounts cached tokens in their session logs and downstream stats.
 fn build_anthropic_usage(resp: &Value, mode: &UsageValueMode) -> Value {
-    let raw_prompt = usage_value(resp, "prompt_tokens", mode);
-    let output = usage_value(resp, "completion_tokens", mode);
+    let raw_prompt = usage_value(resp, "prompt_tokens", Some("input_tokens"), mode);
+    let output = usage_value(resp, "completion_tokens", Some("output_tokens"), mode);
     let usage_obj = resp.get("usage");
     let anthropic_cache_read = usage_obj
         .and_then(|u| u.get("cache_read_input_tokens"))
@@ -174,17 +174,17 @@ fn map_finish_reason(finish_reason: &str) -> &'static str {
     }
 }
 
-fn usage_value(resp: &Value, key: &str, mode: &UsageValueMode) -> Value {
+fn usage_value(resp: &Value, key: &str, alias: Option<&str>, mode: &UsageValueMode) -> Value {
+    let usage = resp.get("usage");
     match mode {
         UsageValueMode::CoerceU64 => json!(
-            resp.get("usage")
-                .and_then(|u| u.get(key))
+            usage
+                .and_then(|u| u.get(key).or_else(|| alias.and_then(|name| u.get(name))))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0)
         ),
-        UsageValueMode::PreserveJson => resp
-            .get("usage")
-            .and_then(|u| u.get(key))
+        UsageValueMode::PreserveJson => usage
+            .and_then(|u| u.get(key).or_else(|| alias.and_then(|name| u.get(name))))
             .cloned()
             .unwrap_or(json!(0)),
     }
@@ -439,6 +439,34 @@ mod tests {
         assert_eq!(result["usage"]["output_tokens"], 50);
         assert_eq!(result["usage"]["cache_read_input_tokens"], 800);
         assert!(result["usage"].get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
+    fn openai_input_output_token_aliases_become_anthropic_usage() {
+        let resp = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "input_tokens": 15000,
+                "output_tokens": 42
+            }
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg",
+                model: "grok-4.3",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result["usage"]["input_tokens"], 15000);
+        assert_eq!(result["usage"]["output_tokens"], 42);
     }
 
     #[test]

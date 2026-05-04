@@ -1431,6 +1431,7 @@ struct OpenAIStreamConverter {
     output_tokens: u64,
     cache_read_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+    pending_stop_reason: Option<&'static str>,
     saw_tool_use: bool,
 }
 
@@ -1452,6 +1453,7 @@ impl OpenAIStreamConverter {
             output_tokens: 0,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            pending_stop_reason: None,
             saw_tool_use: false,
         }
     }
@@ -1514,7 +1516,7 @@ impl OpenAIStreamConverter {
                 &mut self.thinking_block_idx,
                 &mut self.text_block_idx,
                 &mut self.tool_blocks,
-                fallback_stop,
+                self.pending_stop_reason.unwrap_or(fallback_stop),
             );
             self.finished = true;
         }
@@ -1546,7 +1548,7 @@ impl OpenAIStreamConverter {
                     &mut self.thinking_block_idx,
                     &mut self.text_block_idx,
                     &mut self.tool_blocks,
-                    fallback_stop,
+                    self.pending_stop_reason.unwrap_or(fallback_stop),
                 );
                 self.finished = true;
             }
@@ -1734,25 +1736,14 @@ impl OpenAIStreamConverter {
                 }
             }
 
-            if !self.finished
-                && let Some(finish_reason) = choice.finish_reason.as_deref()
+            if let Some(finish_reason) = choice.finish_reason.as_deref()
                 && !finish_reason.is_empty()
             {
-                finalize_stream_message(
-                    output,
-                    &mut self.message_started,
-                    &self.message_id,
-                    &self.model,
-                    self.input_tokens,
-                    self.output_tokens,
-                    self.cache_read_input_tokens,
-                    self.cache_creation_input_tokens,
-                    &mut self.thinking_block_idx,
-                    &mut self.text_block_idx,
-                    &mut self.tool_blocks,
-                    map_openai_finish_reason(finish_reason),
-                );
-                self.finished = true;
+                // Some OpenAI-compatible providers (notably xAI) send the final
+                // usage object in a trailing usage-only chunk after finish_reason.
+                // Defer Anthropic message_delta until [DONE]/EOF so Claude Code
+                // logs the real token totals instead of zeros.
+                self.pending_stop_reason = Some(map_openai_finish_reason(finish_reason));
             }
         }
 
@@ -2310,8 +2301,8 @@ data: [DONE]\n";
     #[test]
     fn openai_sse_to_anthropic_accepts_input_output_token_names() {
         let sse = "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
-	data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\
-	data: [DONE]\n";
+		data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\
+		data: [DONE]\n";
         let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
         let delta_section = result
             .split("event: message_delta\n")
@@ -2322,6 +2313,27 @@ data: [DONE]\n";
             .find(|l| l.starts_with("data: "))
             .expect("data line after message_delta");
         let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        assert_eq!(payload["usage"]["input_tokens"], 15000);
+        assert_eq!(payload["usage"]["output_tokens"], 42);
+    }
+
+    #[test]
+    fn openai_sse_to_anthropic_waits_for_trailing_usage_after_finish_reason() {
+        let sse = "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
+data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\
+data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\
+data: [DONE]\n";
+        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
+        let delta_section = result
+            .split("event: message_delta\n")
+            .nth(1)
+            .expect("message_delta event present");
+        let data_line = delta_section
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line after message_delta");
+        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        assert_eq!(payload["delta"]["stop_reason"], "end_turn");
         assert_eq!(payload["usage"]["input_tokens"], 15000);
         assert_eq!(payload["usage"]["output_tokens"], 42);
     }
