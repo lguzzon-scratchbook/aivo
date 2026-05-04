@@ -1,4 +1,9 @@
-use console::{Key, Term};
+use console::Term;
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use std::io::Write;
 
 /// Outcome returned by `FuzzySelect::interact_outcome`. Most callers want
 /// `interact_opt` instead, which collapses `Query` and `Cancelled` to `None`.
@@ -88,6 +93,8 @@ impl FuzzySelect {
     pub fn interact_outcome(self) -> std::io::Result<FuzzyOutcome> {
         let term = Term::stderr();
         term.hide_cursor()?;
+        let _raw_mode = RawModeGuard::enable()?;
+        let _paste_mode = BracketedPasteGuard::enable().ok();
 
         let mut query = String::new();
         let mut selection = self.default.min(self.items.len().saturating_sub(1));
@@ -210,7 +217,7 @@ impl FuzzySelect {
                 lines
             };
 
-            let key = match term.read_key_raw() {
+            let input = match read_fuzzy_input() {
                 Ok(key) => key,
                 Err(e) => {
                     let _ = term.clear_last_lines(1 + items_drawn);
@@ -222,16 +229,16 @@ impl FuzzySelect {
             // Clear drawn lines before next iteration or exit
             term.clear_last_lines(1 + items_drawn)?;
 
-            match key {
-                key if is_previous_key(&key) && count > 0 => {
+            match input {
+                FuzzyInput::Previous if count > 0 => {
                     selection =
                         next_enabled_filtered(&filtered, selection, false, |i| self.is_disabled(i));
                 }
-                key if is_next_key(&key) && count > 0 => {
+                FuzzyInput::Next if count > 0 => {
                     selection =
                         next_enabled_filtered(&filtered, selection, true, |i| self.is_disabled(i));
                 }
-                Key::Enter => {
+                FuzzyInput::Enter => {
                     if count > 0 {
                         let orig_idx = filtered[selection].0;
                         if self.is_disabled(orig_idx) {
@@ -246,17 +253,17 @@ impl FuzzySelect {
                     term.show_cursor()?;
                     return Ok(FuzzyOutcome::Query(query));
                 }
-                Key::Escape | Key::CtrlC => {
+                FuzzyInput::Cancel => {
                     term.show_cursor()?;
                     return Ok(FuzzyOutcome::Cancelled);
                 }
-                Key::Backspace if !query.is_empty() => {
+                FuzzyInput::Backspace if !query.is_empty() => {
                     query.pop();
                     selection = 0;
                     page_start = 0;
                 }
-                Key::Char(c) if !c.is_control() => {
-                    query.push(c);
+                FuzzyInput::Text(text) if !text.is_empty() => {
+                    query.push_str(&text);
                     selection = 0;
                     page_start = 0;
                 }
@@ -264,6 +271,133 @@ impl FuzzySelect {
             }
         }
     }
+}
+
+struct BracketedPasteGuard;
+
+impl BracketedPasteGuard {
+    fn enable() -> std::io::Result<Self> {
+        let mut stderr = std::io::stderr();
+        crossterm::execute!(stderr, EnableBracketedPaste)?;
+        stderr.flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for BracketedPasteGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stderr(), DisableBracketedPaste);
+    }
+}
+
+#[cfg(unix)]
+struct RawModeGuard {
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn enable() -> std::io::Result<Self> {
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd;
+
+        let stdin = std::io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut original = MaybeUninit::uninit();
+        let rc = unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let original = unsafe { original.assume_init() };
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        // Keep output processing enabled so existing line rendering still gets
+        // normal newline handling while input is raw.
+        raw.c_oflag = original.c_oflag;
+        let rc = unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, &raw) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(Self { original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let stdin = std::io::stdin();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&stdin);
+        let _ = unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, &self.original) };
+    }
+}
+
+#[cfg(not(unix))]
+struct RawModeGuard;
+
+#[cfg(not(unix))]
+impl RawModeGuard {
+    fn enable() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+enum FuzzyInput {
+    Previous,
+    Next,
+    Enter,
+    Cancel,
+    Backspace,
+    Text(String),
+    Ignore,
+}
+
+fn read_fuzzy_input() -> std::io::Result<FuzzyInput> {
+    loop {
+        match event::read()? {
+            Event::Paste(text) => return Ok(FuzzyInput::Text(normalize_pasted_query(&text))),
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) => {
+                return Ok(match code {
+                    KeyCode::Up => FuzzyInput::Previous,
+                    KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        FuzzyInput::Previous
+                    }
+                    KeyCode::Down => FuzzyInput::Next,
+                    KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        FuzzyInput::Next
+                    }
+                    KeyCode::Enter => FuzzyInput::Enter,
+                    KeyCode::Esc => FuzzyInput::Cancel,
+                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        FuzzyInput::Cancel
+                    }
+                    KeyCode::Backspace => FuzzyInput::Backspace,
+                    KeyCode::Char(c) if !c.is_control() => FuzzyInput::Text(c.to_string()),
+                    _ => FuzzyInput::Ignore,
+                });
+            }
+            Event::Key(_) => {}
+            _ => return Ok(FuzzyInput::Ignore),
+        }
+    }
+}
+
+fn normalize_pasted_query(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Advances `selection` within `filtered` until it lands on an enabled row,
@@ -295,18 +429,6 @@ fn next_enabled_filtered(
         }
     }
     start
-}
-
-fn is_previous_key(key: &Key) -> bool {
-    matches!(key, Key::ArrowUp | Key::Char('\x10')) || matches_application_arrow(key, 'A')
-}
-
-fn is_next_key(key: &Key) -> bool {
-    matches!(key, Key::ArrowDown | Key::Char('\x0e')) || matches_application_arrow(key, 'B')
-}
-
-fn matches_application_arrow(key: &Key, direction: char) -> bool {
-    matches!(key, Key::UnknownEscSeq(seq) if seq.as_slice() == ['O', direction])
 }
 
 /// Truncate a string to fit within terminal width, accounting for ANSI escape codes.
@@ -396,8 +518,7 @@ pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_next_key, is_previous_key, next_enabled_filtered, score_match};
-    use console::Key;
+    use super::{next_enabled_filtered, normalize_pasted_query, score_match};
 
     fn filtered_fixture(items: &[&'static str]) -> Vec<(usize, &'static String)> {
         // `next_enabled_filtered` only reads the original index, but the
@@ -460,20 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_application_cursor_mode_arrows() {
-        assert!(is_previous_key(&Key::UnknownEscSeq(vec!['O', 'A'])));
-        assert!(is_next_key(&Key::UnknownEscSeq(vec!['O', 'B'])));
-    }
-
-    #[test]
-    fn recognizes_standard_navigation_shortcuts() {
-        assert!(is_previous_key(&Key::ArrowUp));
-        assert!(is_previous_key(&Key::Char('\x10')));
-        assert!(is_next_key(&Key::ArrowDown));
-        assert!(is_next_key(&Key::Char('\x0e')));
-    }
-
-    #[test]
     fn score_prefers_prefix_over_substring_over_subsequence() {
         // "openai" prefix-matches the literal "openai" provider label, contains-matches
         // "groq …/openai/v1", and only subsequence-matches "OpenRouter …openrouter.ai".
@@ -528,5 +635,13 @@ mod tests {
         filtered.sort_by_cached_key(|(_, item)| score_match("openai", item));
         assert_eq!(filtered[0].0, 0);
         assert_eq!(filtered[1].0, 1);
+    }
+
+    #[test]
+    fn pasted_query_discards_embedded_newlines() {
+        assert_eq!(
+            normalize_pasted_query("OpenRouter\nhttps://openrouter.ai\r\n"),
+            "OpenRouterhttps://openrouter.ai"
+        );
     }
 }
