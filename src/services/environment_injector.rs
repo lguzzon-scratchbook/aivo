@@ -14,7 +14,7 @@ use crate::services::provider_profile::{
     ProviderKind, ProviderProfile, is_direct_openai_base, provider_profile_for_key,
 };
 use crate::services::provider_protocol::{
-    ProviderProtocol, is_anthropic_endpoint, is_google_endpoint,
+    ProviderProtocol, is_anthropic_endpoint, is_google_endpoint, is_official_anthropic_endpoint,
 };
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
@@ -226,6 +226,10 @@ impl EnvironmentInjector {
         }
     }
 
+    fn should_disable_claude_nonessential_traffic(key: &ApiKey) -> bool {
+        !key.is_claude_oauth() && !is_official_anthropic_endpoint(&key.base_url)
+    }
+
     /// Creates a new EnvironmentInjector
     pub fn new() -> Self {
         Self
@@ -370,10 +374,6 @@ impl EnvironmentInjector {
             env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
             env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), String::new());
             env.insert("ANTHROPIC_BASE_URL".to_string(), String::new());
-            env.insert(
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
-                "1".to_string(),
-            );
             return env;
         }
 
@@ -418,10 +418,12 @@ impl EnvironmentInjector {
             );
         }
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
-        env.insert(
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
-            "1".to_string(),
-        );
+        if Self::should_disable_claude_nonessential_traffic(key) {
+            env.insert(
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                "1".to_string(),
+            );
+        }
         env.insert("BASH_DEFAULT_TIMEOUT_MS".to_string(), "2400000".to_string());
         env.insert("BASH_MAX_TIMEOUT_MS".to_string(), "2500000".to_string());
         env.insert(
@@ -1108,10 +1110,7 @@ mod tests {
             env.get("ANTHROPIC_AUTH_TOKEN"),
             Some(&"sk-test-key-12345".to_string())
         );
-        assert_eq!(
-            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
-            Some(&"1".to_string())
-        );
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"));
         assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }
 
@@ -1140,10 +1139,7 @@ mod tests {
         // token — Claude Code's auth precedence prefers those env vars.
         assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
         assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&String::new()));
-        assert_eq!(
-            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
-            Some(&"1".to_string())
-        );
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"));
         // ANTHROPIC_BASE_URL is cleared so a caller-exported value can't
         // misroute OAuth traffic (Claude Code falls back to its default
         // subscription backend when the env var is empty).
@@ -1235,6 +1231,10 @@ mod tests {
             Some(&"sk-test-key-12345".to_string())
         );
         assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&"MiniMax-M1".to_string()));
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+            Some(&"1".to_string())
+        );
         assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }
 
@@ -1253,6 +1253,10 @@ mod tests {
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL"),
             Some(&"https://api.minimax.io/anthropic".to_string())
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+            Some(&"1".to_string())
         );
         assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }

@@ -35,14 +35,27 @@ fn claude_direct_anthropic() {
         "https://api.anthropic.com"
     );
     assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").unwrap(), "sk-ant-test");
-    assert_eq!(
-        env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap(),
-        "1"
-    );
+    assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"));
     // Model vars set
     assert!(env.contains_key("ANTHROPIC_MODEL"));
     // Direct Anthropic uses native name (hyphens)
     assert_eq!(env.get("ANTHROPIC_MODEL").unwrap(), "claude-sonnet-4-6");
+}
+
+#[test]
+fn claude_third_party_anthropic_direct_disables_nonessential_traffic() {
+    let inj = EnvironmentInjector;
+    let key = make_key("https://api.minimax.io/anthropic/v1", "sk-mm-test");
+    let env = inj.for_claude(&key, Some("MiniMax-M1"));
+
+    assert_eq!(
+        env.get("ANTHROPIC_BASE_URL").unwrap(),
+        "https://api.minimax.io/anthropic"
+    );
+    assert_eq!(
+        env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap(),
+        "1"
+    );
 }
 
 #[test]
@@ -56,6 +69,10 @@ fn claude_openrouter_uses_router() {
     assert_eq!(
         env.get("AIVO_ROUTER_BASE_URL").unwrap(),
         "https://openrouter.ai/api/v1"
+    );
+    assert_eq!(
+        env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap(),
+        "1"
     );
 }
 

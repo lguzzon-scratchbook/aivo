@@ -148,6 +148,11 @@ pub fn is_anthropic_endpoint(base_url: &str) -> bool {
     host == "api.anthropic.com" || normalized.ends_with("/anthropic")
 }
 
+pub fn is_official_anthropic_endpoint(base_url: &str) -> bool {
+    let normalized = normalize_protocol_base(base_url).to_ascii_lowercase();
+    extract_url_host(&normalized) == "api.anthropic.com"
+}
+
 pub fn is_google_endpoint(base_url: &str) -> bool {
     let normalized = normalize_protocol_base(base_url).to_ascii_lowercase();
     let host = extract_url_host(&normalized);
@@ -378,6 +383,17 @@ mod tests {
             detect_provider_protocol("https://api.minimax.io/anthropic/messages/count_tokens"),
             ProviderProtocol::Anthropic
         );
+    }
+
+    #[test]
+    fn official_anthropic_endpoint_requires_anthropic_host() {
+        assert!(is_official_anthropic_endpoint("https://api.anthropic.com"));
+        assert!(is_official_anthropic_endpoint(
+            "https://api.anthropic.com/v1/messages"
+        ));
+        assert!(!is_official_anthropic_endpoint(
+            "https://api.minimax.io/anthropic/v1"
+        ));
     }
 
     #[test]
