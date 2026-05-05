@@ -106,6 +106,10 @@ impl Sidecar {
 const AUDIO_CACHE_SUBDIR: &str = "audio";
 /// Schema version baked into every hash. Bump to invalidate the cache.
 const HASH_SCHEMA: &str = "v1";
+/// Length of the hex-encoded cache hash. 16 hex chars = 64 bits, which is
+/// far more than enough collision resistance for a single-user on-disk TTS
+/// cache and keeps filenames readable.
+const HASH_LEN: usize = 16;
 
 /// Inputs that determine TTS output bytes. Two requests with equal
 /// `CacheKey`s should produce byte-identical audio from the same provider.
@@ -263,9 +267,10 @@ pub fn list_entries(cache_dir: &Path) -> Result<Vec<CacheEntry>> {
         if !AUDIO_EXTS.contains(&ext_lower.as_str()) {
             continue;
         }
-        // Filename stems are SHA-256 hex (64 chars). Skip anything that
-        // doesn't look like one to avoid surfacing user files dropped here.
-        if stem.len() != 64 || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Filename stems are truncated SHA-256 hex (`HASH_LEN` chars). Skip
+        // anything that doesn't look like one to avoid surfacing user files
+        // dropped here.
+        if stem.len() != HASH_LEN || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
         let mtime = dirent.metadata().and_then(|m| m.modified()).ok();
@@ -320,9 +325,9 @@ pub fn delete_entry(cache_dir: &Path, hash: &str) -> Result<Vec<PathBuf>> {
 }
 
 /// Hex-encoded SHA-256 over a versioned, newline-joined serialization of
-/// the cache fields. Newlines inside `text` are fine — the field order is
-/// fixed and every other field is a short identifier without newlines, so
-/// the serialization is unambiguous.
+/// the cache fields, truncated to `HASH_LEN` chars. Newlines inside `text`
+/// are fine — the field order is fixed and every other field is a short
+/// identifier without newlines, so the serialization is unambiguous.
 pub fn hash_key(key: &CacheKey) -> String {
     let mut hasher = Sha256::new();
     hasher.update(HASH_SCHEMA.as_bytes());
@@ -336,7 +341,9 @@ pub fn hash_key(key: &CacheKey) -> String {
     hasher.update(key.format.as_bytes());
     hasher.update(b"\n");
     hasher.update(key.speed.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let mut full = format!("{:x}", hasher.finalize());
+    full.truncate(HASH_LEN);
+    full
 }
 
 #[cfg(test)]
@@ -505,7 +512,7 @@ mod tests {
     #[test]
     fn list_entries_skips_non_hex_filenames() {
         let dir = tempfile::tempdir().unwrap();
-        let hash = "a".repeat(64);
+        let hash = "a".repeat(HASH_LEN);
         touch(&dir.path().join(format!("{hash}.mp3")), b"audio");
         touch(&dir.path().join("not-a-hash.mp3"), b"x");
         touch(&dir.path().join("README.txt"), b"x");
@@ -525,8 +532,8 @@ mod tests {
     #[test]
     fn list_entries_sorts_newest_first_via_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let h1 = "a".repeat(64);
-        let h2 = "b".repeat(64);
+        let h1 = "a".repeat(HASH_LEN);
+        let h2 = "b".repeat(HASH_LEN);
         touch(&dir.path().join(format!("{h1}.mp3")), b"x");
         touch(&dir.path().join(format!("{h2}.mp3")), b"x");
         let mut older = Sidecar::new("older", None, "tts-1", None, "mp3", None, 1);
@@ -543,7 +550,7 @@ mod tests {
     #[test]
     fn delete_entry_removes_audio_and_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let hash = "a".repeat(64);
+        let hash = "a".repeat(HASH_LEN);
         touch(&dir.path().join(format!("{hash}.mp3")), b"audio");
         let s = Sidecar::new("hi", None, "tts-1", None, "mp3", None, 5);
         write_sidecar(dir.path(), &hash, &s).unwrap();
@@ -556,7 +563,7 @@ mod tests {
     #[test]
     fn delete_entry_is_idempotent_when_files_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let hash = "a".repeat(64);
+        let hash = "a".repeat(HASH_LEN);
         let removed = delete_entry(dir.path(), &hash).unwrap();
         assert!(removed.is_empty());
     }
