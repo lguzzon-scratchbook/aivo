@@ -156,14 +156,17 @@ impl AudioCommand {
         // arrive, and wrap the accumulated PCM into WAV for the cache. The
         // cache slot uses format=wav so subsequent identical runs hit it.
         // Anything else (explicit format, output path, save-only, Gemini)
-        // takes the existing buffered path.
+        // takes the existing buffered path. Builds without `audio_playback`
+        // can't push chunks to a sink at all — fall back to buffered so we
+        // don't burn an API request whose audio gets discarded.
         let streaming_eligible = !args.no_play
             && args.output.is_none()
             && args.format.is_none()
             && matches!(
                 provider_protocol,
                 ProviderProtocol::Openai | ProviderProtocol::ResponsesApi
-            );
+            )
+            && playback::supports_streaming();
         let effective_format: Option<String> = if streaming_eligible {
             Some("wav".to_string())
         } else {
