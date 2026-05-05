@@ -437,7 +437,12 @@ async fn forward_to_provider(
                 // doesn't recognize Google's `x-goog-api-key`). Probe at least
                 // one fallback before bailing so genuine cross-protocol hosts
                 // can still be discovered.
-                if classification.is_terminal && attempt > 0 {
+                //
+                // 429 is the exception: a rate-limit response is never an
+                // auth-shape mismatch, so the carve-out doesn't apply. Probing
+                // 4 fallback paths against the same upstream just burns more
+                // requests inside the already-overbudget quota window.
+                if classification.is_terminal && (attempt > 0 || classification.is_rate_limited) {
                     // Pin in-memory: the path answered authoritatively, so
                     // retry storms hit it directly instead of re-probing.
                     commit_protocol_switch(active_protocol, protocol, variant, attempt);

@@ -121,6 +121,13 @@ pub fn should_bail_on_mismatch(
     if classification.is_semantic_rejection {
         return true;
     }
+    // 429 always bails: rate-limit responses can't be cured by probing a
+    // different protocol/path (they're a quota statement, not an
+    // auth-shape mismatch), and probing 4 more candidates inside the
+    // same minute window just deepens the overage.
+    if classification.is_rate_limited {
+        return true;
+    }
     if classification.is_terminal && attempt > 0 {
         return true;
     }
@@ -331,7 +338,17 @@ mod tests {
     fn cls(is_terminal: bool, is_semantic_rejection: bool) -> AttemptClassification {
         AttemptClassification {
             is_terminal,
+            is_rate_limited: false,
             is_semantic_rejection,
+            quirk_hint: None,
+        }
+    }
+
+    fn cls_rate_limited() -> AttemptClassification {
+        AttemptClassification {
+            is_terminal: true,
+            is_rate_limited: true,
+            is_semantic_rejection: false,
             quirk_hint: None,
         }
     }
@@ -344,6 +361,25 @@ mod tests {
                 assert!(
                     should_bail_on_mismatch(attempt, &c, proven),
                     "expected bail for attempt={attempt}, proven={proven}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bail_on_rate_limit_at_any_attempt() {
+        // 429 must bail immediately even at attempt 0 (and on an unproven
+        // route). The DeepSeek-style auth-shape carve-out doesn't apply to
+        // rate-limit responses — Google's gemma quota saying "16k TPM
+        // exceeded" is not "this host doesn't speak the protocol", so
+        // probing 4 more candidates against the same upstream just
+        // multiplies the load against the same already-overbudget window.
+        let c = cls_rate_limited();
+        for attempt in [0usize, 1, 5] {
+            for proven in [false, true] {
+                assert!(
+                    should_bail_on_mismatch(attempt, &c, proven),
+                    "expected bail for 429 at attempt={attempt}, proven={proven}"
                 );
             }
         }

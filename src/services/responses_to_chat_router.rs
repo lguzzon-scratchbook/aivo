@@ -822,7 +822,12 @@ async fn forward_openai_chat_request(
                 // "this host rejected the protocol's auth header shape" rather
                 // than "your key is bad" (e.g. cross-protocol gateways). Probe
                 // at least one fallback before believing the upstream.
-                if classification.is_terminal && attempt > 0 {
+                //
+                // 429 doesn't get the carve-out: a rate-limit response is a
+                // quota statement, not an auth-shape mismatch, and probing
+                // more candidates against the same upstream piles requests
+                // into the same already-overbudget window.
+                if classification.is_terminal && (attempt > 0 || classification.is_rate_limited) {
                     // The path answered (with an error, but it answered) —
                     // pin it in memory so retry storms from codex/claude
                     // don't re-probe the wrong chat/completions paths every

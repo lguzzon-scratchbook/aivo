@@ -314,12 +314,21 @@ pub fn quirk_hint_for_error_body(body: &str) -> Option<&'static str> {
 /// parsing the body for the envelope and quirk-hint scans entirely.
 pub struct AttemptClassification {
     pub is_terminal: bool,
+    /// 429 specifically. Distinguished from the broader `is_terminal` flag
+    /// because the attempt-0 carve-out for terminal errors (probe one
+    /// fallback before bailing on 401/403, since those can mean "wrong
+    /// auth-header shape") doesn't apply: a quota-exhausted response is
+    /// never an auth-shape mismatch, and probing fallback paths just
+    /// burns more requests against the same already-overbudget quota
+    /// window.
+    pub is_rate_limited: bool,
     pub is_semantic_rejection: bool,
     pub quirk_hint: Option<&'static str>,
 }
 
 pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification {
     let is_terminal = is_terminal_upstream_error(status);
+    let is_rate_limited = status == 429;
     let is_semantic_rejection = matches!(status, 400 | 422) && is_request_error_envelope(body);
     let quirk_hint = if is_semantic_rejection {
         quirk_hint_for_error_body(body)
@@ -328,6 +337,7 @@ pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification
     };
     AttemptClassification {
         is_terminal,
+        is_rate_limited,
         is_semantic_rejection,
         quirk_hint,
     }

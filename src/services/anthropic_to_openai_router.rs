@@ -966,7 +966,12 @@ async fn handle_anthropic_to_upstream(
                 // "this host rejected the protocol's auth header shape" rather
                 // than "your key is bad" (e.g. cross-protocol gateways). Probe
                 // at least one fallback before believing the upstream.
-                if classification.is_terminal && attempt > 0 {
+                //
+                // 429 doesn't get the carve-out: rate-limit is a quota
+                // statement, not an auth-shape mismatch, and probing more
+                // candidates against the same upstream piles requests into
+                // the same already-overbudget window.
+                if classification.is_terminal && (attempt > 0 || classification.is_rate_limited) {
                     // Pin in-memory so retry storms hit this path directly
                     // instead of re-probing the wrong chat/completions paths.
                     commit_protocol_switch(active_protocol, protocol, variant, attempt);
