@@ -2693,9 +2693,10 @@ mod tests {
             detect_base_url("moonshotai"),
             Some("https://api.moonshot.ai/v1")
         );
+        assert_eq!(detect_base_url("minimax"), Some("https://api.minimax.io"));
         assert_eq!(
-            detect_base_url("minimax"),
-            Some("https://api.minimax.io/anthropic/v1")
+            detect_base_url("minimax-cn"),
+            Some("https://api.minimax.com")
         );
         assert_eq!(
             detect_base_url("vercel"),

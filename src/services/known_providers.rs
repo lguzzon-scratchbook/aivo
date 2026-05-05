@@ -31,6 +31,13 @@ static KNOWN_PROVIDERS: LazyLock<Vec<KnownProvider>> = LazyLock::new(|| {
 /// contain descriptive words like "China" or "Gateway" that also produce
 /// false positives on short inputs.
 pub fn find_by_name_substring(input: &str) -> Option<&KnownProvider> {
+    let input_lower = (input.len() >= 3).then(|| input.to_ascii_lowercase())?;
+    if let Some(exact) = KNOWN_PROVIDERS
+        .iter()
+        .find(|p| p.id.eq_ignore_ascii_case(&input_lower))
+    {
+        return Some(exact);
+    }
     matching_providers(input).next()
 }
 

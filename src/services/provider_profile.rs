@@ -148,7 +148,7 @@ pub static MINIMAX_MODELS: &[&str] = &[
 ];
 
 pub fn is_minimax_base(base_url: &str) -> bool {
-    base_url.contains("minimax.io") || base_url.contains("minimaxi.com")
+    base_url.contains("minimax.io") || base_url.contains("minimax.com")
 }
 
 pub fn is_copilot_base(base_url: &str) -> bool {
@@ -503,10 +503,7 @@ mod tests {
 
     #[test]
     fn classifies_minimax_with_static_models() {
-        for url in [
-            "https://api.minimax.io/anthropic/v1",
-            "https://api.minimaxi.com/anthropic",
-        ] {
+        for url in ["https://api.minimax.io", "https://api.minimax.com"] {
             let profile = provider_profile_for_base_url(url);
             assert_eq!(profile.kind, ProviderKind::AnthropicCompatible, "{url}");
             assert_eq!(
