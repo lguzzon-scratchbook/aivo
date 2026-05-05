@@ -221,7 +221,7 @@ where
     Ok(current)
 }
 
-/// One row of the history listing.
+/// One row of the audio cache listing.
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     /// SHA-256 hash (the cache key, also the filename stem).

@@ -217,7 +217,7 @@ fn print_help_line() {
     let _ = writeln!(
         err,
         "{}",
-        crate::style::dim("controls: SPACE pause · ←/→ seek 5s · q quit (saves position)")
+        crate::style::dim("controls: SPACE pause · ←/→ seek 5s · q quit")
     );
 }
 
@@ -281,8 +281,8 @@ impl Drop for RawModeGuard {
 /// rodio's `OutputStream` is `!Send` on macOS — the audio device handle,
 /// sink, and queue all stay on this thread for their entire lifetime.
 ///
-/// On TTY: SPACE pauses, q/Esc/Ctrl-C saves position and quits, ←/→ are
-/// no-ops with a one-line hint. On non-TTY: silent drain to completion.
+/// On TTY: SPACE pauses, q/Esc/Ctrl-C quits, ←/→ are no-ops with a
+/// one-line hint. On non-TTY: silent drain to completion.
 pub fn run_streaming_playback(
     chunk_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<PlaybackOutcome> {

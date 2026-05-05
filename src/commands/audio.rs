@@ -7,7 +7,7 @@
 //! identical inputs hit the cache and skip the provider entirely.
 
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -69,7 +69,10 @@ impl AudioCommand {
         };
 
         group("Input:");
-        opt("-f, --file <PATH>", "Read prompt text from a file (UTF-8)");
+        opt(
+            "-f, --file [PATH]",
+            "Read prompt from a file; omit PATH or pass - for stdin",
+        );
 
         group("Voice & Model:");
         opt("-k, --key <ID|NAME>", "API key to use");
@@ -93,13 +96,9 @@ impl AudioCommand {
 
         group("Playback:");
         opt("    --no-play", "Save without playing");
-        opt(
-            "    --restart",
-            "Ignore saved playback position; play from start",
-        );
 
-        group("History:");
-        opt("    --history", "Browse cached entries (replay or delete)");
+        group("List:");
+        opt("    --list", "Browse cached entries (replay or delete)");
 
         group("Other:");
         opt("-r, --refresh", "Bypass model-list cache");
@@ -109,18 +108,18 @@ impl AudioCommand {
         let ctl = |s: &str| println!("  {}", style::dim(s));
         ctl("SPACE  pause / resume");
         ctl("← / →  seek 5s back / forward");
-        ctl("q      quit (saves position; resume on next run)");
+        ctl("q      quit");
         println!();
         println!("{}", style::bold("Examples:"));
         let ex = |s: &str| println!("  {}", style::dim(s));
         ex("aivo speak \"hello world\"");
         ex("aivo speak \"narration line\" -m tts-1-hd --voice nova");
         ex("aivo speak -f script.txt");
+        ex("aivo speak -f -");
         ex("echo \"hi from pipe\" | aivo speak");
         ex("aivo speak \"...\" --no-play -o out.mp3   # save only");
         ex("aivo speak \"...\" --overwrite           # force regenerate");
-        ex("aivo speak --history                      # browse cached entries");
-        ex("aivo speak \"...\" --restart              # ignore saved position");
+        ex("aivo speak --list                       # browse cached entries");
     }
 
     /// Prints the audio-scope active key and model under the help output.
@@ -255,8 +254,7 @@ impl AudioCommand {
 
             if streaming_eligible {
                 let start = std::time::Instant::now();
-                let result =
-                    stream_and_save(&key, &request, &cache_file, &cache_dir, &cache_hash).await;
+                let result = stream_and_save(&key, &request, &cache_file).await;
                 elapsed = start.elapsed();
                 match result {
                     Ok((bytes, outcome)) => {
@@ -286,7 +284,7 @@ impl AudioCommand {
                             audio_cache::write_sidecar(&cache_dir, &cache_hash, &sidecar)
                         {
                             eprintln!(
-                                "{} could not write history metadata: {e}",
+                                "{} could not write audio metadata: {e}",
                                 style::dim("note:")
                             );
                         }
@@ -313,7 +311,7 @@ impl AudioCommand {
                 };
                 // Write the metadata sidecar alongside the freshly-generated
                 // audio. Failure here is non-fatal — the audio is the source
-                // of truth; the sidecar just powers `--history` and resume.
+                // of truth; the sidecar just powers `--list`.
                 let mut sidecar = Sidecar::new(
                     &prompt,
                     args.voice.as_deref(),
@@ -327,7 +325,7 @@ impl AudioCommand {
                     playback::probe_duration(&cache_file).map(|d| d.as_secs_f32());
                 if let Err(e) = audio_cache::write_sidecar(&cache_dir, &cache_hash, &sidecar) {
                     eprintln!(
-                        "{} could not write history metadata: {e}",
+                        "{} could not write audio metadata: {e}",
                         style::dim("note:")
                     );
                 }
@@ -364,22 +362,7 @@ impl AudioCommand {
             played = true;
             persist_playback_outcome(&cache_dir, &cache_hash, &outcome);
         } else if !args.no_play {
-            // Resume offset: read from sidecar unless the user passed
-            // --restart. We require >1s so a stale tiny offset doesn't
-            // surprise the user with "Resuming from 00:00".
-            let start_at = if args.restart {
-                Duration::ZERO
-            } else {
-                resume_offset(&cache_dir, &cache_hash)
-            };
-            if !start_at.is_zero() {
-                eprintln!(
-                    "{} resuming from {} ({})",
-                    style::dim("note:"),
-                    fmt_clock(start_at),
-                    style::dim("--restart to start over"),
-                );
-            }
+            let start_at = Duration::ZERO;
             match playback::play_interactive(&final_path, start_at) {
                 Ok(outcome) => {
                     played = true;
@@ -422,9 +405,9 @@ impl AudioCommand {
         ExitCode::Success
     }
 
-    /// `aivo speak --history` — fuzzy-pick a cached entry, then play or
+    /// `aivo speak --list` — fuzzy-pick a cached entry, then play or
     /// delete it. Pure local I/O; no key, no provider call.
-    pub async fn run_history(self, args: AudioArgs) -> ExitCode {
+    pub async fn run_list(self) -> ExitCode {
         let cache_dir = audio_cache::audio_cache_dir(self.session_store.config_dir());
 
         if !std::io::stderr().is_terminal() {
@@ -439,7 +422,7 @@ impl AudioCommand {
             if entries.is_empty() {
                 println!(
                     "{} no cached entries yet. Run `aivo speak \"…\"` first.",
-                    style::dim("history:")
+                    style::dim("list:")
                 );
                 return ExitCode::Success;
             }
@@ -463,7 +446,7 @@ impl AudioCommand {
             if entries.is_empty() {
                 println!(
                     "{} no cached entries yet. Run `aivo speak \"…\"` first.",
-                    style::dim("history:")
+                    style::dim("list:")
                 );
                 return ExitCode::Success;
             }
@@ -505,30 +488,18 @@ impl AudioCommand {
                 // Play / Delete errors are printed inline; we keep looping
                 // so the user can pick another entry.
                 0 => {
-                    let _ = self.history_play(entry, &cache_dir, args.restart);
+                    let _ = self.list_play(entry, &cache_dir);
                 }
                 1 => {
-                    let _ = history_delete(entry, &cache_dir);
+                    let _ = list_delete(entry, &cache_dir);
                 }
                 _ => {} // Cancel: fall through to next iteration
             }
         }
     }
 
-    fn history_play(&self, entry: &CacheEntry, cache_dir: &Path, restart: bool) -> ExitCode {
-        let start_at = if restart {
-            Duration::ZERO
-        } else {
-            resume_offset(cache_dir, &entry.hash)
-        };
-        if !start_at.is_zero() {
-            eprintln!(
-                "{} resuming from {} ({})",
-                style::dim("note:"),
-                fmt_clock(start_at),
-                style::dim("--restart to start over"),
-            );
-        }
+    fn list_play(&self, entry: &CacheEntry, cache_dir: &Path) -> ExitCode {
+        let start_at = Duration::ZERO;
         match playback::play_interactive(&entry.audio_path, start_at) {
             Ok(outcome) => {
                 persist_playback_outcome(cache_dir, &entry.hash, &outcome);
@@ -553,22 +524,8 @@ async fn stream_and_save(
     key: &ApiKey,
     request: &AudioRequest,
     cache_file: &Path,
-    cache_dir: &Path,
-    cache_hash: &str,
 ) -> anyhow::Result<(u64, PlaybackOutcome)> {
     eprintln!("{} streaming…", style::dim(format!("{} ", request.model)));
-
-    // Resume offset is *not* applied to streaming because the queue can't
-    // skip into samples that haven't been pushed yet. If a saved position
-    // exists, the user gets a hint that resume kicks in on cached replay.
-    if let Some(s) = audio_cache::read_sidecar(cache_dir, cache_hash)
-        && s.last_pos_seconds > 1.0
-    {
-        eprintln!(
-            "{} previous resume position will apply on next replay (cached)",
-            style::dim("note:"),
-        );
-    }
 
     // Channel: download task → playback thread. Std mpsc, not tokio's,
     // because the consumer is a plain `std::thread` (rodio's OutputStream
@@ -618,7 +575,7 @@ async fn stream_and_save(
     Ok((bytes, outcome))
 }
 
-fn history_delete(entry: &CacheEntry, cache_dir: &Path) -> ExitCode {
+fn list_delete(entry: &CacheEntry, cache_dir: &Path) -> ExitCode {
     match audio_cache::delete_entry(cache_dir, &entry.hash) {
         Ok(removed) => {
             for p in removed {
@@ -670,23 +627,9 @@ fn validate_prompt_len(text: &str, protocol: ProviderProtocol) -> anyhow::Result
     Ok(())
 }
 
-/// Reads `last_pos_seconds` from the sidecar, gated to >1.0s so a stale
-/// fractional offset doesn't trigger a useless "Resuming from 00:00".
-fn resume_offset(cache_dir: &Path, hash: &str) -> Duration {
-    let s = match audio_cache::read_sidecar(cache_dir, hash) {
-        Some(s) => s,
-        None => return Duration::ZERO,
-    };
-    if s.last_pos_seconds > 1.0 && s.last_pos_seconds.is_finite() {
-        Duration::from_secs_f32(s.last_pos_seconds)
-    } else {
-        Duration::ZERO
-    }
-}
-
 /// Mirrors a `PlaybackOutcome` back into the sidecar. Completed playback
-/// clears the position; a quit / interrupt stores the current offset so the
-/// next run can resume.
+/// clears the legacy position field; a quit / interrupt stores the current
+/// offset for metadata compatibility with older sidecars.
 fn persist_playback_outcome(cache_dir: &Path, hash: &str, outcome: &PlaybackOutcome) {
     let new_pos = if outcome.completed {
         0.0
@@ -703,14 +646,7 @@ fn persist_playback_outcome(cache_dir: &Path, hash: &str, outcome: &PlaybackOutc
     }
 }
 
-fn fmt_clock(d: Duration) -> String {
-    let total = d.as_secs();
-    let m = total / 60;
-    let s = total % 60;
-    format!("{m:02}:{s:02}")
-}
-
-/// One-line summary for the history picker. Format:
+/// One-line summary for the list picker. Format:
 /// `MM-DD HH:MM M:SS [voice[·1.5x]] "preview…"` — date and duration sit
 /// adjacent (single space) so the eye lands on the preview quickly. The
 /// optional discriminator (voice and non-default speed) appears only
@@ -721,15 +657,11 @@ fn format_entry_oneliner(entry: &CacheEntry) -> String {
     let when = entry
         .sidecar
         .as_ref()
-        .map(|s| s.created_at.format("%m-%d %H:%M").to_string())
+        .map(|s| format_list_time(s.created_at))
         .unwrap_or_else(|| {
             entry
                 .mtime
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| {
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
-                })
-                .map(|d| d.format("%m-%d %H:%M").to_string())
+                .map(format_system_time_list)
                 .unwrap_or_else(|| "??-?? ??:??".to_string())
         });
     let duration = entry
@@ -764,6 +696,17 @@ fn format_entry_oneliner(entry: &CacheEntry) -> String {
     format!("{when} {duration}{discriminator}  \"{preview}\"")
 }
 
+fn format_list_time(ts: chrono::DateTime<chrono::Utc>) -> String {
+    ts.with_timezone(&chrono::Local)
+        .format("%m-%d %H:%M")
+        .to_string()
+}
+
+fn format_system_time_list(ts: std::time::SystemTime) -> String {
+    let local: chrono::DateTime<chrono::Local> = ts.into();
+    local.format("%m-%d %H:%M").to_string()
+}
+
 /// `voice[·SPEEDx]` — optional middle column. Empty when the entry was
 /// generated with the default voice and default speed (the common case),
 /// so most rows skip it entirely.
@@ -781,7 +724,7 @@ fn format_discriminator(s: &Sidecar) -> String {
 }
 
 /// `M:SS` for clips under an hour, `H:MM:SS` for the rare longer one. Used
-/// for compact display in the history picker, distinct from the playback
+/// for compact display in the list picker, distinct from the playback
 /// status line's `MM:SS` (which is fixed-width and zero-padded).
 fn fmt_duration_short(d: Duration) -> String {
     let total = d.as_secs();
@@ -970,6 +913,28 @@ pub fn read_prompt_file(path: &Path) -> anyhow::Result<String> {
     Ok(trimmed.to_string())
 }
 
+#[allow(dead_code)] // used by the binary's main.rs; lib build doesn't see it
+pub fn is_stdin_file_arg(path: &str) -> bool {
+    path == "-"
+}
+
+#[allow(dead_code)] // used by the binary's main.rs; lib build doesn't see it
+pub fn read_prompt_stdin_explicit() -> anyhow::Result<String> {
+    if std::io::stdin().is_terminal() {
+        eprintln!("{}", style::dim("Enter prompt, then press Ctrl-D to send."));
+    }
+
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|e| anyhow::anyhow!("cannot read stdin for --file: {e}"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("stdin for --file is empty");
+    }
+    Ok(trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +977,13 @@ mod tests {
     fn read_prompt_file_reports_missing_path() {
         let err = read_prompt_file(Path::new("/nonexistent/aivo-test.txt")).unwrap_err();
         assert!(err.to_string().contains("--file"));
+    }
+
+    #[test]
+    fn stdin_file_arg_is_dash_only() {
+        assert!(is_stdin_file_arg("-"));
+        assert!(!is_stdin_file_arg("prompt.txt"));
+        assert!(!is_stdin_file_arg(""));
     }
 
     #[test]
@@ -1068,12 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn fmt_clock_renders_mm_ss() {
-        assert_eq!(fmt_clock(Duration::from_secs(0)), "00:00");
-        assert_eq!(fmt_clock(Duration::from_secs(75)), "01:15");
-    }
-
-    #[test]
     fn fmt_duration_short_drops_leading_zeros_under_an_hour() {
         assert_eq!(fmt_duration_short(Duration::from_secs(0)), "0:00");
         assert_eq!(fmt_duration_short(Duration::from_secs(9)), "0:09");
@@ -1108,7 +1074,8 @@ mod tests {
             mtime: None,
         };
         let line = format_entry_oneliner(&entry);
-        assert!(line.contains("05-04 15:22"), "got: {line}");
+        let expected_when = format_list_time("2026-05-04T15:22:00Z".parse().unwrap());
+        assert!(line.contains(&expected_when), "got: {line}");
         assert!(line.contains("0:11"), "got: {line}");
         assert!(line.contains("the quick brown fox"), "got: {line}");
         assert!(
@@ -1116,7 +1083,10 @@ mod tests {
             "model should be hidden: {line}"
         );
         // Single space between date and duration (the "too big" gap fix).
-        assert!(line.contains("05-04 15:22 0:11"), "got: {line}");
+        assert!(
+            line.contains(&format!("{expected_when} 0:11")),
+            "got: {line}"
+        );
     }
 
     #[test]

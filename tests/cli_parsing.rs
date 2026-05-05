@@ -320,12 +320,65 @@ fn speak_with_file_long_flag() {
 }
 
 #[test]
+fn speak_with_file_short_flag_without_path_uses_stdin_marker() {
+    let cli = Cli::try_parse_from(["aivo", "speak", "-f"]).unwrap();
+    if let Some(Commands::Speak(args)) = cli.command {
+        assert_eq!(args.file.as_deref(), Some("-"));
+        assert!(args.prompt.is_none());
+    } else {
+        panic!("Expected Speak command");
+    }
+}
+
+#[test]
+fn speak_with_file_long_flag_without_path_uses_stdin_marker() {
+    let cli = Cli::try_parse_from(["aivo", "speak", "--file"]).unwrap();
+    if let Some(Commands::Speak(args)) = cli.command {
+        assert_eq!(args.file.as_deref(), Some("-"));
+    } else {
+        panic!("Expected Speak command");
+    }
+}
+
+#[test]
 fn speak_prompt_and_file_are_mutually_exclusive() {
     let err = Cli::try_parse_from(["aivo", "speak", "hello", "-f", "script.txt"]).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("cannot be used") || msg.contains("conflict"),
         "expected conflict error, got: {msg}"
+    );
+}
+
+#[test]
+fn speak_with_list_flag() {
+    let cli = Cli::try_parse_from(["aivo", "speak", "--list"]).unwrap();
+    if let Some(Commands::Speak(args)) = cli.command {
+        assert!(args.list);
+        assert!(args.prompt.is_none());
+        assert!(args.file.is_none());
+    } else {
+        panic!("Expected Speak command");
+    }
+}
+
+#[test]
+fn speak_rejects_removed_history_flag() {
+    let err = Cli::try_parse_from(["aivo", "speak", "--history"]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unexpected argument") || msg.contains("unrecognized"),
+        "expected unknown flag error, got: {msg}"
+    );
+}
+
+#[test]
+fn speak_rejects_removed_restart_flag() {
+    let err = Cli::try_parse_from(["aivo", "speak", "hello", "--restart"]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unexpected argument") || msg.contains("unrecognized"),
+        "expected unknown flag error, got: {msg}"
     );
 }
 

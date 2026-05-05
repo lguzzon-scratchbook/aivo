@@ -641,10 +641,18 @@ pub struct AudioArgs {
     #[arg(value_name = "PROMPT", value_parser = non_empty())]
     pub prompt: Option<String>,
 
-    /// Read the prompt text from a file (UTF-8). Mutually exclusive with
-    /// the positional `<PROMPT>`.
-    #[arg(short = 'f', long = "file", value_name = "PATH",
-          value_parser = non_empty(), conflicts_with = "prompt")]
+    /// Read the prompt text from a file (UTF-8). Omit PATH or pass `-` to
+    /// read stdin explicitly. Mutually exclusive with the positional
+    /// `<PROMPT>`.
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "-",
+        value_parser = non_empty(),
+        conflicts_with = "prompt"
+    )]
     pub file: Option<String>,
 
     /// Audio model (e.g. tts-1, tts-1-hd, gpt-4o-mini-tts)
@@ -702,16 +710,10 @@ pub struct AudioArgs {
     #[arg(long)]
     pub no_play: bool,
 
-    /// Ignore any saved playback position and play from the beginning.
-    /// Without this, `speak` resumes where it left off after a previous
-    /// Ctrl-C / quit on the same cached entry.
-    #[arg(long)]
-    pub restart: bool,
-
-    /// Browse cached TTS history with a fuzzy picker. Each entry can be
+    /// List cached TTS entries with a fuzzy picker. Each entry can be
     /// replayed or deleted. Mutually exclusive with a prompt or `--file`.
-    #[arg(long, conflicts_with_all = ["prompt", "file"])]
-    pub history: bool,
+    #[arg(long = "list", conflicts_with_all = ["prompt", "file"])]
+    pub list: bool,
 
     /// Emit a JSON object with the result (path, bytes, model, voice)
     #[arg(long)]

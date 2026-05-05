@@ -947,11 +947,11 @@ async fn audio_dispatch(
     models_cache: &services::ModelsCache,
     audio_args: cli::AudioArgs,
 ) -> ExitCode {
-    // History mode is purely local: no provider call, no key resolution.
+    // List mode is purely local: no provider call, no key resolution.
     // Route it before we try to resolve a prompt or a key.
-    if audio_args.history {
+    if audio_args.list {
         let command = AudioCommand::new(session_store.clone(), models_cache.clone());
-        return command.run_history(audio_args).await;
+        return command.run_list().await;
     }
 
     let prompt = match resolve_speak_prompt(&audio_args) {
@@ -1002,8 +1002,9 @@ async fn audio_dispatch(
 }
 
 /// Resolves the speak prompt from (positional, `--file`, piped stdin) in
-/// that precedence. Returns `Ok(None)` to mean "show help" — i.e. the
-/// caller had no positional, no `--file`, and stdin was a TTY or empty.
+/// that precedence. `--file -` or `--file` with no value reads stdin
+/// explicitly. Returns `Ok(None)` to mean "show help" — i.e. the caller
+/// had no positional, no `--file`, and stdin was a TTY or empty.
 fn resolve_speak_prompt(args: &cli::AudioArgs) -> anyhow::Result<Option<String>> {
     if let Some(p) = args
         .prompt
@@ -1014,7 +1015,11 @@ fn resolve_speak_prompt(args: &cli::AudioArgs) -> anyhow::Result<Option<String>>
         return Ok(Some(p.to_string()));
     }
     if let Some(path) = args.file.as_deref() {
-        return commands::audio::read_prompt_file(std::path::Path::new(path)).map(Some);
+        return if commands::audio::is_stdin_file_arg(path) {
+            commands::audio::read_prompt_stdin_explicit().map(Some)
+        } else {
+            commands::audio::read_prompt_file(std::path::Path::new(path)).map(Some)
+        };
     }
     match services::stdin_io::read_stdin_if_piped()? {
         Some(s) => {
