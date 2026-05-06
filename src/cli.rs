@@ -570,6 +570,12 @@ pub struct ImageArgs {
     /// Emit a JSON object with the result (path, bytes, url, model, size)
     #[arg(long)]
     pub json: bool,
+
+    /// Disable inline image preview in supported terminals (Kitty,
+    /// Ghostty, WezTerm, Warp, recent iTerm2). Override per-invocation;
+    /// `AIVO_PREVIEW=0` disables globally.
+    #[arg(long)]
+    pub no_preview: bool,
 }
 
 /// Arguments for the video command. Video generation is async on every

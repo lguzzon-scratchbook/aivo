@@ -73,6 +73,10 @@ impl ImageCommand {
             "Print provider URL only; skip download (URLs may expire)",
         );
         opt("    --json", "Emit JSON result (for scripting)");
+        opt(
+            "    --no-preview",
+            "Disable inline preview in supported terminals (Kitty, Ghostty, WezTerm, Warp, iTerm2)",
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo image \"a red panda in space\""));
@@ -193,8 +197,25 @@ impl ImageCommand {
             print_json(&artifact, &key, &model, &request, elapsed);
         } else {
             print_human(&artifact, &key, &model, request.size.as_deref());
+            maybe_preview(&artifact, args.no_preview);
         }
         ExitCode::Success
+    }
+}
+
+/// Best-effort inline preview after a successful save. Skipped when the
+/// user passed `--no-preview`, when there's no on-disk artifact (e.g.
+/// `--url` mode), or when stdout is piped / the terminal doesn't speak
+/// the Kitty graphics protocol (handled inside `display_png`).
+fn maybe_preview(artifact: &ImageArtifact, no_preview: bool) {
+    if no_preview {
+        return;
+    }
+    let Some(path) = artifact.path.as_deref() else {
+        return;
+    };
+    if let Ok(bytes) = std::fs::read(path) {
+        crate::services::terminal_graphics::display_image(&bytes);
     }
 }
 
