@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.19.20
+
+### Features
+
+- `aivo image`: inline preview in supported terminals.
+- `aivo run` (codex): `--max-context` now drives Codex via `model_context_window`.
+- Keys: editing a Bedrock entry reuses the add flow's region picker.
+
+### Fixes
+
+- Router: bail on 429 instead of probing fallback paths.
+- CLI: `--<N>m` accepted as a generic max-context shorthand.
+- Refactor: split `main.rs` into `cli_args` + `run` modules.
+
+
+## v0.19.19
+
+### Fixes
+
+- Audio: preserve external playback on `--no-default-features` builds.
+
+
 ## v0.19.18
 
 ### Improvements
