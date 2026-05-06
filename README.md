@@ -1,12 +1,12 @@
 # aivo
 
-A command-line tool that connects your coding agent to almost any model. It includes free models out of the box — no API keys, no signup.
+A command-line tool that connects coding agents to any compatible model provider. Includes a free starter provider for first-run use.
 
-## What it does
+## Features
 
-- Encrypted local storage for multiple provider keys.
-- Runs `claude`, `codex`, `gemini`, `opencode`, `pi` against any saved key.
-- Chat TUI, one-shot `-x`, and a local OpenAI-compatible server.
+- AES-256-GCM encrypted storage for multiple provider keys.
+- Launches `claude`, `codex`, `gemini`, `opencode`, and `pi` against any saved key.
+- Chat TUI, one-shot `-x` mode, and a local OpenAI-compatible HTTP server.
 
 ## Install
 
@@ -18,14 +18,14 @@ npm install -g @yuanchuan/aivo                       # npm (recommended on Windo
 
 ## Quick Start
 
-aivo ships with a free built-in provider (`aivo/starter`) that activates on first run — no API key needed:
+The built-in `aivo/starter` provider activates on first run, so no key is required to try it:
 
 ```bash
 aivo -x hello
 aivo claude
 ```
 
-Add your own key for more models:
+Add a key to access more models:
 
 ```bash
 aivo keys add                                # interactive picker
@@ -33,7 +33,7 @@ aivo claude
 aivo claude --model moonshotai/kimi-k2.5     # pin a model
 ```
 
-`aivo keys add` covers OpenAI-compatible endpoints (OpenRouter, Groq, DeepSeek, …) plus built-in OAuth flows for GitHub Copilot, OpenAI Codex, Claude Code, Gemini, and a local Ollama instance.
+`aivo keys add` supports OpenAI-compatible endpoints (OpenRouter, Groq, DeepSeek, and others), native APIs (Anthropic, Google AI Studio, Amazon Bedrock, Cloudflare Workers AI), local Ollama, and OAuth flows for GitHub Copilot, OpenAI Codex, Claude Code, and Gemini.
 
 ## Commands
 
@@ -54,7 +54,7 @@ Run `aivo <command> --help` for the full flag list.
 
 ## run
 
-Launch an AI tool with the active provider key. The `run` keyword is optional — `aivo claude` is equivalent to `aivo run claude`. Extra args are passed through.
+Launch an AI tool with the active provider key. The `run` keyword is optional: `aivo claude` is equivalent to `aivo run claude`. Extra arguments are passed through.
 
 Supported tools:
 
@@ -80,7 +80,7 @@ Pin a different model to one of Claude Code's named slots:
 aivo claude --opus-model=deepseek-v4-pro --sonnet-model=deepseek-v4-flash
 ```
 
-Without a tool name, `aivo run` opens the interactive start flow and remembers your last selection.
+Without a tool name, `aivo run` opens the interactive start flow and remembers the last selection.
 
 ## keys
 
@@ -95,7 +95,7 @@ aivo keys cat | edit | rm <name>
 aivo keys ping --all                         # health-check all keys
 ```
 
-Any endpoint that speaks a supported protocol can be saved.
+Any endpoint implementing a supported protocol can be saved.
 
 ## models
 
@@ -110,7 +110,7 @@ aivo models --json | jq '.models[].id'
 
 ## chat
 
-Interactive chat TUI, or one-shot `-x` mode for piping.
+Interactive chat TUI, or one-shot `-x` mode for scripting and pipelines.
 
 ```bash
 aivo chat                                    # full-screen TUI
@@ -151,7 +151,7 @@ aivo serve --log /tmp/requests.jsonl
 
 ## alias
 
-Short names for models or launch presets — both share one namespace.
+Short names for models or launch presets. Both share one namespace.
 
 ```bash
 aivo alias                                   # list
@@ -179,7 +179,7 @@ aivo info --json
 
 ## logs
 
-Query the local SQLite log database used by `chat`, `run`, and `serve`. Chat logs include turn content + token usage; `run` and `serve` log metadata only.
+Query the local SQLite log database used by `chat`, `run`, and `serve`. Chat logs include turn content and token usage. `run` and `serve` log metadata only.
 
 ```bash
 aivo logs                                    # newest first
@@ -195,6 +195,7 @@ aivo logs --by run --watch                   # live tail
 ## stats
 
 Aggregates token counts from aivo chat, Claude Code, Codex, Gemini, OpenCode, and Pi by reading each tool's native data files.
+
 
 ```bash
 aivo stats

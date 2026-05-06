@@ -233,14 +233,15 @@ pub struct RunArgs {
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     pub envs: Vec<String>,
 
-    /// Claude only: append the canonical `[<size>]` suffix to the model name
-    /// in every default slot env var (`ANTHROPIC_MODEL`,
-    /// `ANTHROPIC_DEFAULT_SONNET_MODEL`, etc.) so Claude Code opts into the
-    /// matching context window. Equivalent to passing
-    /// `--model your-model[<size>]` directly, but fans out to every slot.
-    /// Per-slot overrides (`--haiku-model`, `--sonnet-model`, …) are left
-    /// verbatim. Accepts any `<N>m` (e.g. `1m`, `2m`, `12m`); aivo only
-    /// validates shape — Claude Code decides which tiers it actually honors.
+    /// Opt into a larger context window for the underlying tool. Accepts any
+    /// `<N>m` (e.g. `1m`, `2m`, `12m`); aivo only validates shape.
+    ///
+    /// - For `claude`: appends a `[<size>]` suffix to the model name in every
+    ///   default slot env var (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+    ///   etc.) so Claude Code opts into the matching beta context tier. Per-slot
+    ///   overrides (`--haiku-model`, `--sonnet-model`, …) are left verbatim.
+    /// - For `codex`: passes `--config model_context_window=<N×1_000_000>` to
+    ///   codex, which clamps the value against the model's advertised ceiling.
     #[arg(long = "max-context", value_name = "SIZE")]
     pub max_context: Option<String>,
 

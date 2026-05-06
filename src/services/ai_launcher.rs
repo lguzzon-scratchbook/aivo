@@ -13,8 +13,8 @@ use tokio::signal;
 use crate::errors::{CLIError, ErrorCategory};
 use crate::services::environment_injector::{ClaudeModelOverrides, EnvironmentInjector};
 use crate::services::launch_args::{
-    build_preview_notes, build_runtime_args, inject_codex_provider_config, merge_preview_env,
-    preview_args, rewrite_codex_preview_env,
+    build_preview_notes, build_runtime_args, inject_codex_max_context,
+    inject_codex_provider_config, merge_preview_env, preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
     cleanup_runtime_artifacts, finalize_codex_oauth, finalize_gemini_oauth,
@@ -232,6 +232,10 @@ impl AILauncher {
 
         if options.tool == AIToolType::Codex {
             inject_codex_provider_config(&mut runtime.env, &mut runtime_args.args);
+            inject_codex_max_context(
+                &mut runtime_args.args,
+                options.claude_overrides.max_context.as_deref(),
+            );
         }
 
         let event_group_id = new_log_id();
@@ -493,7 +497,7 @@ impl AILauncher {
     pub async fn prepare_launch(&self, options: &LaunchOptions) -> Result<PreparedLaunch> {
         let resolved = self.resolve_launch_context(options, false).await?;
         let mut env_vars = merge_preview_env(&resolved.tool_config.env_vars, options.env.as_ref());
-        let args = preview_args(
+        let mut args = preview_args(
             options.tool,
             &options.args,
             resolved.model.as_deref(),
@@ -508,6 +512,7 @@ impl AILauncher {
 
         if options.tool == AIToolType::Codex {
             rewrite_codex_preview_env(&mut env_vars);
+            inject_codex_max_context(&mut args, options.claude_overrides.max_context.as_deref());
         }
 
         Ok(PreparedLaunch {

@@ -332,15 +332,15 @@ pub async fn run() -> ! {
                     );
                     process::exit(ExitCode::UserError.code());
                 };
-                let tool_is_claude = run_args
+                let supported = run_args
                     .tool
                     .as_deref()
                     .and_then(AIToolType::parse)
-                    .is_some_and(|t| matches!(t, AIToolType::Claude));
-                if !tool_is_claude {
+                    .is_some_and(|t| matches!(t, AIToolType::Claude | AIToolType::Codex));
+                if !supported {
                     let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
                     eprintln!(
-                        "{} --max-context only applies to `aivo run claude`. {} doesn't have a context-bar issue.",
+                        "{} --max-context only applies to `aivo run claude` and `aivo run codex` (got {}).",
                         style::red("Error:"),
                         tool_name
                     );

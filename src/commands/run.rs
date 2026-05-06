@@ -349,15 +349,60 @@ impl RunCommand {
             }
         };
 
-        claude_overrides.max_context = resolve_max_context(
-            &self.cache,
-            key_override.as_ref().map(|k| k.base_url.as_str()),
-            resolved_model.as_deref(),
-            max_context,
-        )
-        .await;
+        // Auto-defaults (1m/2m based on the model's advertised context window)
+        // only make sense for Claude — they target Anthropic's beta-tier
+        // context-bar opt-in. For Codex the same flag is a raw token-count
+        // override of `model_context_window`, so silently picking "1m" because
+        // a model happens to advertise ≥1M tokens would unexpectedly shadow
+        // Codex's own discovery. Only respect the user's explicit value there.
+        claude_overrides.max_context = match ai_tool {
+            AIToolType::Claude => {
+                resolve_max_context(
+                    &self.cache,
+                    key_override.as_ref().map(|k| k.base_url.as_str()),
+                    resolved_model.as_deref(),
+                    max_context,
+                )
+                .await
+            }
+            _ => max_context,
+        };
 
         let launch_model = resolve_model_placeholder(resolved_model);
+
+        // `--max-context` / `--1m` is a model-name suffix: aivo writes
+        // `<model>[<tag>]` into ANTHROPIC_MODEL, Claude Code parses the suffix
+        // off and adds the `anthropic-beta: context-1m-2025-08-07` header.
+        // With no model resolved (user picked "(leave it to the tool)", let
+        // it persist via `__default__`, or skipped `-m` entirely), there's
+        // nothing to attach the suffix to — env vars are never written and
+        // the flag silently no-ops. Surface this before Claude takes over the
+        // screen, and gate the launch on Enter so the note isn't lost. Check
+        // after `resolve_model_placeholder` so the `__default__` sentinel is
+        // already collapsed to `None`.
+        if matches!(ai_tool, AIToolType::Claude)
+            && claude_overrides.max_context.is_some()
+            && launch_model.is_none()
+        {
+            let tag = claude_overrides.max_context.as_deref().unwrap_or("1m");
+            eprintln!();
+            eprintln!(
+                "{} `--{tag}` needs a model id to attach `[{tag}]` to.",
+                style::yellow("Note:"),
+            );
+            eprintln!("  No model was selected, so Claude Code will boot with its built-in");
+            eprintln!("  default and {tag} context will NOT be active. Inside the session, run");
+            eprintln!("    /model <model-id>[{tag}]   (e.g. /model claude-sonnet-4-6[{tag}])");
+            eprintln!("  to enable it.");
+            eprintln!();
+            use std::io::{IsTerminal, Write};
+            if !dry_run && std::io::stderr().is_terminal() && std::io::stdin().is_terminal() {
+                eprint!("Press Enter to continue, or Ctrl+C to abort... ");
+                let _ = std::io::stderr().flush();
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_line(&mut buf);
+            }
+        }
 
         // Optional context injection: inject exactly one past session.
         let args = if let Some(selector) = context_selector {

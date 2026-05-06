@@ -163,6 +163,16 @@ pub(crate) fn parse_context_token(tok: &str) -> Option<String> {
     Some(format!("{digits}m"))
 }
 
+/// `"<digits>m"` → `Some(<digits> * 1_000_000)`. Used by codex's `-c
+/// model_context_window=<tokens>` injection. Returns `None` if the input
+/// isn't already in canonical `<digits>m` form (callers should have run it
+/// through `parse_context_token` first).
+pub(crate) fn context_tag_to_tokens(tag: &str) -> Option<u64> {
+    let digits = tag.strip_suffix('m')?;
+    let n: u64 = digits.parse().ok()?;
+    n.checked_mul(1_000_000)
+}
+
 /// Returns true if `raw_args[1]` could plausibly be a Bundle alias name —
 /// i.e. it's worth paying for a config read to find out. False for built-in
 /// commands, tool shortcuts, and bare flags.
@@ -1065,6 +1075,17 @@ mod tests {
         );
         assert_eq!(r.max_context, None);
         assert_eq!(r.remaining_args, args(&["--foo", "--ma", "--m", "--1mb"]));
+    }
+
+    #[test]
+    fn context_tag_to_tokens_table() {
+        assert_eq!(context_tag_to_tokens("1m"), Some(1_000_000));
+        assert_eq!(context_tag_to_tokens("2m"), Some(2_000_000));
+        assert_eq!(context_tag_to_tokens("12m"), Some(12_000_000));
+        assert_eq!(context_tag_to_tokens("1M"), None); // canonical form is lowercase
+        assert_eq!(context_tag_to_tokens("foo"), None);
+        assert_eq!(context_tag_to_tokens("m"), None);
+        assert_eq!(context_tag_to_tokens("1"), None);
     }
 
     #[test]

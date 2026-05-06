@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
 
+use crate::cli_args::context_tag_to_tokens;
 use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::codex_model_map::map_model_for_codex_cli;
@@ -258,6 +259,23 @@ pub(crate) fn inject_codex_provider_config(
     }
     config_args.append(args);
     *args = config_args;
+}
+
+/// Append `--config model_context_window=<tokens>` for codex when the user
+/// asked for `--max-context=<N>m`. Codex clamps the value against the
+/// model's advertised ceiling internally, so passing a high value on a
+/// small model is silently a no-op rather than an error. We append (not
+/// prepend) so the user's own `--config` flags, if any, parse first and
+/// can win on conflict per codex's last-write-wins semantics.
+pub(crate) fn inject_codex_max_context(args: &mut Vec<String>, max_context: Option<&str>) {
+    let Some(tag) = max_context else {
+        return;
+    };
+    let Some(tokens) = context_tag_to_tokens(tag) else {
+        return;
+    };
+    args.push("--config".to_string());
+    args.push(format!("model_context_window={tokens}"));
 }
 
 /// Rewrites env vars for the dry-run preview so it reflects what codex
@@ -693,6 +711,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.args, vec!["explain this code"]);
+    }
+
+    #[test]
+    fn inject_codex_max_context_appends_config_arg() {
+        let mut args = vec!["-m".to_string(), "gpt-5".to_string()];
+        inject_codex_max_context(&mut args, Some("1m"));
+        assert_eq!(
+            args,
+            vec!["-m", "gpt-5", "--config", "model_context_window=1000000"]
+        );
+    }
+
+    #[test]
+    fn inject_codex_max_context_handles_multi_digit_tags() {
+        let mut args: Vec<String> = vec![];
+        inject_codex_max_context(&mut args, Some("12m"));
+        assert_eq!(args, vec!["--config", "model_context_window=12000000"]);
+    }
+
+    #[test]
+    fn inject_codex_max_context_noop_when_unset() {
+        let mut args = vec!["existing".to_string()];
+        inject_codex_max_context(&mut args, None);
+        assert_eq!(args, vec!["existing"]);
+    }
+
+    #[test]
+    fn inject_codex_max_context_noop_on_malformed_tag() {
+        // Defensive: callers should pass canonical `<N>m`, but if junk slips
+        // through (e.g. a future code path forgets to validate), we silently
+        // skip rather than appending a garbage `--config` value.
+        let mut args = vec!["existing".to_string()];
+        inject_codex_max_context(&mut args, Some("foo"));
+        assert_eq!(args, vec!["existing"]);
     }
 
     #[test]
