@@ -8,7 +8,7 @@
 //!   tool calling in Chat Completions when `reasoning_effort` is `"none"`.
 //! - **Anthropic** (Messages API): `thinking: { type: "enabled", budget_tokens }`
 //!   plus the newer `output_config.effort` ∈ {`"low"`, `"medium"`, `"high"`,
-//!   `"max"`}.
+//!   `"xhigh"`, `"max"`}.
 //! - **Gemini** (3.x): `generationConfig.thinkingConfig.thinking_level`
 //!   ∈ {`"low"`, `"medium"`, `"high"`}. Gemini 2.5 used `thinkingBudget`
 //!   (numeric); Gemini 3 rejects that key.
@@ -50,7 +50,11 @@ impl CanonicalEffort {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
-            "max" => Some(Self::Max),
+            // Anthropic accepts `xhigh` as the deep-effort tier on Opus 4.7
+            // adaptive thinking; treat it as `max` so callers that bridge
+            // to OpenAI emit `reasoning_effort: "xhigh"` instead of
+            // collapsing the intent down to `high`.
+            "xhigh" | "max" => Some(Self::Max),
             _ => None,
         }
     }
@@ -139,21 +143,37 @@ pub(crate) fn extract_openai_effort(body: &Value) -> Option<CanonicalEffort> {
         .and_then(CanonicalEffort::from_openai_str)
 }
 
-/// Extract a canonical effort from an Anthropic request body. Looks at
-/// `thinking.budget_tokens` first (most precise), then `output_config.effort`.
+/// Extract a canonical effort from an Anthropic request body. For
+/// `thinking.type` ∈ {`"enabled"`, `"adaptive"`}, prefers
+/// `thinking.budget_tokens` (the precise, manual control), then
+/// `output_config.effort` (the primary control for adaptive thinking),
+/// then falls back to `High` so an explicit thinking request isn't
+/// silently downgraded to Anthropic's default. When thinking is absent or
+/// disabled, falls through to `output_config.effort` alone.
 pub(crate) fn extract_anthropic_effort(body: &Value) -> Option<CanonicalEffort> {
-    if let Some(thinking) = body.get("thinking")
-        && thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
-    {
-        if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_u64()) {
-            return Some(CanonicalEffort::from_anthropic_budget_tokens(budget));
-        }
-        return Some(CanonicalEffort::High);
-    }
-    body.get("output_config")
+    let output_config_effort = body
+        .get("output_config")
         .and_then(|c| c.get("effort"))
         .and_then(|v| v.as_str())
-        .and_then(CanonicalEffort::from_anthropic_effort_str)
+        .and_then(CanonicalEffort::from_anthropic_effort_str);
+
+    let thinking_type = body
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str());
+
+    if matches!(thinking_type, Some("enabled" | "adaptive")) {
+        if let Some(budget) = body
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_u64())
+        {
+            return Some(CanonicalEffort::from_anthropic_budget_tokens(budget));
+        }
+        return output_config_effort.or(Some(CanonicalEffort::High));
+    }
+
+    output_config_effort
 }
 
 /// True if the OpenAI request would be rejected upstream because GPT-5.4+
@@ -274,6 +294,69 @@ mod tests {
     fn extract_anthropic_effort_falls_back_to_output_config_effort() {
         let body = json!({ "output_config": { "effort": "max" } });
         assert_eq!(extract_anthropic_effort(&body), Some(CanonicalEffort::Max));
+    }
+
+    #[test]
+    fn extract_anthropic_effort_uses_output_config_effort_for_adaptive() {
+        // Adaptive is controlled by output_config.effort, not budget_tokens.
+        let body = json!({
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": "low" }
+        });
+        assert_eq!(extract_anthropic_effort(&body), Some(CanonicalEffort::Low));
+    }
+
+    #[test]
+    fn extract_anthropic_effort_max_via_adaptive_plus_effort() {
+        let body = json!({
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": "max" }
+        });
+        assert_eq!(extract_anthropic_effort(&body), Some(CanonicalEffort::Max));
+    }
+
+    #[test]
+    fn extract_anthropic_effort_recognizes_xhigh_for_adaptive() {
+        // Anthropic accepts `xhigh` for Opus 4.7 adaptive thinking. Without
+        // parsing it, we'd fall back to `High` and silently downgrade the
+        // user's deep-effort intent when bridging to OpenAI.
+        let body = json!({
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": "xhigh" }
+        });
+        assert_eq!(extract_anthropic_effort(&body), Some(CanonicalEffort::Max));
+    }
+
+    #[test]
+    fn from_anthropic_effort_str_accepts_xhigh_as_max() {
+        assert_eq!(
+            CanonicalEffort::from_anthropic_effort_str("xhigh"),
+            Some(CanonicalEffort::Max)
+        );
+        assert_eq!(
+            CanonicalEffort::from_anthropic_effort_str("XHIGH"),
+            Some(CanonicalEffort::Max)
+        );
+    }
+
+    #[test]
+    fn extract_anthropic_effort_defaults_high_for_adaptive_without_effort() {
+        let body = json!({ "thinking": { "type": "adaptive" } });
+        assert_eq!(extract_anthropic_effort(&body), Some(CanonicalEffort::High));
+    }
+
+    #[test]
+    fn extract_anthropic_effort_enabled_without_budget_uses_output_config_effort() {
+        // Same precedence change applies to enabled — if no budget, honor
+        // the user's effort hint instead of jumping to High.
+        let body = json!({
+            "thinking": { "type": "enabled" },
+            "output_config": { "effort": "medium" }
+        });
+        assert_eq!(
+            extract_anthropic_effort(&body),
+            Some(CanonicalEffort::Medium)
+        );
     }
 
     #[test]

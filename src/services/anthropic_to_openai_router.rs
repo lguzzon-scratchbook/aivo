@@ -25,7 +25,8 @@ use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
 };
 use crate::services::anthropic_route_pipeline::{
-    CacheControlPatch, RequestContext, RequestPatch, inject_chat_completions_cache_control,
+    CacheControlPatch, RequestContext, RequestPatch, ThinkingNormalizationPatch,
+    inject_chat_completions_cache_control,
 };
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self, router_http_client};
@@ -535,6 +536,7 @@ async fn try_native_anthropic(
         upstream_base_url: &config.target_base_url,
     };
     CacheControlPatch.patch_json("messages", &mut native_body, &ctx)?;
+    ThinkingNormalizationPatch.patch_json("messages", &mut native_body, &ctx)?;
 
     let mut saw_upstream_error = false;
     for &path in candidates {

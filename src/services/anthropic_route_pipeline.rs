@@ -42,6 +42,7 @@ impl RouterPipeline {
             Box::new(CacheControlPatch),
             Box::new(ModelNamePatch),
             Box::new(AnthropicVersionPatch),
+            Box::new(ThinkingNormalizationPatch),
         ])
     }
 
@@ -201,6 +202,130 @@ impl RequestPatch for AnthropicVersionPatch {
         }
         Ok(())
     }
+}
+
+/// Reconciles the `thinking` field with per-model capabilities.
+///
+/// Claude Code 2.x sends `thinking:{type:"adaptive"}` regardless of the
+/// routed model, but adaptive is only accepted on Opus 4.7/4.6, Sonnet 4.6,
+/// and Mythos — older models 400 with a discriminated-union error on
+/// compliant upstreams. Strip adaptive on unsupporting models, strip the
+/// paired `output_config.effort` only when the target model is not known to
+/// support effort, and rewrite `enabled` → `adaptive` on Opus 4.7 (which
+/// dropped manual mode entirely).
+pub struct ThinkingNormalizationPatch;
+
+impl RequestPatch for ThinkingNormalizationPatch {
+    fn patch_json(&self, _route: &str, body: &mut Value, _ctx: &RequestContext<'_>) -> Result<()> {
+        let Some(obj) = body.as_object_mut() else {
+            return Ok(());
+        };
+        let Some(model) = obj
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let Some(type_str) = obj
+            .get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+
+        match type_str.as_str() {
+            "adaptive" if !model_supports_adaptive_thinking(&model) => {
+                obj.remove("thinking");
+                if !model_supports_output_effort(&model) {
+                    drop_output_config_effort(obj);
+                }
+            }
+            "enabled" if model_rejects_enabled_thinking(&model) => {
+                rewrite_enabled_to_adaptive(obj);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+fn drop_output_config_effort(obj: &mut serde_json::Map<String, Value>) {
+    let drop_output_config = obj
+        .get_mut("output_config")
+        .and_then(|o| o.as_object_mut())
+        .map(|oc| {
+            oc.remove("effort");
+            oc.is_empty()
+        })
+        .unwrap_or(false);
+    if drop_output_config {
+        obj.remove("output_config");
+    }
+}
+
+/// Preserves non-`type`/non-`budget_tokens` keys such as `display`, and
+/// drops `budget_tokens` (adaptive carries no budget). Does not synthesize
+/// `output_config.effort` from the dropped budget — many upstreams reject
+/// `output_config` outright, so introducing the field can produce "Extra
+/// inputs are not permitted" 400s. Callers that want effort control on
+/// Opus 4.7 can set `output_config.effort` themselves.
+fn rewrite_enabled_to_adaptive(obj: &mut serde_json::Map<String, Value>) {
+    let mut new_thinking = match obj.remove("thinking") {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    new_thinking.remove("budget_tokens");
+    new_thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
+    obj.insert("thinking".to_string(), Value::Object(new_thinking));
+}
+
+/// Strips any slash provider prefix or dotted platform prefix, lowercases,
+/// and converts dots to dashes so capability matching works regardless of
+/// which transform the request has been through. Claude Code sends
+/// `claude-opus-4-7`; OpenRouter's rename produces
+/// `anthropic/claude-opus-4.7`; Bedrock-style IDs can look like
+/// `us.anthropic.claude-sonnet-4-6`.
+fn normalize_model_for_match(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    let bare = lower.split('/').next_back().unwrap_or(&lower);
+    let bare = bare.find("claude-").map(|idx| &bare[idx..]).unwrap_or(bare);
+    bare.replace('.', "-")
+}
+
+/// True if `model` (already normalized) starts with `prefix` followed by a
+/// model-component boundary — end of string or `-`. Prevents
+/// `claude-opus-4-60` from matching `claude-opus-4-6`.
+fn matches_model_prefix(model: &str, prefix: &str) -> bool {
+    if !model.starts_with(prefix) {
+        return false;
+    }
+    matches!(model.as_bytes().get(prefix.len()), None | Some(b'-'))
+}
+
+fn model_supports_adaptive_thinking(model: &str) -> bool {
+    let n = normalize_model_for_match(model);
+    matches_model_prefix(&n, "claude-opus-4-7")
+        || matches_model_prefix(&n, "claude-opus-4-6")
+        || matches_model_prefix(&n, "claude-sonnet-4-6")
+        || matches_model_prefix(&n, "claude-mythos")
+}
+
+fn model_supports_output_effort(model: &str) -> bool {
+    let n = normalize_model_for_match(model);
+    matches_model_prefix(&n, "claude-mythos")
+        || matches_model_prefix(&n, "claude-opus-4-7")
+        || matches_model_prefix(&n, "claude-opus-4-6")
+        || matches_model_prefix(&n, "claude-sonnet-4-6")
+        || matches_model_prefix(&n, "claude-opus-4-5")
+}
+
+fn model_rejects_enabled_thinking(model: &str) -> bool {
+    let n = normalize_model_for_match(model);
+    matches_model_prefix(&n, "claude-opus-4-7")
 }
 
 #[cfg(test)]
@@ -445,5 +570,288 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("2023-06-01")
         );
+    }
+
+    // ─── ThinkingNormalizationPatch ───────────────────────────────────────
+
+    fn run_thinking_patch(body: &mut Value) {
+        let ctx = RequestContext {
+            upstream_base_url: "https://openrouter.ai/api/v1",
+        };
+        ThinkingNormalizationPatch
+            .patch_json("messages", body, &ctx)
+            .unwrap();
+    }
+
+    #[test]
+    fn thinking_patch_keeps_adaptive_on_opus_4_7() {
+        let mut body = json!({
+            "model": "claude-opus-4-7",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_keeps_adaptive_on_anthropic_prefixed_sonnet_4_6() {
+        // Mirrors what arrives after ModelNamePatch rewrites for OpenRouter:
+        // dotted form, anthropic/ prefix.
+        let mut body = json!({
+            "model": "anthropic/claude-sonnet-4.6",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_keeps_adaptive_on_opus_4_6_with_date_suffix() {
+        let mut body = json!({
+            "model": "claude-opus-4-6-20260120",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_keeps_adaptive_on_mythos() {
+        let mut body = json!({
+            "model": "claude-mythos-preview",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_tolerates_dotted_canonical_form() {
+        let mut body = json!({
+            "model": "claude-sonnet-4.6",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_keeps_adaptive_on_bedrock_style_sonnet_4_6() {
+        let mut body = json!({
+            "model": "us.anthropic.claude-sonnet-4-6",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_strips_adaptive_on_haiku_4_5() {
+        let mut body = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_strips_adaptive_on_anthropic_prefixed_haiku() {
+        let mut body = json!({
+            "model": "anthropic/claude-haiku-4-5-20251001",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_strips_adaptive_on_sonnet_4_5() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-5",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_preserves_effort_on_opus_4_5_when_stripping_adaptive() {
+        let mut body = json!({
+            "model": "claude-opus-4-5",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"}
+        });
+        run_thinking_patch(&mut body);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["output_config"], json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn thinking_patch_strips_paired_output_config_effort() {
+        let mut body = json!({
+            "model": "claude-haiku-4-5",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"}
+        });
+        run_thinking_patch(&mut body);
+        assert!(body.get("thinking").is_none());
+        // output_config is removed entirely once it becomes empty — many
+        // upstreams reject `output_config` on non-adaptive-capable models.
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_preserves_other_output_config_keys_when_stripping_adaptive() {
+        let mut body = json!({
+            "model": "claude-haiku-4-5",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high", "other_key": "keep"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["output_config"], json!({"other_key": "keep"}));
+    }
+
+    #[test]
+    fn thinking_patch_rewrites_enabled_to_adaptive_on_opus_4_7() {
+        let mut body = json!({
+            "model": "claude-opus-4-7",
+            "thinking": {"type": "enabled", "budget_tokens": 16000}
+        });
+        run_thinking_patch(&mut body);
+        // budget_tokens dropped (adaptive carries none); no output_config
+        // synthesized — the field is rejected as "Extra inputs" on many
+        // upstreams.
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_preserves_display_when_rewriting_enabled_on_opus_4_7() {
+        let mut body = json!({
+            "model": "claude-opus-4-7",
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 4096,
+                "display": "summarized"
+            }
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_leaves_user_output_config_alone_when_rewriting_enabled() {
+        // We don't touch output_config in the rewrite — if the user set
+        // effort explicitly, it survives.
+        let mut body = json!({
+            "model": "claude-opus-4-7",
+            "thinking": {"type": "enabled", "budget_tokens": 16000},
+            "output_config": {"effort": "low"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn thinking_patch_keeps_enabled_on_sonnet_4_6() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-6",
+            "thinking": {"type": "enabled", "budget_tokens": 8192}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 8192})
+        );
+    }
+
+    #[test]
+    fn thinking_patch_keeps_enabled_on_haiku_4_5() {
+        let mut body = json!({
+            "model": "claude-haiku-4-5",
+            "thinking": {"type": "enabled", "budget_tokens": 4096}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 4096})
+        );
+    }
+
+    #[test]
+    fn thinking_patch_ignores_disabled_type() {
+        let mut body = json!({
+            "model": "claude-haiku-4-5",
+            "thinking": {"type": "disabled"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn thinking_patch_no_op_without_thinking_field() {
+        let mut body = json!({"model": "claude-haiku-4-5", "messages": []});
+        run_thinking_patch(&mut body);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_no_op_without_model_field() {
+        let mut body = json!({"thinking": {"type": "adaptive"}});
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn matches_model_prefix_respects_component_boundary() {
+        // Avoid `claude-opus-4-6` matching a hypothetical `claude-opus-4-60`.
+        assert!(matches_model_prefix("claude-opus-4-6", "claude-opus-4-6"));
+        assert!(matches_model_prefix(
+            "claude-opus-4-6-20260101",
+            "claude-opus-4-6"
+        ));
+        assert!(!matches_model_prefix("claude-opus-4-60", "claude-opus-4-6"));
+    }
+
+    #[test]
+    fn full_pipeline_preserves_adaptive_on_opus_4_7_through_openrouter_rename() {
+        // End-to-end: Claude Code sends dash-form, OpenRouter pipeline
+        // renames the model to anthropic-prefixed dotted form, and the
+        // thinking patch (running after the rename) must still recognize
+        // Opus 4.7 as supporting adaptive.
+        let pipeline = RouterPipeline::for_openrouter();
+        let ctx = RequestContext {
+            upstream_base_url: "https://openrouter.ai/api/v1",
+        };
+        let mut body = json!({
+            "model": "claude-opus-4-7",
+            "thinking": {"type": "adaptive"}
+        });
+        pipeline.patch_json("messages", &mut body, &ctx).unwrap();
+
+        assert_eq!(body["model"], "anthropic/claude-opus-4.7");
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn full_pipeline_strips_adaptive_on_haiku_4_5_through_openrouter_rename() {
+        let pipeline = RouterPipeline::for_openrouter();
+        let ctx = RequestContext {
+            upstream_base_url: "https://openrouter.ai/api/v1",
+        };
+        let mut body = json!({
+            "model": "claude-haiku-4-5",
+            "thinking": {"type": "adaptive"}
+        });
+        pipeline.patch_json("messages", &mut body, &ctx).unwrap();
+
+        assert_eq!(body["model"], "anthropic/claude-haiku-4.5");
+        assert!(body.get("thinking").is_none());
     }
 }
