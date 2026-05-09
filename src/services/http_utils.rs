@@ -286,6 +286,7 @@ fn should_passthrough_header(name: &str) -> bool {
         || lower == "anthropic-version"
         || lower == "anthropic-beta"
         || lower.starts_with("anthropic-")
+        || lower == "user-agent"
 }
 
 /// Removes the `anthropic-beta` header from a HeaderMap.
@@ -842,6 +843,7 @@ mod tests {
             "Authorization: Bearer local-token\r\n",
             "x-api-key: upstream-token\r\n",
             "Content-Type: application/json\r\n",
+            "User-Agent: claude-cli/1.2.3\r\n",
             "x-provider: anthropic\r\n",
             "x-vercel-ai-gateway-team: team_123\r\n",
             "anthropic-beta: prompt-caching-2024-07-31\r\n",
@@ -864,9 +866,29 @@ mod tests {
             headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
             Some("prompt-caching-2024-07-31")
         );
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("claude-cli/1.2.3")
+        );
         assert!(headers.get("authorization").is_none());
         assert!(headers.get("x-api-key").is_none());
         assert!(headers.get("content-type").is_none());
+    }
+
+    #[test]
+    fn test_extract_passthrough_headers_forwards_user_agent() {
+        let req = concat!(
+            "POST /v1/messages HTTP/1.1\r\n",
+            "Host: localhost:8080\r\n",
+            "user-agent: codex/0.42 (linux)\r\n",
+            "\r\n",
+            "{}"
+        );
+        let headers = extract_passthrough_headers(req).unwrap();
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("codex/0.42 (linux)")
+        );
     }
 
     #[test]
