@@ -1259,6 +1259,7 @@ mod tests {
             model.to_string(),
             ModelMetadata {
                 context_window: Some(ctx_tokens),
+                ..Default::default()
             },
         );
         cache

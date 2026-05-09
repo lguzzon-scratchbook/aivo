@@ -7,15 +7,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OnceCell, RwLock};
 
-const CACHE_TTL_SECS: u64 = 3600; // 1 hour
+const CACHE_TTL_SECS: u64 = 4 * 3600; // 4 hours
 
-/// Per-model metadata harvested from `aivo models`. Treated as long-lived:
-/// returned regardless of `fetched_at` TTL because a model's context window
-/// doesn't change once published.
+/// Per-model metadata harvested from `aivo models`. Stores every column the
+/// table renders so `aivo models` can serve from cache without a network
+/// roundtrip. `context_window` is also consumed by `aivo run claude
+/// --max-context` and is treated as long-lived (returned regardless of the
+/// entry's `fetched_at` TTL).
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ModelMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -90,6 +100,20 @@ impl ModelsCache {
         let entries = self.entries().await;
         let state = entries.read().await;
         state.get(base_url).and_then(Self::fresh_models)
+    }
+
+    /// Returns the cached id list and per-model metadata for `base_url` when
+    /// the entry is fresh. Used by `aivo models` to reconstruct its rich
+    /// table from cache without re-fetching.
+    pub async fn get_with_metadata(
+        &self,
+        base_url: &str,
+    ) -> Option<(Vec<String>, HashMap<String, ModelMetadata>)> {
+        let entries = self.entries().await;
+        let state = entries.read().await;
+        let entry = state.get(base_url)?;
+        let models = Self::fresh_models(entry)?;
+        Some((models, entry.metadata.clone()))
     }
 
     /// Writes models for `base_url`. Plain `set` preserves any existing
@@ -244,6 +268,7 @@ mod tests {
             "gpt-4.1".to_string(),
             ModelMetadata {
                 context_window: Some(1_000_000),
+                ..Default::default()
             },
         );
         cache
@@ -298,6 +323,7 @@ mod tests {
             "gpt-4.1".to_string(),
             ModelMetadata {
                 context_window: Some(1_000_000),
+                ..Default::default()
             },
         );
         cache

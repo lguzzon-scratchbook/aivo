@@ -260,7 +260,7 @@ impl ModelsCommand {
     async fn execute_internal(
         &self,
         key_override: Option<ApiKey>,
-        _refresh: bool,
+        refresh: bool,
         search: Option<String>,
         json: bool,
     ) -> Result<ExitCode> {
@@ -298,11 +298,18 @@ impl ModelsCommand {
 
         // `aivo models` shows the provider's full catalog, including image,
         // audio, and embedding models. Chat pickers filter/annotate at their
-        // own call sites. The fetch always hits the network — the metadata
-        // cache only carries context_window, so we can't satisfy this command
-        // from cache. Always show the spinner so a warm cache doesn't leave
-        // the terminal silent during the roundtrip.
-        let mut models = {
+        // own call sites. Serve from cache whenever the entry is fresh — the
+        // TTL handles staleness, and id-only providers (minimax, cloudflare)
+        // round-trip as id-only rows just like a fresh fetch would.
+        let cached_entry = if refresh || is_ollama {
+            None
+        } else {
+            self.cache.get_with_metadata(&all_cache_key).await
+        };
+
+        let mut models = if let Some((ids, meta)) = cached_entry {
+            models_from_cache(ids, meta)
+        } else {
             let started_at = Instant::now();
             let (spinning, spinner_handle) = style::start_spinner(Some(" Fetching models..."));
             let result = fetch_models_detailed_filtered(&client, &key, false).await;
@@ -312,21 +319,21 @@ impl ModelsCommand {
             }
             style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
-            result?
-        };
+            let fresh = result?;
 
-        // Cache the full list (including image/audio/embed) under the `#all`
-        // namespace so `aivo image` and future broad pickers can share it.
-        // Also persist per-model context-window metadata so `aivo run claude`
-        // can default `--max-context` for known 1M/2M models without making
-        // its own network call.
-        if !is_ollama {
-            let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-            let metadata = build_metadata_map(&models);
-            self.cache
-                .set_with_metadata(&all_cache_key, ids, metadata)
-                .await;
-        }
+            // Cache the full list (including image/audio/embed) under the `#all`
+            // namespace so `aivo image` and future broad pickers can share it.
+            // Persist every column the table prints so the next call can be
+            // satisfied without a network roundtrip.
+            if !is_ollama {
+                let ids: Vec<String> = fresh.iter().map(|m| m.id.clone()).collect();
+                let metadata = build_metadata_map(&fresh);
+                self.cache
+                    .set_with_metadata(&all_cache_key, ids, metadata)
+                    .await;
+            }
+            fresh
+        };
 
         let is_starter = is_aivo_starter_base(&key.base_url);
         models.sort_by(|a, b| {
@@ -683,21 +690,46 @@ pub(crate) async fn fetch_all_models(client: &Client, key: &ApiKey) -> Result<Ve
         .map(|v| v.into_iter().map(|m| m.id).collect())
 }
 
-/// Pulls per-model context-window metadata out of a detailed model list
-/// so it can be persisted alongside the cached name list. Skips entries
-/// where the provider didn't return a context window.
+/// Pulls every displayed column out of a detailed model list so the cache can
+/// reproduce the table on a warm read. Skips models that returned no
+/// metadata at all (id-only entries from providers like Cloudflare).
 fn build_metadata_map(models: &[ModelInfo]) -> HashMap<String, ModelMetadata> {
     models
         .iter()
         .filter_map(|m| {
-            m.context_tokens.map(|ctx| {
-                (
-                    m.id.clone(),
-                    ModelMetadata {
-                        context_window: Some(ctx),
-                    },
-                )
-            })
+            let meta = ModelMetadata {
+                context_window: m.context_tokens,
+                max_output: m.max_output.clone(),
+                input_price: m.input_price.clone(),
+                output_price: m.output_price.clone(),
+                multiplier: m.multiplier,
+            };
+            let any = meta.context_window.is_some()
+                || meta.max_output.is_some()
+                || meta.input_price.is_some()
+                || meta.output_price.is_some()
+                || meta.multiplier.is_some();
+            any.then(|| (m.id.clone(), meta))
+        })
+        .collect()
+}
+
+/// Rebuilds the `aivo models` row list from a cached id list and metadata
+/// map. Models present in `ids` but missing from `metadata` (e.g. Cloudflare
+/// id-only entries) render as plain rows.
+fn models_from_cache(ids: Vec<String>, metadata: HashMap<String, ModelMetadata>) -> Vec<ModelInfo> {
+    ids.into_iter()
+        .map(|id| {
+            let m = metadata.get(&id).cloned().unwrap_or_default();
+            ModelInfo {
+                id,
+                context: m.context_window.map(format_token_count),
+                context_tokens: m.context_window,
+                max_output: m.max_output,
+                input_price: m.input_price,
+                output_price: m.output_price,
+                multiplier: m.multiplier,
+            }
         })
         .collect()
 }
@@ -1446,6 +1478,73 @@ mod tests {
         let s = err.to_string();
         assert!(s.starts_with("Could not fetch models"));
         assert!(s.contains("server error"));
+    }
+
+    #[test]
+    fn models_from_cache_round_trips_full_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "openrouter/sonnet".to_string(),
+            ModelMetadata {
+                context_window: Some(200_000),
+                max_output: Some("32K".to_string()),
+                input_price: Some("$3".to_string()),
+                output_price: Some("$15".to_string()),
+                multiplier: None,
+            },
+        );
+        metadata.insert(
+            "copilot/gpt-5".to_string(),
+            ModelMetadata {
+                multiplier: Some(0.5),
+                ..Default::default()
+            },
+        );
+
+        let ids = vec![
+            "openrouter/sonnet".to_string(),
+            "copilot/gpt-5".to_string(),
+            "id-only-model".to_string(),
+        ];
+        let models = models_from_cache(ids, metadata);
+
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "openrouter/sonnet");
+        assert_eq!(models[0].context.as_deref(), Some("200K"));
+        assert_eq!(models[0].context_tokens, Some(200_000));
+        assert_eq!(models[0].max_output.as_deref(), Some("32K"));
+        assert_eq!(models[0].input_price.as_deref(), Some("$3"));
+        assert_eq!(models[0].output_price.as_deref(), Some("$15"));
+
+        assert_eq!(models[1].multiplier, Some(0.5));
+        assert!(models[1].context.is_none());
+
+        // Models without metadata reconstruct as id-only rows.
+        assert_eq!(models[2].id, "id-only-model");
+        assert!(models[2].context.is_none());
+        assert!(models[2].input_price.is_none());
+    }
+
+    #[test]
+    fn build_metadata_map_skips_id_only_models() {
+        let models = vec![
+            ModelInfo {
+                id: "rich".to_string(),
+                context: Some("128K".to_string()),
+                context_tokens: Some(128_000),
+                max_output: Some("8K".to_string()),
+                input_price: Some("$1".to_string()),
+                output_price: Some("$2".to_string()),
+                multiplier: None,
+            },
+            ModelInfo::id_only("bare".to_string()),
+        ];
+        let map = build_metadata_map(&models);
+        assert!(map.contains_key("rich"));
+        assert!(!map.contains_key("bare"));
+        let rich = map.get("rich").unwrap();
+        assert_eq!(rich.context_window, Some(128_000));
+        assert_eq!(rich.max_output.as_deref(), Some("8K"));
     }
 
     #[test]
