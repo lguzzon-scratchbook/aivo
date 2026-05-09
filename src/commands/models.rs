@@ -19,8 +19,7 @@ use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::models_cache::{ModelMetadata, ModelsCache, full_catalog_key};
 use crate::services::provider_profile::{
-    ModelListingStrategy, cloudflare_ai_base, is_aivo_starter_base, provider_profile_for_base_url,
-    provider_profile_for_key,
+    ModelListingStrategy, cloudflare_ai_base, is_aivo_starter_base, provider_profile_for_key,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -293,12 +292,6 @@ impl ModelsCommand {
             return Ok(ExitCode::UserError);
         }
 
-        let profile = provider_profile_for_base_url(&key.base_url);
-        let is_static = matches!(
-            profile.model_listing_strategy,
-            ModelListingStrategy::Static(_)
-        );
-
         let client = http_utils::router_http_client();
         let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
         let all_cache_key = full_catalog_key(&key.base_url);
@@ -374,7 +367,6 @@ impl ModelsCommand {
         if json {
             let payload = serde_json::json!({
                 "provider": key.base_url,
-                "is_static": is_static,
                 "models": models,
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -382,15 +374,6 @@ impl ModelsCommand {
             let widths = ColumnWidths::from_models(&models);
             for model in &models {
                 println!("{}", format_model_line(model, &widths));
-            }
-
-            if is_static {
-                eprintln!(
-                    "{}",
-                    style::dim(
-                        "Note: This provider does not have a model listing API. Showing a built-in list."
-                    )
-                );
             }
         }
 
@@ -770,12 +753,6 @@ async fn fetch_models_detailed_filtered(
     let profile = provider_profile_for_key(key);
 
     let raw: Vec<ModelInfo> = match profile.model_listing_strategy {
-        ModelListingStrategy::Static(models) => Ok::<_, anyhow::Error>(
-            models
-                .iter()
-                .map(|s| ModelInfo::id_only(s.to_string()))
-                .collect(),
-        ),
         ModelListingStrategy::AivoStarter => {
             let starter_base = crate::constants::AIVO_STARTER_REAL_URL;
             let url = format!("{}/v1/models", starter_base.trim_end_matches('/'));
@@ -794,7 +771,7 @@ async fn fetch_models_detailed_filtered(
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
-            Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
+            Ok::<_, anyhow::Error>(resp.data.into_iter().map(|m| m.into_model_info()).collect())
         }
         ModelListingStrategy::Ollama => {
             crate::services::ollama::ensure_ready().await?;

@@ -23,7 +23,6 @@ pub enum ModelListingStrategy {
     CloudflareSearch,
     OpenAiCompatible,
     AivoStarter,
-    Static(&'static [&'static str]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,11 +37,6 @@ pub struct ProviderQuirks {
     pub model_prefix: Option<&'static str>,
     pub requires_reasoning_content: bool,
     pub max_tokens_cap: Option<u64>,
-    /// Sub-path prepended to `/v1/messages` when probing the provider's native
-    /// Anthropic endpoint. For hosts like DeepSeek that expose both
-    /// `/v1/chat/completions` (OpenAI) and `/anthropic/v1/messages` (Anthropic)
-    /// on one base URL.
-    pub anthropic_path_prefix: Option<&'static str>,
     /// Whether to strip Anthropic-specific `cache_control` blocks from the
     /// converted request before forwarding upstream. Some OpenAI-compat shims
     /// (Bedrock proxies, custom gateways) reject unknown `cache_control` keys
@@ -60,11 +54,6 @@ impl ProviderQuirks {
         let is_deepseek = base_url.contains("deepseek.com");
         let requires_reasoning_content =
             is_deepseek || base_url.contains("moonshot.cn") || base_url.contains("moonshot.ai");
-        let anthropic_path_prefix = if is_deepseek {
-            Some("/anthropic")
-        } else {
-            None
-        };
         // Bedrock-style hosts and the AWS gateway shim reject Anthropic
         // cache_control fields when they appear on system/message content
         // converted into the OpenAI Chat shape. Strip them defensively for the
@@ -77,7 +66,6 @@ impl ProviderQuirks {
             model_prefix,
             requires_reasoning_content,
             max_tokens_cap: None,
-            anthropic_path_prefix,
             strips_cache_control,
         }
     }
@@ -86,7 +74,6 @@ impl ProviderQuirks {
         self.model_prefix.is_some()
             || self.requires_reasoning_content
             || self.max_tokens_cap.is_some()
-            || self.anthropic_path_prefix.is_some()
             || self.strips_cache_control
     }
 
@@ -99,9 +86,6 @@ impl ProviderQuirks {
         }
         if let Some(cap) = self.max_tokens_cap {
             env.insert(format!("{prefix}_MAX_TOKENS_CAP"), cap.to_string());
-        }
-        if let Some(sub) = self.anthropic_path_prefix {
-            env.insert(format!("{prefix}_ANTHROPIC_PATH_PREFIX"), sub.to_string());
         }
         if self.strips_cache_control {
             env.insert(format!("{prefix}_STRIP_CACHE_CONTROL"), "1".to_string());
@@ -137,18 +121,6 @@ impl ProviderProfile {
     pub fn upstream_protocol_for_cli(&self, cli_native: ProviderProtocol) -> ProviderProtocol {
         cli_native
     }
-}
-
-pub static MINIMAX_MODELS: &[&str] = &[
-    "minimax-m2.7",
-    "minimax-m2.7-highspeed",
-    "minimax-m2.5",
-    "minimax-m2.5-highspeed",
-    "m2-her",
-];
-
-pub fn is_minimax_base(base_url: &str) -> bool {
-    base_url.contains("minimax.io") || base_url.contains("minimax.com")
 }
 
 pub fn is_copilot_base(base_url: &str) -> bool {
@@ -334,20 +306,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
         };
     }
 
-    if is_minimax_base(base_url) {
-        return ProviderProfile {
-            kind: ProviderKind::AnthropicCompatible,
-            default_protocol: ProviderProtocol::Anthropic,
-            quirks,
-            model_listing_strategy: ModelListingStrategy::Static(MINIMAX_MODELS),
-            serve_flags: ServeFlags {
-                is_copilot: false,
-                is_openrouter: false,
-                is_starter: false,
-            },
-        };
-    }
-
     match detect_provider_protocol(base_url) {
         ProviderProtocol::Anthropic => ProviderProfile {
             kind: ProviderKind::AnthropicCompatible,
@@ -502,23 +460,28 @@ mod tests {
     }
 
     #[test]
-    fn classifies_minimax_with_static_models() {
+    fn classifies_minimax_like_deepseek() {
+        // Bare host: falls through to OpenAI defaults (kind, protocol, listing)
+        // — same as DeepSeek. Anthropic-shape requests get routed via the
+        // `/anthropic` path-prefix quirk.
         for url in ["https://api.minimax.io", "https://api.minimax.com"] {
             let profile = provider_profile_for_base_url(url);
-            assert_eq!(profile.kind, ProviderKind::AnthropicCompatible, "{url}");
+            assert_eq!(profile.kind, ProviderKind::OpenAiCompatible, "{url}");
+            assert_eq!(profile.default_protocol, ProviderProtocol::Openai, "{url}");
             assert_eq!(
-                profile.default_protocol,
-                ProviderProtocol::Anthropic,
+                profile.model_listing_strategy,
+                ModelListingStrategy::OpenAiCompatible,
                 "{url}"
             );
-            assert!(
-                matches!(
-                    profile.model_listing_strategy,
-                    ModelListingStrategy::Static(_)
-                ),
-                "expected Static model listing for MiniMax at {url}"
-            );
         }
+        // `/anthropic` suffix: protocol detection flips to Anthropic.
+        let profile = provider_profile_for_base_url("https://api.minimax.io/anthropic");
+        assert_eq!(profile.kind, ProviderKind::AnthropicCompatible);
+        assert_eq!(profile.default_protocol, ProviderProtocol::Anthropic);
+        assert_eq!(
+            profile.model_listing_strategy,
+            ModelListingStrategy::Anthropic
+        );
     }
 
     #[test]
@@ -619,7 +582,6 @@ mod tests {
             model_prefix: Some("@cf/"),
             requires_reasoning_content: true,
             max_tokens_cap: Some(8192),
-            anthropic_path_prefix: Some("/anthropic"),
             strips_cache_control: true,
         };
         let mut env = HashMap::new();
@@ -628,7 +590,6 @@ mod tests {
         assert_eq!(env.get("TEST_MODEL_PREFIX").unwrap(), "@cf/");
         assert_eq!(env.get("TEST_REQUIRE_REASONING").unwrap(), "1");
         assert_eq!(env.get("TEST_MAX_TOKENS_CAP").unwrap(), "8192");
-        assert_eq!(env.get("TEST_ANTHROPIC_PATH_PREFIX").unwrap(), "/anthropic");
         assert_eq!(env.get("TEST_STRIP_CACHE_CONTROL").unwrap(), "1");
     }
 
@@ -641,23 +602,12 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
-            anthropic_path_prefix: None,
             strips_cache_control: false,
         };
         let mut env = HashMap::new();
         quirks.inject(&mut env, "TEST");
 
         assert!(env.is_empty());
-    }
-
-    #[test]
-    fn deepseek_has_anthropic_path_prefix_quirk() {
-        use super::ProviderQuirks;
-        let quirks = ProviderQuirks::for_base_url("https://api.deepseek.com/v1");
-        assert_eq!(quirks.anthropic_path_prefix, Some("/anthropic"));
-
-        let other = ProviderQuirks::for_base_url("https://api.example.com/v1");
-        assert_eq!(other.anthropic_path_prefix, None);
     }
 
     #[test]

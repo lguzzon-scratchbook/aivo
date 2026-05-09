@@ -76,10 +76,6 @@ pub struct AnthropicToOpenAIRouterConfig {
     /// Cap applied to `max_tokens` before forwarding to the provider,
     /// for providers that reject values above a fixed output ceiling.
     pub max_tokens_cap: Option<u64>,
-    /// Known Anthropic sub-path (e.g. `"/anthropic"` for DeepSeek). When set,
-    /// the native probe targets `{base}{prefix}/v1/messages` instead of
-    /// `{base}/v1/messages`.
-    pub anthropic_path_prefix: Option<String>,
     /// Whether this is the aivo starter provider (requires device fingerprint headers).
     pub is_starter: bool,
 }
@@ -405,18 +401,18 @@ const DEFAULT_ANTHROPIC_SUB_PATH: &str = "/anthropic";
 ///
 /// A `None` return means the probe has given up for this router lifetime —
 /// the caller should bail out without making a request.
-fn probe_paths(
-    outcome: ProbeOutcome,
-    configured_prefix: Option<&str>,
-) -> Option<&'static [AnthropicProbePath]> {
+///
+/// Unlearned hosts always try `Root` then `Prefixed`. Hosts that mount
+/// Anthropic at `/anthropic/v1/messages` (e.g. DeepSeek, MiniMax) self-discover
+/// via the trailing fallback on first launch and pin the result to the key's
+/// `learned.*_path_variant`, so subsequent launches go straight to the winning
+/// path.
+fn probe_paths(outcome: ProbeOutcome) -> Option<&'static [AnthropicProbePath]> {
     match outcome {
         ProbeOutcome::UseRoot => Some(&[AnthropicProbePath::Root]),
         ProbeOutcome::UsePrefixed => Some(&[AnthropicProbePath::Prefixed]),
         ProbeOutcome::Failed => None,
-        ProbeOutcome::Unlearned => Some(match configured_prefix {
-            Some(_) => &[AnthropicProbePath::Prefixed],
-            None => &[AnthropicProbePath::Root, AnthropicProbePath::Prefixed],
-        }),
+        ProbeOutcome::Unlearned => Some(&[AnthropicProbePath::Root, AnthropicProbePath::Prefixed]),
     }
 }
 
@@ -528,8 +524,7 @@ async fn try_native_anthropic(
     passthrough_headers: &HeaderMap,
     probe: &ProbeState,
 ) -> Result<NativeAnthropicResult> {
-    let configured = config.anthropic_path_prefix.as_deref();
-    let Some(candidates) = probe_paths(probe.outcome(), configured) else {
+    let Some(candidates) = probe_paths(probe.outcome()) else {
         // Probe was previously marked Failed (all paths confirmed missing);
         // surface that as EndpointMissing so the caller flips to Openai.
         return Ok(NativeAnthropicResult::EndpointMissing);
@@ -545,7 +540,7 @@ async fn try_native_anthropic(
     for &path in candidates {
         let sub_path = match path {
             AnthropicProbePath::Root => None,
-            AnthropicProbePath::Prefixed => Some(configured.unwrap_or(DEFAULT_ANTHROPIC_SUB_PATH)),
+            AnthropicProbePath::Prefixed => Some(DEFAULT_ANTHROPIC_SUB_PATH),
         };
         let url = build_anthropic_messages_url(&config.target_base_url, sub_path);
 
@@ -1867,19 +1862,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_paths_uses_configured_prefix_only_when_no_prior_learning() {
-        // Known provider → single targeted probe, no wasted fallback.
+    fn probe_paths_falls_back_to_anthropic_prefix_for_unlearned_host() {
+        // Unlearned host → probe root first, then /anthropic. Hosts that mount
+        // Anthropic only at /anthropic/v1/messages self-discover via the trailing
+        // fallback and pin the result, so subsequent launches skip the probe.
         assert_eq!(
-            probe_paths(ProbeOutcome::Unlearned, Some("/anthropic")),
-            Some(&[AnthropicProbePath::Prefixed][..]),
-        );
-    }
-
-    #[test]
-    fn probe_paths_falls_back_to_anthropic_prefix_for_unknown_provider() {
-        // Unknown provider → probe root first, then /anthropic.
-        assert_eq!(
-            probe_paths(ProbeOutcome::Unlearned, None),
+            probe_paths(ProbeOutcome::Unlearned),
             Some(&[AnthropicProbePath::Root, AnthropicProbePath::Prefixed][..]),
         );
     }
@@ -1887,24 +1875,18 @@ mod tests {
     #[test]
     fn probe_paths_locks_in_after_first_success() {
         assert_eq!(
-            probe_paths(ProbeOutcome::UseRoot, None),
+            probe_paths(ProbeOutcome::UseRoot),
             Some(&[AnthropicProbePath::Root][..]),
         );
         assert_eq!(
-            probe_paths(ProbeOutcome::UsePrefixed, None),
+            probe_paths(ProbeOutcome::UsePrefixed),
             Some(&[AnthropicProbePath::Prefixed][..]),
-        );
-        // Learned state trumps the configured prefix.
-        assert_eq!(
-            probe_paths(ProbeOutcome::UseRoot, Some("/anthropic")),
-            Some(&[AnthropicProbePath::Root][..]),
         );
     }
 
     #[test]
     fn probe_paths_returns_none_when_failed() {
-        assert_eq!(probe_paths(ProbeOutcome::Failed, None), None);
-        assert_eq!(probe_paths(ProbeOutcome::Failed, Some("/anthropic")), None);
+        assert_eq!(probe_paths(ProbeOutcome::Failed), None);
     }
 
     #[test]
@@ -2222,7 +2204,6 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
-            anthropic_path_prefix: None,
             is_starter: false,
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
@@ -2248,7 +2229,6 @@ mod tests {
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
-            anthropic_path_prefix: None,
             is_starter: false,
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
