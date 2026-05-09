@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -17,6 +18,7 @@ use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, SessionStore,
 };
+use crate::services::symlink_util::{symlink_dir, symlink_file};
 
 /// Holds the shadow `CODEX_HOME` dir + metadata needed to sync refreshed
 /// tokens back into aivo's store after codex exits.
@@ -802,19 +804,35 @@ pub(crate) async fn cleanup_runtime_artifacts(
     }
 }
 
-/// Writes a temporary `PI_CODING_AGENT_DIR` with `models.json`, `auth.json`,
-/// and `settings.json` so Pi discovers the aivo custom provider.
+/// Writes a temporary `PI_CODING_AGENT_DIR` that surfaces the user's real
+/// `~/.pi/agent/` customization (packages, MCP servers, rules, themes,
+/// settings, auth) while pinning the provider to the aivo entry.
+///
+/// `models.json` is aivo-only so an explicit `--model anthropic/foo`
+/// against an aivo launch errors with "unknown provider" instead of
+/// silently routing through the user's real key. Everything else is
+/// symlinked so mid-session writes (package installs, login flows)
+/// persist back to the real home.
 ///
 /// When `port` is `Some`, the placeholder `PLACEHOLDER_LOOPBACK_URL` in
 /// `AIVO_PI_MODELS_JSON` is patched with the real router port.
 /// When `port` is `None`, the JSON already contains the real upstream URL.
 async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>) -> Result<()> {
+    let real_agent = crate::services::system_env::home_dir().map(|h| h.join(".pi").join("agent"));
+    write_pi_agent_dir_with_real(env, port, real_agent.as_deref()).await
+}
+
+async fn write_pi_agent_dir_with_real(
+    env: &mut HashMap<String, String>,
+    port: Option<u16>,
+    real_agent: Option<&Path>,
+) -> Result<()> {
     let raw = env
         .get("AIVO_PI_MODELS_JSON")
         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_PI_MODELS_JSON"))?
         .clone();
 
-    let models_json = match port {
+    let aivo_models_json = match port {
         Some(p) => {
             ensure_loopback_no_proxy(env);
             raw.replace(PLACEHOLDER_LOOPBACK_URL, &format!("http://127.0.0.1:{p}"))
@@ -828,16 +846,15 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
         .keep();
 
     tokio::try_join!(
-        tokio::fs::write(dir.join("models.json"), &models_json),
-        tokio::fs::write(dir.join("auth.json"), "{}"),
-        tokio::fs::write(dir.join("settings.json"), "{}"),
+        tokio::fs::write(dir.join("models.json"), aivo_models_json.as_bytes()),
+        link_or_default(real_agent, "settings.json", &dir),
+        link_or_default(real_agent, "auth.json", &dir),
     )?;
 
-    // Reuse pi's managed bin/ (fd, rg) so pi doesn't re-download on each launch.
-    if let Some(home) = crate::services::system_env::home_dir() {
-        let real_bin = home.join(".pi").join("agent").join("bin");
-        populate_pi_bin_dir(&real_bin, &dir.join("bin")).await;
-        seed_pi_sessions(Some(home.join(".pi").join("agent").join("sessions")), &dir).await;
+    if let Some(real_agent) = real_agent {
+        link_pi_agent_state(real_agent, &dir).await;
+        populate_pi_bin_dir(&real_agent.join("bin"), &dir.join("bin")).await;
+        seed_pi_sessions(Some(real_agent.join("sessions")), &dir).await;
     } else {
         seed_pi_sessions(None, &dir).await;
     }
@@ -847,6 +864,73 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
         dir.to_string_lossy().to_string(),
     );
     Ok(())
+}
+
+/// Tries symlink → hard-link → copy so writes propagate back to `real`
+/// when possible. NTFS hard links work without Developer Mode and still
+/// propagate writes; copy is the last-resort read-only path. Returns
+/// `Err` only if all three fail (e.g., `real` became unreadable).
+async fn link_existing_file(real: &Path, dest: &Path) -> std::io::Result<()> {
+    if symlink_file(real, dest).await.is_ok() {
+        return Ok(());
+    }
+    if tokio::fs::hard_link(real, dest).await.is_ok() {
+        return Ok(());
+    }
+    let bytes = tokio::fs::read(real).await?;
+    tokio::fs::write(dest, bytes).await
+}
+
+/// Touches the real file with `{}` if missing, then links it into
+/// `dest` via `link_existing_file`. Used for files Pi expects to find
+/// (`settings.json`, `auth.json`) — the default keeps Pi happy even on
+/// a fresh `~/.pi/agent/`.
+async fn link_or_default(
+    real_agent: Option<&Path>,
+    name: &str,
+    dest: &Path,
+) -> std::io::Result<()> {
+    let dest_path = dest.join(name);
+    let Some(real) = real_agent else {
+        return tokio::fs::write(&dest_path, "{}").await;
+    };
+    let real_path = real.join(name);
+
+    if !real_path.is_file() {
+        if let Some(parent) = real_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&real_path, "{}").await;
+    }
+
+    if link_existing_file(&real_path, &dest_path).await.is_ok() {
+        return Ok(());
+    }
+    // Last-resort: real became unreadable between is_file() check and copy.
+    tokio::fs::write(&dest_path, b"{}").await
+}
+
+/// Symlinks the user's mutable `~/.pi/agent/` state (rules, tools,
+/// prompts, themes, git-sourced packages, mcp.json) into the temp dir.
+/// Dirs are pre-created so first-time `pi install <git-pkg>` lands in
+/// the real home instead of vanishing with the temp dir. `mcp.json`
+/// goes through the same symlink → hard-link → copy chain as the other
+/// linked files so MCP servers stay reachable on Windows without
+/// Developer Mode. On Windows without Developer Mode dir symlinks fail;
+/// in-session writes to those dirs are then lost — same gap as
+/// `codex_home_shadow`.
+async fn link_pi_agent_state(real_agent: &Path, dest: &Path) {
+    for d in ["rules", "tools", "prompts", "themes", "git"] {
+        let real = real_agent.join(d);
+        if tokio::fs::create_dir_all(&real).await.is_ok() {
+            let _ = symlink_dir(&real, &dest.join(d)).await;
+        }
+    }
+
+    let mcp = real_agent.join("mcp.json");
+    if mcp.is_file() {
+        let _ = link_existing_file(&mcp, &dest.join("mcp.json")).await;
+    }
 }
 
 /// Populate `dest_bin` with pi's managed binaries from `real_bin`. Best
@@ -3129,5 +3213,239 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(visible, "{\"type\":\"session\"}\n");
+    }
+
+    fn aivo_models_only(api_key: &str) -> String {
+        serde_json::json!({
+            "providers": {
+                "aivo": {
+                    "baseUrl": "https://example.invalid",
+                    "apiKey": api_key,
+                    "api": "openai-completions",
+                    "models": [{ "id": "m", "name": "m" }]
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn pi_env(models: &str) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("AIVO_PI_MODELS_JSON".to_string(), models.to_string());
+        env
+    }
+
+    fn temp_agent_dir_from(env: &HashMap<String, String>) -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            env.get("PI_CODING_AGENT_DIR")
+                .expect("PI_CODING_AGENT_DIR set"),
+        )
+    }
+
+    /// Launches `write_pi_agent_dir_with_real` against a fresh `real` tempdir
+    /// and returns the temp dir handle plus the resolved agent path.
+    async fn launch_pi_agent(
+        real: Option<&std::path::Path>,
+    ) -> (HashMap<String, String>, std::path::PathBuf) {
+        let mut env = pi_env(&aivo_models_only("k"));
+        super::write_pi_agent_dir_with_real(&mut env, None, real)
+            .await
+            .unwrap();
+        let agent = temp_agent_dir_from(&env);
+        (env, agent)
+    }
+
+    #[tokio::test]
+    async fn write_pi_agent_dir_symlinks_settings_and_auth() {
+        // Mid-session writes must reach the real file, not vanish with the temp dir.
+        let real = tempfile::tempdir().unwrap();
+        let real_settings = "{\"packages\":[\"pi-subagents\"],\"defaultThinkingLevel\":\"high\"}";
+        let real_auth = "{\"openai\":\"sk-real\"}";
+        tokio::fs::write(real.path().join("settings.json"), real_settings)
+            .await
+            .unwrap();
+        tokio::fs::write(real.path().join("auth.json"), real_auth)
+            .await
+            .unwrap();
+
+        let (_env, agent) = launch_pi_agent(Some(real.path())).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(agent.join("settings.json"))
+                .await
+                .unwrap(),
+            real_settings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(agent.join("auth.json"))
+                .await
+                .unwrap(),
+            real_auth
+        );
+
+        let updated = "{\"packages\":[\"pi-subagents\",\"pi-newpkg\"]}";
+        tokio::fs::write(agent.join("settings.json"), updated)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(real.path().join("settings.json"))
+                .await
+                .unwrap(),
+            updated
+        );
+    }
+
+    #[tokio::test]
+    async fn write_pi_agent_dir_persists_first_time_writes_back_to_real_home() {
+        // First-time Pi use: real ~/.pi/agent/ exists, settings.json doesn't yet.
+        let real = tempfile::tempdir().unwrap();
+        let (_env, agent) = launch_pi_agent(Some(real.path())).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.path().join("settings.json"))
+                .await
+                .unwrap(),
+            "{}"
+        );
+
+        let installed = "{\"packages\":[\"pi-newpkg\"]}";
+        tokio::fs::write(agent.join("settings.json"), installed)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(real.path().join("settings.json"))
+                .await
+                .unwrap(),
+            installed
+        );
+    }
+
+    #[tokio::test]
+    async fn write_pi_agent_dir_aivo_only_models() {
+        // User's custom providers must NOT leak — otherwise --model anthropic/foo
+        // silently bypasses the aivo key.
+        let real = tempfile::tempdir().unwrap();
+        let real_models = serde_json::json!({
+            "providers": {
+                "user-anthropic": { "baseUrl": "https://anthropic.example", "api": "anthropic-messages" }
+            }
+        })
+        .to_string();
+        tokio::fs::write(real.path().join("models.json"), &real_models)
+            .await
+            .unwrap();
+
+        let mut env = pi_env(&aivo_models_only("fresh-key"));
+        super::write_pi_agent_dir_with_real(&mut env, None, Some(real.path()))
+            .await
+            .unwrap();
+        let agent = temp_agent_dir_from(&env);
+
+        let written: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(agent.join("models.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(written["providers"]["aivo"].is_object());
+        assert_eq!(written["providers"]["aivo"]["apiKey"], "fresh-key");
+        assert!(written["providers"]["user-anthropic"].is_null());
+    }
+
+    #[tokio::test]
+    async fn write_pi_agent_dir_persists_first_time_git_package_install() {
+        // git-sourced packages land under <agentDir>/git/<host>/<path>/ — must
+        // survive temp dir cleanup even on fresh ~/.pi/agent.
+        let real = tempfile::tempdir().unwrap();
+        let (_env, agent) = launch_pi_agent(Some(real.path())).await;
+
+        assert!(real.path().join("git").is_dir());
+
+        let installed = agent.join("git/github.com/example/pkg");
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(installed.join("package.json"), "{\"name\":\"pkg\"}")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.path().join("git/github.com/example/pkg/package.json"))
+                .await
+                .unwrap(),
+            "{\"name\":\"pkg\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_pi_agent_dir_links_user_customization() {
+        let real = tempfile::tempdir().unwrap();
+        for d in ["rules", "tools", "prompts", "themes", "git"] {
+            tokio::fs::create_dir_all(real.path().join(d))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(real.path().join("rules/lean-ctx.md"), "rule body")
+            .await
+            .unwrap();
+        tokio::fs::write(real.path().join("mcp.json"), "{\"servers\":{}}")
+            .await
+            .unwrap();
+
+        let (_env, agent) = launch_pi_agent(Some(real.path())).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(agent.join("rules/lean-ctx.md"))
+                .await
+                .unwrap(),
+            "rule body"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(agent.join("mcp.json"))
+                .await
+                .unwrap(),
+            "{\"servers\":{}}"
+        );
+        for d in ["tools", "prompts", "themes", "git"] {
+            assert!(agent.join(d).is_dir(), "{d} missing");
+        }
+
+        // mcp.json must persist mid-session writes back to the real home
+        // — same persistence guarantee as settings.json. Regressions that
+        // copy instead of link (e.g., dropping the symlink/hard-link
+        // chain) would silently break `pi mcp add` during aivo sessions.
+        let updated = "{\"servers\":{\"new\":{\"command\":\"x\"}}}";
+        tokio::fs::write(agent.join("mcp.json"), updated)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(real.path().join("mcp.json"))
+                .await
+                .unwrap(),
+            updated
+        );
+    }
+
+    #[tokio::test]
+    async fn write_pi_agent_dir_falls_back_when_no_real_home() {
+        let (_env, agent) = launch_pi_agent(None).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(agent.join("settings.json"))
+                .await
+                .unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(agent.join("auth.json"))
+                .await
+                .unwrap(),
+            "{}"
+        );
+        let models: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(agent.join("models.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(models["providers"]["aivo"].is_object());
     }
 }
