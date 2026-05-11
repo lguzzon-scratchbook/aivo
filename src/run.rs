@@ -13,8 +13,8 @@ use crate::cli_args::{
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AliasCommand, AudioCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand,
-    KeysCommand, LogsCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand,
+    self, AliasCommand, AudioCommand, ChatCommand, ImageCommand, InfoCommand, KeysCommand,
+    LogsCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, ShareCommand, StartCommand,
     StartFlowArgs, StatsCommand, UpdateCommand, VideoCommand,
 };
 use crate::errors::ExitCode;
@@ -130,8 +130,8 @@ pub async fn run() -> ! {
             Commands::Logs(_) => LogsCommand::print_help(),
             Commands::Stats(_) => StatsCommand::print_help(),
             Commands::Update(_) => UpdateCommand::print_help(),
-            Commands::Context(_) => ContextCommand::print_help(),
             Commands::Amp(_) => crate::commands::AmpCommand::print_help(),
+            Commands::Share(_) => ShareCommand::print_help(),
         }
         process::exit(0);
     }
@@ -622,15 +622,15 @@ pub async fn run() -> ! {
             command.execute(stats_args).await
         }
 
-        Commands::Context(context_args) => {
-            let command = ContextCommand::new();
-            command.execute(context_args).await
-        }
-
         Commands::Amp(amp_args) => {
             use crate::commands::AmpCommand;
             let command = AmpCommand::new();
             command.execute(amp_args).await
+        }
+
+        Commands::Share(share_args) => {
+            let command = ShareCommand::new(session_store);
+            command.execute(share_args).await
         }
 
         Commands::Update(update_args) if update_args.rollback => {

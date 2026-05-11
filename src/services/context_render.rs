@@ -90,6 +90,7 @@ mod tests {
             topic: topic.into(),
             last_response: last.into(),
             updated_at: Utc::now(),
+            cwd: None,
         }
     }
 

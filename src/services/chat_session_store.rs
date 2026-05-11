@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
 use crate::services::atomic_write::atomic_write_secure;
@@ -379,6 +379,60 @@ impl ChatSessionStore {
         Ok(entries)
     }
 
+    /// Every chat session on disk, no key/cwd filter applied. Caller filters.
+    /// Index is rebuilt from session files when missing or unreadable so a
+    /// stale `index.json` doesn't hide rows from the picker.
+    pub(crate) async fn all_chat_sessions(&self) -> Result<Vec<SessionIndexEntry>> {
+        self.migrate_sessions_if_needed().await?;
+        match self.load_index().await {
+            Ok(idx) => Ok(idx.entries),
+            Err(_) => Ok(self.rebuild_index().await?.entries),
+        }
+    }
+
+    /// Closest chat session by `updated_at` to `ts`, restricted to `cwd` (and
+    /// `key_id` when provided). Used to back-fill the session linkage on
+    /// `chat`-source log rows written before `log_store::LogEvent.session_id`
+    /// existed: the chat session is persisted within ~1s of the log row, so
+    /// closest-mtime-in-cwd is reliable in practice. Returns `None` when no
+    /// session in that cwd exists or all candidates are further than
+    /// `max_skew_secs` from `ts`.
+    pub(crate) async fn find_chat_session_near(
+        &self,
+        cwd: &str,
+        key_id: Option<&str>,
+        ts: DateTime<Utc>,
+        max_skew_secs: i64,
+    ) -> Result<Option<String>> {
+        self.migrate_sessions_if_needed().await?;
+        let index = match self.load_index().await {
+            Ok(idx) => idx,
+            Err(_) => self.rebuild_index().await?,
+        };
+        let mut best: Option<(i64, String)> = None;
+        for entry in &index.entries {
+            if entry.cwd != cwd {
+                continue;
+            }
+            if let Some(k) = key_id
+                && entry.key_id != k
+            {
+                continue;
+            }
+            let Ok(updated) = DateTime::parse_from_rfc3339(&entry.updated_at) else {
+                continue;
+            };
+            let skew_ms = (updated.with_timezone(&Utc) - ts).num_milliseconds().abs();
+            if skew_ms / 1000 > max_skew_secs {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(b, _)| skew_ms < *b) {
+                best = Some((skew_ms, entry.session_id.clone()));
+            }
+        }
+        Ok(best.map(|(_, id)| id))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn save_chat_session_with_id(
         &self,
@@ -754,6 +808,78 @@ mod tests {
             .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "sess-a");
+    }
+
+    #[tokio::test]
+    async fn find_chat_session_near_picks_closest_in_cwd() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        // Two sessions in /tmp/x with distinct updated_at; one in /tmp/y
+        // (must not be returned even when its mtime is closer to the probe).
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/x",
+                "early-x",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "t",
+                "p",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/x",
+                "late-x",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "t",
+                "p",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .save_chat_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/y",
+                "ringer-y",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "t",
+                "p",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+
+        let probe = Utc::now();
+        let id = store
+            .find_chat_session_near("/tmp/x", Some(&key_id), probe, 60)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("late-x"));
+
+        // Tight skew window with a probe far from any session returns None.
+        let far_past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let id = store
+            .find_chat_session_near("/tmp/x", Some(&key_id), far_past, 60)
+            .await
+            .unwrap();
+        assert_eq!(id, None);
     }
 
     #[tokio::test]

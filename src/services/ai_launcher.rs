@@ -822,6 +822,9 @@ impl AILauncher {
         // than via global set_var so we never race with concurrent tasks.
         apply_refreshed_path(&mut cmd);
 
+        // kill_on_drop ensures the child is sent SIGKILL if aivo panics or
+        // is SIGKILL'd before wait_for_process() can forward a graceful signal.
+        cmd.kill_on_drop(true);
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn {}", command))?;

@@ -203,6 +203,47 @@ impl LogStore {
         .context("Failed to join log get task")?
     }
 
+    /// Like `get_by_reference` but prefix-matches the id and event_group_id
+    /// columns. Used by the share resolver because `aivo logs` displays
+    /// truncated ids (8 chars) and pasting one needs to find the full row.
+    /// Returns at most `limit` matches; collisions are surfaced to the
+    /// caller for disambiguation.
+    pub async fn find_by_id_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<LogEntry>> {
+        let path = self.path.clone();
+        let prefix = prefix.trim().to_string();
+        let limit = limit.max(1);
+        tokio::task::spawn_blocking(move || -> Result<Vec<LogEntry>> {
+            if !path.exists() {
+                return Ok(Vec::new());
+            }
+            let conn = open_read_connection(&path)?;
+            let sql = format!(
+                "select {} from events
+                  where id like ?1 || '%'
+                     or event_group_id like ?1 || '%'
+                  order by ts_utc desc
+                  limit ?2",
+                event_select_columns(true)
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params![prefix, limit as i64], map_log_row)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            // Collapse duplicates by event_group_id: a run start+finish pair
+            // shares a group id and should resolve to a single hit.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            out.retain(|e| {
+                let key = e.event_group_id.clone().unwrap_or_else(|| e.id.clone());
+                seen.insert(key)
+            });
+            Ok(out)
+        })
+        .await
+        .context("Failed to join log prefix-find task")?
+    }
+
     pub async fn get_by_reference(&self, reference: &str) -> Result<Option<LogEntry>> {
         let path = self.path.clone();
         let reference = reference.trim().to_string();

@@ -27,4 +27,9 @@ pub struct Thread {
     pub last_response: String,
     /// Session end timestamp (falls back to file mtime when the source lacks one).
     pub updated_at: DateTime<Utc>,
+    /// The cwd this session belongs to, when knowable. None for sources whose
+    /// home directory layout obscures cwd (e.g. gemini's sha256-hashed dirs).
+    /// Populated best-effort and used by `aivo logs --cwd` filtering and the
+    /// listing's cwd column.
+    pub cwd: Option<String>,
 }

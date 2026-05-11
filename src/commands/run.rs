@@ -663,7 +663,7 @@ impl RunCommand {
         if tool != Some("amp") {
             print_opt(
                 "-c, --context[=<id>]",
-                "Inject one past session (bare = picker; id from `aivo context`)",
+                "Inject one past session (bare = picker; id from `aivo logs --by native`)",
             );
         }
         print_opt(
@@ -965,7 +965,7 @@ fn select_thread<'a>(threads: &'a [Thread], selector: &str) -> SelectOutcome<'a>
         .collect();
     match matches.len() {
         0 => SelectOutcome::Err(format!(
-            "No session matches id prefix '{}'. Run `aivo context` to see available ids.",
+            "No session matches id prefix '{}'. Run `aivo logs --by native` to see available ids.",
             selector
         )),
         1 => SelectOutcome::Picked(matches[0]),

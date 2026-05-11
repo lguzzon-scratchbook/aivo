@@ -1,4 +1,6 @@
 use anyhow::Result;
+use chrono::{DateTime, TimeZone, Utc};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -7,9 +9,66 @@ use crate::cli::LogsArgs;
 use crate::commands::chat::format_time_ago_short;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
+use crate::services::amp_threads;
+use crate::services::context_ingest::{self, IngestOptions};
+use crate::services::id_compact::compact_id;
 use crate::services::log_store::{LogEntry, LogQuery};
+use crate::services::project_id::Thread;
 use crate::services::system_env;
 use crate::style;
+
+/// One row in the unified `aivo logs` listing. Mixes `logs.db` events
+/// (chat/run/serve), native CLI sessions (claude/codex/gemini/pi/opencode),
+/// and amp threads. Each variant carries its own provenance and time, so
+/// the merge sort + filter pipeline can treat them uniformly.
+#[derive(Debug, Clone)]
+enum UnifiedRow {
+    // LogEntry is large (~1KB worth of optional fields); box to keep the
+    // enum's stack footprint reasonable for `Vec<UnifiedRow>` allocation.
+    Log(Box<LogEntry>),
+    Native(Thread),
+    Amp(AmpRow),
+}
+
+#[derive(Debug, Clone)]
+struct AmpRow {
+    id: String,
+    title: Option<String>,
+    updated_at: DateTime<Utc>,
+    message_count: u64,
+}
+
+impl AmpRow {
+    fn from_value(v: &Value) -> Option<Self> {
+        let id = v.get("id")?.as_str()?.to_string();
+        let title = v.get("title").and_then(|x| x.as_str()).map(str::to_string);
+        let updated_at = v
+            .get("updatedAt")
+            .and_then(|x| x.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let message_count = v.get("messageCount").and_then(|x| x.as_u64()).unwrap_or(0);
+        Some(Self {
+            id,
+            title,
+            updated_at,
+            message_count,
+        })
+    }
+}
+
+impl UnifiedRow {
+    fn ts(&self) -> DateTime<Utc> {
+        match self {
+            UnifiedRow::Log(e) => DateTime::parse_from_rfc3339(&e.ts_utc)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            UnifiedRow::Native(t) => t.updated_at,
+            UnifiedRow::Amp(a) => a.updated_at,
+        }
+    }
+}
 
 const SEPARATOR: &str = "\u{00b7}";
 
@@ -37,49 +96,92 @@ impl LogsCommand {
         match args.action.as_deref() {
             Some("status") => self.show_status(&args).await,
             Some("show") => self.show_entry(&args).await,
+            Some("share") => self.share_session(args).await,
             Some(other) => anyhow::bail!(
-                "Unknown subcommand '{other}'. Valid: show <id>, status. Use -s <query> to search."
+                "Unknown subcommand '{other}'. Valid: show <id>, share [id], status. Use -s <query> to search."
             ),
             None => self.list_entries(&args).await,
         }
     }
 
+    async fn share_session(&self, args: LogsArgs) -> Result<ExitCode> {
+        use crate::cli::ShareArgs;
+        use crate::commands::ShareCommand;
+
+        let share_args = ShareArgs {
+            session_id: args.target,
+            live: args.live,
+            no_redact: args.no_redact,
+            all: args.all,
+            open: args.open,
+            debug_local_only: args.debug_local_only,
+        };
+        let cmd = ShareCommand::new(self.session_store.clone());
+        Ok(cmd.execute(share_args).await)
+    }
+
     async fn show_status(&self, args: &LogsArgs) -> Result<ExitCode> {
         ensure_no_target(args, "status")?;
         let status = self.session_store.logs().status().await?;
+
+        // Aggregate native CLI + amp counts alongside logs.db.
+        let native_counts = native_session_counts().await;
+        let amp_count = amp_threads::list_threads(&amp_threads::default_threads_dir(), 10_000)
+            .await
+            .len() as u64;
+        let native_total: u64 = native_counts.iter().map(|(_, c)| *c).sum();
+        let grand_total = status.total_entries + native_total + amp_count;
+
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&status)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "logs_db": status,
+                    "native_sessions": native_counts
+                        .iter()
+                        .map(|(cli, count)| json!({"cli": cli, "count": count}))
+                        .collect::<Vec<_>>(),
+                    "amp_threads": amp_count,
+                    "grand_total": grand_total,
+                }))?
+            );
             return Ok(ExitCode::Success);
         }
 
         println!(
             "{} {} {} {} {} {}",
-            style::bold(status.total_entries.to_string()),
-            style::dim("events"),
+            style::bold(grand_total.to_string()),
+            style::dim("rows"),
             style::dim(SEPARATOR),
             style::dim(format_bytes(status.file_size_bytes)),
             style::dim(SEPARATOR),
             style::dim(system_env::collapse_tilde(&status.path)),
         );
 
-        if status.counts_by_source.is_empty() {
+        if grand_total == 0 {
             println!();
-            println!("{}", style::dim("No log entries recorded yet."));
+            println!("{}", style::dim("Nothing recorded yet."));
             return Ok(ExitCode::Success);
         }
 
-        // Flatten sources + tools into a single list sorted by count desc.
-        // A source with 2+ tools is replaced by its individual tool rows so
-        // the breakdown reads as one flat ranking rather than a hierarchy.
+        // Flatten the breakdown across all three sources into one ranking.
+        // Prefix logs.db rows with their source ("run claude" vs bare
+        // "claude") so they're distinguishable from native session counts.
         let mut rows: Vec<(String, u64)> = Vec::new();
         for source in status.counts_by_source {
             if source.tools.len() >= 2 {
                 for tool in source.tools {
-                    rows.push((tool.tool, tool.count));
+                    rows.push((format!("{} {}", source.source, tool.tool), tool.count));
                 }
             } else {
                 rows.push((source.source, source.count));
             }
+        }
+        for (cli, count) in native_counts {
+            rows.push((format!("{cli} sessions"), count));
+        }
+        if amp_count > 0 {
+            rows.push(("amp threads".to_string(), amp_count));
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.1));
 
@@ -110,20 +212,58 @@ impl LogsCommand {
             .target
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Usage: aivo logs show <id>"))?;
-        let entry = self
-            .session_store
-            .logs()
-            .get_by_reference(id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("No log entry with id '{}'", id))?;
 
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&entry)?);
+        // 1. Try logs.db first with prefix matching — `aivo logs` displays
+        //    8-char ids and copy-pasting one needs to find the full row.
+        //    For chat/run/serve, the metadata view here is the right output
+        //    (don't auto-drill into chat sessions; that's `aivo logs share`'s
+        //    job — `show` is the row-level inspector).
+        let logs_hits = self.session_store.logs().find_by_id_prefix(id, 5).await?;
+        if logs_hits.len() > 1 {
+            let summary = logs_hits
+                .iter()
+                .map(|e| format!("{} [{}]", &e.id, e.source))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "ambiguous logs.db prefix '{}' — matched: {}. Re-run with a longer prefix.",
+                id,
+                summary
+            );
+        }
+        if let Some(entry) = logs_hits.into_iter().next() {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&entry)?);
+            } else {
+                print_entry(&entry, &self.session_store).await;
+            }
             return Ok(ExitCode::Success);
         }
 
-        print_entry(&entry);
-        Ok(ExitCode::Success)
+        // 2. Fall back to native CLI / amp via the share resolver, which
+        //    already does prefix-matching across all 7 sources and surfaces
+        //    cross-source ambiguity. We don't need the full payload — the
+        //    metadata + first/last messages from `Thread`-style summaries
+        //    are enough — but reusing one resolver is simpler than carving
+        //    out a duplicate.
+        use crate::services::share_resolver::{ResolverContext, resolve_session};
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let ctx = ResolverContext::from_system(cwd, self.session_store.clone());
+        match resolve_session(id, &ctx).await {
+            Ok(resolved) => {
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&resolved.payload)?);
+                } else {
+                    print_share_payload(&resolved.payload);
+                }
+                Ok(ExitCode::Success)
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "No log entry, native session, or amp thread matching '{}'.\n  ({})",
+                id,
+                e
+            )),
+        }
     }
 
     async fn list_entries(&self, args: &LogsArgs) -> Result<ExitCode> {
@@ -133,30 +273,51 @@ impl LogsCommand {
         if args.watch {
             return self.watch_entries(args).await;
         }
-        let entries = self.fetch_entries(args).await?;
+
+        // Paint a spinner only if the fetch takes longer than `SPINNER_DELAY`
+        // — fast invocations stay flicker-free. JSON output skips the
+        // spinner entirely so machine-readable callers see clean stdout.
+        const SPINNER_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+        let rows = if args.json {
+            self.fetch_unified_rows(args).await?
+        } else {
+            let fetch = self.fetch_unified_rows(args);
+            tokio::pin!(fetch);
+            tokio::select! {
+                r = &mut fetch => r?,
+                _ = tokio::time::sleep(SPINNER_DELAY) => {
+                    let (spinning, handle) = style::start_spinner(Some(" loading…"));
+                    let r = (&mut fetch).await;
+                    style::stop_spinner(&spinning);
+                    let _ = handle.await;
+                    r?
+                }
+            }
+        };
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&entries)?);
+            println!("{}", serde_json::to_string_pretty(&unified_to_json(&rows))?);
             return Ok(ExitCode::Success);
         }
 
-        render_text_entries(entries, args.limit);
+        render_unified_rows(&rows);
         Ok(ExitCode::Success)
     }
 
     async fn watch_entries(&self, args: &LogsArgs) -> Result<ExitCode> {
         const WATCH_INTERVAL: Duration = Duration::from_secs(1);
-        let mut seen_ids = HashSet::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
 
         loop {
-            let entries = self.fetch_entries(args).await?;
+            let rows = self.fetch_unified_rows(args).await?;
 
             if args.jsonl {
-                let mut ordered = entries;
+                let mut ordered = rows.clone();
                 ordered.reverse();
-                for entry in ordered {
-                    if seen_ids.insert(entry.id.clone()) {
-                        println!("{}", serde_json::to_string(&entry)?);
+                for row in ordered {
+                    let key = unified_id_key(&row);
+                    if seen_ids.insert(key) {
+                        println!("{}", serde_json::to_string(&unified_row_to_json(&row))?);
                     }
                 }
                 io::stdout().flush()?;
@@ -168,7 +329,7 @@ impl LogsCommand {
                     style::dim("(Ctrl+C to stop)")
                 );
                 println!();
-                render_text_entries(entries, args.limit);
+                render_unified_rows(&rows);
                 io::stdout().flush()?;
             }
 
@@ -176,31 +337,101 @@ impl LogsCommand {
         }
     }
 
-    async fn fetch_entries(&self, args: &LogsArgs) -> Result<Vec<LogEntry>> {
-        // Over-fetch to compensate for run event collapsing (start+finish pairs)
-        let query_limit = if args.watch {
-            args.limit.saturating_mul(5)
-        } else if args.json {
-            args.limit
+    /// Pulls rows from all three data sources, applies the user's filters,
+    /// merges, sorts desc by ts, and trims to `--limit`.
+    async fn fetch_unified_rows(&self, args: &LogsArgs) -> Result<Vec<UnifiedRow>> {
+        let plan = SourcePlan::from_args(args);
+        // Default = current cwd. `--all` opts out, `--cwd <path>` overrides.
+        // Expand `.` / `~/` so explicit shorthands work.
+        let cwd_filter: Option<String> = if args.all {
+            None
+        } else if let Some(explicit) = args.cwd.as_deref() {
+            Some(expand_cwd_filter(explicit))
         } else {
-            args.limit.saturating_mul(3)
+            system_env::current_dir().map(|p| p.to_string_lossy().to_string())
         };
-        let entries = self
-            .session_store
-            .logs()
-            .list(LogQuery {
-                limit: query_limit,
-                search: args.search.clone(),
-                by: args.by.clone(),
-                model: args.model.clone(),
-                key_query: args.key.clone(),
-                cwd: args.cwd.clone(),
-                since: args.since.clone(),
-                until: args.until.clone(),
-                errors_only: args.errors,
-            })
-            .await?;
-        Ok(entries)
+
+        // Logs.db rows. Over-fetch to compensate for run-pair collapsing.
+        let log_rows: Vec<LogEntry> = if plan.include_logs() {
+            let query_limit = if args.watch {
+                args.limit.saturating_mul(5)
+            } else if args.json {
+                args.limit
+            } else {
+                args.limit.saturating_mul(3)
+            };
+            let mut entries = self
+                .session_store
+                .logs()
+                .list(LogQuery {
+                    limit: query_limit,
+                    search: args.search.clone(),
+                    by: args.by.clone(),
+                    model: args.model.clone(),
+                    key_query: args.key.clone(),
+                    cwd: cwd_filter.clone(),
+                    since: args.since.clone(),
+                    until: args.until.clone(),
+                    errors_only: args.errors,
+                })
+                .await?;
+            // Run events are emitted as start+finish pairs sharing an
+            // event_group_id; collapse here too so the unified listing
+            // doesn't show both halves.
+            entries = collapse_run_events(entries, args.limit.saturating_mul(3));
+            entries
+        } else {
+            Vec::new()
+        };
+
+        // Native CLI sessions. Filters that don't apply (--errors, --model,
+        // --key) cause us to skip native rows entirely; user clearly wants
+        // logs.db-only output.
+        //
+        // Perf: counter-intuitively, the project-scoped ingester is slower
+        // than global on a multi-project machine — codex/gemini walk the
+        // same global tree either way, but scoped *rejects* every non-
+        // matching file (forcing the walk to continue past the cap).
+        // Global stops at cap quickly. So we always walk globally and
+        // post-filter by cwd. The 14-day age cap bounds the worst case.
+        let native_rows: Vec<Thread> = if plan.include_native() {
+            let opts = IngestOptions {
+                max_age_days: if args.since.is_some() || args.until.is_some() {
+                    None // explicit time filter takes over
+                } else {
+                    Some(14) // matches the previous `aivo context` default
+                },
+                max_per_source: Some(args.limit.saturating_mul(2).max(50)),
+            };
+            let mut all = context_ingest::ingest_native_sessions_global(opts).await?;
+            all.retain(|t| native_passes_filters(t, args, cwd_filter.as_deref()));
+            all
+        } else {
+            Vec::new()
+        };
+
+        // Amp threads: amp has no cwd concept. If the user filtered by --cwd,
+        // exclude amp from the listing entirely (it can't possibly match).
+        let amp_rows: Vec<AmpRow> = if plan.include_amp() && cwd_filter.is_none() {
+            let amp_dir = amp_threads::default_threads_dir();
+            let raw =
+                amp_threads::list_threads(&amp_dir, args.limit.saturating_mul(2).max(50)).await;
+            raw.iter()
+                .filter_map(AmpRow::from_value)
+                .filter(|a| amp_passes_filters(a, args))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut merged: Vec<UnifiedRow> =
+            Vec::with_capacity(log_rows.len() + native_rows.len() + amp_rows.len());
+        merged.extend(log_rows.into_iter().map(|e| UnifiedRow::Log(Box::new(e))));
+        merged.extend(native_rows.into_iter().map(UnifiedRow::Native));
+        merged.extend(amp_rows.into_iter().map(UnifiedRow::Amp));
+        merged.sort_by_key(|r| std::cmp::Reverse(r.ts()));
+        merged.truncate(args.limit);
+        Ok(merged)
     }
 
     pub fn print_help() {
@@ -208,7 +439,11 @@ impl LogsCommand {
         println!();
         println!(
             "{}",
-            style::dim("Query local SQLite logs for chat, run, and serve activity.")
+            style::dim("Unified activity feed: aivo's own events (chat, run, serve), native CLI")
+        );
+        println!(
+            "{}",
+            style::dim("sessions (claude, codex, gemini, pi, opencode), and amp threads.")
         );
         println!();
         let print_opt = |flag: &str, desc: &str| {
@@ -219,38 +454,89 @@ impl LogsCommand {
             );
         };
         println!("{}", style::bold("Commands:"));
-        print_opt("(default)", "List recent log entries (newest first)");
-        print_opt("show <id>", "Show one entry in detail");
-        print_opt("status", "Show entry counts, size, and database path");
+        print_opt(
+            "(default)",
+            "List recent rows from all sources (newest first)",
+        );
+        print_opt(
+            "show <id>",
+            "Show one row in detail; accepts logs.db ids, native session ids, or T-…",
+        );
+        print_opt(
+            "share [id]",
+            "Share a session via tunneled viewer URL; omit id to open the picker",
+        );
+        print_opt("status", "Show counts and storage paths across sources");
         println!();
         println!("{}", style::bold("Filters:"));
+        print_opt("-n, --limit <N>", "Maximum rows after merge (default: 20)");
         print_opt(
-            "-n, --limit <N>",
-            "Maximum number of rows to show (default: 20)",
+            "--json",
+            "Output JSON (tagged union: log_entry|native_session|amp_thread)",
         );
-        print_opt("--json", "Output JSON");
-        print_opt("--watch", "Continuously refresh matching logs");
-        print_opt("--jsonl", "Emit newly seen entries as JSONL while watching");
-        print_opt("-s, --search <query>", "Search title/body text");
+        print_opt(
+            "--watch",
+            "Continuously refresh (1s poll across all sources)",
+        );
+        print_opt("--jsonl", "Emit newly seen rows as JSONL while watching");
+        print_opt("-s, --search <query>", "Search title/topic/body text");
         print_opt(
             "--by <name>",
-            "Filter by chat, run, serve, or tool (claude, codex, gemini, opencode, pi)",
+            "chat | run | serve | claude | codex | gemini | pi | opencode | amp | native",
         );
-        print_opt("--model <model>", "Filter by model substring");
-        print_opt("-k, --key <id|name>", "Filter by saved key ID or name");
-        print_opt("--cwd <path>", "Filter by working directory substring");
-        print_opt("--since <time>", "Only show entries on or after this time");
-        print_opt("--until <time>", "Only show entries on or before this time");
-        print_opt("--errors", "Only show HTTP >= 400 or non-zero exit code");
+        print_opt(
+            "--model <model>",
+            "Filter by model substring (logs.db only)",
+        );
+        print_opt("-k, --key <id|name>", "Filter by saved key (logs.db only)");
+        print_opt(
+            "--cwd <path>",
+            "Filter to a specific cwd (default: current cwd)",
+        );
+        print_opt("-a, --all", "Show rows from every project (no cwd filter)");
+        print_opt("--since <time>", "Only show rows on or after this time");
+        print_opt("--until <time>", "Only show rows on or before this time");
+        print_opt(
+            "--errors",
+            "Only HTTP >= 400 or non-zero exit (logs.db only)",
+        );
         println!();
         println!("{}", style::bold("Examples:"));
-        println!("  {}", style::dim("aivo logs"));
-        println!("  {}", style::dim("aivo logs --by chat -n 5"));
-        println!("  {}", style::dim("aivo logs --by claude --errors"));
-        println!("  {}", style::dim("aivo logs --by run --watch"));
+        println!(
+            "  {}",
+            style::dim("aivo logs                     # current project, newest first")
+        );
+        println!(
+            "  {}",
+            style::dim("aivo logs --all               # every project")
+        );
+        println!(
+            "  {}",
+            style::dim(
+                "aivo logs --by claude         # claude run-events + claude native sessions"
+            )
+        );
+        println!(
+            "  {}",
+            style::dim("aivo logs --by native         # only native CLI sessions")
+        );
+        println!(
+            "  {}",
+            style::dim("aivo logs --by amp            # only amp threads")
+        );
+        println!(
+            "  {}",
+            style::dim("aivo logs show 1335c631       # any unique id prefix works")
+        );
+        println!(
+            "  {}",
+            style::dim("aivo logs share               # pick a session and share it")
+        );
+        println!(
+            "  {}",
+            style::dim("aivo logs share 1335c631      # share by id prefix")
+        );
         println!("  {}", style::dim("aivo logs --watch --jsonl"));
-        println!("  {}", style::dim("aivo logs show 7m2q8k4v9cpr"));
-        println!("  {}", style::dim("aivo logs status"));
     }
 }
 
@@ -274,33 +560,133 @@ fn validate_args(args: &LogsArgs) -> Result<()> {
     if args.watch && args.action.is_some() {
         anyhow::bail!("--watch is only supported for `aivo logs` list output");
     }
+    let is_share = args.action.as_deref() == Some("share");
+    if !is_share && (args.live || args.no_redact || args.open || args.debug_local_only) {
+        anyhow::bail!(
+            "--live, --no-redact, --open, --debug-local-only only apply to `aivo logs share`"
+        );
+    }
     Ok(())
 }
 
-fn render_text_entries(entries: Vec<LogEntry>, limit: usize) {
-    if entries.is_empty() {
-        println!("{}", style::dim("No log entries found."));
+fn render_unified_rows(rows: &[UnifiedRow]) {
+    if rows.is_empty() {
+        println!("{}", style::dim("No entries found."));
         return;
     }
-
-    for entry in collapse_run_events(entries, limit) {
-        print_summary(&entry);
+    let detail_width = available_detail_width();
+    for row in rows {
+        match row {
+            UnifiedRow::Log(e) => print_summary(e, detail_width),
+            UnifiedRow::Native(t) => print_native_summary(t, detail_width),
+            UnifiedRow::Amp(a) => print_amp_summary(a, detail_width),
+        }
     }
 }
 
-fn print_summary(entry: &LogEntry) {
+/// Detail-column width that keeps each row on a single terminal line.
+/// `prefix` covers age (5) + id (8) + bracket (10) + 3 separator spaces = 26;
+/// the trailing `+1` leaves headroom for the cursor so terminals that
+/// auto-wrap on the *last* column don't push every row to two lines.
+/// Clamped to a comfortable reading band so very wide terminals don't
+/// produce unscannable 200-char rows.
+fn available_detail_width() -> usize {
+    const PREFIX: usize = 5 + 1 + ID_COL_WIDTH + 1 + BRACKET_COL_WIDTH + 1;
+    let cols = console::Term::stdout().size().1 as usize;
+    cols.saturating_sub(PREFIX + 1).clamp(30, 80)
+}
+
+/// Width of the id column. 8 chars matches git-style short SHA — enough
+/// entropy to avoid collisions across a user's history while keeping the
+/// table compact. The resolver matches any unique prefix, so longer ids
+/// still work when pasted from other tools.
+const ID_COL_WIDTH: usize = 8;
+/// Width of the source bracket column, padded for `[opencode]` (10 chars).
+/// Keeps detail-column alignment consistent across all sources.
+const BRACKET_COL_WIDTH: usize = 10;
+
+fn print_native_summary(t: &Thread, detail_width: usize) {
+    let time_ago = format_time_ago_short_dt(t.updated_at);
+    let id = compact_id(&t.session_id, ID_COL_WIDTH);
+    let topic = trim_to_one_line(&t.topic, detail_width);
+    println!(
+        "{} {} {} {}",
+        style::dim(format!("{:>5}", time_ago)),
+        style::cyan(format!("{:<width$}", id, width = ID_COL_WIDTH)),
+        style::magenta(format!(
+            "{:<width$}",
+            format!("[{}]", t.cli),
+            width = BRACKET_COL_WIDTH
+        )),
+        topic
+    );
+}
+
+fn print_amp_summary(a: &AmpRow, detail_width: usize) {
+    let time_ago = format_time_ago_short_dt(a.updated_at);
+    let id = compact_id(&a.id, ID_COL_WIDTH);
+    let title = a
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("(amp thread, {} messages)", a.message_count));
+    let title = trim_to_one_line(&title, detail_width);
+    println!(
+        "{} {} {} {}",
+        style::dim(format!("{:>5}", time_ago)),
+        style::cyan(format!("{:<width$}", id, width = ID_COL_WIDTH)),
+        style::magenta(format!("{:<width$}", "[amp]", width = BRACKET_COL_WIDTH)),
+        title
+    );
+}
+
+/// "5m" / "2d" — for `Thread`/`AmpRow` which have already-parsed timestamps.
+fn format_time_ago_short_dt(ts: DateTime<Utc>) -> String {
+    format_time_ago_short(&ts.to_rfc3339())
+}
+
+/// Collapse every kind of line/whitespace separator into a single space, then
+/// truncate to `max_chars` with an ellipsis. Bulletproof against topics with
+/// `\r`-only line breaks, Unicode line separators, tabs, or other control
+/// chars that would otherwise leak a second line into the table.
+pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for c in text.chars() {
+        let is_separator = matches!(
+            c,
+            '\n' | '\r' | '\t' | '\x0B' | '\x0C' | '\u{2028}' | '\u{2029}'
+        ) || c.is_control();
+        let ch = if is_separator { ' ' } else { c };
+        if ch == ' ' {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    let one_line = out.trim();
+    if one_line.chars().count() > max_chars {
+        let prefix: String = one_line.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", prefix)
+    } else {
+        one_line.to_string()
+    }
+}
+
+fn print_summary(entry: &LogEntry, detail_width: usize) {
     let display_id = display_id(entry);
     let time_ago = format_time_ago_short(&entry.ts_utc);
-    let detail = match entry.source.as_str() {
-        "chat" => {
-            let title = entry.title.clone().unwrap_or_else(|| "(chat)".to_string());
-            let tokens = format_token_summary(entry);
-            if tokens.is_empty() {
-                title
-            } else {
-                format!("{title}  {tokens}")
-            }
-        }
+    // (text, dim_suffix). Trimming runs on the plain text *before* styling
+    // so `is_control()`-based whitespace collapse can't strip ANSI escape
+    // bytes out of the suffix and leave bare `[2m…[0m` literals on screen.
+    let (text, dim_suffix): (String, String) = match entry.source.as_str() {
+        "chat" => (
+            entry.title.clone().unwrap_or_else(|| "(chat)".to_string()),
+            format_token_summary(entry),
+        ),
         "run" => {
             let tool = entry.tool.as_deref().unwrap_or("run");
             let model = entry
@@ -318,7 +704,7 @@ fn print_summary(entry: &LogEntry) {
                 .duration_ms
                 .map(|ms| format!(" ({})", format_duration_ms(ms)))
                 .unwrap_or_default();
-            format!("{tool} {model} {state}{duration}")
+            (format!("{tool} {model} {state}{duration}"), String::new())
         }
         "serve" => {
             let title = entry.title.clone().unwrap_or_else(|| "request".to_string());
@@ -330,24 +716,56 @@ fn print_summary(entry: &LogEntry) {
                 .duration_ms
                 .map(|ms| format!(" ({})", format_duration_ms(ms)))
                 .unwrap_or_default();
-            format!("{title} status={status}{duration}")
+            (format!("{title} status={status}{duration}"), String::new())
         }
-        _ => entry.title.clone().unwrap_or_else(|| entry.kind.clone()),
+        _ => (
+            entry.title.clone().unwrap_or_else(|| entry.kind.clone()),
+            String::new(),
+        ),
     };
-    // Column order matches `aivo context`: age first, id second, then detail.
+    // Reserve space for the suffix when sizing the title — token counts are
+    // short and high-signal, so prefer trimming the title over dropping them.
+    // Floor at 10 so a pathological wide suffix can't squeeze the title to
+    // nothing.
+    let text_budget = if dim_suffix.is_empty() {
+        detail_width
+    } else {
+        detail_width
+            .saturating_sub(dim_suffix.chars().count() + 1)
+            .max(10)
+    };
+    let text = trim_to_one_line(&text, text_budget);
+    let detail = if dim_suffix.is_empty() {
+        text
+    } else {
+        format!("{text} {}", style::dim(dim_suffix))
+    };
+    // Same column shape as native/amp rows: age (5) · id (8) · bracket (10) · detail.
+    // `{:<W.W}` truncates a too-long id to W chars then pads it to W — gives
+    // a clean column even when logs.db's full 12-char id is longer than W.
     println!(
         "{} {} {} {}",
         style::dim(format!("{:>5}", time_ago)),
-        style::cyan(display_id),
-        style::yellow(format!("[{}]", entry.source)),
+        style::cyan(format!(
+            "{:<width$.width$}",
+            display_id,
+            width = ID_COL_WIDTH
+        )),
+        style::yellow(format!(
+            "{:<width$}",
+            format!("[{}]", entry.source),
+            width = BRACKET_COL_WIDTH
+        )),
         detail
     );
 }
 
+/// Plain (unstyled) token-count fragment — caller applies dim *after*
+/// trimming so the escape bytes aren't fed through `trim_to_one_line`.
 fn format_token_summary(entry: &LogEntry) -> String {
     match (entry.input_tokens, entry.output_tokens) {
         (Some(input), Some(output)) if input > 0 || output > 0 => {
-            style::dim(format!("({input}\u{2192}{output} tokens)"))
+            format!("({input}\u{2192}{output} tokens)")
         }
         _ => String::new(),
     }
@@ -433,7 +851,7 @@ fn display_id(entry: &LogEntry) -> &str {
     &entry.id
 }
 
-fn print_entry(entry: &LogEntry) {
+async fn print_entry(entry: &LogEntry, store: &SessionStore) {
     println!("{} {}", style::bold("id:"), entry.id);
     println!("{} {}", style::bold("time:"), entry.ts_utc);
     println!("{} {}", style::bold("source:"), entry.source);
@@ -464,6 +882,13 @@ fn print_entry(entry: &LogEntry) {
     }
     if let Some(value) = &entry.session_id {
         println!("{} {}", style::bold("session:"), value);
+    } else if let Some(inferred) = inferred_chat_session(entry, store).await {
+        println!(
+            "{} {} {}",
+            style::bold("session:"),
+            inferred,
+            style::dim("(inferred)")
+        );
     }
     if let Some(value) = entry.status_code {
         println!("{} {}", style::bold("status:"), value);
@@ -502,6 +927,26 @@ fn print_entry(entry: &LogEntry) {
     }
 }
 
+/// Old `chat` rows (written before `LogEvent.session_id` existed) have no
+/// stored linkage to their chat session. Match cwd + key_id and pick the
+/// session whose `updated_at` is closest to the event's `ts_utc` — chat
+/// sessions are persisted within ~1s of the log row, so the match is reliable
+/// when both still exist on disk.
+async fn inferred_chat_session(entry: &LogEntry, store: &SessionStore) -> Option<String> {
+    if entry.source != "chat" {
+        return None;
+    }
+    let cwd = entry.cwd.as_deref()?;
+    let ts = DateTime::parse_from_rfc3339(&entry.ts_utc)
+        .ok()?
+        .with_timezone(&Utc);
+    store
+        .find_chat_session_near(cwd, entry.key_id.as_deref(), ts, 60)
+        .await
+        .ok()
+        .flatten()
+}
+
 fn collapse_run_events(entries: Vec<LogEntry>, limit: usize) -> Vec<LogEntry> {
     let mut seen_groups = HashSet::new();
     let mut collapsed = Vec::new();
@@ -522,6 +967,293 @@ fn collapse_run_events(entries: Vec<LogEntry>, limit: usize) -> Vec<LogEntry> {
     collapsed
 }
 
+// ---------------------------------------------------------------------------
+// SourcePlan — translates `--by` and the strict-logs.db filters into a
+// per-source eligibility set. Centralizes the "which sources can this query
+// possibly include" decision so fetch_unified_rows stays readable.
+// ---------------------------------------------------------------------------
+
+struct SourcePlan {
+    logs: bool,
+    native: bool,
+    amp: bool,
+}
+
+impl SourcePlan {
+    fn from_args(args: &LogsArgs) -> Self {
+        // Filters that only make sense for logs.db rows force a strict mode.
+        let strict_logs = args.errors || args.key.is_some() || args.model.is_some();
+
+        let by = args.by.as_deref().map(str::to_ascii_lowercase);
+        let by = by.as_deref();
+
+        // Determine eligibility per source.
+        let logs;
+        let native;
+        let amp;
+        match by {
+            // Bare logs.db sources.
+            Some("chat") | Some("run") | Some("serve") => {
+                logs = true;
+                native = false;
+                amp = false;
+            }
+            // "amp" is amp-only.
+            Some("amp") => {
+                logs = false;
+                native = false;
+                amp = true;
+            }
+            // "native" = all native CLI sessions, no logs.db, no amp.
+            Some("native") => {
+                logs = false;
+                native = true;
+                amp = false;
+            }
+            // CLI names: matching logs.db `tool` substring + native rows of that cli.
+            Some("claude") | Some("codex") | Some("gemini") | Some("opencode") | Some("pi") => {
+                logs = true;
+                native = !strict_logs;
+                amp = false;
+            }
+            // No --by: all sources, modulo strict-logs.
+            None | Some(_) => {
+                logs = true;
+                native = !strict_logs;
+                amp = !strict_logs;
+            }
+        }
+
+        Self { logs, native, amp }
+    }
+
+    fn include_logs(&self) -> bool {
+        self.logs
+    }
+    fn include_native(&self) -> bool {
+        self.native
+    }
+    fn include_amp(&self) -> bool {
+        self.amp
+    }
+}
+
+/// Apply the user-facing filters that aren't already encoded by SourcePlan
+/// to a single native `Thread`. `cwd_filter` is pre-expanded (`.` → cwd,
+/// `~/` → home). Returns true if the thread should be kept.
+fn native_passes_filters(t: &Thread, args: &LogsArgs, cwd_filter: Option<&str>) -> bool {
+    // `--by claude` (or other cli name) must match the thread's cli.
+    if let Some(by) = args.by.as_deref() {
+        let by = by.to_ascii_lowercase();
+        match by.as_str() {
+            "native" => {} // accepts every native cli
+            "claude" | "codex" | "gemini" | "opencode" | "pi" if t.cli != by => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    if let Some(needle) = cwd_filter {
+        let cwd_match = t
+            .cwd
+            .as_deref()
+            .map(|c| c.contains(needle))
+            .unwrap_or(false);
+        if !cwd_match {
+            return false;
+        }
+    }
+    if let Some(needle) = args.search.as_deref() {
+        let n = needle.to_ascii_lowercase();
+        let hay = format!(
+            "{} {} {}",
+            t.topic.to_ascii_lowercase(),
+            t.last_response.to_ascii_lowercase(),
+            t.cli.to_ascii_lowercase()
+        );
+        if !hay.contains(&n) {
+            return false;
+        }
+    }
+    if let Some(since) = args.since.as_deref()
+        && let Some(cutoff) = parse_loose_time(since)
+        && t.updated_at < cutoff
+    {
+        return false;
+    }
+    if let Some(until) = args.until.as_deref()
+        && let Some(cutoff) = parse_loose_time(until)
+        && t.updated_at > cutoff
+    {
+        return false;
+    }
+    true
+}
+
+/// Expand `--cwd` shorthand: `.` → current cwd, `~/` → home, otherwise
+/// passthrough. Used so users can type `aivo logs --cwd .` without thinking
+/// about path semantics.
+fn expand_cwd_filter(input: &str) -> String {
+    if input == "."
+        && let Some(cwd) = system_env::current_dir()
+    {
+        return cwd.to_string_lossy().to_string();
+    }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = system_env::home_dir()
+    {
+        return home.join(rest).to_string_lossy().to_string();
+    }
+    if input == "~"
+        && let Some(home) = system_env::home_dir()
+    {
+        return home.to_string_lossy().to_string();
+    }
+    input.to_string()
+}
+
+fn amp_passes_filters(a: &AmpRow, args: &LogsArgs) -> bool {
+    if let Some(needle) = args.search.as_deref() {
+        let n = needle.to_ascii_lowercase();
+        let title = a.title.as_deref().unwrap_or("").to_ascii_lowercase();
+        if !title.contains(&n) && !a.id.to_ascii_lowercase().contains(&n) {
+            return false;
+        }
+    }
+    if let Some(since) = args.since.as_deref()
+        && let Some(cutoff) = parse_loose_time(since)
+        && a.updated_at < cutoff
+    {
+        return false;
+    }
+    if let Some(until) = args.until.as_deref()
+        && let Some(cutoff) = parse_loose_time(until)
+        && a.updated_at > cutoff
+    {
+        return false;
+    }
+    true
+}
+
+/// Best-effort time parse: tries RFC3339 first, falls back to a date-only
+/// `YYYY-MM-DD` parse. Matches the loose semantics LogStore already accepts.
+fn parse_loose_time(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0).map(|n| Utc.from_utc_datetime(&n));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// JSON shape for --json / --jsonl
+// ---------------------------------------------------------------------------
+
+fn unified_to_json(rows: &[UnifiedRow]) -> Vec<Value> {
+    rows.iter().map(unified_row_to_json).collect()
+}
+
+fn unified_row_to_json(row: &UnifiedRow) -> Value {
+    match row {
+        UnifiedRow::Log(e) => {
+            let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+            if let Some(map) = v.as_object_mut() {
+                map.insert("kind".to_string(), Value::String("log_entry".into()));
+            }
+            v
+        }
+        UnifiedRow::Native(t) => json!({
+            "kind": "native_session",
+            "cli": t.cli,
+            "session_id": t.session_id,
+            "source_path": t.source_path,
+            "topic": t.topic,
+            "last_response": t.last_response,
+            "updated_at": t.updated_at.to_rfc3339(),
+            "cwd": t.cwd,
+        }),
+        UnifiedRow::Amp(a) => json!({
+            "kind": "amp_thread",
+            "id": a.id,
+            "title": a.title,
+            "updated_at": a.updated_at.to_rfc3339(),
+            "message_count": a.message_count,
+        }),
+    }
+}
+
+/// Tally native session counts per CLI for `aivo logs status`. Walks the
+/// global ingester with caps lifted; capped at a sensible upper bound so
+/// status never spends too long on huge histories.
+async fn native_session_counts() -> Vec<(String, u64)> {
+    let opts = IngestOptions {
+        max_age_days: None,
+        max_per_source: Some(10_000),
+    };
+    let threads = context_ingest::ingest_native_sessions_global(opts)
+        .await
+        .unwrap_or_default();
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for t in threads {
+        *counts.entry(t.cli).or_insert(0) += 1;
+    }
+    let mut out: Vec<(String, u64)> = counts.into_iter().collect();
+    out.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    out
+}
+
+/// Stable identity per row for watch-mode dedup. Logs.db `run` events
+/// collapse on `event_group_id`; otherwise the row's own id is unique.
+fn unified_id_key(row: &UnifiedRow) -> String {
+    match row {
+        UnifiedRow::Log(e) => {
+            if e.source == "run"
+                && let Some(g) = &e.event_group_id
+            {
+                format!("log:run:{g}")
+            } else {
+                format!("log:{}", e.id)
+            }
+        }
+        UnifiedRow::Native(t) => format!("native:{}:{}", t.cli, t.session_id),
+        UnifiedRow::Amp(a) => format!("amp:{}", a.id),
+    }
+}
+
+/// Pretty-print a `SharePayload` returned by `share_resolver` for
+/// `aivo logs show <native-or-amp-id>`. Mirrors `print_entry`'s style.
+fn print_share_payload(p: &crate::services::share_payload::SharePayload) {
+    println!("{} {}", style::bold("source:"), p.source_cli);
+    println!("{} {}", style::bold("session:"), p.session_id);
+    if let Some(model) = &p.model {
+        println!("{} {}", style::bold("model:"), model);
+    }
+    if let Some(root) = &p.project.root {
+        println!("{} {}", style::bold("cwd:"), style::dim(root));
+    }
+    if let Some(updated) = p.updated_at {
+        println!("{} {}", style::bold("updated:"), updated.to_rfc3339());
+    }
+    println!("{} {}", style::bold("messages:"), p.messages.len());
+    if let Some(summary) = &p.meta.redaction_summary
+        && !summary.is_empty()
+    {
+        let s = summary
+            .iter()
+            .map(|h| format!("{} {}", h.count, h.category))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{} {}", style::bold("redacted:"), style::dim(s));
+    }
+    println!();
+    println!(
+        "{}",
+        style::dim("(use `aivo logs share <id>` to open a viewer)")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,9 +1271,14 @@ mod tests {
             model: None,
             key: None,
             cwd: None,
+            all: false,
             since: None,
             until: None,
             errors: false,
+            live: false,
+            no_redact: false,
+            open: false,
+            debug_local_only: false,
         }
     }
 

@@ -165,11 +165,14 @@ pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     (spinning, handle)
 }
 
-/// Stops the spinner and clears its character from the line.
+/// Stops the spinner and erases the entire line (so any label printed
+/// alongside the spinner glyph is cleared too — `\r\x1b[2K` is "carriage
+/// return + erase entire line", which works on every terminal where the
+/// rest of `style::*` already assumes ANSI support).
 pub fn stop_spinner(spinning: &Arc<AtomicBool>) {
     if spinning.swap(false, Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        eprint!("\r \r");
+        eprint!("\r\x1b[2K");
         let _ = io::stderr().flush();
     }
 }

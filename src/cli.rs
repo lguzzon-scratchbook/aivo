@@ -81,12 +81,38 @@ pub enum Commands {
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
 
-    /// Cross-CLI context — auto-extracted from your sessions; bare command shows your last activity
-    #[command(hide = true)]
-    Context(ContextArgs),
-
     /// Amp-specific configuration (workspace MCP server trust, etc.)
     Amp(AmpArgs),
+
+    /// Hidden alias for `aivo logs share` (the canonical form). Kept so
+    /// muscle memory from the original top-level command keeps working.
+    #[command(hide = true)]
+    Share(ShareArgs),
+}
+
+/// Arguments for `aivo logs share` (and the hidden top-level `aivo share` alias).
+#[derive(Args, Debug, Clone)]
+pub struct ShareArgs {
+    /// Session id from `aivo logs` (claude / codex / gemini / pi / opencode / chat / amp).
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: Option<String>,
+
+    /// Follow ongoing changes; default is a one-time snapshot taken at share time.
+    #[arg(long)]
+    pub live: bool,
+
+    /// Skip redaction. Default scrubs API keys, OAuth tokens, $HOME paths,
+    /// and secret-shaped env values.
+    #[arg(long)]
+    pub no_redact: bool,
+
+    /// Show sessions from all projects, not just the current directory.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Bind only on 127.0.0.1 — local debugging without the public tunnel.
+    #[arg(long, hide = true)]
+    pub debug_local_only: bool,
 }
 
 /// Arguments for `aivo amp`. Currently scoped to the `trust` subcommand
@@ -291,7 +317,7 @@ pub struct RunArgs {
 
     /// Inject cross-CLI context for this launch. Bare flag opens an
     /// interactive picker; `--context=<session-id>` picks a specific session
-    /// (prefix match; see `aivo context` for available ids).
+    /// (prefix match; see `aivo logs --by native` for available ids).
     #[arg(short = 'c', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
     pub context: Option<String>,
 
@@ -437,26 +463,6 @@ pub struct StatsArgs {
     pub since: Option<String>,
 }
 
-/// Arguments for the context command
-#[derive(Args, Debug, Clone)]
-pub struct ContextArgs {
-    /// Subcommand slot (removed actions still caught to give a helpful error)
-    #[arg(value_name = "ACTION")]
-    pub action: Option<String>,
-
-    /// Dump all available threads as JSON (bare command only)
-    #[arg(long)]
-    pub json: bool,
-
-    /// Show all sessions, bypassing the default age and count caps
-    #[arg(short = 'a', long)]
-    pub all: bool,
-
-    /// Override the age cap (default 14 days)
-    #[arg(long, value_name = "DAYS")]
-    pub last_days: Option<i64>,
-}
-
 /// Arguments for the update command
 #[derive(Args, Debug, Clone)]
 pub struct UpdateArgs {
@@ -523,9 +529,15 @@ pub struct LogsArgs {
     #[arg(short = 'k', long, value_name = "ID|NAME", value_parser = non_empty())]
     pub key: Option<String>,
 
-    /// Filter by working directory substring
+    /// Filter by working directory substring. Defaults to the current cwd
+    /// when neither `--cwd` nor `--all` is given.
     #[arg(long, value_name = "PATH", value_parser = non_empty())]
     pub cwd: Option<String>,
+
+    /// Show rows from every project, ignoring the implicit current-cwd
+    /// filter. Mutually exclusive with `--cwd`.
+    #[arg(short = 'a', long, conflicts_with = "cwd")]
+    pub all: bool,
 
     /// Filter events since this ISO-like timestamp/date
     #[arg(long, value_name = "TIME", value_parser = non_empty())]
@@ -538,6 +550,23 @@ pub struct LogsArgs {
     /// Only show errors (HTTP >= 400 or exit_code != 0)
     #[arg(long)]
     pub errors: bool,
+
+    // `logs share` only — guarded by validate_args() for non-share actions.
+    /// `logs share`: follow ongoing changes (default: one-time snapshot).
+    #[arg(long)]
+    pub live: bool,
+
+    /// `logs share`: skip redaction (default: scrub API keys, OAuth, $HOME, secret env).
+    #[arg(long)]
+    pub no_redact: bool,
+
+    /// `logs share`: open the share URL in the default browser once ready.
+    #[arg(long)]
+    pub open: bool,
+
+    /// `logs share`: bind only on 127.0.0.1 — local debugging without the public tunnel.
+    #[arg(long, hide = true)]
+    pub debug_local_only: bool,
 }
 
 /// Arguments for the chat command

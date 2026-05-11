@@ -1695,6 +1695,22 @@ impl SessionStore {
             .await
     }
 
+    pub async fn find_chat_session_near(
+        &self,
+        cwd: &str,
+        key_id: Option<&str>,
+        ts: chrono::DateTime<chrono::Utc>,
+        max_skew_secs: i64,
+    ) -> Result<Option<String>> {
+        self.sessions
+            .find_chat_session_near(cwd, key_id, ts, max_skew_secs)
+            .await
+    }
+
+    pub async fn all_chat_sessions(&self) -> Result<Vec<SessionIndexEntry>> {
+        self.sessions.all_chat_sessions().await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn save_chat_session_with_id(
         &self,

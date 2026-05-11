@@ -136,6 +136,334 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
     Ok(threads)
 }
 
+/// Global counterpart to `ingest_project`: walks every native CLI session
+/// aivo can see, regardless of cwd. Used by `aivo logs` for the unified
+/// listing. Each source is fanned out concurrently and capped per
+/// `opts.max_per_source`. Threads are merged, age-filtered, sorted desc by
+/// `updated_at`.
+pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Thread>> {
+    let cap = opts.max_per_source;
+    let (claude, codex, gemini, pi, opencode) = tokio::join!(
+        ingest_claude_global(cap),
+        ingest_codex_global(cap),
+        ingest_gemini_global(cap),
+        ingest_pi_global(cap),
+        ingest_opencode_global(cap),
+    );
+
+    let mut threads: Vec<Thread> =
+        Vec::with_capacity(claude.len() + codex.len() + gemini.len() + pi.len() + opencode.len());
+    threads.extend(claude);
+    threads.extend(codex);
+    threads.extend(gemini);
+    threads.extend(pi);
+    threads.extend(opencode);
+
+    if let Some(days) = opts.max_age_days {
+        let cutoff = Utc::now() - chrono::Duration::days(days);
+        threads.retain(|t| t.updated_at >= cutoff);
+    }
+    threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
+    Ok(threads)
+}
+
+async fn ingest_claude_global(cap: Option<usize>) -> Vec<Thread> {
+    let Some(home) = system_env::home_dir() else {
+        return Vec::new();
+    };
+    let projects_root = home.join(".claude").join("projects");
+    let Ok(mut rd) = fs::read_dir(&projects_root).await else {
+        return Vec::new();
+    };
+
+    // Collect all jsonl files under each cwd-encoded subdir, sorted desc by
+    // mtime. Early-exit at the cap.
+    let mut all_paths: Vec<(PathBuf, SystemTime)> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut sub = match fs::read_dir(&dir).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        while let Ok(Some(f)) = sub.next_entry().await {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = f
+                .metadata()
+                .await
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            all_paths.push((p, mtime));
+        }
+    }
+    all_paths.sort_by_key(|e| std::cmp::Reverse(e.1));
+
+    let mut out = Vec::new();
+    for (path, _) in all_paths {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_claude_thread(&path).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+async fn ingest_codex_global(cap: Option<usize>) -> Vec<Thread> {
+    let Some(home) = system_env::home_dir() else {
+        return Vec::new();
+    };
+    let codex_root = home.join(".codex").join("sessions");
+    if !codex_root.exists() {
+        return Vec::new();
+    }
+    let files = walk_jsonl_newest_first(&codex_root).await;
+    let mut out = Vec::new();
+    for path in files {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_codex_thread_any(&path).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+/// Codex extractor without the cwd filter — accepts any session_meta.cwd
+/// and surfaces it on the resulting `Thread`. Used by the global ingester.
+async fn extract_codex_thread_any(path: &Path) -> Option<Thread> {
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
+    let mut lines = BufReader::new(file).lines();
+
+    let mut session_id: Option<String> = None;
+    let mut first_user: Option<String> = None;
+    let mut last_assistant: Option<String> = None;
+    let mut last_timestamp: Option<DateTime<Utc>> = None;
+    let mut session_cwd: Option<String> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if kind == "session_meta"
+            && let Some(payload) = v.get("payload")
+        {
+            if let Some(id) = payload.get("id").and_then(|s| s.as_str()) {
+                session_id = Some(id.to_string());
+            }
+            if let Some(cwd) = payload.get("cwd").and_then(|s| s.as_str()) {
+                session_cwd = Some(cwd.to_string());
+            }
+        }
+        if let Some(ts) = v.get("timestamp").and_then(|s| s.as_str())
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
+        {
+            last_timestamp = Some(parsed.with_timezone(&Utc));
+        }
+        if kind == "response_item"
+            && let Some(payload) = v.get("payload")
+            && payload.get("type").and_then(|t| t.as_str()) == Some("message")
+        {
+            let role = payload.get("role").and_then(|s| s.as_str()).unwrap_or("");
+            let raw = extract_codex_message_text(payload).unwrap_or_default();
+            let text = match sanitize_turn(&raw) {
+                Some(t) => t,
+                None => continue,
+            };
+            match role {
+                "user" if first_user.is_none() => first_user = Some(text),
+                "assistant" => last_assistant = Some(text),
+                _ => {}
+            }
+        }
+    }
+
+    Some(Thread {
+        cli: "codex".into(),
+        session_id: session_id?,
+        source_path: path.to_string_lossy().to_string(),
+        topic: first_user?,
+        last_response: last_assistant.unwrap_or_default(),
+        updated_at: last_timestamp.unwrap_or_else(Utc::now),
+        cwd: session_cwd,
+    })
+}
+
+async fn ingest_gemini_global(cap: Option<usize>) -> Vec<Thread> {
+    let Some(home) = system_env::home_dir() else {
+        return Vec::new();
+    };
+    let tmp_root = home.join(".gemini").join("tmp");
+    let Ok(mut rd) = fs::read_dir(&tmp_root).await else {
+        return Vec::new();
+    };
+    let mut all_paths: Vec<(PathBuf, SystemTime)> = Vec::new();
+    while let Ok(Some(dir_entry)) = rd.next_entry().await {
+        let chats = dir_entry.path().join("chats");
+        if !chats.is_dir() {
+            continue;
+        }
+        let mut sub = match fs::read_dir(&chats).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        while let Ok(Some(f)) = sub.next_entry().await {
+            let p = f.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !name.starts_with("session-") || !name.ends_with(".json") {
+                continue;
+            }
+            let mtime = f
+                .metadata()
+                .await
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            all_paths.push((p, mtime));
+        }
+    }
+    all_paths.sort_by_key(|e| std::cmp::Reverse(e.1));
+
+    let mut out = Vec::new();
+    for (path, _) in all_paths {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_gemini_thread(&path).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+async fn ingest_pi_global(cap: Option<usize>) -> Vec<Thread> {
+    let Some(home) = system_env::home_dir() else {
+        return Vec::new();
+    };
+    let sessions_root = home.join(".pi").join("agent").join("sessions");
+    let Ok(mut rd) = fs::read_dir(&sessions_root).await else {
+        return Vec::new();
+    };
+    let mut all_paths: Vec<(PathBuf, SystemTime)> = Vec::new();
+    while let Ok(Some(dir_entry)) = rd.next_entry().await {
+        let dir = dir_entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut sub = match fs::read_dir(&dir).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        while let Ok(Some(f)) = sub.next_entry().await {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = f
+                .metadata()
+                .await
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            all_paths.push((p, mtime));
+        }
+    }
+    all_paths.sort_by_key(|e| std::cmp::Reverse(e.1));
+
+    let mut out = Vec::new();
+    for (path, _) in all_paths {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_pi_thread(&path).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+async fn ingest_opencode_global(cap: Option<usize>) -> Vec<Thread> {
+    let Some(home) = system_env::home_dir() else {
+        return Vec::new();
+    };
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    let cap_i = cap.unwrap_or(1_000) as i64;
+
+    tokio::task::spawn_blocking(move || opencode_query_global(&db_path, cap_i))
+        .await
+        .unwrap_or_default()
+}
+
+fn opencode_query_global(db_path: &Path, cap: i64) -> Vec<Thread> {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            warn_unreadable_session(db_path, &err.to_string());
+            return Vec::new();
+        }
+    };
+
+    // Pull every project's recent sessions ordered globally by recency.
+    let mut stmt = match conn.prepare(
+        "SELECT s.id, s.time_updated, p.worktree
+           FROM session s
+           JOIN project p ON p.id = s.project_id
+           ORDER BY s.time_updated DESC
+           LIMIT ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows: Vec<(String, i64, String)> = stmt
+        .query_map([cap], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for (session_id, time_updated_ms, worktree) in rows {
+        if let Some(thread) =
+            opencode_extract_session(&conn, &session_id, time_updated_ms, Some(worktree))
+        {
+            out.push(thread);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Claude: ~/.claude/projects/<encoded-cwd>/*.jsonl
 // ---------------------------------------------------------------------------
@@ -339,6 +667,8 @@ async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
+        // Gemini's per-cwd dir is sha256(cwd) — irreversible. Leave None.
+        cwd: None,
     })
 }
 
@@ -512,7 +842,18 @@ async fn extract_pi_thread(path: &Path) -> Option<Thread> {
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
+        cwd: decode_pi_cwd(path),
     })
+}
+
+/// Reverse the `--<dashes>--` encoding that Pi uses for its per-cwd session
+/// dirs. `--Users-alice-foo--` → `/Users/alice/foo`. Lossy when the original cwd
+/// itself contained literal `-` characters; acceptable for display and
+/// substring filtering.
+fn decode_pi_cwd(path: &Path) -> Option<String> {
+    let parent = path.parent()?.file_name()?.to_str()?;
+    let inner = parent.strip_prefix("--")?.strip_suffix("--")?;
+    Some(format!("/{}", inner.replace('-', "/")))
 }
 
 /// Pi message content is an array of blocks; text blocks carry `text`.
@@ -602,7 +943,12 @@ fn opencode_query(db_path: &Path, project_root: &str, cap: i64) -> Vec<Thread> {
 
     let mut out = Vec::new();
     for (session_id, time_updated_ms) in sessions {
-        if let Some(thread) = opencode_extract_session(&conn, &session_id, time_updated_ms) {
+        if let Some(thread) = opencode_extract_session(
+            &conn,
+            &session_id,
+            time_updated_ms,
+            Some(project_root.to_string()),
+        ) {
             out.push(thread);
         }
     }
@@ -613,6 +959,7 @@ fn opencode_extract_session(
     conn: &rusqlite::Connection,
     session_id: &str,
     time_updated_ms: i64,
+    worktree: Option<String>,
 ) -> Option<Thread> {
     // Join messages to their text parts, ordered chronologically. The first
     // `role=user` with substantive text → topic; the last `role=assistant` → last_response.
@@ -668,6 +1015,7 @@ fn opencode_extract_session(
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at,
+        cwd: worktree,
     })
 }
 
@@ -838,7 +1186,19 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
+        cwd: decode_claude_cwd(path),
     })
+}
+
+/// Reverse the encoded-dir convention used by Claude Code under
+/// `~/.claude/projects/`. `-Users-alice-foo` → `/Users/alice/foo`. Lossy when the
+/// original cwd contained literal hyphens (we can't tell an encoded path
+/// separator from a real `-`); acceptable for display + substring filtering.
+/// Windows paths (`C--Users-...`) round-trip cosmetically only — kept for
+/// at-a-glance display.
+fn decode_claude_cwd(path: &Path) -> Option<String> {
+    let parent = path.parent()?.file_name()?.to_str()?;
+    Some(parent.replace('-', "/"))
 }
 
 /// Returns Some iff the session's session_meta.cwd matches the project root.
@@ -856,6 +1216,7 @@ async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread>
     let mut first_user: Option<String> = None;
     let mut last_assistant: Option<String> = None;
     let mut last_timestamp: Option<DateTime<Utc>> = None;
+    let mut session_cwd: Option<String> = None;
     let mut project_matches = false;
 
     while let Ok(Some(line)) = lines.next_line().await {
@@ -875,10 +1236,11 @@ async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread>
             if let Some(id) = payload.get("id").and_then(|s| s.as_str()) {
                 session_id = Some(id.to_string());
             }
-            if let Some(cwd) = payload.get("cwd").and_then(|s| s.as_str())
-                && paths_match(cwd, project_root)
-            {
-                project_matches = true;
+            if let Some(cwd) = payload.get("cwd").and_then(|s| s.as_str()) {
+                session_cwd = Some(cwd.to_string());
+                if paths_match(cwd, project_root) {
+                    project_matches = true;
+                }
             }
         }
 
@@ -920,6 +1282,7 @@ async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread>
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
+        cwd: session_cwd,
     })
 }
 
