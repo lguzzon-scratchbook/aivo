@@ -4,8 +4,8 @@
  */
 use console::style;
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 const BRAILLE_SPINNER_FRAMES: [&str; 10] = [
@@ -157,6 +157,32 @@ pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
         let mut i = 1;
         while spinning_clone.load(Ordering::Relaxed) {
             eprint!("\r{}{}", dim(spinner_frame(i)), label);
+            let _ = io::stderr().flush();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            i += 1;
+        }
+    });
+    (spinning, handle)
+}
+
+/// Like `start_spinner` but reads the label from a shared `Mutex<String>`
+/// on every frame, so callers can update progress text in flight (e.g.
+/// "(2/3) loading…") without restarting the spinner. The line is fully
+/// erased between frames so a shrinking label leaves no trailing chars.
+pub fn start_spinner_with_label(label: Arc<Mutex<String>>) -> (Arc<AtomicBool>, JoinHandle<()>) {
+    let spinning = Arc::new(AtomicBool::new(true));
+    let spinning_clone = spinning.clone();
+    let first_label = label.lock().map(|s| s.clone()).unwrap_or_default();
+    let first_frame = spinner_frame(0);
+
+    eprint!("\r\x1b[2K{}{}", dim(first_frame), first_label);
+    let _ = io::stderr().flush();
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut i = 1;
+        while spinning_clone.load(Ordering::Relaxed) {
+            let text = label.lock().map(|s| s.clone()).unwrap_or_default();
+            eprint!("\r\x1b[2K{}{}", dim(spinner_frame(i)), text);
             let _ = io::stderr().flush();
             std::thread::sleep(std::time::Duration::from_millis(80));
             i += 1;

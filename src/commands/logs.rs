@@ -3,6 +3,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cli::LogsArgs;
@@ -110,13 +112,44 @@ impl LogsCommand {
 
     async fn show_status(&self, args: &LogsArgs) -> Result<ExitCode> {
         ensure_no_target(args, "status")?;
-        let status = self.session_store.logs().status().await?;
 
-        // Aggregate native CLI + amp counts alongside logs.db.
-        let native_counts = native_session_counts().await;
-        let amp_count = amp_threads::list_threads(&amp_threads::default_threads_dir(), 10_000)
-            .await
-            .len() as u64;
+        // Run the three reads concurrently — they touch independent
+        // backends (SQLite, native session dirs, amp threads dir) so
+        // there's no contention. A shared completion counter feeds the
+        // spinner's progress label as each phase finishes.
+        const PHASES: usize = 3;
+        let done = Arc::new(AtomicUsize::new(0));
+
+        let store = self.session_store.clone();
+        let done_a = done.clone();
+        let logs_fut = async move {
+            let r = store.logs().status().await;
+            done_a.fetch_add(1, Ordering::Relaxed);
+            r
+        };
+        let done_b = done.clone();
+        let native_fut = async move {
+            let r = native_session_counts().await;
+            done_b.fetch_add(1, Ordering::Relaxed);
+            r
+        };
+        let done_c = done.clone();
+        let amp_fut = async move {
+            let r = amp_threads::list_threads(&amp_threads::default_threads_dir(), 10_000)
+                .await
+                .len() as u64;
+            done_c.fetch_add(1, Ordering::Relaxed);
+            r
+        };
+        let work = async { tokio::join!(logs_fut, native_fut, amp_fut) };
+
+        // JSON callers want clean stdout — skip the spinner entirely.
+        let (status, native_counts, amp_count) = if args.json {
+            work.await
+        } else {
+            run_with_progress_spinner(work, done.clone(), PHASES).await
+        };
+        let status = status?;
         let native_total: u64 = native_counts.iter().map(|(_, c)| *c).sum();
         let grand_total = status.total_entries + native_total + amp_count;
 
@@ -537,6 +570,51 @@ fn print_help_status() {
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo logs status"));
+}
+
+/// Drives `work` to completion while painting a delayed spinner whose
+/// label tracks `done`/`total` progress. Mirrors the SPINNER_DELAY pattern
+/// used by `list_entries`: fast invocations finish before the spinner ever
+/// shows, so there's no flash on cheap calls.
+async fn run_with_progress_spinner<F>(work: F, done: Arc<AtomicUsize>, total: usize) -> F::Output
+where
+    F: std::future::Future,
+{
+    const SPINNER_DELAY: Duration = Duration::from_millis(250);
+    tokio::pin!(work);
+    tokio::select! {
+        r = &mut work => return r,
+        _ = tokio::time::sleep(SPINNER_DELAY) => {}
+    }
+
+    let label = Arc::new(Mutex::new(progress_label(
+        done.load(Ordering::Relaxed),
+        total,
+    )));
+    let (spinning, handle) = style::start_spinner_with_label(label.clone());
+
+    let updater = {
+        let label = label.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(mut s) = label.lock() {
+                    *s = progress_label(done.load(Ordering::Relaxed), total);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+
+    let result = (&mut work).await;
+    updater.abort();
+    style::stop_spinner(&spinning);
+    let _ = handle.await;
+    result
+}
+
+fn progress_label(done: usize, total: usize) -> String {
+    format!(" loading log status ({done}/{total})…")
 }
 
 fn ensure_no_target(args: &LogsArgs, action: &str) -> Result<()> {
