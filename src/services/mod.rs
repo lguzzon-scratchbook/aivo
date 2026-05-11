@@ -77,6 +77,7 @@ pub mod share_picker;
 pub mod share_redact;
 pub mod share_resolver;
 pub mod share_tunnel;
+pub mod shutdown_signal;
 pub mod since;
 pub mod stdin_io;
 pub mod symlink_util;

@@ -17,6 +17,7 @@ use crate::services::share_picker;
 use crate::services::share_redact::{RedactCtx, redact};
 use crate::services::share_resolver::{ResolverContext, resolve_session};
 use crate::services::share_tunnel;
+use crate::services::shutdown_signal::ShutdownSignal;
 use crate::style;
 
 pub struct ShareCommand {
@@ -84,7 +85,7 @@ impl ShareCommand {
             resolver_ctx_for_state,
         );
 
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = ShutdownSignal::new();
         let (port, handle) = start_local_server("127.0.0.1:0", state, shutdown.clone()).await?;
         let local_base = format!("http://127.0.0.1:{port}");
 
@@ -96,7 +97,7 @@ impl ShareCommand {
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
-                shutdown.notify_waiters();
+                shutdown.fire();
             });
         }
 
@@ -106,7 +107,7 @@ impl ShareCommand {
             if args.open {
                 let _ = crate::services::browser_open::open_url(&state_url);
             }
-            shutdown.notified().await;
+            shutdown.wait().await;
             println!();
             ExitCode::Success
         } else {
@@ -119,7 +120,7 @@ impl ShareCommand {
             }
         };
 
-        shutdown.notify_waiters();
+        shutdown.fire();
         // Best-effort drain — the loop is non-blocking and exits on the next
         // accept-or-shutdown poll.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

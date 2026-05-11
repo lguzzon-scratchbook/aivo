@@ -50,6 +50,7 @@ use crate::services::http_utils::{
 use crate::services::share_payload::SharePayload;
 use crate::services::share_redact::{RedactCtx, redact};
 use crate::services::share_resolver::{ResolverContext, resolve_session};
+use crate::services::shutdown_signal::ShutdownSignal;
 
 const VIEWER_ORIGIN: &str = "https://s.getaivo.dev";
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -141,7 +142,7 @@ fn parse_cursor(s: &str) -> Option<(usize, usize)> {
 pub async fn start_local_server(
     bind_addr: &str,
     state: LiveState,
-    shutdown: Arc<Notify>,
+    shutdown: ShutdownSignal,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(bind_addr).await?;
     let port = listener.local_addr()?.port();
@@ -170,13 +171,13 @@ pub fn build_state(
     LiveState::from_snapshot(session_id, snapshot, live, redact_ctx, resolver_ctx)
 }
 
-async fn live_refresher(state: Arc<RwLock<LiveState>>, shutdown: Arc<Notify>) {
+async fn live_refresher(state: Arc<RwLock<LiveState>>, shutdown: ShutdownSignal) {
     let mut ticker = tokio::time::interval(LIVE_REFRESH_INTERVAL);
     ticker.tick().await; // skip immediate first tick — initial state is already fresh
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = shutdown.notified() => return,
+            _ = shutdown.wait() => return,
         }
         let mut guard = state.write().await;
         match guard.refresh_if_live().await {
@@ -189,15 +190,11 @@ async fn live_refresher(state: Arc<RwLock<LiveState>>, shutdown: Arc<Notify>) {
     }
 }
 
-async fn run_loop(listener: TcpListener, state: Arc<RwLock<LiveState>>, shutdown: Arc<Notify>) {
+async fn run_loop(listener: TcpListener, state: Arc<RwLock<LiveState>>, shutdown: ShutdownSignal) {
     loop {
         let accept = tokio::select! {
             result = listener.accept() => result,
-            _ = shutdown.notified() => {
-                // Wake every parked long-poll so connections drain promptly.
-                state.read().await.wake.notify_waiters();
-                return;
-            }
+            _ = shutdown.wait() => return,
         };
         let Ok((mut socket, _peer)) = accept else {
             continue;
@@ -227,7 +224,7 @@ async fn run_loop(listener: TcpListener, state: Arc<RwLock<LiveState>>, shutdown
 async fn handle_request(
     request: &str,
     state: &Arc<RwLock<LiveState>>,
-    shutdown: &Notify,
+    shutdown: &ShutdownSignal,
 ) -> Vec<u8> {
     let path = http_utils::extract_request_path(request);
     let path_no_query = path.split('?').next().unwrap_or(&path);
@@ -252,7 +249,7 @@ async fn handle_request(
 async fn serve_state(
     query: &str,
     state: &Arc<RwLock<LiveState>>,
-    shutdown: &Notify,
+    shutdown: &ShutdownSignal,
     head_only: bool,
 ) -> Vec<u8> {
     let wait_secs = query_u64(query, "wait").unwrap_or(0).min(MAX_WAIT_SECS);
@@ -282,7 +279,7 @@ async fn serve_state(
 
         tokio::select! {
             _ = notified.as_mut() => continue,
-            _ = shutdown.notified() => return build_state_304(&current_cursor, head_only),
+            _ = shutdown.wait() => return build_state_304(&current_cursor, head_only),
             _ = tokio::time::sleep(remaining) => return build_state_304(&current_cursor, head_only),
         }
     }
@@ -505,7 +502,7 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
@@ -516,12 +513,12 @@ mod tests {
         assert_eq!(parsed["meta"]["source_cli"], "amp");
         assert_eq!(parsed["meta"]["message_count"], 1);
         assert_eq!(parsed["meta"]["live"], false);
-        assert_eq!(parsed["cursor"].as_str().unwrap().contains(':'), true);
+        assert!(parsed["cursor"].as_str().unwrap().contains(':'));
         assert_eq!(parsed["payload"]["replace_from"], 0);
         assert_eq!(parsed["payload"]["messages"][0]["role"], "user");
         assert_eq!(parsed["payload"]["schema_version"], "1");
 
-        shutdown.notify_waiters();
+        shutdown.fire();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -534,7 +531,7 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
@@ -561,7 +558,7 @@ mod tests {
             "long-poll overshot: {elapsed:?}"
         );
 
-        shutdown.notify_waiters();
+        shutdown.fire();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -574,7 +571,7 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
@@ -590,7 +587,7 @@ mod tests {
         let started = Instant::now();
         let poll = tokio::spawn(async move { http_get(port, &path).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown.notify_waiters();
+        shutdown.fire();
 
         let (status, _) = poll.await.unwrap();
         let elapsed = started.elapsed();
@@ -610,7 +607,7 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
@@ -621,7 +618,7 @@ mod tests {
         let (status, _) = http_request(port, "POST", "/state").await;
         assert_eq!(status, 405);
 
-        shutdown.notify_waiters();
+        shutdown.fire();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -634,13 +631,13 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
         let (status, _) = http_request(port, "OPTIONS", "/state").await;
         assert_eq!(status, 204);
-        shutdown.notify_waiters();
+        shutdown.fire();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

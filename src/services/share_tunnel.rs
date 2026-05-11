@@ -19,18 +19,18 @@
 //! The `--debug-local-only` flag in `aivo logs share` skips this whole module
 //! and binds the local server on 127.0.0.1 directly.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
 use http::HeaderValue;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::services::share_codec::{ClientFrame, METHOD_HEAD, SUBPROTOCOL, ServerFrame};
+use crate::services::shutdown_signal::ShutdownSignal;
 
 const DEFAULT_BASE_URL: &str = "https://s.getaivo.dev";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,7 +40,7 @@ const OUTBOUND_BUFFER: usize = 64;
 /// or `shutdown` fires (Ctrl+C). Returns Ok on clean shutdown; Err on connect
 /// / register failure or on a server-side reject.
 ///
-/// The `shutdown` notify is shared with the local share server so a single
+/// The `shutdown` signal is shared with the local share server so a single
 /// Ctrl+C wakes both: the tunnel loop breaks AND every parked long-poll on
 /// the local share returns immediately. Without that wiring, Ctrl+C would
 /// wait on in-flight `reqwest` calls into the local share's wait window,
@@ -48,7 +48,7 @@ const OUTBOUND_BUFFER: usize = 64;
 pub async fn run_tunnel(
     local_base: String,
     open_in_browser: bool,
-    shutdown: Arc<Notify>,
+    shutdown: ShutdownSignal,
 ) -> Result<()> {
     let api_base =
         std::env::var("AIVO_SHARE_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
@@ -163,7 +163,7 @@ pub async fn run_tunnel(
 
     loop {
         tokio::select! {
-            _ = shutdown.notified() => {
+            _ = shutdown.wait() => {
                 println!();
                 break;
             }
