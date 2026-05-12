@@ -599,26 +599,42 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     // Native CLIs: project-scoped enumeration, then closest-mtime match within
     // the matching cli.
     //
-    // Claude uses a dedicated enumerator (`list_claude_sessions_for_cwd`)
-    // instead of `ingest_project`, because the latter's `extract_claude_thread`
-    // applies a substantive-content filter (drops files whose turns are all
-    // under MIN_TURN_CHARS) that's appropriate for AI-context injection but
-    // wrong here — short sessions like `claude -p 'say hi'` would be silently
-    // un-shareable. Other CLIs still go through `ingest_project` until their
-    // extractors are audited for the same issue.
-    let threads: Vec<Thread> = if tool == "claude" {
-        context_ingest::list_claude_sessions_for_cwd(std::path::Path::new(&run_cwd)).await
-    } else {
-        let opts = IngestOptions {
-            max_age_days: None,
-            min_updated_at: None,
-            max_per_source: Some(50),
-        };
-        context_ingest::ingest_project(std::path::Path::new(&run_cwd), opts)
-            .await?
-            .into_iter()
-            .filter(|t| t.cli == tool)
-            .collect()
+    // Every native CLI uses a dedicated enumerator that skips the
+    // substantive-content filter `ingest_project`'s extractors apply (turns
+    // must be ≥ MIN_TURN_CHARS, no `<environment_context>`/`<turn_aborted>`
+    // markers). That filter is right for AI-context injection but wrong here
+    // — short prompts like `claude -p 'say hi'`, CJK queries like
+    // `今天成都的天气` (7 chars), or a session that's still mid-conversation
+    // would otherwise be silently un-shareable, and the resolver would fall
+    // back to whichever older session in the same cwd happens to have
+    // substantive turns. An unknown tool name falls back to `ingest_project`
+    // (which won't return anything for unknown tools, yielding a clean "no
+    // session found" error).
+    let run_path = std::path::Path::new(&run_cwd);
+    let threads: Vec<Thread> = match tool {
+        "claude" => context_ingest::list_claude_sessions_for_cwd(run_path).await,
+        "codex" => {
+            context_ingest::list_codex_sessions_for_cwd(&ctx.codex_sessions_root, run_path).await
+        }
+        "pi" => context_ingest::list_pi_sessions_for_cwd(&ctx.pi_sessions_root, run_path).await,
+        "gemini" => {
+            context_ingest::list_gemini_sessions_for_cwd(&ctx.gemini_tmp_root, run_path).await
+        }
+        "opencode" => {
+            context_ingest::list_opencode_sessions_for_cwd(&ctx.opencode_db_path, run_path).await
+        }
+        _ => {
+            let opts = IngestOptions {
+                max_age_days: None,
+                min_updated_at: None,
+                max_per_source: Some(50),
+            };
+            context_ingest::ingest_project(run_path, opts)
+                .await?
+                .into_iter()
+                .filter(|t| t.cli == tool)
+                .collect()
+        }
     };
     let mut candidates: Vec<&Thread> = threads.iter().collect();
     if candidates.is_empty() {

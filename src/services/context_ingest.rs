@@ -667,6 +667,103 @@ async fn ingest_codex(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
     out
 }
 
+/// Enumerate every codex session file under `codex_root` whose
+/// `session_meta.cwd` matches `project_root`, without
+/// `extract_codex_thread`'s substantive-turn filter. Returns one stub per
+/// parseable file with `session_id`, `source_path`, `cwd`, and
+/// `updated_at` populated; `topic` / `last_response` stay empty.
+///
+/// Used by the share resolver's run-event path, which only needs to know
+/// which sessions exist for a cwd. Without this, sessions whose user
+/// prompts are all under `MIN_TURN_CHARS` (e.g. CJK prompts like
+/// `今天成都的天气`, 7 chars) get silently dropped and the resolver picks
+/// the closest-mtime *surviving* session instead — typically an older,
+/// longer session in the same cwd.
+///
+/// `codex_root` is parameterized (rather than read from `$HOME/.codex/`)
+/// so tests can inject a temp directory without mutating env vars.
+pub async fn list_codex_sessions_for_cwd(codex_root: &Path, project_root: &Path) -> Vec<Thread> {
+    if !codex_root.exists() {
+        return Vec::new();
+    }
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_str = canonical_root.to_string_lossy().to_string();
+
+    let files = walk_jsonl_newest_first(codex_root, None).await;
+    let mut out = Vec::new();
+    for path in files {
+        if let Some(stub) = extract_codex_session_stub(&path, &canonical_str).await {
+            out.push(stub);
+        }
+    }
+    out
+}
+
+/// Read codex session headlines without scanning every response_item. We
+/// need session_meta (id + cwd), the file's last timestamp for closest-
+/// mtime sorting, and that's it. Falls back to filesystem mtime when the
+/// jsonl carries no timestamps.
+async fn extract_codex_session_stub(path: &Path, project_root: &str) -> Option<Thread> {
+    let file = fs::File::open(path).await.ok()?;
+    let mut lines = BufReader::new(file).lines();
+
+    let mut session_id: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
+    let mut project_matches = false;
+    let mut latest_ts: Option<DateTime<Utc>> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(ts) = v.get("timestamp").and_then(|s| s.as_str())
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
+        {
+            latest_ts = Some(parsed.with_timezone(&Utc));
+        }
+        if v.get("type").and_then(|t| t.as_str()) == Some("session_meta")
+            && let Some(payload) = v.get("payload")
+        {
+            if let Some(id) = payload.get("id").and_then(|s| s.as_str()) {
+                session_id = Some(id.to_string());
+            }
+            if let Some(cwd) = payload.get("cwd").and_then(|s| s.as_str()) {
+                session_cwd = Some(cwd.to_string());
+                if paths_match(cwd, project_root) {
+                    project_matches = true;
+                }
+            }
+        }
+    }
+
+    if !project_matches {
+        return None;
+    }
+    let updated_at = match latest_ts {
+        Some(ts) => ts,
+        None => fs::metadata(path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now),
+    };
+    Some(Thread {
+        cli: "codex".into(),
+        session_id: session_id?,
+        source_path: path.to_string_lossy().to_string(),
+        topic: String::new(),
+        last_response: String::new(),
+        updated_at,
+        cwd: session_cwd,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Gemini: ~/.gemini/tmp/<sha256(abs_cwd)>/chats/session-*.json
 // ---------------------------------------------------------------------------
@@ -700,13 +797,23 @@ pub(crate) async fn gemini_matching_session_files(canonical_root: &str) -> Vec<P
         Some(h) => h,
         None => return Vec::new(),
     };
+    gemini_matching_session_files_in(&home.join(".gemini").join("tmp"), canonical_root).await
+}
+
+/// `gemini_matching_session_files` parameterized on the `~/.gemini/tmp/` root
+/// so tests (and the share resolver's run-event path, which carries an
+/// explicit `gemini_tmp_root` in `ResolverContext`) can inject a non-HOME
+/// directory without mutating env vars.
+pub(crate) async fn gemini_matching_session_files_in(
+    tmp_root: &Path,
+    canonical_root: &str,
+) -> Vec<PathBuf> {
     let project_hash = hex_sha256(canonical_root.as_bytes());
-    let tmp_root = home.join(".gemini").join("tmp");
     if !tmp_root.exists() {
         return Vec::new();
     }
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
-    let mut tmp_rd = match fs::read_dir(&tmp_root).await {
+    let mut tmp_rd = match fs::read_dir(tmp_root).await {
         Ok(rd) => rd,
         Err(_) => return Vec::new(),
     };
@@ -810,6 +917,77 @@ async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
         // Gemini's per-cwd dir is sha256(cwd) — irreversible. Leave None.
+        cwd: None,
+    })
+}
+
+/// Enumerate gemini session files for the project without applying
+/// `extract_gemini_thread`'s substantive-turn filter. Returns one stub per
+/// parseable file with `session_id` and `updated_at` populated.
+///
+/// Used by the share resolver's run-event path. `extract_gemini_thread`
+/// drops sessions whose user turns are all short — same bug class as
+/// claude/codex/pi.
+///
+/// `gemini_tmp_root` is parameterized so tests can inject a temp dir.
+pub async fn list_gemini_sessions_for_cwd(
+    gemini_tmp_root: &Path,
+    project_root: &Path,
+) -> Vec<Thread> {
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_str = canonical_root.to_string_lossy().to_string();
+    let paths = gemini_matching_session_files_in(gemini_tmp_root, &canonical_str).await;
+    let mut out = Vec::new();
+    for path in paths {
+        if let Some(stub) = extract_gemini_session_stub(&path).await {
+            out.push(stub);
+        }
+    }
+    out
+}
+
+/// Headline-only read: `sessionId` + the latest per-message timestamp (or
+/// `lastUpdated` as a fallback). Bounded — gemini session files are JSON
+/// blobs but we still only need a handful of fields.
+async fn extract_gemini_session_stub(path: &Path) -> Option<Thread> {
+    let content = fs::read_to_string(path).await.ok()?;
+    let v: Value = serde_json::from_str(&content).ok()?;
+    let session_id = v.get("sessionId").and_then(|s| s.as_str())?.to_string();
+
+    let mut latest_ts: Option<DateTime<Utc>> = None;
+    if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            if let Some(ts) = msg.get("timestamp").and_then(|s| s.as_str())
+                && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
+            {
+                let parsed = parsed.with_timezone(&Utc);
+                latest_ts = Some(latest_ts.map_or(parsed, |cur| cur.max(parsed)));
+            }
+        }
+    }
+    if latest_ts.is_none()
+        && let Some(ts) = v.get("lastUpdated").and_then(|s| s.as_str())
+        && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
+    {
+        latest_ts = Some(parsed.with_timezone(&Utc));
+    }
+    let updated_at = match latest_ts {
+        Some(ts) => ts,
+        None => fs::metadata(path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now),
+    };
+    Some(Thread {
+        cli: "gemini".into(),
+        session_id,
+        source_path: path.to_string_lossy().to_string(),
+        topic: String::new(),
+        last_response: String::new(),
+        updated_at,
         cwd: None,
     })
 }
@@ -988,6 +1166,94 @@ async fn extract_pi_thread(path: &Path) -> Option<Thread> {
     })
 }
 
+/// Enumerate pi session files under the project's encoded cwd dir without
+/// applying `extract_pi_thread`'s substantive-turn filter. Returns one stub
+/// per parseable file with `session_id`, `source_path`, `cwd`, and
+/// `updated_at` populated; `topic` / `last_response` stay empty.
+///
+/// Used by the share resolver's run-event path. Without this, a brand-new pi
+/// run whose only turns are still short prompts gets dropped, and the
+/// resolver falls back to whichever older session in the same cwd survived
+/// the filter — making `aivo share <run-id>` display a stale session from
+/// days ago instead of the live one.
+///
+/// `pi_root` is parameterized so tests can inject a temp dir.
+pub async fn list_pi_sessions_for_cwd(pi_root: &Path, project_root: &Path) -> Vec<Thread> {
+    if !pi_root.exists() {
+        return Vec::new();
+    }
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_str = canonical_root.to_string_lossy().to_string();
+    let encoded = format!("--{}--", canonical_str.trim_matches('/').replace('/', "-"));
+    let session_dir = pi_root.join(encoded);
+    if !session_dir.exists() {
+        return Vec::new();
+    }
+
+    let files = list_jsonl_newest_first(&session_dir, None).await;
+    let mut out = Vec::new();
+    for path in files {
+        if let Some(stub) = extract_pi_session_stub(&path).await {
+            out.push(stub);
+        }
+    }
+    out
+}
+
+/// Headline-only read for resolver use: session id + latest timestamp.
+/// Falls back to file mtime when the jsonl has no timestamps yet (e.g. a
+/// session that just started and hasn't recorded its first turn).
+async fn extract_pi_session_stub(path: &Path) -> Option<Thread> {
+    let file = fs::File::open(path).await.ok()?;
+    let mut lines = BufReader::new(file).lines();
+
+    let mut session_id: Option<String> = None;
+    let mut latest_ts: Option<DateTime<Utc>> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if session_id.is_none()
+            && v.get("type").and_then(|t| t.as_str()) == Some("session")
+            && let Some(id) = v.get("id").and_then(|s| s.as_str())
+        {
+            session_id = Some(id.to_string());
+        }
+        if let Some(ts) = v.get("timestamp").and_then(|s| s.as_str())
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
+        {
+            let parsed = parsed.with_timezone(&Utc);
+            latest_ts = Some(latest_ts.map_or(parsed, |cur| cur.max(parsed)));
+        }
+    }
+
+    let session_id = session_id?;
+    let updated_at = match latest_ts {
+        Some(ts) => ts,
+        None => fs::metadata(path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now),
+    };
+    Some(Thread {
+        cli: "pi".into(),
+        session_id,
+        source_path: path.to_string_lossy().to_string(),
+        topic: String::new(),
+        last_response: String::new(),
+        updated_at,
+        cwd: decode_pi_cwd(path),
+    })
+}
+
 /// Reverse the `--<dashes>--` encoding that Pi uses for its per-cwd session
 /// dirs. `--Users-alice-foo--` → `/Users/alice/foo`. Lossy when the original cwd
 /// itself contained literal `-` characters; acceptable for display and
@@ -1159,6 +1425,69 @@ fn opencode_extract_session(
         updated_at,
         cwd: worktree,
     })
+}
+
+/// Enumerate opencode sessions for the project without joining onto the
+/// `message`/`part` tables (which `opencode_extract_session` does to pick
+/// `topic`/`last_response`, and which it then filters via `sanitize_turn`).
+/// Returns one stub per row in `session` whose `project_id` matches —
+/// share resolver only needs `session_id` + `updated_at` for the
+/// closest-mtime pick.
+pub async fn list_opencode_sessions_for_cwd(db_path: &Path, project_root: &Path) -> Vec<Thread> {
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_str = canonical_root.to_string_lossy().to_string();
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || opencode_list_stubs(&db_path, &canonical_str))
+        .await
+        .unwrap_or_default()
+}
+
+fn opencode_list_stubs(db_path: &Path, project_root: &str) -> Vec<Thread> {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let project_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM project WHERE worktree = ?1 LIMIT 1",
+            [project_root],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let Some(project_id) = project_id else {
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, time_updated FROM session
+           WHERE project_id = ?1
+           ORDER BY time_updated DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([&project_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+        .unwrap_or_default();
+    rows.into_iter()
+        .map(|(session_id, time_ms)| Thread {
+            cli: "opencode".into(),
+            session_id: session_id.clone(),
+            source_path: format!("db://opencode/{session_id}"),
+            topic: String::new(),
+            last_response: String::new(),
+            updated_at: chrono::DateTime::<Utc>::from_timestamp_millis(time_ms)
+                .unwrap_or_else(Utc::now),
+            cwd: Some(project_root.to_string()),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1816,5 +2145,394 @@ mod tests {
             max_per_source: None,
         };
         assert!(effective_cutoff(&opts).is_none());
+    }
+
+    /// Regression: a codex session whose only user turn is a short CJK
+    /// prompt (e.g. `今天成都的天气`, 7 chars) used to be silently dropped
+    /// by `extract_codex_thread`'s `MIN_TURN_CHARS = 40` filter. The share
+    /// resolver's "closest-mtime codex session in this cwd" heuristic
+    /// would then fall back to an older, longer session that happened to
+    /// survive the filter — wrong session, wrong date, wrong contents.
+    /// `list_codex_sessions_for_cwd` must include the short-prompt
+    /// session.
+    #[tokio::test]
+    async fn list_codex_sessions_for_cwd_includes_short_cjk_prompt() {
+        let codex_root = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let project_str = project_path.to_string_lossy().to_string();
+
+        // Older session in the same cwd with a *long* user turn — would
+        // survive the substantive-turn filter under the old code.
+        let day_old = codex_root.path().join("2026").join("05").join("01");
+        std::fs::create_dir_all(&day_old).unwrap();
+        let old_file = day_old.join("rollout-old.jsonl");
+        let long_text = "x".repeat(120);
+        let old_jsonl = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "timestamp": "2026-05-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "OLD-ID", "cwd": project_str}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-01T00:00:10Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": long_text}]}
+            })
+        );
+        fs::write(&old_file, old_jsonl).await.unwrap();
+
+        // Today's session in the same cwd with a short CJK prompt — the
+        // case the user-reported bug exercised.
+        let day_today = codex_root.path().join("2026").join("05").join("12");
+        std::fs::create_dir_all(&day_today).unwrap();
+        let new_file = day_today.join("rollout-new.jsonl");
+        let new_jsonl = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "timestamp": "2026-05-12T03:26:40Z",
+                "type": "session_meta",
+                "payload": {"id": "NEW-ID", "cwd": project_str}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-12T03:26:41Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "今天成都的天气"}]}
+            })
+        );
+        fs::write(&new_file, new_jsonl).await.unwrap();
+
+        let threads = list_codex_sessions_for_cwd(codex_root.path(), project.path()).await;
+        let ids: Vec<&str> = threads.iter().map(|t| t.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"NEW-ID"),
+            "short CJK prompt session must be included; got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"OLD-ID"),
+            "long-prompt session must still be included; got {ids:?}"
+        );
+    }
+
+    /// `paths_match` excludes sessions that recorded a different cwd —
+    /// the prefix-collision bug only mattered because the resolver was
+    /// scoped to a cwd; that scoping must keep working with the new
+    /// non-filtering enumerator.
+    #[tokio::test]
+    async fn list_codex_sessions_for_cwd_skips_other_cwds() {
+        let codex_root = TempDir::new().unwrap();
+        let mine = TempDir::new().unwrap();
+        let theirs = TempDir::new().unwrap();
+        let day = codex_root.path().join("2026").join("05").join("12");
+        std::fs::create_dir_all(&day).unwrap();
+        let theirs_str = std::fs::canonicalize(theirs.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let jsonl = format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": "2026-05-12T03:26:40Z",
+                "type": "session_meta",
+                "payload": {"id": "OTHER-CWD", "cwd": theirs_str}
+            })
+        );
+        fs::write(day.join("rollout.jsonl"), jsonl).await.unwrap();
+
+        let threads = list_codex_sessions_for_cwd(codex_root.path(), mine.path()).await;
+        assert!(
+            threads.is_empty(),
+            "session in a different cwd must not appear; got {:?}",
+            threads.iter().map(|t| &t.session_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: a live pi session whose only turns so far are short
+    /// prompts (e.g. `hi`) used to be dropped by `extract_pi_thread`'s
+    /// `sanitize_turn`/`MIN_TURN_CHARS` filter. The share resolver then
+    /// returned the closest-mtime *surviving* session, typically a long
+    /// older session in the same cwd — so two distinct run events both
+    /// resolved to the same stale session. The new enumerator must
+    /// include the short-prompt session.
+    #[tokio::test]
+    async fn list_pi_sessions_for_cwd_includes_short_prompt_session() {
+        let pi_root = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let project_str = project_path.to_string_lossy().to_string();
+        let encoded = format!("--{}--", project_str.trim_matches('/').replace('/', "-"));
+        let session_dir = pi_root.path().join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Old long session — survives the old filter, masks the new one.
+        let long_text = "x".repeat(120);
+        let old_jsonl = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type": "session", "id": "OLD-PI"}),
+            serde_json::json!({
+                "type": "message",
+                "timestamp": "2026-05-06T00:00:00Z",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": long_text}]}
+            })
+        );
+        let old_path = session_dir.join("old.jsonl");
+        fs::write(&old_path, old_jsonl).await.unwrap();
+
+        // Today's short-prompt session — the bug case.
+        let new_jsonl = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type": "session", "id": "NEW-PI"}),
+            serde_json::json!({
+                "type": "message",
+                "timestamp": "2026-05-12T03:26:40Z",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "hi"}]}
+            })
+        );
+        let new_path = session_dir.join("new.jsonl");
+        fs::write(&new_path, new_jsonl).await.unwrap();
+
+        let threads = list_pi_sessions_for_cwd(pi_root.path(), project.path()).await;
+        let ids: Vec<&str> = threads.iter().map(|t| t.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"NEW-PI"),
+            "short-prompt session must be included; got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"OLD-PI"),
+            "long-prompt session must still be included; got {ids:?}"
+        );
+    }
+
+    /// Regression: a gemini session whose user turns are all short used to
+    /// be dropped by `extract_gemini_thread`'s sanitize_turn filter, with
+    /// the same fall-back-to-older-session symptom as claude/codex/pi.
+    #[tokio::test]
+    async fn list_gemini_sessions_for_cwd_includes_short_prompt_session() {
+        let gemini_tmp = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let project_str = project_path.to_string_lossy().to_string();
+        let project_hash = hex_sha256(project_str.as_bytes());
+
+        let chats_dir = gemini_tmp.path().join(&project_hash).join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        // Old long session — survives the old filter.
+        let long_text = "x".repeat(120);
+        let old_file = chats_dir.join("session-old.json");
+        let old_json = serde_json::json!({
+            "projectHash": project_hash,
+            "sessionId": "OLD-G",
+            "lastUpdated": "2026-05-06T00:00:00Z",
+            "messages": [
+                {"type": "user", "timestamp": "2026-05-06T00:00:00Z",
+                 "content": [{"text": long_text}]}
+            ]
+        });
+        fs::write(&old_file, old_json.to_string()).await.unwrap();
+
+        // Today's short-prompt session — the bug case.
+        let new_file = chats_dir.join("session-new.json");
+        let new_json = serde_json::json!({
+            "projectHash": project_hash,
+            "sessionId": "NEW-G",
+            "lastUpdated": "2026-05-12T03:26:40Z",
+            "messages": [
+                {"type": "user", "timestamp": "2026-05-12T03:26:40Z",
+                 "content": [{"text": "hi"}]}
+            ]
+        });
+        fs::write(&new_file, new_json.to_string()).await.unwrap();
+
+        let threads = list_gemini_sessions_for_cwd(gemini_tmp.path(), project.path()).await;
+        let ids: Vec<&str> = threads.iter().map(|t| t.session_id.as_str()).collect();
+        assert!(ids.contains(&"NEW-G"), "short session missing; got {ids:?}");
+        assert!(ids.contains(&"OLD-G"), "long session missing; got {ids:?}");
+    }
+
+    /// Gemini dirs with a different `projectHash` must not leak in.
+    #[tokio::test]
+    async fn list_gemini_sessions_for_cwd_skips_other_cwds() {
+        let gemini_tmp = TempDir::new().unwrap();
+        let mine = TempDir::new().unwrap();
+        let theirs = TempDir::new().unwrap();
+
+        let theirs_str = std::fs::canonicalize(theirs.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let theirs_hash = hex_sha256(theirs_str.as_bytes());
+        let chats_dir = gemini_tmp.path().join(&theirs_hash).join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+        let body = serde_json::json!({
+            "projectHash": theirs_hash,
+            "sessionId": "OTHER-CWD",
+            "messages": []
+        });
+        fs::write(chats_dir.join("session-x.json"), body.to_string())
+            .await
+            .unwrap();
+
+        let threads = list_gemini_sessions_for_cwd(gemini_tmp.path(), mine.path()).await;
+        assert!(
+            threads.is_empty(),
+            "session in a different cwd must not appear; got {:?}",
+            threads.iter().map(|t| &t.session_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: opencode sessions whose `message`/`part` rows are all
+    /// short text used to be filtered out by `opencode_extract_session`'s
+    /// sanitize_turn check. The enumerator must include them so two
+    /// distinct runs don't both collapse onto the same older session.
+    #[tokio::test]
+    async fn list_opencode_sessions_for_cwd_includes_messageless_session() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("opencode.db");
+        let project = TempDir::new().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let project_str = project_path.to_string_lossy().to_string();
+
+        // Minimal opencode schema. Only `project` and `session` are touched
+        // by the stub enumerator — we deliberately omit `message`/`part` to
+        // prove the stub doesn't depend on them.
+        tokio::task::spawn_blocking({
+            let db_path = db_path.clone();
+            let project_str = project_str.clone();
+            move || {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute(
+                    "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, time_updated INTEGER NOT NULL)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO project (id, worktree) VALUES ('p1', ?1)",
+                    [&project_str],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO session (id, project_id, time_updated) VALUES ('OLD-OC', 'p1', 1714867200000)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO session (id, project_id, time_updated) VALUES ('NEW-OC', 'p1', 1715472400000)",
+                    [],
+                )
+                .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let threads = list_opencode_sessions_for_cwd(&db_path, project.path()).await;
+        let ids: Vec<&str> = threads.iter().map(|t| t.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"NEW-OC"),
+            "newer session missing; got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"OLD-OC"),
+            "older session missing; got {ids:?}"
+        );
+    }
+
+    /// Sessions whose `project_id` belongs to a different worktree must
+    /// not leak in.
+    #[tokio::test]
+    async fn list_opencode_sessions_for_cwd_skips_other_cwds() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("opencode.db");
+        let mine = TempDir::new().unwrap();
+        let theirs = TempDir::new().unwrap();
+        let mine_str = std::fs::canonicalize(mine.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let theirs_str = std::fs::canonicalize(theirs.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        tokio::task::spawn_blocking({
+            let db_path = db_path.clone();
+            move || {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute(
+                    "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, time_updated INTEGER NOT NULL)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO project (id, worktree) VALUES ('p1', ?1)",
+                    [&mine_str],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO project (id, worktree) VALUES ('p2', ?1)",
+                    [&theirs_str],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO session (id, project_id, time_updated) VALUES ('NOT-MINE', 'p2', 1715472400000)",
+                    [],
+                )
+                .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let threads = list_opencode_sessions_for_cwd(&db_path, mine.path()).await;
+        assert!(
+            threads.is_empty(),
+            "session in a different cwd must not appear; got {:?}",
+            threads.iter().map(|t| &t.session_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Different-cwd dirs must not leak in — pi's per-cwd encoded dir
+    /// scoping must keep working with the new enumerator.
+    #[tokio::test]
+    async fn list_pi_sessions_for_cwd_skips_other_cwds() {
+        let pi_root = TempDir::new().unwrap();
+        let mine = TempDir::new().unwrap();
+        let theirs = TempDir::new().unwrap();
+
+        let theirs_str = std::fs::canonicalize(theirs.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let theirs_encoded = format!("--{}--", theirs_str.trim_matches('/').replace('/', "-"));
+        let theirs_dir = pi_root.path().join(&theirs_encoded);
+        std::fs::create_dir_all(&theirs_dir).unwrap();
+        let jsonl = format!(
+            "{}\n",
+            serde_json::json!({"type": "session", "id": "OTHER-CWD"})
+        );
+        fs::write(theirs_dir.join("a.jsonl"), jsonl).await.unwrap();
+
+        let threads = list_pi_sessions_for_cwd(pi_root.path(), mine.path()).await;
+        assert!(
+            threads.is_empty(),
+            "session in a different cwd must not appear; got {:?}",
+            threads.iter().map(|t| &t.session_id).collect::<Vec<_>>()
+        );
     }
 }
