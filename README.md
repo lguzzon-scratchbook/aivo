@@ -1,6 +1,7 @@
 [![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
 
-> Aivo is a command-line tool that connects your coding agent to almost any model. It also includes built-in models out of the box — no API keys, no signup.
+> Aivo is a command-line tool that connects your favorite coding agent to almost any model. It also ships with built-in free models to use — no API keys, no signup.
+
 
 ## Docs
 
@@ -168,17 +169,26 @@ Names that collide with built-in subcommands or tool names are rejected.
 
 ## logs
 
-Query the local SQLite log database used by `chat`, `run`, and `serve`. Chat logs include turn content and token usage. `run` and `serve` log metadata only.
+Unified activity feed across aivo's own events (`chat`, `run`, `serve`), native CLI sessions (`claude`, `codex`, `gemini`, `pi`, `opencode`), and `amp` threads. Defaults to the current project's cwd; use `-a` for every project.
 
 ```bash
-aivo logs                                    # newest first
-aivo logs show <id>                          # one entry in detail
-aivo logs status                             # counts, db size, path
+aivo logs                                    # current cwd, newest first
+aivo logs -a                                 # all projects
+aivo logs show <id>                          # logs.db id, native session id, or T-… amp id
+aivo logs status                             # counts and storage paths across sources
 
-aivo logs --by chat -n 5
-aivo logs --by claude --errors
-aivo logs -s "rate limit" --since 7d
-aivo logs --by run --watch                   # live tail
+aivo logs --by claude -n 5                   # claude run-events + native sessions
+aivo logs --by native                        # only native CLI sessions
+aivo logs --by amp                           # only amp threads
+aivo logs -s "rate limit" --since 7d --errors
+aivo logs --watch --jsonl                    # live tail as JSONL
+```
+
+Share a session via a tunneled viewer URL:
+
+```bash
+aivo logs share                              # interactive picker
+aivo logs share <id>                         # share by id prefix
 ```
 
 ## stats
