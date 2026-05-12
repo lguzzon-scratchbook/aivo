@@ -261,7 +261,7 @@ async fn proxy_one(
                 .map(|s| (name.as_str().to_string(), s.to_string()))
         })
         .collect();
-    let _ = out_tx
+    if out_tx
         .send(
             ClientFrame::ResponseHead {
                 id,
@@ -270,15 +270,49 @@ async fn proxy_one(
             }
             .encode(),
         )
-        .await;
+        .await
+        .is_err()
+    {
+        return;
+    }
 
-    let body = resp.bytes().await.unwrap_or_default();
+    // Forward the body as it arrives off the local share. For a chunked-
+    // streaming `/state` long-poll this yields one Bytes per HTTP chunk —
+    // typically one ND-JSON line per token — and the public proxy can
+    // emit each as its own SSE event without waiting for the full body.
+    // For legacy Content-Length responses, hyper still streams bytes off
+    // the socket; we just get one or a few Bytes items.
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        if out_tx
+            .send(
+                ClientFrame::ResponseChunk {
+                    id,
+                    last: false,
+                    body: &chunk,
+                }
+                .encode(),
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     let _ = out_tx
         .send(
             ClientFrame::ResponseChunk {
                 id,
                 last: true,
-                body: &body,
+                body: &[],
             }
             .encode(),
         )

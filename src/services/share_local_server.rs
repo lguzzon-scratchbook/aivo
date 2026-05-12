@@ -45,7 +45,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock};
 
 use crate::services::http_utils::{
-    self, http_error_response, http_response_head_with_extra, read_full_request,
+    self, format_http_chunk, http_chunked_response_head_with_extra, http_error_response,
+    http_response_head_with_extra, read_full_request,
 };
 use crate::services::share_payload::SharePayload;
 use crate::services::share_redact::{RedactCtx, redact};
@@ -215,8 +216,7 @@ async fn run_loop(listener: TcpListener, state: Arc<RwLock<LiveState>>, shutdown
                     }
                 };
             let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            let response = handle_request(&request, &state, &shutdown).await;
-            let _ = socket.write_all(&response).await;
+            let _ = handle_request(&request, &state, &shutdown, &mut socket).await;
         });
     }
 }
@@ -225,7 +225,8 @@ async fn handle_request(
     request: &str,
     state: &Arc<RwLock<LiveState>>,
     shutdown: &ShutdownSignal,
-) -> Vec<u8> {
+    socket: &mut tokio::net::TcpStream,
+) -> std::io::Result<()> {
     let path = http_utils::extract_request_path(request);
     let path_no_query = path.split('?').next().unwrap_or(&path);
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -234,58 +235,128 @@ async fn handle_request(
     let method_is_options = request.starts_with("OPTIONS ");
 
     if method_is_options {
-        return cors_preflight();
+        return socket.write_all(&cors_preflight()).await;
     }
     if !method_is_get {
-        return http_error_response(405, "method not allowed").into_bytes();
+        return socket
+            .write_all(http_error_response(405, "method not allowed").as_bytes())
+            .await;
     }
 
     match path_no_query {
-        "/state" => serve_state(query, state, shutdown, method_is_head).await,
-        _ => http_error_response(404, "not found").into_bytes(),
+        "/state" => serve_state(query, state, shutdown, method_is_head, socket).await,
+        _ => {
+            socket
+                .write_all(http_error_response(404, "not found").as_bytes())
+                .await
+        }
     }
 }
 
+/// Serve `/state`. `wait == 0` is the immediate path — return one full
+/// 200 (`Content-Length`) or 304, matching v2 legacy semantics. `wait > 0`
+/// holds the connection open and streams every cursor advance during the
+/// wait window as an ND-JSON line over `Transfer-Encoding: chunked`.
+/// The public proxy splits on `\n` and emits one SSE event per line.
 async fn serve_state(
     query: &str,
     state: &Arc<RwLock<LiveState>>,
     shutdown: &ShutdownSignal,
     head_only: bool,
-) -> Vec<u8> {
+    socket: &mut tokio::net::TcpStream,
+) -> std::io::Result<()> {
     let wait_secs = query_u64(query, "wait").unwrap_or(0).min(MAX_WAIT_SECS);
-    let since = query_string(query, "since").map(percent_decode);
+    let mut since = query_string(query, "since").map(percent_decode);
 
+    // Immediate-response path: caller didn't ask to long-poll. Preserves
+    // the legacy Content-Length-bounded shape for snapshot fetches and
+    // tests that read until EOF without decoding chunked framing.
+    if wait_secs == 0 {
+        let guard = state.read().await;
+        let resp = if since.as_deref() == Some(guard.cursor.as_str()) {
+            build_state_304(&guard.cursor, head_only)
+        } else {
+            build_state_200(&guard, since.as_deref(), head_only)
+        };
+        drop(guard);
+        return socket.write_all(&resp).await;
+    }
+
+    // Long-poll path: stream cursor advances. Hold the response open until
+    // the deadline so a burst of advances (token-by-token LLM stream)
+    // collapses to one HTTP round-trip with many ND-JSON chunks.
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    let mut head_written = false;
 
     loop {
-        // Arm the wake-notify BEFORE reading the cursor so we don't miss a
-        // refresh that lands between read and await. Notify::notified()
-        // "subscribes" at creation time, not at first poll.
+        // Arm wake-notify BEFORE reading the cursor so we don't miss a
+        // refresh that lands between read and await.
         let wake = state.read().await.wake.clone();
         let notified = wake.notified();
         tokio::pin!(notified);
 
         let current_cursor = state.read().await.cursor.clone();
         if since.as_deref() != Some(current_cursor.as_str()) {
-            // Advanced (or first request). Serialize the delta + return.
-            let guard = state.read().await;
-            return build_state_200(&guard, since.as_deref(), head_only);
+            let line = {
+                let guard = state.read().await;
+                build_state_advance_json(&guard, since.as_deref())
+            };
+
+            if !head_written {
+                let head =
+                    http_chunked_response_head_with_extra(200, "application/json", &cors_extra());
+                socket.write_all(head.as_bytes()).await?;
+                head_written = true;
+                if head_only {
+                    // HEAD: head already sent; close with empty body.
+                    return socket.write_all(b"0\r\n\r\n").await;
+                }
+            }
+
+            // ND-JSON record: one JSON object + trailing `\n`. Combine into
+            // a single chunked write so the line is delivered as one HTTP
+            // chunk; the public proxy splits its receive buffer on `\n`.
+            let mut record = Vec::with_capacity(line.len() + 1);
+            record.extend_from_slice(&line);
+            record.push(b'\n');
+            let chunk = format_http_chunk(&record);
+            socket.write_all(&chunk).await?;
+            socket.flush().await?;
+
+            since = Some(current_cursor.clone());
+            // Keep looping — more advances may arrive within this window.
         }
 
         if Instant::now() >= deadline {
-            return build_state_304(&current_cursor, head_only);
+            if head_written {
+                return socket.write_all(b"0\r\n\r\n").await;
+            }
+            return socket
+                .write_all(&build_state_304(&current_cursor, head_only))
+                .await;
         }
         let remaining = deadline - Instant::now();
 
         tokio::select! {
             _ = notified.as_mut() => continue,
-            _ = shutdown.wait() => return build_state_304(&current_cursor, head_only),
-            _ = tokio::time::sleep(remaining) => return build_state_304(&current_cursor, head_only),
+            _ = shutdown.wait() => {
+                if head_written {
+                    return socket.write_all(b"0\r\n\r\n").await;
+                }
+                return socket
+                    .write_all(&build_state_304(&current_cursor, head_only))
+                    .await;
+            }
+            _ = tokio::time::sleep(remaining) => continue,
         }
     }
 }
 
-fn build_state_200(state: &LiveState, since: Option<&str>, head_only: bool) -> Vec<u8> {
+/// Build one `{meta, cursor, payload}` state-advance JSON object. Shared
+/// by the legacy single-response path and the chunked-streaming path —
+/// the latter wraps each line in HTTP chunked framing plus a trailing
+/// `\n` to form an ND-JSON record.
+fn build_state_advance_json(state: &LiveState, since: Option<&str>) -> Vec<u8> {
     let count = state.messages_json.len();
     let (replace_from, slice_from) = match since.and_then(parse_cursor) {
         Some((s_count, s_last_len)) if s_count == count => {
@@ -327,7 +398,11 @@ fn build_state_200(state: &LiveState, since: Option<&str>, head_only: bool) -> V
     body.extend_from_slice(b",\"schema_version\":");
     body.extend_from_slice(json_string(&state.snapshot.schema_version).as_bytes());
     body.extend_from_slice(b"}}");
+    body
+}
 
+fn build_state_200(state: &LiveState, since: Option<&str>, head_only: bool) -> Vec<u8> {
+    let body = build_state_advance_json(state, since);
     let head = http_response_head_with_extra(200, "application/json", body.len(), &cors_extra());
     let mut out = head.into_bytes();
     if !head_only {
@@ -679,5 +754,94 @@ mod tests {
         assert_eq!(percent_decode("3%3A7"), "3:7");
         assert_eq!(percent_decode("3:7"), "3:7");
         assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    /// Decode an HTTP/1.1 chunked-encoded body. Returns the concatenated
+    /// chunk bodies — stops at the zero-length terminator chunk. Test-
+    /// only; the public proxy uses reqwest which handles this natively.
+    fn decode_chunked(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            let Some(crlf) = body[i..].windows(2).position(|w| w == b"\r\n") else {
+                break;
+            };
+            let len_str = std::str::from_utf8(&body[i..i + crlf]).unwrap_or("0");
+            // Strip any chunk-extension after `;` (we don't emit any).
+            let len_str = len_str.split(';').next().unwrap_or("0").trim();
+            let n = usize::from_str_radix(len_str, 16).unwrap_or(0);
+            i += crlf + 2;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&body[i..i + n]);
+            i += n + 2; // skip trailing \r\n
+        }
+        out
+    }
+
+    /// Long-poll with `since != current` — the very first iteration sees
+    /// an advance and writes the chunked HTTP head + one ND-JSON line.
+    /// At the deadline the server writes the zero-length terminator and
+    /// returns. Verifies wire shape: `Transfer-Encoding: chunked`, one
+    /// JSON-line chunk, then terminator.
+    #[tokio::test]
+    async fn long_poll_with_advance_streams_chunked_ndjson() {
+        let state = build_state(
+            "T-test".into(),
+            fake_payload(),
+            false,
+            RedactCtx::default(),
+            None,
+        );
+        let shutdown = ShutdownSignal::new();
+        let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
+            .await
+            .unwrap();
+
+        let (status, head, body) = http_get_with_head(port, "/state?wait=1&since=bogus").await;
+        assert_eq!(status, 200);
+        assert!(
+            head.to_lowercase().contains("transfer-encoding: chunked"),
+            "expected chunked transfer encoding, got head:\n{head}"
+        );
+        let decoded = decode_chunked(&body);
+        let text = std::str::from_utf8(&decoded).expect("decoded body is utf-8");
+        // Exactly one ND-JSON record with a trailing `\n`.
+        assert!(
+            text.ends_with('\n'),
+            "expected trailing newline on ND-JSON record, got: {text:?}"
+        );
+        let line = text.trim_end_matches('\n');
+        assert!(
+            !line.contains('\n'),
+            "expected a single line for a single advance, got: {line:?}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("ND-JSON line parses as JSON");
+        assert_eq!(parsed["payload"]["replace_from"], 0);
+        assert_eq!(parsed["payload"]["messages"][0]["role"], "user");
+        assert!(parsed["cursor"].as_str().is_some());
+
+        shutdown.fire();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Like `http_get` but also returns the head text — needed to
+    /// inspect `Transfer-Encoding` on the chunked-streaming path.
+    async fn http_get_with_head(port: u16, path: &str) -> (u16, String, Vec<u8>) {
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes())
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = std::str::from_utf8(&buf[..head_end]).unwrap().to_string();
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let body = buf[head_end + 4..].to_vec();
+        (status, head, body)
     }
 }
