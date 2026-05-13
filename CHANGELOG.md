@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.21.2
+
+## Features
+
+- `aivo-starter`: detect removed models before launch and re-prompt for a replacement.
+
+## Improvements
+
+- `aivo share`: replace the fullscreen TUI picker with an inline picker.
+
+## Fixes
+
+- Tests: gate Unix-shaped `pi` cwd encoding tests on `cfg(unix)`.
+
+## Polish
+
+- Services: route OpenRouter base-URL checks through a shared `is_openrouter_base` helper.
+
+---
+
 ## v0.21.1
 
 ## Fixes
