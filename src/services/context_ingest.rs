@@ -84,6 +84,13 @@ pub struct IngestOptions {
     pub min_updated_at: Option<DateTime<Utc>>,
     /// `Some(n)` early-exits each source after `n` extractions; `None` = all.
     pub max_per_source: Option<usize>,
+    /// When true, accept sessions whose first user turn falls under
+    /// `MIN_TURN_CHARS` ("hi", "ok", …). The text still passes through
+    /// `strip_aivo_context` and is rejected only if empty after that.
+    /// Set by listing callers (`aivo logs`, share picker) so today's
+    /// short-prompt sessions show up. Context-injection callers leave it
+    /// false — short prompts don't help seed prior context.
+    pub include_short_first_user: bool,
 }
 
 impl Default for IngestOptions {
@@ -92,6 +99,7 @@ impl Default for IngestOptions {
             max_age_days: Some(DEFAULT_THREAD_MAX_AGE_DAYS),
             min_updated_at: None,
             max_per_source: Some(DEFAULT_MAX_THREADS_PER_SOURCE),
+            include_short_first_user: false,
         }
     }
 }
@@ -103,6 +111,7 @@ impl IngestOptions {
             max_age_days: None,
             min_updated_at: None,
             max_per_source: None,
+            include_short_first_user: false,
         }
     }
 }
@@ -131,14 +140,15 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let canonical_str = canonical_root.to_string_lossy().to_string();
     let cap = opts.max_per_source;
+    let permissive = opts.include_short_first_user;
 
     // Independent I/O — fan out across sources concurrently.
     let (claude, codex, gemini, pi, opencode) = tokio::join!(
-        ingest_claude(&canonical_root, cap),
-        ingest_codex(&canonical_str, cap),
-        ingest_gemini(&canonical_str, cap),
-        ingest_pi(&canonical_str, cap),
-        ingest_opencode(canonical_str.clone(), cap),
+        ingest_claude(&canonical_root, cap, permissive),
+        ingest_codex(&canonical_str, cap, permissive),
+        ingest_gemini(&canonical_str, cap, permissive),
+        ingest_pi(&canonical_str, cap, permissive),
+        ingest_opencode(canonical_str.clone(), cap, permissive),
     );
 
     let mut threads: Vec<Thread> =
@@ -164,6 +174,7 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
 /// `updated_at`.
 pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Thread>> {
     let cap = opts.max_per_source;
+    let permissive = opts.include_short_first_user;
     // Push the time cutoff down to the file walks: each per-source ingester
     // drops jsonl files whose mtime is already older than the cutoff before
     // touching them. mtime ≥ last-message-ts for an append-only jsonl, so a
@@ -171,11 +182,11 @@ pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Th
     let cutoff = effective_cutoff(&opts);
     let cutoff_st = cutoff.map(SystemTime::from);
     let (claude, codex, gemini, pi, opencode) = tokio::join!(
-        ingest_claude_global(cap, cutoff_st),
-        ingest_codex_global(cap, cutoff_st),
-        ingest_gemini_global(cap, cutoff_st),
-        ingest_pi_global(cap, cutoff_st),
-        ingest_opencode_global(cap, cutoff),
+        ingest_claude_global(cap, cutoff_st, permissive),
+        ingest_codex_global(cap, cutoff_st, permissive),
+        ingest_gemini_global(cap, cutoff_st, permissive),
+        ingest_pi_global(cap, cutoff_st, permissive),
+        ingest_opencode_global(cap, cutoff, permissive),
     );
 
     let mut threads: Vec<Thread> =
@@ -196,7 +207,11 @@ pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Th
     Ok(threads)
 }
 
-async fn ingest_claude_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
+async fn ingest_claude_global(
+    cap: Option<usize>,
+    after: Option<SystemTime>,
+    permissive: bool,
+) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -244,14 +259,18 @@ async fn ingest_claude_global(cap: Option<usize>, after: Option<SystemTime>) -> 
         {
             break;
         }
-        if let Some(thread) = extract_claude_thread(&path).await {
+        if let Some(thread) = extract_claude_thread(&path, permissive).await {
             out.push(thread);
         }
     }
     out
 }
 
-async fn ingest_codex_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
+async fn ingest_codex_global(
+    cap: Option<usize>,
+    after: Option<SystemTime>,
+    permissive: bool,
+) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -267,7 +286,7 @@ async fn ingest_codex_global(cap: Option<usize>, after: Option<SystemTime>) -> V
         {
             break;
         }
-        if let Some(thread) = extract_codex_thread_any(&path).await {
+        if let Some(thread) = extract_codex_thread_any(&path, permissive).await {
             out.push(thread);
         }
     }
@@ -276,7 +295,7 @@ async fn ingest_codex_global(cap: Option<usize>, after: Option<SystemTime>) -> V
 
 /// Codex extractor without the cwd filter — accepts any session_meta.cwd
 /// and surfaces it on the resulting `Thread`. Used by the global ingester.
-async fn extract_codex_thread_any(path: &Path) -> Option<Thread> {
+async fn extract_codex_thread_any(path: &Path, permissive: bool) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -322,13 +341,15 @@ async fn extract_codex_thread_any(path: &Path) -> Option<Thread> {
         {
             let role = payload.get("role").and_then(|s| s.as_str()).unwrap_or("");
             let raw = extract_codex_message_text(payload).unwrap_or_default();
-            let text = match sanitize_turn(&raw) {
-                Some(t) => t,
-                None => continue,
-            };
             match role {
-                "user" if first_user.is_none() => first_user = Some(text),
-                "assistant" => last_assistant = Some(text),
+                "user" if first_user.is_none() => {
+                    first_user = pick_first_user_turn(&raw, permissive);
+                }
+                "assistant" => {
+                    if let Some(t) = sanitize_turn(&raw) {
+                        last_assistant = Some(t);
+                    }
+                }
                 _ => {}
             }
         }
@@ -345,7 +366,11 @@ async fn extract_codex_thread_any(path: &Path) -> Option<Thread> {
     })
 }
 
-async fn ingest_gemini_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
+async fn ingest_gemini_global(
+    cap: Option<usize>,
+    after: Option<SystemTime>,
+    permissive: bool,
+) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -391,14 +416,18 @@ async fn ingest_gemini_global(cap: Option<usize>, after: Option<SystemTime>) -> 
         {
             break;
         }
-        if let Some(thread) = extract_gemini_thread(&path).await {
+        if let Some(thread) = extract_gemini_thread(&path, permissive).await {
             out.push(thread);
         }
     }
     out
 }
 
-async fn ingest_pi_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
+async fn ingest_pi_global(
+    cap: Option<usize>,
+    after: Option<SystemTime>,
+    permissive: bool,
+) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -443,14 +472,18 @@ async fn ingest_pi_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<
         {
             break;
         }
-        if let Some(thread) = extract_pi_thread(&path).await {
+        if let Some(thread) = extract_pi_thread(&path, permissive).await {
             out.push(thread);
         }
     }
     out
 }
 
-async fn ingest_opencode_global(cap: Option<usize>, after: Option<DateTime<Utc>>) -> Vec<Thread> {
+async fn ingest_opencode_global(
+    cap: Option<usize>,
+    after: Option<DateTime<Utc>>,
+    permissive: bool,
+) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -467,12 +500,14 @@ async fn ingest_opencode_global(cap: Option<usize>, after: Option<DateTime<Utc>>
     // cutoff so the SQL doesn't need two prepared statements.
     let after_ms = after.map(|dt| dt.timestamp_millis()).unwrap_or(0);
 
-    tokio::task::spawn_blocking(move || opencode_query_global(&db_path, cap_i, after_ms))
-        .await
-        .unwrap_or_default()
+    tokio::task::spawn_blocking(move || {
+        opencode_query_global(&db_path, cap_i, after_ms, permissive)
+    })
+    .await
+    .unwrap_or_default()
 }
 
-fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64) -> Vec<Thread> {
+fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64, permissive: bool) -> Vec<Thread> {
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -505,9 +540,13 @@ fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64) -> Vec<Thread>
 
     let mut out = Vec::new();
     for (session_id, time_updated_ms, worktree) in rows {
-        if let Some(thread) =
-            opencode_extract_session(&conn, &session_id, time_updated_ms, Some(worktree))
-        {
+        if let Some(thread) = opencode_extract_session(
+            &conn,
+            &session_id,
+            time_updated_ms,
+            Some(worktree),
+            permissive,
+        ) {
             out.push(thread);
         }
     }
@@ -518,7 +557,7 @@ fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64) -> Vec<Thread>
 // Claude: ~/.claude/projects/<encoded-cwd>/*.jsonl
 // ---------------------------------------------------------------------------
 
-async fn ingest_claude(canonical_root: &Path, cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_claude(canonical_root: &Path, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -539,7 +578,7 @@ async fn ingest_claude(canonical_root: &Path, cap: Option<usize>) -> Vec<Thread>
         {
             break;
         }
-        if let Some(thread) = extract_claude_thread(&path).await {
+        if let Some(thread) = extract_claude_thread(&path, permissive).await {
             out.push(thread);
         }
     }
@@ -642,7 +681,7 @@ async fn extract_claude_session_stub(path: &Path) -> Option<Thread> {
 // Codex: ~/.codex/sessions/YYYY/MM/DD/*.jsonl, per-file cwd match
 // ---------------------------------------------------------------------------
 
-async fn ingest_codex(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_codex(canonical_root: &str, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -660,7 +699,7 @@ async fn ingest_codex(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
         {
             break;
         }
-        if let Some(thread) = extract_codex_thread(&path, canonical_root).await {
+        if let Some(thread) = extract_codex_thread(&path, canonical_root, permissive).await {
             out.push(thread);
         }
     }
@@ -768,7 +807,7 @@ async fn extract_codex_session_stub(path: &Path, project_root: &str) -> Option<T
 // Gemini: ~/.gemini/tmp/<sha256(abs_cwd)>/chats/session-*.json
 // ---------------------------------------------------------------------------
 
-async fn ingest_gemini(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_gemini(canonical_root: &str, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
     let paths = gemini_matching_session_files(canonical_root).await;
     let mut out = Vec::new();
     for path in paths {
@@ -777,7 +816,7 @@ async fn ingest_gemini(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> 
         {
             break;
         }
-        if let Some(thread) = extract_gemini_thread(&path).await {
+        if let Some(thread) = extract_gemini_thread(&path, permissive).await {
             out.push(thread);
         }
     }
@@ -852,7 +891,7 @@ pub(crate) async fn gemini_matching_session_files_in(
     entries.into_iter().map(|(p, _)| p).collect()
 }
 
-async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
+async fn extract_gemini_thread(path: &Path, permissive: bool) -> Option<Thread> {
     let content = match fs::read_to_string(path).await {
         Ok(c) => c,
         Err(err) => {
@@ -881,10 +920,6 @@ async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
             continue;
         }
         let raw = extract_gemini_content(msg.get("content")).unwrap_or_default();
-        let text = match sanitize_turn(&raw) {
-            Some(t) => t,
-            None => continue,
-        };
         if let Some(ts) = msg.get("timestamp").and_then(|s| s.as_str())
             && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
         {
@@ -892,10 +927,12 @@ async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
         }
         match kind {
             "user" if first_user.is_none() => {
-                first_user = Some(text);
+                first_user = pick_first_user_turn(&raw, permissive);
             }
             "gemini" => {
-                last_assistant = Some(text);
+                if let Some(t) = sanitize_turn(&raw) {
+                    last_assistant = Some(t);
+                }
             }
             _ => {}
         }
@@ -1072,7 +1109,7 @@ pub(crate) fn pi_session_dir(canonical_root: &str) -> Option<PathBuf> {
     )
 }
 
-async fn ingest_pi(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_pi(canonical_root: &str, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
     let session_dir = match pi_session_dir(canonical_root) {
         Some(d) if d.exists() => d,
         _ => return Vec::new(),
@@ -1086,14 +1123,14 @@ async fn ingest_pi(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
         {
             break;
         }
-        if let Some(thread) = extract_pi_thread(&path).await {
+        if let Some(thread) = extract_pi_thread(&path, permissive).await {
             out.push(thread);
         }
     }
     out
 }
 
-async fn extract_pi_thread(path: &Path) -> Option<Thread> {
+async fn extract_pi_thread(path: &Path, permissive: bool) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -1140,16 +1177,14 @@ async fn extract_pi_thread(path: &Path) -> Option<Thread> {
         };
         let role = message.get("role").and_then(|s| s.as_str()).unwrap_or("");
         let raw = extract_pi_text(message).unwrap_or_default();
-        let text = match sanitize_turn(&raw) {
-            Some(t) => t,
-            None => continue,
-        };
         match role {
             "user" if first_user.is_none() => {
-                first_user = Some(text);
+                first_user = pick_first_user_turn(&raw, permissive);
             }
             "assistant" => {
-                last_assistant = Some(text);
+                if let Some(t) = sanitize_turn(&raw) {
+                    last_assistant = Some(t);
+                }
             }
             _ => {}
         }
@@ -1285,7 +1320,11 @@ pub(crate) fn extract_pi_text(message: &Value) -> Option<String> {
 // OpenCode: SQLite at ~/.local/share/opencode/opencode.db
 // ---------------------------------------------------------------------------
 
-async fn ingest_opencode(canonical_root: String, cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_opencode(
+    canonical_root: String,
+    cap: Option<usize>,
+    permissive: bool,
+) -> Vec<Thread> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -1301,12 +1340,14 @@ async fn ingest_opencode(canonical_root: String, cap: Option<usize>) -> Vec<Thre
     let cap_i = cap.unwrap_or(1_000) as i64;
 
     // rusqlite is sync — run the whole query block in spawn_blocking.
-    tokio::task::spawn_blocking(move || opencode_query(&db_path, &canonical_root, cap_i))
-        .await
-        .unwrap_or_default()
+    tokio::task::spawn_blocking(move || {
+        opencode_query(&db_path, &canonical_root, cap_i, permissive)
+    })
+    .await
+    .unwrap_or_default()
 }
 
-fn opencode_query(db_path: &Path, project_root: &str, cap: i64) -> Vec<Thread> {
+fn opencode_query(db_path: &Path, project_root: &str, cap: i64, permissive: bool) -> Vec<Thread> {
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1356,6 +1397,7 @@ fn opencode_query(db_path: &Path, project_root: &str, cap: i64) -> Vec<Thread> {
             &session_id,
             time_updated_ms,
             Some(project_root.to_string()),
+            permissive,
         ) {
             out.push(thread);
         }
@@ -1368,9 +1410,10 @@ fn opencode_extract_session(
     session_id: &str,
     time_updated_ms: i64,
     worktree: Option<String>,
+    permissive: bool,
 ) -> Option<Thread> {
-    // Join messages to their text parts, ordered chronologically. The first
-    // `role=user` with substantive text → topic; the last `role=assistant` → last_response.
+    // Join messages to their text parts, ordered chronologically. First
+    // `role=user` → topic; last `role=assistant` → last_response.
     let mut stmt = conn
         .prepare(
             "SELECT json_extract(m.data, '$.role') AS role, p.data
@@ -1399,16 +1442,14 @@ fn opencode_extract_session(
             Err(_) => continue,
         };
         let raw = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
-        let text = match sanitize_turn(raw) {
-            Some(t) => t,
-            None => continue,
-        };
         match role.as_str() {
             "user" if first_user.is_none() => {
-                first_user = Some(text);
+                first_user = pick_first_user_turn(raw, permissive);
             }
             "assistant" => {
-                last_assistant = Some(text);
+                if let Some(t) = sanitize_turn(raw) {
+                    last_assistant = Some(t);
+                }
             }
             _ => {}
         }
@@ -1598,7 +1639,7 @@ fn warn_unreadable_session(path: &Path, reason: &str) {
 // Per-file JSONL extractors
 // ---------------------------------------------------------------------------
 
-async fn extract_claude_thread(path: &Path) -> Option<Thread> {
+async fn extract_claude_thread(path: &Path, permissive: bool) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -1651,10 +1692,6 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
         }
 
         let raw = extract_claude_text(v.get("message")).unwrap_or_default();
-        let text = match sanitize_turn(&raw) {
-            Some(t) => t,
-            None => continue,
-        };
 
         if let Some(ts) = v.get("timestamp").and_then(|s| s.as_str())
             && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
@@ -1664,10 +1701,12 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
 
         match kind {
             "user" if first_user.is_none() => {
-                first_user = Some(text);
+                first_user = pick_first_user_turn(&raw, permissive);
             }
             "assistant" => {
-                last_assistant = Some(text);
+                if let Some(t) = sanitize_turn(&raw) {
+                    last_assistant = Some(t);
+                }
             }
             _ => {}
         }
@@ -1696,7 +1735,7 @@ fn decode_claude_cwd(path: &Path) -> Option<String> {
 }
 
 /// Returns Some iff the session's session_meta.cwd matches the project root.
-async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread> {
+async fn extract_codex_thread(path: &Path, project_root: &str, permissive: bool) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -1750,16 +1789,14 @@ async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread>
         {
             let role = payload.get("role").and_then(|s| s.as_str()).unwrap_or("");
             let raw = extract_codex_message_text(payload).unwrap_or_default();
-            let text = match sanitize_turn(&raw) {
-                Some(t) => t,
-                None => continue,
-            };
             match role {
                 "user" if first_user.is_none() => {
-                    first_user = Some(text);
+                    first_user = pick_first_user_turn(&raw, permissive);
                 }
                 "assistant" => {
-                    last_assistant = Some(text);
+                    if let Some(t) = sanitize_turn(&raw) {
+                        last_assistant = Some(t);
+                    }
                 }
                 _ => {}
             }
@@ -1822,6 +1859,27 @@ pub(crate) fn extract_codex_message_text(payload: &Value) -> Option<String> {
         }
     }
     if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Pick the first user turn for use as a session title. Both modes strip
+/// aivo-context echo and skip turns dominated by CLI-harness boilerplate
+/// (`<environment_context>`, `<local-command-caveat>`, …) — those aren't
+/// what the user said. Strict mode additionally enforces `MIN_TURN_CHARS`;
+/// permissive mode keeps short prompts like "hi" as the row title.
+fn pick_first_user_turn(raw: &str, permissive: bool) -> Option<String> {
+    let cleaned = strip_aivo_context(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    if BOILERPLATE_MARKERS.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+    if !permissive && trimmed.chars().count() < MIN_TURN_CHARS {
+        return None;
+    }
+    Some(truncate_chars(trimmed, MAX_TURN_CHARS))
 }
 
 fn is_substantive(text: &str) -> bool {
@@ -1984,7 +2042,9 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
 
-        let thread = extract_claude_thread(&path).await.expect("should extract");
+        let thread = extract_claude_thread(&path, false)
+            .await
+            .expect("should extract");
         assert_eq!(thread.cli, "claude");
         assert_eq!(thread.session_id, "sess1");
         assert!(thread.topic.starts_with("Please explain how the cursor"));
@@ -2001,7 +2061,26 @@ mod tests {
             r#"{"type":"assistant","sessionId":"sess1","isSidechain":false,"message":{"content":"ok"}}"#,
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
-        assert!(extract_claude_thread(&path).await.is_none());
+        assert!(extract_claude_thread(&path, false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn extract_claude_thread_permissive_keeps_short_turns() {
+        // Listing callers set `permissive=true` so today's `hi`/`ok` sessions
+        // show up in `aivo logs` instead of vanishing under MIN_TURN_CHARS.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let lines = [
+            r#"{"type":"user","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:00:00Z","cwd":"/tmp/p","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:00:05Z","message":{"content":[{"type":"text","text":"Hi!"}]}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).await.unwrap();
+
+        let thread = extract_claude_thread(&path, true)
+            .await
+            .expect("permissive extractor keeps short-turn sessions");
+        assert_eq!(thread.session_id, "sess1");
+        assert_eq!(thread.topic, "hi");
     }
 
     #[tokio::test]
@@ -2018,8 +2097,8 @@ mod tests {
         fs::write(&path, lines.join("\n")).await.unwrap();
 
         assert!(
-            extract_claude_thread(&path).await.is_none(),
-            "regular extractor still rejects short turns (regression guard)"
+            extract_claude_thread(&path, false).await.is_none(),
+            "strict extractor still rejects short turns (regression guard for `aivo run` context injection)"
         );
         let stub = extract_claude_session_stub(&path)
             .await
@@ -2061,7 +2140,7 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
 
-        let thread = extract_codex_thread(&path, &proj_str)
+        let thread = extract_codex_thread(&path, &proj_str, false)
             .await
             .expect("matched cwd");
         assert_eq!(thread.cli, "codex");
@@ -2079,7 +2158,11 @@ mod tests {
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Lorem ipsum dolor sit amet consectetur"}]}}"#,
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
-        assert!(extract_codex_thread(&path, "/not/matching").await.is_none());
+        assert!(
+            extract_codex_thread(&path, "/not/matching", false)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2123,6 +2206,7 @@ mod tests {
             max_age_days: Some(1),
             min_updated_at: Some(Utc::now() - chrono::Duration::days(30)),
             max_per_source: None,
+            include_short_first_user: false,
         };
         let cutoff = effective_cutoff(&recent).unwrap();
         assert!(cutoff > Utc::now() - chrono::Duration::days(2));
@@ -2132,6 +2216,7 @@ mod tests {
             max_age_days: Some(30),
             min_updated_at: Some(Utc::now() - chrono::Duration::days(1)),
             max_per_source: None,
+            include_short_first_user: false,
         };
         let cutoff = effective_cutoff(&explicit).unwrap();
         assert!(cutoff > Utc::now() - chrono::Duration::days(2));
@@ -2143,6 +2228,7 @@ mod tests {
             max_age_days: None,
             min_updated_at: None,
             max_per_source: None,
+            include_short_first_user: false,
         };
         assert!(effective_cutoff(&opts).is_none());
     }

@@ -100,6 +100,15 @@ pub struct ToolCount {
     pub count: u64,
 }
 
+/// Aivo-side metadata captured at launch and joined onto a native session
+/// row. Sourced from the `[run]` finished event whose `session_id` matches
+/// the native session file the launched CLI just produced.
+#[derive(Debug, Clone, Default)]
+pub struct RunMeta {
+    pub key_name: Option<String>,
+    pub exit_code: Option<i64>,
+}
+
 impl LogStore {
     pub fn new(config_dir: PathBuf) -> Self {
         Self {
@@ -203,11 +212,12 @@ impl LogStore {
         .context("Failed to join log get task")?
     }
 
-    /// Like `get_by_reference` but prefix-matches the id and event_group_id
-    /// columns. Used by the share resolver because `aivo logs` displays
-    /// truncated ids (8 chars) and pasting one needs to find the full row.
-    /// Returns at most `limit` matches; collisions are surfaced to the
-    /// caller for disambiguation.
+    /// Like `get_by_reference` but prefix-matches the id, event_group_id,
+    /// and session_id columns. Used by the share resolver and `aivo logs
+    /// show` because the listing displays the most useful id per source:
+    /// row id for run/serve, event_group_id for collapsed run pairs,
+    /// session_id for chat rows. Returns at most `limit` matches;
+    /// collisions are surfaced to the caller for disambiguation.
     pub async fn find_by_id_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<LogEntry>> {
         let path = self.path.clone();
         let prefix = prefix.trim().to_string();
@@ -221,6 +231,7 @@ impl LogStore {
                 "select {} from events
                   where id like ?1 || '%'
                      or event_group_id like ?1 || '%'
+                     or session_id like ?1 || '%'
                   order by ts_utc desc
                   limit ?2",
                 event_select_columns(true)
@@ -231,17 +242,134 @@ impl LogStore {
             for row in rows {
                 out.push(row?);
             }
-            // Collapse duplicates by event_group_id: a run start+finish pair
-            // shares a group id and should resolve to a single hit.
+            // Collapse duplicates: a run start+finish pair shares
+            // `event_group_id`; multiple chat events share `session_id`. Keep
+            // the most recent row in each group (rows arrive ts_utc desc).
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             out.retain(|e| {
-                let key = e.event_group_id.clone().unwrap_or_else(|| e.id.clone());
+                let key = e
+                    .event_group_id
+                    .clone()
+                    .or_else(|| e.session_id.clone())
+                    .unwrap_or_else(|| e.id.clone());
                 seen.insert(key)
             });
             Ok(out)
         })
         .await
         .context("Failed to join log prefix-find task")?
+    }
+
+    /// Every distinct `session_id` referenced by a chat event in logs.db.
+    /// Used by `aivo logs prune` to spot chat sessions whose underlying
+    /// file has been deleted (orphan logs.db entries).
+    pub async fn distinct_chat_session_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<String>> {
+            if !path.exists() {
+                return Ok(std::collections::HashSet::new());
+            }
+            let conn = open_read_connection(&path)?;
+            let mut stmt = conn.prepare(
+                "select distinct session_id from events \
+                 where source = 'chat' and session_id is not null",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut out = std::collections::HashSet::new();
+            for row in rows {
+                out.insert(row?);
+            }
+            Ok(out)
+        })
+        .await
+        .context("Failed to join distinct-chat-session-ids task")?
+    }
+
+    /// Look up `[run]` finished-event metadata for a batch of native
+    /// session ids. Returns `(key_name, exit_code)` per session id that
+    /// has a matching `tool_launch` finished row. Used by `aivo logs` to
+    /// enrich native rows with the aivo-side context that the native
+    /// session file alone doesn't carry (which key was used, exit status).
+    pub async fn run_meta_for_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, RunMeta>> {
+        if session_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let path = self.path.clone();
+        let ids: Vec<String> = session_ids.to_vec();
+        tokio::task::spawn_blocking(
+            move || -> Result<std::collections::HashMap<String, RunMeta>> {
+                if !path.exists() {
+                    return Ok(std::collections::HashMap::new());
+                }
+                let conn = open_read_connection(&path)?;
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "select session_id, key_name, exit_code from events \
+                 where source = 'run' and phase = 'finished' \
+                   and session_id in ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                let rows = stmt.query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })?;
+                let mut out = std::collections::HashMap::new();
+                for row in rows {
+                    let (sid, key_name, exit_code) = row?;
+                    out.insert(
+                        sid,
+                        RunMeta {
+                            key_name,
+                            exit_code,
+                        },
+                    );
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .context("Failed to join run-meta-for-sessions task")?
+    }
+
+    /// Delete every chat event whose `session_id` is in `ids`. Used by
+    /// `aivo logs prune` to clean up orphan rows. Returns the number of
+    /// events removed.
+    pub async fn delete_chat_events_by_session_ids(&self, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let path = self.path.clone();
+        let ids: Vec<String> = ids.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            if !path.exists() {
+                return Ok(0);
+            }
+            let mut conn = open_connection(&path)?;
+            let tx = conn.transaction()?;
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "delete from events where source = 'chat' and session_id in ({placeholders})"
+            );
+            let params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let affected = tx.execute(&sql, params.as_slice())?;
+            tx.commit()?;
+            Ok(affected as u64)
+        })
+        .await
+        .context("Failed to join delete-chat-events task")?
     }
 
     pub async fn get_by_reference(&self, reference: &str) -> Result<Option<LogEntry>> {
@@ -533,8 +661,33 @@ fn build_list_query(query: &LogQuery, include_run_phase_fields: bool) -> (String
         params.push(SqlValue::Text(term));
     }
     if let Some(cwd) = normalize_text_filter(query.cwd.clone()) {
-        sql.push_str(" and lower(coalesce(cwd, '')) like ?");
-        params.push(SqlValue::Text(format!("%{cwd}%")));
+        // "this directory or its descendants" — equality first, then a
+        // `cwd/%` prefix. A bare substring match would falsely include
+        // sibling dirs that share a path prefix (e.g. filter `/foo/bar`
+        // also matching `/foo/bar-other`).
+        //
+        // Cross-platform normalization:
+        //   - trailing separators (`/` or `\`) stripped on both sides
+        //   - the filter's backslashes pre-flipped to `/` in Rust
+        //   - the stored cwd's backslashes flipped to `/` on the SQL side
+        //     via `replace(..., '\', '/')` so a row written as
+        //     `C:\Users\yc` matches a filter typed as `C:/Users/yc`
+        // The `lower()` on both sides keeps comparisons case-insensitive
+        // (`normalize_text_filter` already lowercased the filter, but the
+        // column might still hold mixed case on Windows or from older
+        // writes). Index loss from the function wrapping is acceptable —
+        // we already filter by `ts_utc desc` first.
+        let cwd: String = cwd
+            .trim_end_matches(['/', '\\'])
+            .chars()
+            .map(|ch| if ch == '\\' { '/' } else { ch })
+            .collect();
+        sql.push_str(
+            " and (replace(lower(coalesce(cwd, '')), '\\', '/') = ? \
+                or replace(lower(coalesce(cwd, '')), '\\', '/') like ? || '/%')",
+        );
+        params.push(SqlValue::Text(cwd.clone()));
+        params.push(SqlValue::Text(cwd));
     }
     if let Some(since) = normalize_query_value(query.since.clone()) {
         sql.push_str(" and ts_utc >= ?");

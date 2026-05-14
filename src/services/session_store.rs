@@ -1707,6 +1707,10 @@ impl SessionStore {
             .await
     }
 
+    pub async fn chat_session_ids_on_disk(&self) -> std::collections::HashSet<String> {
+        self.sessions.session_ids_on_disk().await
+    }
+
     pub async fn all_chat_sessions(&self) -> Result<Vec<SessionIndexEntry>> {
         self.sessions.all_chat_sessions().await
     }

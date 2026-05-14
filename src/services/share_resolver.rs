@@ -135,7 +135,12 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
                     .session_store
                     .get_chat_session(&chat_id)
                     .await?
-                    .ok_or_else(|| anyhow!("chat session '{}' missing on disk", chat_id))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "chat session '{}' was deleted (logs.db still has its events but the session file is gone). Run `aivo logs prune` to remove orphan chat events.",
+                            chat_id
+                        )
+                    })?;
                 let payload = extract_chat_full(&state, ctx.project_root.to_str())?;
                 return Ok(ResolvedSession { payload });
             }
@@ -628,6 +633,10 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
                 max_age_days: None,
                 min_updated_at: None,
                 max_per_source: Some(50),
+                // Run-event fallback resolves short sessions too — the
+                // resolver looks up the native session that aivo launched,
+                // and that session might have started with a short prompt.
+                include_short_first_user: true,
             };
             context_ingest::ingest_project(run_path, opts)
                 .await?

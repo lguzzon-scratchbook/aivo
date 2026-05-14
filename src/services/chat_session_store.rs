@@ -390,6 +390,31 @@ impl ChatSessionStore {
         }
     }
 
+    /// Returns the set of chat session ids that currently exist as files
+    /// under `sessions/`. Used by `aivo logs` to detect chat events in
+    /// logs.db that reference a deleted session file (orphans).
+    pub(crate) async fn session_ids_on_disk(&self) -> std::collections::HashSet<String> {
+        let dir = self.sessions_dir();
+        let mut out = std::collections::HashSet::new();
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+            return out;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem == "index" {
+                continue;
+            }
+            out.insert(stem.to_string());
+        }
+        out
+    }
+
     /// Closest chat session by `updated_at` to `ts`, restricted to `cwd` (and
     /// `key_id` when provided). Used to back-fill the session linkage on
     /// `chat`-source log rows written before `log_store::LogEvent.session_id`

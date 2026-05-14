@@ -26,6 +26,7 @@ use crate::services::launch_runtime::{
 use crate::services::log_store::{LogEvent, new_log_id};
 use crate::services::model_names::{is_gpt_chat_model_name, is_openai_style_model_name};
 use crate::services::models_cache::ModelsCache;
+use crate::services::native_session_probe::SessionProbe;
 use crate::services::ollama;
 use crate::services::path_search::{collect_path_dirs, collect_path_dirs_from, find_in_dirs};
 use crate::services::provider_profile::{
@@ -438,6 +439,12 @@ impl AILauncher {
             })
             .await;
 
+        // Snapshot the launched CLI's session dir so we can identify the
+        // new session file it produces and link the [run] event to it.
+        // Cwd-scoped where the layout supports it, so a heavy user with
+        // thousands of historical sessions still pays only ms.
+        let probe = SessionProbe::snapshot(options.tool, cwd.as_deref()).await;
+
         let child_result = self.spawn_child(
             &resolved.tool_config.command,
             &runtime_args.args,
@@ -502,6 +509,7 @@ impl AILauncher {
         .await;
 
         let exit_code = result.as_ref().ok().copied();
+        let detected_session_id = probe.detect_new().await;
         let _ = self
             .session_store
             .logs()
@@ -509,6 +517,7 @@ impl AILauncher {
                 phase: Some("finished".to_string()),
                 exit_code: exit_code.map(i64::from),
                 duration_ms: Some(started_at.elapsed().as_millis() as i64),
+                session_id: detected_session_id,
                 payload_json: Some(serde_json::json!({
                     "command": resolved.tool_config.command,
                     "args": runtime_args.args,

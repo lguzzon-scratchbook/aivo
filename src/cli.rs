@@ -571,6 +571,10 @@ pub struct LogsArgs {
     /// `logs share`: bind only on 127.0.0.1 — local debugging without the public tunnel.
     #[arg(long, hide = true)]
     pub debug_local_only: bool,
+
+    /// `logs prune`: skip the interactive confirmation and delete immediately.
+    #[arg(short = 'f', long)]
+    pub force: bool,
 }
 
 /// Arguments for the chat command

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use crate::services::SessionStore;
 use crate::services::amp_threads;
 use crate::services::context_ingest::{self, IngestOptions};
 use crate::services::id_compact::compact_id;
-use crate::services::log_store::{LogEntry, LogQuery};
+use crate::services::log_store::{LogEntry, LogQuery, RunMeta};
 use crate::services::project_id::Thread;
 use crate::services::system_env;
 use crate::style;
@@ -24,7 +24,7 @@ use crate::style;
 /// and amp threads. Each variant carries its own provenance and time, so
 /// the merge sort + filter pipeline can treat them uniformly.
 #[derive(Debug, Clone)]
-enum UnifiedRow {
+pub(crate) enum UnifiedRow {
     // LogEntry is large (~1KB worth of optional fields); box to keep the
     // enum's stack footprint reasonable for `Vec<UnifiedRow>` allocation.
     Log(Box<LogEntry>),
@@ -33,11 +33,11 @@ enum UnifiedRow {
 }
 
 #[derive(Debug, Clone)]
-struct AmpRow {
-    id: String,
-    title: Option<String>,
-    updated_at: DateTime<Utc>,
-    message_count: u64,
+pub(crate) struct AmpRow {
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) message_count: u64,
 }
 
 impl AmpRow {
@@ -61,6 +61,160 @@ impl AmpRow {
 }
 
 const SEPARATOR: &str = "\u{00b7}";
+
+impl UnifiedRow {
+    /// Stable identifier suitable for the share resolver. For `Log/run` this
+    /// is the event group id (matches what `aivo logs` prints), otherwise the
+    /// native session_id / amp thread id / logs row id.
+    pub(crate) fn id(&self) -> String {
+        match self {
+            UnifiedRow::Log(e) => display_id(e).to_string(),
+            UnifiedRow::Native(t) => t.session_id.clone(),
+            UnifiedRow::Amp(a) => a.id.clone(),
+        }
+    }
+
+    /// `"chat" | "run" | "serve" | "claude" | … | "amp"`. Matches what `aivo
+    /// logs` displays in the bracket column.
+    pub(crate) fn source_label(&self) -> &str {
+        match self {
+            UnifiedRow::Log(e) => e.source.as_str(),
+            UnifiedRow::Native(t) => t.cli.as_str(),
+            UnifiedRow::Amp(_) => "amp",
+        }
+    }
+
+    /// True iff this row is a chat event referencing a `session_id` that no
+    /// longer has a file on disk — `logs.db` outlives the chat session file
+    /// because it records durable events, while session files can be
+    /// deleted. Used to tag stale rows in the listing and to short-circuit
+    /// share attempts with a friendlier error.
+    pub(crate) fn is_orphan_chat(&self, orphan_chat_ids: &HashSet<String>) -> bool {
+        match self {
+            UnifiedRow::Log(e) if e.source == "chat" => e
+                .session_id
+                .as_deref()
+                .is_some_and(|sid| orphan_chat_ids.contains(sid)),
+            _ => false,
+        }
+    }
+
+    /// Plain-text formatted row matching `aivo logs`'s column shape
+    /// (`<age:5> <id:8> <bracket:10> <detail>`). No ANSI escapes — callers
+    /// (e.g. `FuzzySelect`) apply their own highlighting. Orphan chat rows
+    /// (session file deleted) get a `(file deleted)` suffix; native rows
+    /// with `[run]` metadata pick up a ` · <key> · exit <N>` suffix.
+    pub(crate) fn picker_label(
+        &self,
+        detail_width: usize,
+        orphan_chat_ids: &HashSet<String>,
+        run_meta: &RunMetaIndex,
+    ) -> String {
+        let (age, id, detail) = match self {
+            UnifiedRow::Log(e) => (
+                format_time_ago_short(&e.ts_utc),
+                display_id(e).to_string(),
+                log_row_detail(e),
+            ),
+            UnifiedRow::Native(t) => (
+                format_time_ago_short_dt(t.updated_at),
+                compact_id(&t.session_id, ID_COL_WIDTH),
+                t.topic.clone(),
+            ),
+            UnifiedRow::Amp(a) => (
+                format_time_ago_short_dt(a.updated_at),
+                compact_id(&a.id, ID_COL_WIDTH),
+                a.title
+                    .clone()
+                    .unwrap_or_else(|| format!("(amp thread, {} messages)", a.message_count)),
+            ),
+        };
+        let bracket = format!("[{}]", self.source_label());
+        let orphan_suffix = if self.is_orphan_chat(orphan_chat_ids) {
+            " (file deleted)"
+        } else {
+            ""
+        };
+        let run_suffix_plain = match self {
+            UnifiedRow::Native(t) => run_meta
+                .get(&t.session_id)
+                .map(format_run_meta_suffix_plain)
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let detail_budget = detail_width
+            .saturating_sub(orphan_suffix.chars().count())
+            .saturating_sub(run_suffix_plain.chars().count());
+        let detail = trim_to_one_line(&detail, detail_budget);
+        format!(
+            "{:>5} {:<id_w$.id_w$} {:<br_w$} {}{}{}",
+            age,
+            id,
+            bracket,
+            detail,
+            run_suffix_plain,
+            orphan_suffix,
+            id_w = ID_COL_WIDTH,
+            br_w = BRACKET_COL_WIDTH,
+        )
+    }
+}
+
+/// Plain-text detail string for a logs.db row — mirrors the `text` half of
+/// `print_summary` (token suffix included for chat rows). Kept here so
+/// picker labels stay in sync with `aivo logs` printing.
+fn log_row_detail(entry: &LogEntry) -> String {
+    match entry.source.as_str() {
+        "chat" => {
+            let title = entry.title.clone().unwrap_or_else(|| "(chat)".to_string());
+            let suffix = format_token_summary(entry);
+            if suffix.is_empty() {
+                title
+            } else {
+                format!("{title} {suffix}")
+            }
+        }
+        "run" => {
+            let tool = entry.tool.as_deref().unwrap_or("run");
+            let model = entry
+                .model
+                .clone()
+                .unwrap_or_else(|| "(tool default)".to_string());
+            let state = match entry.phase.as_deref() {
+                Some("started") => "running".to_string(),
+                _ => entry
+                    .exit_code
+                    .map(|code| format!("exit={code}"))
+                    .unwrap_or_else(|| "exit=?".to_string()),
+            };
+            let duration = entry
+                .duration_ms
+                .map(|ms| format!(" ({})", format_duration_ms(ms)))
+                .unwrap_or_default();
+            format!("{tool} {model} {state}{duration}")
+        }
+        "serve" => {
+            let title = entry.title.clone().unwrap_or_else(|| "request".to_string());
+            let status = entry
+                .status_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let duration = entry
+                .duration_ms
+                .map(|ms| format!(" ({})", format_duration_ms(ms)))
+                .unwrap_or_default();
+            format!("{title} status={status}{duration}")
+        }
+        _ => entry.title.clone().unwrap_or_else(|| entry.kind.clone()),
+    }
+}
+
+/// Picker-facing column-width helper. Same math as
+/// `available_detail_width` so picker labels and `aivo logs` rows line up.
+pub(crate) fn picker_detail_width(term_cols: usize) -> usize {
+    const PREFIX: usize = 5 + 1 + ID_COL_WIDTH + 1 + BRACKET_COL_WIDTH + 1;
+    term_cols.saturating_sub(PREFIX + 4).clamp(20, 80)
+}
 
 pub struct LogsCommand {
     session_store: SessionStore,
@@ -87,11 +241,53 @@ impl LogsCommand {
             Some("status") => self.show_status(&args).await,
             Some("show") => self.show_entry(&args).await,
             Some("share") => self.share_session(args).await,
+            Some("prune") => self.prune_orphans(&args).await,
             Some(other) => anyhow::bail!(
-                "Unknown subcommand '{other}'. Valid: show <id>, share [id], status. Use -s <query> to search."
+                "Unknown subcommand '{other}'. Valid: show <id>, share [id], status, prune. Use -s <query> to search."
             ),
             None => self.list_entries(&args).await,
         }
+    }
+
+    /// `aivo logs prune` — delete chat events in logs.db whose session file
+    /// has been removed. Confirms unless `--force` is set.
+    async fn prune_orphans(&self, args: &LogsArgs) -> Result<ExitCode> {
+        let orphan_ids = compute_orphan_chat_ids(&self.session_store).await;
+        if orphan_ids.is_empty() {
+            println!("{} No orphan chat events found.", style::green("✓"));
+            return Ok(ExitCode::Success);
+        }
+        let mut ids: Vec<String> = orphan_ids.into_iter().collect();
+        ids.sort();
+        println!(
+            "Found {} chat session(s) with deleted files:",
+            style::bold(ids.len().to_string()),
+        );
+        for id in &ids {
+            let prefix: String = id.chars().take(8).collect();
+            println!("  {} {}", style::cyan(prefix), style::dim(id));
+        }
+        if !args.force {
+            print!("Delete the orphan logs.db rows for these sessions? [y/N] ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("{}", style::dim("Cancelled."));
+                return Ok(ExitCode::Success);
+            }
+        }
+        let deleted = self
+            .session_store
+            .logs()
+            .delete_chat_events_by_session_ids(&ids)
+            .await?;
+        println!(
+            "{} Deleted {} chat event(s) from logs.db.",
+            style::green("✓"),
+            style::bold(deleted.to_string()),
+        );
+        Ok(ExitCode::Success)
     }
 
     async fn share_session(&self, args: LogsArgs) -> Result<ExitCode> {
@@ -299,7 +495,7 @@ impl LogsCommand {
         // — fast invocations stay flicker-free. JSON output skips the
         // spinner entirely so machine-readable callers see clean stdout.
         const SPINNER_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-        let rows = if args.json {
+        let (rows, run_meta) = if args.json {
             self.fetch_unified_rows(args).await?
         } else {
             let fetch = self.fetch_unified_rows(args);
@@ -317,11 +513,15 @@ impl LogsCommand {
         };
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&unified_to_json(&rows))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&unified_to_json(&rows, &run_meta))?
+            );
             return Ok(ExitCode::Success);
         }
 
-        render_unified_rows(&rows);
+        let orphan_chat_ids = compute_orphan_chat_ids(&self.session_store).await;
+        render_unified_rows(&rows, &orphan_chat_ids, &run_meta);
         Ok(ExitCode::Success)
     }
 
@@ -330,7 +530,7 @@ impl LogsCommand {
         let mut seen_ids: HashSet<String> = HashSet::new();
 
         loop {
-            let rows = self.fetch_unified_rows(args).await?;
+            let (rows, run_meta) = self.fetch_unified_rows(args).await?;
 
             if args.jsonl {
                 let mut ordered = rows.clone();
@@ -338,7 +538,10 @@ impl LogsCommand {
                 for row in ordered {
                     let key = unified_id_key(&row);
                     if seen_ids.insert(key) {
-                        println!("{}", serde_json::to_string(&unified_row_to_json(&row))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string(&unified_row_to_json(&row, &run_meta))?
+                        );
                     }
                 }
                 io::stdout().flush()?;
@@ -350,7 +553,8 @@ impl LogsCommand {
                     style::dim("(Ctrl+C to stop)")
                 );
                 println!();
-                render_unified_rows(&rows);
+                let orphan_chat_ids = compute_orphan_chat_ids(&self.session_store).await;
+                render_unified_rows(&rows, &orphan_chat_ids, &run_meta);
                 io::stdout().flush()?;
             }
 
@@ -359,30 +563,11 @@ impl LogsCommand {
     }
 
     /// Pulls rows from all three data sources concurrently, then k-way-merges
-    /// the already-newest-first streams to take only `--limit` rows. No full
-    /// union, no global sort.
-    async fn fetch_unified_rows(&self, args: &LogsArgs) -> Result<Vec<UnifiedRow>> {
-        let plan = SourcePlan::from_args(args);
-        // Default = current cwd. `--all` opts out, `--cwd <path>` overrides.
-        // Expand `.` / `~/` so explicit shorthands work.
-        let cwd_filter: Option<String> = if args.all {
-            None
-        } else if let Some(explicit) = args.cwd.as_deref() {
-            Some(expand_cwd_filter(explicit))
-        } else {
-            system_env::current_dir().map(|p| p.to_string_lossy().to_string())
-        };
-
-        // Run the three source fetches concurrently — they touch disjoint
-        // backends (sqlite, native session jsonl files, amp's thread dir),
-        // so the prior sequential awaits cost us ~3× the slowest source.
-        let (log_rows, native_rows, amp_rows) = tokio::try_join!(
-            fetch_logs_rows(&self.session_store, args, &plan, cwd_filter.clone()),
-            fetch_native_rows(args, &plan, cwd_filter.clone()),
-            fetch_amp_rows(args, &plan, cwd_filter.as_deref()),
-        )?;
-
-        Ok(merge_unified(log_rows, native_rows, amp_rows, args.limit))
+    /// the already-newest-first streams to take only `--limit` rows. Thin
+    /// wrapper around the free `fetch_unified_rows` so `aivo share`'s picker
+    /// can reuse the same pipeline without going through `LogsCommand`.
+    async fn fetch_unified_rows(&self, args: &LogsArgs) -> Result<(Vec<UnifiedRow>, RunMetaIndex)> {
+        fetch_unified_rows(&self.session_store, args).await
     }
 
     pub fn print_help(action: Option<&str>) {
@@ -408,11 +593,15 @@ fn print_help_overview() {
     println!();
     println!(
         "{}",
-        style::dim("Unified activity feed: aivo's own events (chat, run, serve), native CLI")
+        style::dim("Unified session list: aivo chat sessions, native CLI sessions (claude,")
     );
     println!(
         "{}",
-        style::dim("sessions (claude, codex, gemini, pi, opencode), and amp threads.")
+        style::dim("codex, gemini, pi, opencode), and amp threads. `aivo logs share` picks")
+    );
+    println!(
+        "{}",
+        style::dim("from this same list. Use --by run / --by serve to see launch events.")
     );
     println!();
     println!("{}", style::bold("Commands:"));
@@ -429,6 +618,10 @@ fn print_help_overview() {
         "Share a session via tunneled viewer URL; omit id to open the picker",
     );
     logs_help_row("status", "Show counts and storage paths across sources");
+    logs_help_row(
+        "prune",
+        "Remove logs.db chat events whose session file was deleted",
+    );
     println!();
     println!("{}", style::bold("Filters:"));
     logs_help_row("-n, --limit <N>", "Maximum rows after merge (default: 20)");
@@ -444,7 +637,11 @@ fn print_help_overview() {
     logs_help_row("-s, --search <query>", "Search title/topic/body text");
     logs_help_row(
         "--by <name>",
-        "chat | run | serve | claude | codex | gemini | pi | opencode | amp | native",
+        "Sessions: chat | claude | codex | gemini | pi | opencode | amp | native",
+    );
+    logs_help_row(
+        "",
+        "Events:   run | serve  (launch records / HTTP requests)",
     );
     logs_help_row(
         "--model <model>",
@@ -474,7 +671,11 @@ fn print_help_overview() {
     );
     println!(
         "  {}",
-        style::dim("aivo logs --by claude         # claude run-events + claude native sessions")
+        style::dim("aivo logs --by claude         # only native claude sessions")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs --by run            # launch events (tool, model, exit code)")
     );
     println!(
         "  {}",
@@ -646,16 +847,23 @@ fn validate_args(args: &LogsArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_unified_rows(rows: &[UnifiedRow]) {
+fn render_unified_rows(
+    rows: &[UnifiedRow],
+    orphan_chat_ids: &HashSet<String>,
+    run_meta: &RunMetaIndex,
+) {
     if rows.is_empty() {
         println!("{}", style::dim("No entries found."));
         return;
     }
     let detail_width = available_detail_width();
     for row in rows {
+        let orphan = row.is_orphan_chat(orphan_chat_ids);
         match row {
-            UnifiedRow::Log(e) => print_summary(e, detail_width),
-            UnifiedRow::Native(t) => print_native_summary(t, detail_width),
+            UnifiedRow::Log(e) => print_summary(e, detail_width, orphan),
+            UnifiedRow::Native(t) => {
+                print_native_summary(t, detail_width, run_meta.get(&t.session_id))
+            }
             UnifiedRow::Amp(a) => print_amp_summary(a, detail_width),
         }
     }
@@ -682,12 +890,14 @@ const ID_COL_WIDTH: usize = 8;
 /// Keeps detail-column alignment consistent across all sources.
 const BRACKET_COL_WIDTH: usize = 10;
 
-fn print_native_summary(t: &Thread, detail_width: usize) {
+fn print_native_summary(t: &Thread, detail_width: usize, run_meta: Option<&RunMeta>) {
     let time_ago = format_time_ago_short_dt(t.updated_at);
     let id = compact_id(&t.session_id, ID_COL_WIDTH);
-    let topic = trim_to_one_line(&t.topic, detail_width);
+    let suffix = run_meta.map(format_run_meta_suffix).unwrap_or_default();
+    let topic_budget = detail_width.saturating_sub(visible_width(&suffix));
+    let topic = trim_to_one_line(&t.topic, topic_budget);
     println!(
-        "{} {} {} {}",
+        "{} {} {} {}{}",
         style::dim(format!("{:>5}", time_ago)),
         style::cyan(format!("{:<width$}", id, width = ID_COL_WIDTH)),
         style::magenta(format!(
@@ -695,8 +905,59 @@ fn print_native_summary(t: &Thread, detail_width: usize) {
             format!("[{}]", t.cli),
             width = BRACKET_COL_WIDTH
         )),
-        topic
+        topic,
+        suffix,
     );
+}
+
+/// Trailing tag rendered after a native row's topic when we have aivo-side
+/// metadata for it: ` · <key> · exit <N>`. Empty when both fields are
+/// missing — leaves the row identical to the un-enriched form.
+fn format_run_meta_suffix(meta: &RunMeta) -> String {
+    let plain = format_run_meta_suffix_plain(meta);
+    if plain.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", style::dim(plain.trim_start()))
+    }
+}
+
+/// ANSI-free version used by picker labels (FuzzySelect highlights
+/// matched ranges itself; embedded escapes break that highlighting).
+fn format_run_meta_suffix_plain(meta: &RunMeta) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = meta.key_name.as_deref() {
+        parts.push(name.to_string());
+    }
+    if let Some(code) = meta.exit_code {
+        parts.push(format!("exit {code}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+/// Width of a string with ANSI escapes counted as zero-width — needed when
+/// computing how much detail-column budget the suffix consumes.
+fn visible_width(s: &str) -> usize {
+    let mut out = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c == 'm' {
+                in_esc = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            in_esc = true;
+            continue;
+        }
+        out += 1;
+    }
+    out
 }
 
 fn print_amp_summary(a: &AmpRow, detail_width: usize) {
@@ -753,7 +1014,7 @@ pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn print_summary(entry: &LogEntry, detail_width: usize) {
+fn print_summary(entry: &LogEntry, detail_width: usize, is_orphan: bool) {
     let display_id = display_id(entry);
     let time_ago = format_time_ago_short(&entry.ts_utc);
     // (text, dim_suffix). Trimming runs on the plain text *before* styling
@@ -816,6 +1077,11 @@ fn print_summary(entry: &LogEntry, detail_width: usize) {
         text
     } else {
         format!("{text} {}", style::dim(dim_suffix))
+    };
+    let detail = if is_orphan {
+        format!("{detail} {}", style::dim("(file deleted)"))
+    } else {
+        detail
     };
     // Same column shape as native/amp rows: age (5) · id (8) · bracket (10) · detail.
     // `{:<W.W}` truncates a too-long id to W chars then pads it to W — gives
@@ -924,6 +1190,15 @@ fn display_id(entry: &LogEntry) -> &str {
         && let Some(group_id) = entry.event_group_id.as_deref()
     {
         return group_id;
+    }
+    // Chat events: prefer the chat session UUID so a row's id matches what
+    // `aivo share`'s resolver expects and what the chat picker / session
+    // files use. Falls back to the logs.db row id for legacy events that
+    // pre-date the `session_id` linkage column.
+    if entry.source == "chat"
+        && let Some(sid) = entry.session_id.as_deref()
+    {
+        return sid;
     }
     &entry.id
 }
@@ -1071,7 +1346,7 @@ async fn fetch_logs_rows(
         .list(LogQuery {
             limit: query_limit,
             search: args.search.clone(),
-            by: args.by.clone(),
+            by: plan.logs_by(),
             model: args.model.clone(),
             key_query: args.key.clone(),
             cwd: cwd_filter,
@@ -1082,14 +1357,43 @@ async fn fetch_logs_rows(
         .await?;
     // Run events are emitted as start+finish pairs sharing an event_group_id;
     // collapse here too so the unified listing doesn't show both halves.
-    Ok(collapse_run_events(entries, args.limit.saturating_mul(3)))
+    // Then collapse chat events by session_id so the session list shows one
+    // row per chat conversation instead of one per turn.
+    let entries = collapse_run_events(entries, args.limit.saturating_mul(3));
+    Ok(collapse_chat_sessions(entries))
 }
 
-// Perf: counter-intuitively, the project-scoped ingester is slower than global
-// on a multi-project machine — codex/gemini walk the same global tree either
-// way, but scoped *rejects* every non-matching file (forcing the walk to
-// continue past the cap). Global stops at cap quickly. So we always walk
-// globally and post-filter by cwd. The 14-day age cap bounds the worst case.
+/// Collapse same-session chat events down to one row per `session_id`,
+/// keeping the most recent event in each group (entries arrive already
+/// sorted newest-first, so first-seen wins). Old chat rows with
+/// `session_id: None` (written before the linkage field existed) pass
+/// through unchanged — without a key we can't safely group them.
+fn collapse_chat_sessions(entries: Vec<LogEntry>) -> Vec<LogEntry> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.source == "chat"
+            && let Some(sid) = entry.session_id.as_deref()
+            && !seen.insert(sid.to_string())
+        {
+            continue;
+        }
+        out.push(entry);
+    }
+    out
+}
+
+// Perf: we always walk globally and post-filter by cwd — project-scoped
+// walks are slower on a multi-project machine because codex/gemini hit the
+// same global tree either way but reject every non-matching file (forcing
+// the walk to continue past the cap). Global stops at cap quickly.
+//
+// The wrinkle: when a cwd filter IS in effect, capping at limit*2 = 50
+// extracts the globally-newest 50 sessions per CLI and *then* drops the
+// non-cwd ones. On a multi-project machine that often leaves zero matches
+// for the user's actual project even though plenty exist within the 14d
+// window. So we lift the cap when cwd is filtered — the 14d age cap still
+// bounds the worst case, and cwd usually narrows results to a handful.
 async fn fetch_native_rows(
     args: &LogsArgs,
     plan: &SourcePlan,
@@ -1108,7 +1412,14 @@ async fn fetch_native_rows(
         // older than the cutoff can be skipped without parsing. --until can't
         // be pushed down (mtime is an upper bound on updated_at).
         min_updated_at: args.since.as_deref().and_then(parse_loose_time),
-        max_per_source: Some(args.limit.saturating_mul(2).max(50)),
+        max_per_source: if cwd_filter.is_some() {
+            None
+        } else {
+            Some(args.limit.saturating_mul(2).max(50))
+        },
+        // Listing view: keep `hi`/`ok` sessions visible. `aivo run`'s
+        // context picker uses a separate IngestOptions with this off.
+        include_short_first_user: true,
     };
     let mut all = context_ingest::ingest_native_sessions_global(opts).await?;
     all.retain(|t| native_passes_filters(t, args, cwd_filter.as_deref()));
@@ -1132,6 +1443,85 @@ async fn fetch_amp_rows(
         .filter_map(AmpRow::from_value)
         .filter(|a| amp_passes_filters(a, args))
         .collect())
+}
+
+/// Compute the set of chat `session_id`s referenced by logs.db that no
+/// longer have a session file on disk. Used to tag stale rows in the
+/// listing and to refuse `aivo logs share` with a useful pointer. Returns
+/// an empty set on any error — orphan tagging is decoration, not safety.
+pub(crate) async fn compute_orphan_chat_ids(store: &SessionStore) -> HashSet<String> {
+    let log_ids = match store.logs().distinct_chat_session_ids().await {
+        Ok(ids) => ids,
+        Err(_) => return HashSet::new(),
+    };
+    if log_ids.is_empty() {
+        return HashSet::new();
+    }
+    let disk_ids = store.chat_session_ids_on_disk().await;
+    log_ids
+        .into_iter()
+        .filter(|id| !disk_ids.contains(id))
+        .collect()
+}
+
+/// Lookup keyed on a native session_id, supplying the aivo-side metadata
+/// (key name, exit code) recorded by the `[run]` event that produced the
+/// session. Empty for callers that don't fetch enrichment.
+pub(crate) type RunMetaIndex = HashMap<String, RunMeta>;
+
+/// Free-function counterpart of `LogsCommand::fetch_unified_rows`. Shared
+/// with the `aivo share` picker so both surfaces draw from the same merged
+/// stream (same ids, same ordering, same filters). Returns the merged rows
+/// plus a side-table of `[run]` metadata keyed by the native session_id
+/// each launch produced — renderers join on it to show the key/exit on
+/// the native row instead of as a separate `[run]` line.
+pub(crate) async fn fetch_unified_rows(
+    store: &SessionStore,
+    args: &LogsArgs,
+) -> Result<(Vec<UnifiedRow>, RunMetaIndex)> {
+    let plan = SourcePlan::from_args(args);
+    let cwd_filter: Option<String> = if args.all {
+        None
+    } else if let Some(explicit) = args.cwd.as_deref() {
+        Some(expand_cwd_filter(explicit))
+    } else {
+        system_env::current_dir().map(|p| p.to_string_lossy().to_string())
+    };
+    // Canonicalize once so symlinks/`.` resolve and downstream matchers can
+    // do a straight prefix check without each one calling `canonicalize`.
+    let cwd_filter = cwd_filter.map(|s| canonicalize_for_match(&s));
+
+    let (log_rows, native_rows, amp_rows) = tokio::try_join!(
+        fetch_logs_rows(store, args, &plan, cwd_filter.clone()),
+        fetch_native_rows(args, &plan, cwd_filter.clone()),
+        fetch_amp_rows(args, &plan, cwd_filter.as_deref()),
+    )?;
+
+    let rows = merge_unified(log_rows, native_rows, amp_rows, args.limit);
+    let run_meta = run_meta_for_native_rows(store, &rows).await;
+    Ok((rows, run_meta))
+}
+
+/// Pull the `[run]` finished-event metadata for every native session in
+/// the merged view in one query, so the renderer can annotate native rows
+/// without per-row round trips. Errors are swallowed (the enrichment is
+/// decoration, not safety).
+async fn run_meta_for_native_rows(store: &SessionStore, rows: &[UnifiedRow]) -> RunMetaIndex {
+    let session_ids: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r {
+            UnifiedRow::Native(t) => Some(t.session_id.clone()),
+            _ => None,
+        })
+        .collect();
+    if session_ids.is_empty() {
+        return HashMap::new();
+    }
+    store
+        .logs()
+        .run_meta_for_sessions(&session_ids)
+        .await
+        .unwrap_or_default()
 }
 
 /// Three-way merge of newest-first streams. Pops the source with the newest
@@ -1184,61 +1574,93 @@ fn parse_log_ts(s: &str) -> DateTime<Utc> {
 // ---------------------------------------------------------------------------
 
 struct SourcePlan {
+    /// Whether to query logs.db at all.
     logs: bool,
+    /// Effective `LogQuery.by` when `logs` is true. `None` = no SQL-level
+    /// source filter; `Some(s)` = restrict to that source/tool. Default
+    /// is `Some("chat")` so the unified view shows chat *sessions* but
+    /// not run/serve events (those have their own views via explicit
+    /// `--by run` / `--by serve`).
+    logs_by: Option<String>,
     native: bool,
     amp: bool,
 }
 
 impl SourcePlan {
     fn from_args(args: &LogsArgs) -> Self {
-        // Filters that only make sense for logs.db rows force a strict mode.
+        // Filters that only make sense for logs.db rows force a strict mode:
+        // drop native/amp, and open logs.db up to every source so audits
+        // see run/serve errors alongside chat ones.
         let strict_logs = args.errors || args.key.is_some() || args.model.is_some();
 
         let by = args.by.as_deref().map(str::to_ascii_lowercase);
         let by = by.as_deref();
 
-        // Determine eligibility per source.
         let logs;
+        let logs_by;
         let native;
         let amp;
         match by {
-            // Bare logs.db sources.
-            Some("chat") | Some("run") | Some("serve") => {
+            // Explicit logs.db source.
+            Some(name @ ("chat" | "run" | "serve")) => {
                 logs = true;
+                logs_by = Some(name.to_string());
                 native = false;
                 amp = false;
             }
-            // "amp" is amp-only.
             Some("amp") => {
                 logs = false;
+                logs_by = None;
                 native = false;
                 amp = true;
             }
-            // "native" = all native CLI sessions, no logs.db, no amp.
             Some("native") => {
                 logs = false;
+                logs_by = None;
                 native = true;
                 amp = false;
             }
-            // CLI names: matching logs.db `tool` substring + native rows of that cli.
+            // CLI names: native sessions of that cli only. `[run]` rows are
+            // aivo's launch record for the same session — including them
+            // would just duplicate the native row. Users who want the run-
+            // event view ask for `--by run` explicitly. Strict-logs callers
+            // (errors/key/model) bypass this and get the logs.db rows for
+            // that tool.
             Some("claude") | Some("codex") | Some("gemini") | Some("opencode") | Some("pi") => {
-                logs = true;
+                logs = strict_logs;
+                logs_by = if strict_logs { args.by.clone() } else { None };
                 native = !strict_logs;
                 amp = false;
             }
-            // No --by: all sources, modulo strict-logs.
+            // No --by: the unified session list. logs.db restricted to chat
+            // (collapsed by session_id downstream), native + amp join in,
+            // run/serve stay out of the default view. Strict-logs reopens
+            // logs.db to every source for auditing.
             None | Some(_) => {
                 logs = true;
+                logs_by = if strict_logs {
+                    None
+                } else {
+                    Some("chat".to_string())
+                };
                 native = !strict_logs;
                 amp = !strict_logs;
             }
         }
 
-        Self { logs, native, amp }
+        Self {
+            logs,
+            logs_by,
+            native,
+            amp,
+        }
     }
 
     fn include_logs(&self) -> bool {
         self.logs
+    }
+    fn logs_by(&self) -> Option<String> {
+        self.logs_by.clone()
     }
     fn include_native(&self) -> bool {
         self.native
@@ -1264,10 +1686,14 @@ fn native_passes_filters(t: &Thread, args: &LogsArgs, cwd_filter: Option<&str>) 
         }
     }
     if let Some(needle) = cwd_filter {
-        let cwd_match = t
-            .cwd
+        // Canonicalize the thread's cwd too — sessions recorded a non-
+        // canonical path (e.g. `/tmp/hi` on macOS where the real path is
+        // `/private/tmp/hi`) still need to match. The filter side is
+        // already canonicalized by `fetch_unified_rows`.
+        let thread_cwd = t.cwd.as_deref().map(canonicalize_for_match);
+        let cwd_match = thread_cwd
             .as_deref()
-            .map(|c| c.contains(needle))
+            .map(|c| cwd_is_under(c, needle))
             .unwrap_or(false);
         if !cwd_match {
             return false;
@@ -1298,6 +1724,65 @@ fn native_passes_filters(t: &Thread, args: &LogsArgs, cwd_filter: Option<&str>) 
         return false;
     }
     true
+}
+
+/// True iff `child` is `parent` or one of its descendants. Both inputs are
+/// normalized via [`normalize_cwd_for_match`] so backslashes vs forward
+/// slashes and case differences (Windows) don't cause spurious mismatches.
+/// The strip-then-check-separator shape resists prefix-collision false
+/// positives (`/foo/bar` vs `/foo/bar-other`, `/foo/bar` vs
+/// `/elsewhere/foo/bar/x`) that a plain `String::contains` would accept.
+pub(crate) fn cwd_is_under(child: &str, parent: &str) -> bool {
+    let c = normalize_cwd_for_match(child);
+    let p = normalize_cwd_for_match(parent);
+    if c == p {
+        return true;
+    }
+    // After normalization both sides use '/'.
+    c.strip_prefix(&p).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Normalize a cwd string for matching:
+/// - trim trailing path separators (`/` or `\`)
+/// - collapse `\` to `/` so Windows paths (`C:\Foo\Bar`) compare with paths
+///   recorded forward-slashed elsewhere
+/// - lowercase on Windows, where the filesystem is case-insensitive
+fn normalize_cwd_for_match(s: &str) -> String {
+    let trimmed = s.trim_end_matches(['/', '\\']);
+    let unified: String = trimmed
+        .chars()
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
+    if cfg!(windows) {
+        unified.to_ascii_lowercase()
+    } else {
+        unified
+    }
+}
+
+/// Best-effort path canonicalization for cwd matching: resolves symlinks
+/// and `..`/`.` when the path exists on disk, otherwise returns the input
+/// with its trailing separator trimmed. On Windows, strips the `\\?\`
+/// verbatim-namespace prefix that `std::fs::canonicalize` adds — keeping
+/// it would create artificial mismatches against stored cwds (which don't
+/// carry the prefix). Deleted-cwd sessions still need to be listable, so
+/// canonicalize failures fall back to the trimmed input.
+pub(crate) fn canonicalize_for_match(input: &str) -> String {
+    let trimmed = input.trim_end_matches(['/', '\\']);
+    let canonical = std::fs::canonicalize(trimmed)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| trimmed.to_string());
+    #[cfg(windows)]
+    {
+        canonical
+            .strip_prefix("\\\\?\\")
+            .map(str::to_string)
+            .unwrap_or(canonical)
+    }
+    #[cfg(not(windows))]
+    {
+        canonical
+    }
 }
 
 /// Expand `--cwd` shorthand: `.` → current cwd, `~/` → home, otherwise
@@ -1395,11 +1880,13 @@ fn normalize_time_filter(raw: Option<&str>) -> Option<String> {
 // JSON shape for --json / --jsonl
 // ---------------------------------------------------------------------------
 
-fn unified_to_json(rows: &[UnifiedRow]) -> Vec<Value> {
-    rows.iter().map(unified_row_to_json).collect()
+fn unified_to_json(rows: &[UnifiedRow], run_meta: &RunMetaIndex) -> Vec<Value> {
+    rows.iter()
+        .map(|r| unified_row_to_json(r, run_meta))
+        .collect()
 }
 
-fn unified_row_to_json(row: &UnifiedRow) -> Value {
+fn unified_row_to_json(row: &UnifiedRow, run_meta: &RunMetaIndex) -> Value {
     match row {
         UnifiedRow::Log(e) => {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
@@ -1408,16 +1895,29 @@ fn unified_row_to_json(row: &UnifiedRow) -> Value {
             }
             v
         }
-        UnifiedRow::Native(t) => json!({
-            "kind": "native_session",
-            "cli": t.cli,
-            "session_id": t.session_id,
-            "source_path": t.source_path,
-            "topic": t.topic,
-            "last_response": t.last_response,
-            "updated_at": t.updated_at.to_rfc3339(),
-            "cwd": t.cwd,
-        }),
+        UnifiedRow::Native(t) => {
+            let mut v = json!({
+                "kind": "native_session",
+                "cli": t.cli,
+                "session_id": t.session_id,
+                "source_path": t.source_path,
+                "topic": t.topic,
+                "last_response": t.last_response,
+                "updated_at": t.updated_at.to_rfc3339(),
+                "cwd": t.cwd,
+            });
+            if let Some(meta) = run_meta.get(&t.session_id) {
+                let map = v.as_object_mut().unwrap();
+                map.insert(
+                    "run".to_string(),
+                    json!({
+                        "key_name": meta.key_name,
+                        "exit_code": meta.exit_code,
+                    }),
+                );
+            }
+            v
+        }
         UnifiedRow::Amp(a) => json!({
             "kind": "amp_thread",
             "id": a.id,
@@ -1436,6 +1936,7 @@ async fn native_session_counts() -> Vec<(String, u64)> {
         max_age_days: None,
         min_updated_at: None,
         max_per_source: Some(10_000),
+        include_short_first_user: true,
     };
     let threads = context_ingest::ingest_native_sessions_global(opts)
         .await
@@ -1470,6 +1971,8 @@ fn unified_id_key(row: &UnifiedRow) -> String {
 /// Pretty-print a `SharePayload` returned by `share_resolver` for
 /// `aivo logs show <native-or-amp-id>`. Mirrors `print_entry`'s style.
 fn print_share_payload(p: &crate::services::share_payload::SharePayload) {
+    use crate::services::share_payload::ContentBlock;
+
     println!("{} {}", style::bold("source:"), p.source_cli);
     println!("{} {}", style::bold("session:"), p.session_id);
     if let Some(model) = &p.model {
@@ -1482,6 +1985,18 @@ fn print_share_payload(p: &crate::services::share_payload::SharePayload) {
         println!("{} {}", style::bold("updated:"), updated.to_rfc3339());
     }
     println!("{} {}", style::bold("messages:"), p.messages.len());
+
+    // Aggregate content size — useful for "is this conversation worth
+    // sharing?" without spinning up the local server.
+    let chars: usize = p.approximate_chars();
+    if chars > 0 {
+        println!(
+            "{} ~{} KB",
+            style::bold("size:"),
+            (chars / 1024).max(if chars > 0 { 1 } else { 0 }),
+        );
+    }
+
     if let Some(summary) = &p.meta.redaction_summary
         && !summary.is_empty()
     {
@@ -1492,11 +2007,135 @@ fn print_share_payload(p: &crate::services::share_payload::SharePayload) {
             .join(", ");
         println!("{} {}", style::bold("redacted:"), style::dim(s));
     }
+
+    // First user turn ─ the "what was this conversation about?" line.
+    // Skip turns that are just CLI-harness wrappers (codex injects an
+    // `<environment_context>` block, claude can inject `<command-message>`,
+    // etc.); we want the user's actual prompt.
+    if let Some(text) = p
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| first_text(m.content.as_slice()))
+        .find(|t| !looks_like_cli_boilerplate(t))
+    {
+        println!();
+        println!("{}", style::bold("First user:"));
+        print_preview_block(text);
+    }
+
+    // Last assistant turn ─ "where did the conversation end up?". Skip if
+    // the only assistant turns are tool-calls (no text content).
+    if let Some(last_assistant) = p
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && first_text(m.content.as_slice()).is_some())
+        && let Some(text) = first_text(last_assistant.content.as_slice())
+    {
+        println!();
+        println!("{}", style::bold("Last assistant:"));
+        print_preview_block(text);
+    }
+
+    // Surface tool activity at a glance: how many tool calls were made and
+    // what tools were used. Doesn't dump payloads — `aivo logs share` is for
+    // the full view.
+    let tool_calls: Vec<&str> = p
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|c| match c {
+            ContentBlock::ToolCall { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !tool_calls.is_empty() {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for name in &tool_calls {
+            *counts.entry(name).or_insert(0) += 1;
+        }
+        let summary = counts
+            .iter()
+            .map(|(name, n)| format!("{name}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!();
+        println!("{} {}", style::bold("tools:"), style::dim(summary));
+    }
+
     println!();
     println!(
         "{}",
-        style::dim("(use `aivo logs share <id>` to open a viewer)")
+        style::dim("(use `aivo logs share <id>` to open a full viewer)")
     );
+}
+
+/// First text-like content block from a message, if any. Skips tool
+/// calls/results so the preview shows the human-readable side.
+fn first_text(blocks: &[crate::services::share_payload::ContentBlock]) -> Option<&str> {
+    use crate::services::share_payload::ContentBlock;
+    blocks.iter().find_map(|b| match b {
+        ContentBlock::Text { text } | ContentBlock::Code { text, .. } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// Heuristic: does `text` look like a CLI-harness injection rather than
+/// something the user actually typed? Matches the same markers
+/// `pick_first_user_turn` filters during ingest.
+fn looks_like_cli_boilerplate(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<environment_context>",
+        "<command-message>",
+        "<command-name>",
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<system-reminder>",
+        "<user_instructions>",
+        "<developer_instructions>",
+    ];
+    let lower = text.trim_start().to_lowercase();
+    MARKERS.iter().any(|m| lower.starts_with(m))
+}
+
+/// Render a preview block under a "First user:" / "Last assistant:" label.
+/// Each line is prefixed with `│ ` so embedded `key: value` content (or our
+/// own metadata fields quoted back in a transcript) reads as part of the
+/// preview, not as a continuation of the row's metadata block above.
+fn print_preview_block(text: &str) {
+    let clipped = preview_text(text, 6, 600);
+    for line in clipped.split('\n') {
+        println!("{} {}", style::dim("│"), line);
+    }
+}
+
+/// Clip `text` to at most `max_lines` lines and `max_chars`, appending `…`
+/// if anything was dropped. Keeps the show output bounded on huge turns.
+fn preview_text(text: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (lines_used, line) in text.lines().enumerate() {
+        if lines_used >= max_lines {
+            out.push('…');
+            return out;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let remaining = max_chars.saturating_sub(out.chars().count());
+        if line.chars().count() > remaining {
+            out.extend(line.chars().take(remaining.saturating_sub(1)));
+            out.push('…');
+            return out;
+        }
+        out.push_str(line);
+        if out.chars().count() >= max_chars {
+            out.push('…');
+            return out;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1524,6 +2163,7 @@ mod tests {
             no_redact: false,
             open: false,
             debug_local_only: false,
+            force: false,
         }
     }
 
@@ -1540,6 +2180,73 @@ mod tests {
         args.json = true;
         args.watch = true;
         assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn cwd_is_under_handles_prefix_collisions() {
+        // Exact match.
+        assert!(cwd_is_under("/foo/bar", "/foo/bar"));
+        // Subdirectory.
+        assert!(cwd_is_under("/foo/bar/sub", "/foo/bar"));
+        assert!(cwd_is_under("/foo/bar/sub/deep", "/foo/bar"));
+        // Trailing slash tolerance.
+        assert!(cwd_is_under("/foo/bar/", "/foo/bar"));
+        assert!(cwd_is_under("/foo/bar", "/foo/bar/"));
+        // Sibling that shares a prefix — must NOT match. This is the
+        // regression that the old `String::contains` matcher missed.
+        assert!(!cwd_is_under("/foo/bar-other", "/foo/bar"));
+        assert!(!cwd_is_under("/foo/barother", "/foo/bar"));
+        // Path fragment occurring mid-string — must NOT match.
+        assert!(!cwd_is_under("/elsewhere/foo/bar/x", "/foo/bar"));
+        // Unrelated path.
+        assert!(!cwd_is_under("/other", "/foo/bar"));
+    }
+
+    #[test]
+    fn cwd_is_under_handles_windows_paths() {
+        // Backslash separators on both sides — exact and subdir.
+        assert!(cwd_is_under(r"C:\Users\yc\project", r"C:\Users\yc\project"));
+        assert!(cwd_is_under(
+            r"C:\Users\yc\project\src",
+            r"C:\Users\yc\project"
+        ));
+        // Mixed separators: filter forward-slashed, stored back-slashed.
+        // Real Windows runs can produce both depending on where the cwd
+        // string was captured.
+        assert!(cwd_is_under(
+            r"C:\Users\yc\project\src",
+            "C:/Users/yc/project"
+        ));
+        assert!(cwd_is_under(
+            "C:/Users/yc/project/src",
+            r"C:\Users\yc\project"
+        ));
+        // Trailing separator (either kind) tolerated.
+        assert!(cwd_is_under(
+            r"C:\Users\yc\project\",
+            r"C:\Users\yc\project"
+        ));
+        assert!(cwd_is_under(
+            r"C:\Users\yc\project",
+            r"C:\Users\yc\project\"
+        ));
+        // Sibling that shares a prefix — must NOT match.
+        assert!(!cwd_is_under(
+            r"C:\Users\yc\project-other",
+            r"C:\Users\yc\project"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cwd_is_under_case_insensitive_on_windows() {
+        // Windows filesystems are case-insensitive by default; `\foo` and
+        // `\FOO` should match.
+        assert!(cwd_is_under(r"C:\USERS\YC\Project", r"c:\users\yc\project"));
+        assert!(cwd_is_under(
+            r"c:\users\yc\project\Src",
+            r"C:\Users\yc\project"
+        ));
     }
 
     fn test_entry(id: &str, ts: &str, source: &str) -> LogEntry {
@@ -1570,6 +2277,53 @@ mod tests {
         let collapsed = collapse_run_events(entries, 20);
         assert_eq!(collapsed.len(), 1);
         assert_eq!(collapsed[0].id, "2");
+    }
+
+    #[test]
+    fn run_meta_suffix_includes_key_and_exit() {
+        let suffix = format_run_meta_suffix_plain(&RunMeta {
+            key_name: Some("copilot-1".into()),
+            exit_code: Some(0),
+        });
+        assert_eq!(suffix, " · copilot-1 · exit 0");
+    }
+
+    #[test]
+    fn run_meta_suffix_drops_missing_fields() {
+        let suffix = format_run_meta_suffix_plain(&RunMeta {
+            key_name: None,
+            exit_code: Some(2),
+        });
+        assert_eq!(suffix, " · exit 2");
+    }
+
+    #[test]
+    fn run_meta_suffix_empty_when_nothing_known() {
+        let suffix = format_run_meta_suffix_plain(&RunMeta::default());
+        assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn picker_label_appends_run_meta_for_native_row() {
+        let row = UnifiedRow::Native(test_thread(
+            "abc123",
+            DateTime::parse_from_rfc3339("2026-03-27T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let mut meta = HashMap::new();
+        meta.insert(
+            "abc123".to_string(),
+            RunMeta {
+                key_name: Some("copilot-1".into()),
+                exit_code: Some(0),
+            },
+        );
+        let label = row.picker_label(60, &HashSet::new(), &meta);
+        assert!(
+            label.contains("· copilot-1 · exit 0"),
+            "label missing run-meta suffix: {label}"
+        );
     }
 
     #[test]

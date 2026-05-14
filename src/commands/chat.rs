@@ -51,7 +51,7 @@ use super::chat_response_parser::{
 
 // Re-export for submodules (chat_tui_format uses TokenUsage)
 pub(crate) use super::chat_response_parser::TokenUsage;
-pub(crate) use chat_tui_format::{format_time_ago_short, format_time_ago_short_dt};
+pub(crate) use chat_tui_format::format_time_ago_short;
 
 #[path = "chat_tui.rs"]
 mod chat_tui;
