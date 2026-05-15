@@ -4,6 +4,7 @@ use crossterm::event::{
     KeyModifiers,
 };
 use std::io::Write;
+use unicode_width::UnicodeWidthChar;
 
 /// Outcome returned by `FuzzySelect::interact_outcome`. Most callers want
 /// `interact_opt` instead, which collapses `Query` and `Cancelled` to `None`.
@@ -394,8 +395,10 @@ fn query_for_filter(query: &str) -> &str {
     query.trim()
 }
 
-/// Truncate a string to fit within terminal width, accounting for ANSI escape codes.
-/// ANSI sequences are not visible characters, so we track visible width separately.
+/// Truncate a string to fit within terminal width, accounting for ANSI escape
+/// codes (zero-width) and East Asian wide characters (two columns). Keeping
+/// each rendered line within `width` columns is what lets `clear_last_lines`
+/// erase the previous draw cleanly — a wrapped continuation row would survive.
 fn truncate_to_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -413,11 +416,12 @@ fn truncate_to_width(s: &str, width: usize) -> String {
                 in_escape = false;
             }
         } else {
-            if visible >= width {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if visible + w > width {
                 break;
             }
             result.push(c);
-            visible += 1;
+            visible += w;
         }
     }
     result
@@ -481,7 +485,28 @@ pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_fuzzy, normalize_pasted_query, query_for_filter, score_match};
+    use super::{
+        matches_fuzzy, normalize_pasted_query, query_for_filter, score_match, truncate_to_width,
+    };
+
+    #[test]
+    fn truncate_to_width_counts_wide_chars_as_two_columns() {
+        // CJK ideographs occupy 2 terminal columns. Truncating by char count
+        // would let them wrap to a second row, which breaks the picker's
+        // clear-then-redraw cycle.
+        let s = "是官方的数据"; // 6 chars, 12 columns
+        assert_eq!(truncate_to_width(s, 4), "是官"); // fits 2 wide chars
+        assert_eq!(truncate_to_width(s, 5), "是官"); // partial wide char skipped
+        assert_eq!(truncate_to_width(s, 12), "是官方的数据");
+    }
+
+    #[test]
+    fn truncate_to_width_preserves_ansi_escapes() {
+        let s = "\x1b[1mhello\x1b[0m world";
+        // Visible width 11; truncate to 5 keeps "hello" plus its escapes.
+        let out = truncate_to_width(s, 5);
+        assert!(out.starts_with("\x1b[1mhello\x1b[0m"));
+    }
 
     #[test]
     fn score_prefers_prefix_over_substring_over_subsequence() {

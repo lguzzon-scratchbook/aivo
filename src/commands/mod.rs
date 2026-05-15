@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::services::ai_launcher::PreparedLaunch;
 use crate::services::environment_injector::redact_env_value;
 use crate::services::media_io::{
@@ -28,16 +30,31 @@ pub(crate) fn normalize_base_url(url: &str) -> &str {
     url.strip_suffix("/v1").unwrap_or(url)
 }
 
-/// Truncates `text` to its first line, then to `max_chars` with an ellipsis.
-/// Used by `aivo context` and `--context` for one-line topic previews.
-pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
+/// Truncates `text` to its first line, then to `max_cols` terminal columns
+/// with an ellipsis. Width-aware: CJK chars count as 2 columns so picker
+/// rows don't overflow the terminal and wrap to a second row.
+pub(crate) fn trim_to_one_line(text: &str, max_cols: usize) -> String {
     let one_line: String = text.lines().next().unwrap_or("").chars().collect();
-    if one_line.chars().count() > max_chars {
-        let prefix: String = one_line.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{}…", prefix)
-    } else {
-        one_line
+    let total_cols: usize = one_line
+        .chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    if total_cols <= max_cols {
+        return one_line;
     }
+    let budget = max_cols.saturating_sub(1);
+    let mut acc = 0usize;
+    let mut truncated = String::new();
+    for c in one_line.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + w > budget {
+            break;
+        }
+        truncated.push(c);
+        acc += w;
+    }
+    truncated.push('…');
+    truncated
 }
 
 /// Decides the final write path for media commands (`image`/`audio`/

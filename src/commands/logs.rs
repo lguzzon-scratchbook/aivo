@@ -18,6 +18,7 @@ use crate::services::log_store::{LogEntry, LogQuery, RunMeta};
 use crate::services::project_id::Thread;
 use crate::services::system_env;
 use crate::style;
+use unicode_width::UnicodeWidthChar;
 
 /// One row in the unified `aivo logs` listing. Mixes `logs.db` events
 /// (chat/run/serve), native CLI sessions (claude/codex/gemini/pi/opencode),
@@ -983,10 +984,11 @@ fn format_time_ago_short_dt(ts: DateTime<Utc>) -> String {
 }
 
 /// Collapse every kind of line/whitespace separator into a single space, then
-/// truncate to `max_chars` with an ellipsis. Bulletproof against topics with
-/// `\r`-only line breaks, Unicode line separators, tabs, or other control
-/// chars that would otherwise leak a second line into the table.
-pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
+/// truncate to `max_cols` terminal columns with an ellipsis. Width-aware:
+/// CJK and other East Asian Wide chars count as 2 columns so picker rows
+/// containing them don't overflow the terminal and wrap to a second row
+/// (which would defeat `clear_last_lines` in the FuzzySelect redraw loop).
+pub(crate) fn trim_to_one_line(text: &str, max_cols: usize) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
     for c in text.chars() {
@@ -1006,12 +1008,26 @@ pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
         }
     }
     let one_line = out.trim();
-    if one_line.chars().count() > max_chars {
-        let prefix: String = one_line.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{}…", prefix)
-    } else {
-        one_line.to_string()
+    let total_cols: usize = one_line
+        .chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    if total_cols <= max_cols {
+        return one_line.to_string();
     }
+    let budget = max_cols.saturating_sub(1); // reserve one column for the ellipsis
+    let mut acc = 0usize;
+    let mut truncated = String::new();
+    for c in one_line.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + w > budget {
+            break;
+        }
+        truncated.push(c);
+        acc += w;
+    }
+    truncated.push('…');
+    truncated
 }
 
 fn print_summary(entry: &LogEntry, detail_width: usize, is_orphan: bool) {
