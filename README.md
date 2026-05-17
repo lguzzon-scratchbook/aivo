@@ -97,6 +97,25 @@ aivo keys ping --all                         # health-check all keys
 
 Any endpoint implementing a supported protocol can be saved.
 
+### Backup & migrate keys between machines
+
+To move keys to another computer, export them to a password-encrypted envelope:
+
+```bash
+# on the source machine — prompts for a password twice
+aivo keys export ~/aivo-backup.aivo-keys
+
+# on the target machine — prompts for the same password
+aivo keys import ~/aivo-backup.aivo-keys
+
+# import directly from a URL (gist, S3, your own server)
+aivo keys import https://gist.example.com/raw/abc.aivo-keys
+```
+
+* Conflicts on import skip by default — pass `--overwrite` to replace existing keys or `--rename` to keep both.
+* The device-bound `aivo-starter` credential is excluded from exports unless you pass `--include-starter`.
+* OAuth tokens (Claude / Codex / Gemini / Copilot subscription logins) are not exported; re-run those login flows on the target machine.
+
 ## models
 
 List models from the active provider. Cached for one hour.
