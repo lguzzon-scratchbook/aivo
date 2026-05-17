@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.21.6
+
+## Features
+
+- `aivo keys export` / `aivo keys import`: portable password-encrypted backups of stored keys.
+
+## Fixes
+
+- `aivo claude`: honor `-m`/`--1m` for OAuth keys, properly unset conflicting `ANTHROPIC_*` auth vars, and set the beta-header policy per connection mode.
+
+---
+
 ## v0.21.5
 
 ## Fixes
