@@ -519,6 +519,31 @@ impl EnvironmentInjector {
             "0".to_string(),
         );
         env.insert("API_TIMEOUT_MS".to_string(), "30000000".to_string());
+        // Beta-header policy. `ANTHROPIC_BASE_URL` (which we always set)
+        // makes Claude Code treat the upstream as a gateway: fine-grained
+        // tool-input streaming defaults off, and experimental beta fields
+        // (`defer_loading`, `eager_input_streaming`) keep flowing. For real
+        // Anthropic-shaped endpoints (Direct mode) we want streaming on; for
+        // aivo's loopback Anthropic↔OpenAI router (every other mode) we want
+        // the experimental fields stripped so the OpenAI-shaped upstream
+        // doesn't 400 on unknown headers or extra schema keys.
+        match &mode {
+            ConnectionMode::Direct { .. } => {
+                env.insert(
+                    "CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING".to_string(),
+                    "1".to_string(),
+                );
+            }
+            ConnectionMode::Ollama
+            | ConnectionMode::Copilot
+            | ConnectionMode::OpenRouter
+            | ConnectionMode::Routed { .. } => {
+                env.insert(
+                    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS".to_string(),
+                    "1".to_string(),
+                );
+            }
+        }
         if let Some(model) = model {
             let normalized = if matches!(mode, ConnectionMode::Direct { .. }) {
                 anthropic_native_model_name(model)
@@ -1899,6 +1924,41 @@ mod tests {
                 "without --max-context, slot {slot} must keep the user's model unchanged",
             );
         }
+    }
+
+    #[test]
+    fn for_claude_direct_mode_forces_fine_grained_tool_streaming_on() {
+        // ANTHROPIC_BASE_URL being set makes Claude Code default fine-grained
+        // tool-input streaming OFF (treats it as a gateway). For Direct mode
+        // the upstream is a real Anthropic-shaped endpoint, so force it back on.
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.anthropic.com/v1".to_string();
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"),
+            Some(&"1".to_string()),
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"));
+    }
+
+    #[test]
+    fn for_claude_routed_mode_strips_experimental_betas() {
+        // Routed/Ollama/Copilot/OpenRouter all bridge to OpenAI-shaped
+        // upstreams via aivo's loopback router. Beta tool-schema fields
+        // (defer_loading, eager_input_streaming) and anthropic-beta headers
+        // are meaningless there and risk 400s on strict gateways.
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"),
+            Some(&"1".to_string()),
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"));
     }
 
     #[test]
