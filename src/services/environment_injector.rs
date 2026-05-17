@@ -706,18 +706,10 @@ impl EnvironmentInjector {
                 );
             }
             // Clear direct-auth env vars so a caller export can't override
-            // the shadow HOME's OAuth credentials. CODE_ASSIST_ENDPOINT /
-            // CODE_ASSIST_API_VERSION are read at request time by
-            // CodeAssistServer.getBaseUrl(), so an exported value silently
-            // reroutes OAuth traffic. GOOGLE_GENAI_USE_VERTEXAI would lose
-            // to our GOOGLE_GENAI_USE_GCA=true in gemini-cli's auth-type
-            // resolver, but clearing it keeps the override surface tidy.
+            // the shadow HOME's OAuth credentials.
             env.insert("GEMINI_API_KEY".to_string(), String::new());
             env.insert("GOOGLE_API_KEY".to_string(), String::new());
             env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), String::new());
-            env.insert("CODE_ASSIST_ENDPOINT".to_string(), String::new());
-            env.insert("CODE_ASSIST_API_VERSION".to_string(), String::new());
-            env.insert("GOOGLE_GENAI_USE_VERTEXAI".to_string(), String::new());
             return env;
         }
 
@@ -3148,15 +3140,10 @@ mod tests {
         assert!(env.contains_key("GEMINI_MODEL"));
 
         // Direct-mode env vars must be empty so a caller export can't shadow
-        // the OAuth creds inside the shadow HOME. CODE_ASSIST_ENDPOINT and
-        // CODE_ASSIST_API_VERSION are the OAuth-path equivalents — both are
-        // read at request time and would silently reroute traffic.
+        // the OAuth creds inside the shadow HOME.
         assert_eq!(env.get("GEMINI_API_KEY"), Some(&String::new()));
         assert_eq!(env.get("GOOGLE_API_KEY"), Some(&String::new()));
         assert_eq!(env.get("GOOGLE_GEMINI_BASE_URL"), Some(&String::new()));
-        assert_eq!(env.get("CODE_ASSIST_ENDPOINT"), Some(&String::new()));
-        assert_eq!(env.get("CODE_ASSIST_API_VERSION"), Some(&String::new()));
-        assert_eq!(env.get("GOOGLE_GENAI_USE_VERTEXAI"), Some(&String::new()));
 
         // No router-mode indicators — OAuth is always native Google.
         assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
