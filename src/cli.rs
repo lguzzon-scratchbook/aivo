@@ -85,6 +85,9 @@ pub enum Commands {
     /// Amp-specific configuration (workspace MCP server trust, etc.)
     Amp(AmpArgs),
 
+    /// Inspect or manage cached HuggingFace GGUF files
+    Hf(HfArgs),
+
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
@@ -117,6 +120,77 @@ pub struct ShareArgs {
     /// Bind only on 127.0.0.1 — local debugging without the public tunnel.
     #[arg(long, hide = true)]
     pub debug_local_only: bool,
+}
+
+/// Arguments for `aivo hf`. No subcommand → defaults to `list`. Real clap
+/// subcommands so each verb gets its own help + validation + completions
+/// instead of being squeezed into a positional `ACTION` string.
+#[derive(Args, Debug, Clone)]
+pub struct HfArgs {
+    #[command(subcommand)]
+    pub command: Option<HfSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum HfSubcommand {
+    /// List cached repos with size and last-used time
+    #[command(alias = "ls")]
+    List(HfListArgs),
+
+    /// Pre-download a GGUF for future runs (no server spawn)
+    Pull(HfPullArgs),
+
+    /// Delete cached files for one repo (one quant by default, or `--all`)
+    #[command(alias = "remove")]
+    Rm(HfRmArgs),
+
+    /// Delete every cached repo
+    Clean(HfCleanArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HfListArgs {
+    /// Show one row per cached file (filename, size, age) instead of a
+    /// repo-aggregated summary.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HfPullArgs {
+    /// `hf:<owner>/<repo>[:<quant>]` short ref or a full
+    /// `https://huggingface.co/<owner>/<repo>` URL.
+    #[arg(value_name = "REF")]
+    pub reference: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HfRmArgs {
+    /// Repo path: `<owner>/<repo>`.
+    #[arg(value_name = "REPO")]
+    pub repo: String,
+
+    /// Remove only the file matching this quant tag (e.g. `Q5_K_M`).
+    /// When omitted and the repo has a single cached file, that file is
+    /// removed. When omitted and multiple files are cached, the command
+    /// refuses unless `--all` is passed.
+    #[arg(long, value_name = "QUANT")]
+    pub quant: Option<String>,
+
+    /// Remove every cached file under this repo regardless of quant.
+    #[arg(long, conflicts_with = "quant")]
+    pub all: bool,
+
+    /// Skip the confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HfCleanArgs {
+    /// Skip the confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 /// Arguments for `aivo amp`. Currently scoped to the `trust` subcommand
@@ -450,6 +524,15 @@ pub struct ServeArgs {
     /// Require bearer token (auto-generated if no value given)
     #[arg(long, value_name = "TOKEN", num_args = 0..=1, default_missing_value = "")]
     pub auth_token: Option<String>,
+
+    /// Optional positional: `hf:<owner>/<repo>[:<quant>]` short ref or
+    /// `https://huggingface.co/...` URL. When given, `aivo serve`
+    /// spawns a local llama-server for that model and proxies to it
+    /// (no API-key picker; `-k` and `--failover` are ignored).
+    /// Without it, `aivo serve` behaves as a proxy to the active
+    /// provider key, as it always has.
+    #[arg(value_name = "REF")]
+    pub reference: Option<String>,
 }
 
 /// Arguments for the stats command
@@ -605,6 +688,12 @@ pub struct LogsArgs {
 /// Arguments for the chat command
 #[derive(Args, Debug, Clone)]
 pub struct ChatArgs {
+    /// Optional positional: `hf:<owner>/<repo>[:<quant>]` short ref or
+    /// `https://huggingface.co/...` URL. Equivalent to `-m <REF>` with
+    /// the local llama-server lifecycle wired up.
+    #[arg(value_name = "REF")]
+    pub reference: Option<String>,
+
     /// Specify AI model to use (remembered across sessions)
     #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub model: Option<String>,

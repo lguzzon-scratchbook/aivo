@@ -145,6 +145,7 @@ pub mod chat;
 pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
 pub(crate) mod chat_tui_format;
+pub mod hf;
 pub mod image;
 pub mod info;
 pub mod keys;

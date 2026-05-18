@@ -40,6 +40,8 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "keys",
     "chat",
     "image",
+    "video",
+    "audio",
     "models",
     "serve",
     "alias",
@@ -50,6 +52,9 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "update",
     "context",
     "mcp-serve",
+    "share",
+    "hf",
+    "amp",
     // Shortcut keywords rewritten in `rewrite_cli_args`
     "use",
     "ping",
@@ -59,5 +64,4 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "gemini",
     "opencode",
     "pi",
-    "amp",
 ];

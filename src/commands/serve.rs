@@ -126,8 +126,12 @@ impl ServeCommand {
 
         // Capture display info before moving key into the router
         let display_name = key.display_name().to_string();
+        // Sentinel set in run.rs when the positional REF is an HF ref.
+        let hf_mode = key.id == "aivo-hf-local";
         let display_host = if is_copilot {
             "github.com/copilot".to_string()
+        } else if hf_mode {
+            "local llama-server".to_string()
         } else {
             let stripped = key
                 .base_url
@@ -208,24 +212,34 @@ impl ServeCommand {
                 if failover_count == 1 { "" } else { "s" }
             );
         }
+        if hf_mode {
+            eprintln!(
+                "  {} GET /v1/models on this URL to discover the model id",
+                style::dim("·")
+            );
+            eprintln!(
+                "  {} POST /v1/chat/completions accepts any value in the `model` field",
+                style::dim("·")
+            );
+        }
         eprintln!("  {}", style::dim("Press Ctrl+C to stop"));
 
+        // SIGTERM gets the same graceful shutdown as Ctrl-C. Without
+        // this, `kill <aivo-pid>` from outside (or pkill, or a process
+        // manager) would terminate aivo without running cleanup, leaking
+        // any HF-mode llama-server child.
+        let mut sigterm = signal_terminate()?;
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 eprintln!("\n  Shutting down...");
                 shutdown.notify_one();
-                match tokio::time::timeout(std::time::Duration::from_secs(6), &mut handle).await {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(err))) => return Err(err),
-                    Ok(Err(err)) if err.is_cancelled() => {}
-                    Ok(Err(err)) => anyhow::bail!("serve router task failed: {}", err),
-                    Err(_) => {
-                        eprintln!("  Grace period expired, aborting");
-                        handle.abort();
-                        let _ = handle.await;
-                    }
-                }
+                wait_router_shutdown(&mut handle).await?;
+            }
+            _ = sigterm_recv(&mut sigterm) => {
+                eprintln!("\n  Shutting down (SIGTERM)...");
+                shutdown.notify_one();
+                wait_router_shutdown(&mut handle).await?;
             }
             result = &mut handle => match result {
                 Ok(Ok(())) => {
@@ -245,12 +259,18 @@ impl ServeCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo serve", style::bold("Usage:"));
+        println!("{} aivo serve [REF]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
             style::dim(
-                "Start a local OpenAI-compatible server that proxies to the active provider."
+                "Start a local OpenAI-compatible server. Without REF, proxies to the active provider key."
+            )
+        );
+        println!(
+            "{}",
+            style::dim(
+                "With REF (hf:<owner>/<repo>[:<quant>] or https://huggingface.co/...) spawns a local llama-server."
             )
         );
         println!();
@@ -293,12 +313,59 @@ impl ServeCommand {
         println!("  {}", style::dim("aivo serve --log | jq ."));
         println!("  {}", style::dim("aivo serve --log /tmp/requests.jsonl"));
         println!("  {}", style::dim("aivo serve --cors --timeout 60"));
+        println!(
+            "  {}",
+            style::dim("aivo serve hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        );
+        println!(
+            "  {}",
+            style::dim("aivo serve https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF --cors")
+        );
     }
 }
 
-/// True when the bind host reaches beyond loopback — i.e. any network
-/// interface or an explicit non-loopback address. Used to gate warnings
-/// that only matter when the server is actually exposed.
+/// Drains the router's join handle after a shutdown notify, with a 6s
+/// grace period before forced abort.
+async fn wait_router_shutdown(handle: &mut tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    match tokio::time::timeout(std::time::Duration::from_secs(6), &mut *handle).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(err))) => Err(err),
+        Ok(Err(err)) if err.is_cancelled() => Ok(()),
+        Ok(Err(err)) => anyhow::bail!("serve router task failed: {}", err),
+        Err(_) => {
+            eprintln!("  Grace period expired, aborting");
+            handle.abort();
+            let _ = handle.await;
+            Ok(())
+        }
+    }
+}
+
+/// Installs a SIGTERM listener on Unix. On Windows this is a no-op
+/// since the platform lacks SIGTERM; SIGINT (Ctrl-C) is handled separately.
+#[cfg(unix)]
+fn signal_terminate() -> Result<tokio::signal::unix::Signal> {
+    use tokio::signal::unix::{SignalKind, signal};
+    Ok(signal(SignalKind::terminate())?)
+}
+
+#[cfg(not(unix))]
+fn signal_terminate() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn sigterm_recv(sig: &mut tokio::signal::unix::Signal) {
+    sig.recv().await;
+}
+
+#[cfg(not(unix))]
+async fn sigterm_recv(_: &mut ()) {
+    // No SIGTERM on Windows; future never resolves.
+    std::future::pending::<()>().await
+}
+
+/// True when the bind host reaches beyond loopback.
 fn host_binds_publicly(bind_host: &str) -> bool {
     if bind_host == "0.0.0.0" || bind_host == "::" {
         return true;

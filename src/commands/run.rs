@@ -17,9 +17,12 @@ use crate::services::environment_injector::{
     AMP_AGENT_MODES, AmpModeModels, ClaudeModelOverrides, ClaudeSlotFlags,
 };
 use crate::services::http_utils;
+use crate::services::huggingface;
 use crate::services::models_cache::ModelsCache;
 use crate::services::project_id::Thread;
-use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::session_store::{
+    ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode, SessionStore,
+};
 use crate::services::system_env;
 use crate::style;
 
@@ -292,6 +295,7 @@ impl RunCommand {
         context_selector: Option<String>,
         max_context: Option<String>,
     ) -> anyhow::Result<ExitCode> {
+        let mut model = model;
         let tool = match tool {
             Some(t) => t,
             None => {
@@ -336,6 +340,53 @@ impl RunCommand {
         // consume (shadow CODEX_HOME, CLAUDE_CODE_OAUTH_TOKEN, shadow
         // GEMINI_CLI_HOME); every other tool would see an unusable JSON blob.
         let mut key_override = key_override;
+
+        // Bare `hf:` opens a picker; rewrite to a concrete ref so the
+        // match below treats it like any other `hf:<repo>` value.
+        if let Some(m) = model.as_deref()
+            && huggingface::is_bare_hf_picker_trigger(m)
+        {
+            match huggingface::pick_cached_short_ref() {
+                Some(short) => model = Some(short),
+                None => return Ok(ExitCode::Success),
+            }
+        }
+
+        // HF takeover: bypass key resolution, spawn a local llama-server,
+        // synthesize a loopback key pinned to OpenAI Chat Completions on
+        // every tool's protocol (llama-server speaks nothing else).
+        let hf_active = match model.as_deref() {
+            Some(m) if huggingface::is_huggingface_ref(m) => {
+                let hf_ref = huggingface::parse_hf_ref(m)?;
+                let port = if dry_run {
+                    eprintln!(
+                        "  {} {}",
+                        style::yellow("Note:"),
+                        style::dim(
+                            "--dry-run shows a placeholder local port; llama-server is not spawned."
+                        )
+                    );
+                    0
+                } else {
+                    huggingface::ensure_ready(&hf_ref).await?
+                };
+                let mut k = ApiKey::new_with_protocol(
+                    "aivo-hf-local".to_string(),
+                    format!("hf:{}", hf_ref.repo),
+                    huggingface::local_openai_base_url(port),
+                    Some(ClaudeProviderProtocol::Openai),
+                    "huggingface".to_string(),
+                );
+                k.gemini_protocol = Some(GeminiProviderProtocol::Openai);
+                k.codex_mode = Some(OpenAICompatibilityMode::Router);
+                k.opencode_mode = Some(OpenAICompatibilityMode::Router);
+                key_override = Some(k);
+                model = Some(hf_ref.display_model_name());
+                true
+            }
+            _ => false,
+        };
+
         if let Some(ref key) = key_override
             && ai_tool.oauth_incompat_reason(key).is_some()
         {
@@ -394,7 +445,9 @@ impl RunCommand {
             anyhow::bail!("Internal error: no active key available for model resolution");
         };
 
-        if let Some(ref key) = key_override {
+        if let Some(ref key) = key_override
+            && !hf_active
+        {
             let _ = self
                 .session_store
                 .set_last_selection(key, tool, resolved_model.as_deref())

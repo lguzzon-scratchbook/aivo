@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::constants::{KNOWN_TOOLS, RESERVED_ALIAS_NAMES};
 use crate::services::environment_injector::{AmpModeModels, ClaudeSlotFlags};
+use crate::services::huggingface::is_huggingface_ref;
 use crate::services::session_store::BundleAlias;
 
 pub(crate) fn rewrite_cli_args(
@@ -589,6 +590,11 @@ pub(crate) fn extract_aivo_flags(
             if max_context.is_none() {
                 max_context = Some(value);
             }
+        } else if model.is_none() && is_huggingface_ref(arg) {
+            // Positional HF ref → lift it into `-m`. Lets users type
+            // `aivo codex hf:Qwen/...` instead of `aivo codex -m hf:...`.
+            // Explicit `-m` wins (covered by the `model.is_none()` guard).
+            model = Some(arg.clone());
         } else {
             remaining_args.push(arg.clone());
         }
@@ -649,6 +655,118 @@ mod tests {
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
         assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn positional_hf_ref_lifts_to_model() {
+        // `aivo codex hf:Qwen/...` should set model and not pass the
+        // ref through to the underlying tool.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
+        );
+        assert_eq!(
+            r.model.as_deref(),
+            Some("hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        );
+        assert!(r.remaining_args.is_empty());
+    }
+
+    #[test]
+    fn positional_hf_url_lifts_to_model() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
+        );
+        assert_eq!(
+            r.model.as_deref(),
+            Some("https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        );
+        assert!(r.remaining_args.is_empty());
+    }
+
+    #[test]
+    fn explicit_model_wins_over_positional_hf_ref() {
+        // Explicit -m precedes; the HF positional then passes through
+        // to the tool unchanged (e.g. as a prompt fragment).
+        let r = extract_aivo_flags(
+            Some("gpt-4o".to_string()),
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
+        );
+        assert_eq!(r.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            r.remaining_args,
+            args(&["hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"])
+        );
+    }
+
+    #[test]
+    fn positional_hf_ref_with_trailing_prompt() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF", "tell me about rust"]),
+        );
+        assert_eq!(
+            r.model.as_deref(),
+            Some("hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        );
+        assert_eq!(r.remaining_args, args(&["tell me about rust"]));
+    }
+
+    #[test]
+    fn non_hf_positional_passes_through() {
+        // Anything that isn't an HF ref keeps its normal passthrough behavior.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["file.ts", "do the thing"]),
+        );
+        assert_eq!(r.model, None);
+        assert_eq!(r.remaining_args, args(&["file.ts", "do the thing"]));
     }
 
     #[test]

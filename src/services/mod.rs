@@ -46,6 +46,7 @@ pub mod gemini_router;
 pub mod global_stats;
 pub mod http_debug;
 pub mod http_utils;
+pub mod huggingface;
 pub mod id_compact;
 pub mod image_gen;
 pub mod key_compat;

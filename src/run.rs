@@ -61,6 +61,16 @@ fn fast_crypto_guard() {}
 /// and initialize the global HTTP debug logger so subsequent `.send_logged()`
 /// calls capture request/response details. Prints the resolved log path to
 /// stderr; on open failure, warns and continues without logging.
+/// Outer-dispatcher predicate for skipping key resolution; the HF flow
+/// synthesizes its own loopback `ApiKey`.
+fn is_hf_takeover(model: Option<&str>) -> bool {
+    use services::huggingface;
+    match model {
+        Some(m) => huggingface::is_huggingface_ref(m) || huggingface::is_bare_hf_picker_trigger(m),
+        None => false,
+    }
+}
+
 async fn maybe_init_http_debug(value: &Option<String>) {
     let Some(raw) = value else {
         return;
@@ -137,6 +147,7 @@ pub async fn run() -> ! {
             Commands::Amp(amp_args) => {
                 crate::commands::AmpCommand::print_help(amp_args.action.as_deref())
             }
+            Commands::Hf(_) => crate::commands::hf::HfCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
         }
         process::exit(0);
@@ -181,18 +192,45 @@ pub async fn run() -> ! {
         Commands::Chat(chat_args) => {
             maybe_init_http_debug(&chat_args.debug).await;
             let key_explicit = chat_args.key.is_some();
-            let key_override = key_or_exit(
-                resolve_key_override(
-                    &session_store,
-                    chat_args.key.as_deref(),
-                    KeyLookupMode::RequireActiveOrPrompt,
-                    KeyCompatContext::Chat,
+            // Reject non-HF positionals up-front, matching `aivo serve`.
+            if let Some(ref raw) = chat_args.reference
+                && !is_hf_takeover(Some(raw.as_str()))
+            {
+                eprintln!(
+                    "{} `aivo chat <REF>` only accepts a HuggingFace ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`). Got: {}",
+                    style::red("Error:"),
+                    raw,
+                );
+                eprintln!(
+                    "  {}",
+                    style::dim("For a remote provider, pass `--model <name>` instead."),
+                );
+                process::exit(ExitCode::UserError.code());
+            }
+            // Positional lifts into model; explicit -m still wins.
+            let model_input = chat_args
+                .model
+                .clone()
+                .or_else(|| chat_args.reference.clone());
+            // Expand alias before the HF check so `-m <alias-to-hf-ref>`
+            // takes the HF path. `run`'s flow does the same.
+            let expanded_model = resolve_model_alias(&session_store, model_input).await;
+            let key_override = if is_hf_takeover(expanded_model.as_deref()) {
+                None
+            } else {
+                key_or_exit(
+                    resolve_key_override(
+                        &session_store,
+                        chat_args.key.as_deref(),
+                        KeyLookupMode::RequireActiveOrPrompt,
+                        KeyCompatContext::Chat,
+                    )
+                    .await,
                 )
-                .await,
-            );
+            };
             // When -k is used without -m, force model picker (same as run/start)
-            let model = if chat_args.model.is_some() {
-                resolve_model_alias(&session_store, chat_args.model).await
+            let model = if chat_args.model.is_some() || chat_args.reference.is_some() {
+                expanded_model
             } else if key_explicit {
                 Some(String::new())
             } else {
@@ -416,15 +454,19 @@ pub async fn run() -> ! {
                     .and_then(AIToolType::parse)
                     .map(KeyCompatContext::Tool)
                     .unwrap_or(KeyCompatContext::None);
-                let key_override = key_or_exit(
-                    resolve_key_override(
-                        &session_store,
-                        key_flag.as_deref(),
-                        KeyLookupMode::RequireActiveOrPrompt,
-                        compat,
+                let key_override = if is_hf_takeover(model.as_deref()) {
+                    None
+                } else {
+                    key_or_exit(
+                        resolve_key_override(
+                            &session_store,
+                            key_flag.as_deref(),
+                            KeyLookupMode::RequireActiveOrPrompt,
+                            compat,
+                        )
+                        .await,
                     )
-                    .await,
-                );
+                };
 
                 // --relogin: drive the OAuth flow up front so the launch sees
                 // a fresh credential. Done after key resolution (so the user
@@ -603,24 +645,93 @@ pub async fn run() -> ! {
         }
 
         Commands::Serve(serve_args) => {
-            let key_override = match resolve_key_override(
-                &session_store,
-                serve_args.key.as_deref(),
-                KeyLookupMode::PreferActiveAllowNone,
-                KeyCompatContext::None,
-            )
-            .await
+            // Reject non-HF positionals up-front so a typo doesn't fall
+            // through to "no key" mode.
+            if let Some(ref raw) = serve_args.reference
+                && !is_hf_takeover(Some(raw.as_str()))
             {
-                Ok(KeyResolution::Selected(key)) => Some(key),
-                Ok(KeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
-                Ok(KeyResolution::MissingAuth) => None,
-                Err(e) => {
-                    eprintln!("{} {}", style::red("Error:"), e);
-                    process::exit(ExitCode::UserError.code());
+                eprintln!(
+                    "{} `aivo serve <REF>` only accepts a HuggingFace ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`). Got: {}",
+                    style::red("Error:"),
+                    raw,
+                );
+                eprintln!(
+                    "  {}",
+                    style::dim("For a remote provider, omit the positional and use `-k <key>`."),
+                );
+                process::exit(ExitCode::UserError.code());
+            }
+            let hf_mode = serve_args.reference.is_some();
+            if hf_mode {
+                // Warn before download starts so it lands above the spinner.
+                if serve_args.key.is_some() {
+                    eprintln!(
+                        "  {} -k / --key is ignored when a local model is specified",
+                        style::yellow("!"),
+                    );
+                }
+                if serve_args.failover {
+                    eprintln!(
+                        "  {} --failover is ignored when a local model is specified",
+                        style::yellow("!"),
+                    );
+                }
+            }
+            let hf_takeover_key = if hf_mode {
+                let raw = serve_args.reference.as_deref().unwrap_or("");
+                let hf_ref = match services::huggingface::parse_hf_ref(raw) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        process::exit(ExitCode::UserError.code());
+                    }
+                };
+                match services::huggingface::ensure_ready(&hf_ref).await {
+                    Ok(port) => {
+                        let base_url = services::huggingface::local_openai_base_url(port);
+                        Some(services::session_store::ApiKey::new_with_protocol(
+                            "aivo-hf-local".to_string(),
+                            format!("hf:{}", hf_ref.repo),
+                            base_url,
+                            None,
+                            "huggingface".to_string(),
+                        ))
+                    }
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        // ensure_ready may have stored the child in
+                        // SERVER_CHILD before its health-check failed;
+                        // `process::exit` skips destructors so we have
+                        // to kill the orphan explicitly.
+                        services::huggingface::stop_if_we_started();
+                        process::exit(ExitCode::UserError.code());
+                    }
+                }
+            } else {
+                None
+            };
+
+            let key_override = if let Some(key) = hf_takeover_key {
+                Some(key)
+            } else {
+                match resolve_key_override(
+                    &session_store,
+                    serve_args.key.as_deref(),
+                    KeyLookupMode::PreferActiveAllowNone,
+                    KeyCompatContext::None,
+                )
+                .await
+                {
+                    Ok(KeyResolution::Selected(key)) => Some(key),
+                    Ok(KeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
+                    Ok(KeyResolution::MissingAuth) => None,
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        process::exit(ExitCode::UserError.code());
+                    }
                 }
             };
-            // Build failover key list when --failover is enabled
-            let failover_keys = if serve_args.failover {
+            let failover_keys = if serve_args.failover && !hf_mode {
                 let mut all_keys = session_store.get_keys().await.unwrap_or_default();
                 // Decrypt and exclude the primary key
                 let primary_id = key_override.as_ref().map(|k| k.id.clone());
@@ -672,6 +783,11 @@ pub async fn run() -> ! {
             command.execute(amp_args).await
         }
 
+        Commands::Hf(hf_args) => {
+            let command = crate::commands::hf::HfCommand::new();
+            command.execute(hf_args).await
+        }
+
         Commands::Share(share_args) => {
             let command = ShareCommand::new(session_store);
             command.execute(share_args).await
@@ -696,6 +812,8 @@ pub async fn run() -> ! {
 
     // Stop Ollama if aivo auto-started it during this session.
     services::ollama::stop_if_we_started();
+    // Stop llama-server if aivo auto-started it for a HuggingFace run.
+    services::huggingface::stop_if_we_started();
 
     process::exit(exit_code.code());
 }
@@ -743,6 +861,10 @@ fn print_help() {
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
+    print_cmd(
+        "hf",
+        "Manage cached HuggingFace GGUF files (list, pull, rm, clean)",
+    );
     print_cmd(
         "logs",
         "Show recent local logs from chat, run, and serve (show, share, status)",

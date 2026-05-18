@@ -26,6 +26,7 @@ use crate::services::copilot_auth::{
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::copilot_initiator_from_openai;
 use crate::services::http_utils::sse_data_payload;
+use crate::services::huggingface;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{
@@ -207,24 +208,52 @@ impl ChatCommand {
         key_override: Option<ApiKey>,
         json: bool,
     ) -> Result<ExitCode> {
-        let mut key = match key_override {
-            Some(k) => k,
-            None => match self.session_store.get_active_key().await? {
-                Some(k) => k,
-                None => {
-                    eprintln!(
-                        "{} No API key configured. Run 'aivo keys add' first.",
-                        style::red("Error:")
-                    );
-                    return Ok(ExitCode::AuthError);
+        // Bare `hf:` opens a picker; rewrite to a concrete ref.
+        let model_flag = match model_flag.as_deref() {
+            Some(m) if huggingface::is_bare_hf_picker_trigger(m) => {
+                match huggingface::pick_cached_short_ref() {
+                    Some(short) => Some(short),
+                    None => return Ok(ExitCode::Success),
                 }
-            },
+            }
+            _ => model_flag,
         };
 
-        // OAuth entries target subscription backends only the native CLIs can
-        // speak — plain /v1/chat/completions, /v1/messages, and
-        // generateContent endpoints reject them.
-        if key.is_any_oauth() {
+        // HF takeover: bypass key resolution + last_selection persistence.
+        let (mut key, model_flag, hf_active) = match model_flag.as_deref() {
+            Some(m) if huggingface::is_huggingface_ref(m) => {
+                let hf_ref = huggingface::parse_hf_ref(m)?;
+                let port = huggingface::ensure_ready(&hf_ref).await?;
+                let synthetic = ApiKey::new_with_protocol(
+                    "aivo-hf-local".to_string(),
+                    format!("hf:{}", hf_ref.repo),
+                    huggingface::local_openai_base_url(port),
+                    None,
+                    "huggingface".to_string(),
+                );
+                (synthetic, Some(hf_ref.display_model_name()), true)
+            }
+            _ => {
+                let key = match key_override {
+                    Some(k) => k,
+                    None => match self.session_store.get_active_key().await? {
+                        Some(k) => k,
+                        None => {
+                            eprintln!(
+                                "{} No API key configured. Run 'aivo keys add' first.",
+                                style::red("Error:")
+                            );
+                            return Ok(ExitCode::AuthError);
+                        }
+                    },
+                };
+                (key, model_flag, false)
+            }
+        };
+
+        // OAuth keys target subscription backends only the native CLIs can
+        // speak; reject them for `aivo chat`.
+        if !hf_active && key.is_any_oauth() {
             key = match crate::commands::keys::swap_incompatible_key(
                 &self.session_store,
                 &key,
@@ -242,7 +271,14 @@ impl ChatCommand {
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
 
-        let raw_model = match self.resolve_model(&client, &key, model_flag).await? {
+        // HF mode already has the model set; skip `resolve_model` to
+        // avoid persisting it under the ephemeral synthetic key id.
+        let resolved = if hf_active {
+            Some(model_flag.clone().unwrap_or_default())
+        } else {
+            self.resolve_model(&client, &key, model_flag).await?
+        };
+        let raw_model = match resolved {
             Some(m) => m,
             None => {
                 ensure_picker_terminal("model", "--model <name>")?;
@@ -284,22 +320,25 @@ impl ChatCommand {
         };
 
         // Preserve the existing tool in last_selection so `aivo run` (no tool)
-        // still recalls the last *launchable* tool, not "chat".
-        let existing_tool = self
-            .session_store
-            .get_last_selection()
-            .await
-            .ok()
-            .flatten()
-            .map(|s| s.tool);
-        let _ = self
-            .session_store
-            .set_last_selection(
-                &key,
-                existing_tool.as_deref().unwrap_or("chat"),
-                Some(&raw_model),
-            )
-            .await;
+        // still recalls the last *launchable* tool, not "chat". Skipped for
+        // HF — the synthetic key is ephemeral and shouldn't be remembered.
+        if !hf_active {
+            let existing_tool = self
+                .session_store
+                .get_last_selection()
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.tool);
+            let _ = self
+                .session_store
+                .set_last_selection(
+                    &key,
+                    existing_tool.as_deref().unwrap_or("chat"),
+                    Some(&raw_model),
+                )
+                .await;
+        }
 
         let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
         let pending_attachments = build_pending_attachments(&attachments)?;
@@ -504,7 +543,7 @@ impl ChatCommand {
 
     pub fn print_help() {
         println!(
-            "{} aivo chat [--model <model>] [-x [message]] [--attach <path> ...]",
+            "{} aivo chat [REF] [--model <model>] [-x [message]] [--attach <path> ...]",
             style::bold("Usage:")
         );
         println!();
@@ -600,6 +639,10 @@ impl ChatCommand {
         println!("  {}", style::dim("aivo chat"));
         println!("  {}", style::dim("aivo chat --model gpt-4o"));
         println!("  {}", style::dim("aivo chat -m claude-sonnet-4-5"));
+        println!(
+            "  {}",
+            style::dim("aivo chat hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        );
         println!(
             "  {}",
             style::dim("aivo chat --attach README.md --attach screenshot.png")
