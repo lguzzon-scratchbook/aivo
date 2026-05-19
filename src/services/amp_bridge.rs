@@ -122,7 +122,10 @@ impl AmpBridge {
 /// found, or `None` if the file doesn't exist / can't be parsed.
 pub fn detect_native_amp_credentials() -> Option<(String, String)> {
     let home = crate::services::system_env::home_dir()?;
-    let path = home.join(".local/share/amp/secrets.json");
+    let path = crate::services::system_env::join_segments(
+        &home,
+        &[".local", "share", "amp", "secrets.json"],
+    );
     let raw = std::fs::read_to_string(&path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let obj = value.as_object()?;

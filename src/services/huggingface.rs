@@ -273,7 +273,7 @@ pub fn detect_binary() -> Option<PathBuf> {
 fn well_known_install_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(home) = system_env::home_dir() {
-        dirs.push(home.join(".aivo/bin"));
+        dirs.push(home.join(".aivo").join("bin"));
     }
     #[cfg(unix)]
     {
@@ -1101,14 +1101,6 @@ async fn stream_to_file(
 const HF_CACHE_SEGMENTS: &[&str] = &[".config", "aivo", "cache", "huggingface"];
 const LEGACY_HF_CACHE_SEGMENTS: &[&str] = &[".aivo", "cache", "huggingface"];
 
-fn join_segments(base: &Path, segments: &[&str]) -> PathBuf {
-    let mut p = base.to_path_buf();
-    for seg in segments {
-        p.push(seg);
-    }
-    p
-}
-
 /// One-shot migration from the pre-0.23 cache location (`~/.aivo/cache/huggingface`)
 /// to the new one under `~/.config/aivo/`. Skips silently if the new directory
 /// already exists, so a downgrade-then-upgrade won't clobber recent downloads.
@@ -1118,8 +1110,8 @@ fn migrate_legacy_cache_once() {
         let Some(home) = system_env::home_dir() else {
             return;
         };
-        let old = join_segments(&home, LEGACY_HF_CACHE_SEGMENTS);
-        let new = join_segments(&home, HF_CACHE_SEGMENTS);
+        let old = system_env::join_segments(&home, LEGACY_HF_CACHE_SEGMENTS);
+        let new = system_env::join_segments(&home, HF_CACHE_SEGMENTS);
         if !old.is_dir() || new.exists() {
             return;
         }
@@ -1157,14 +1149,14 @@ fn local_cache_path(repo: &str, revision: &str, filename: &str) -> Result<PathBu
     } else {
         format!("@{revision}__{flat}")
     };
-    Ok(join_segments(&home, HF_CACHE_SEGMENTS)
+    Ok(system_env::join_segments(&home, HF_CACHE_SEGMENTS)
         .join(sanitized_repo)
         .join(on_disk))
 }
 
 pub fn cache_root() -> Option<PathBuf> {
     migrate_legacy_cache_once();
-    system_env::home_dir().map(|h| join_segments(&h, HF_CACHE_SEGMENTS))
+    system_env::home_dir().map(|h| system_env::join_segments(&h, HF_CACHE_SEGMENTS))
 }
 
 #[derive(Debug, Clone)]

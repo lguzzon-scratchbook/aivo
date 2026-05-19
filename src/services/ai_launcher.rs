@@ -131,14 +131,14 @@ impl AIToolType {
         if let Some(home) = crate::services::system_env::home_dir() {
             // Common locations across installers (curl scripts, user-level
             // npm prefixes, bun).
-            for sub in [".local/bin", ".npm-global/bin", ".bun/bin"] {
-                dirs.push(home.join(sub));
-            }
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join(".npm-global").join("bin"));
+            dirs.push(home.join(".bun").join("bin"));
             // Tool-specific installer paths.
             match self {
-                Self::Claude => dirs.push(home.join(".claude/local")),
-                Self::Opencode => dirs.push(home.join(".opencode/bin")),
-                Self::Amp => dirs.push(home.join(".amp/bin")),
+                Self::Claude => dirs.push(home.join(".claude").join("local")),
+                Self::Opencode => dirs.push(home.join(".opencode").join("bin")),
+                Self::Amp => dirs.push(home.join(".amp").join("bin")),
                 _ => {}
             }
             #[cfg(windows)]
@@ -1029,11 +1029,11 @@ mod tests {
         let dirs = AIToolType::Claude.well_known_install_dirs();
         let home = crate::services::system_env::home_dir().expect("HOME set in test env");
         assert!(
-            dirs.contains(&home.join(".local/bin")),
+            dirs.contains(&home.join(".local").join("bin")),
             "expected ~/.local/bin among Claude fallback dirs, got {dirs:?}"
         );
         assert!(
-            dirs.contains(&home.join(".claude/local")),
+            dirs.contains(&home.join(".claude").join("local")),
             "expected ~/.claude/local among Claude fallback dirs, got {dirs:?}"
         );
     }
@@ -1047,7 +1047,7 @@ mod tests {
         for tool in [AIToolType::Codex, AIToolType::Gemini, AIToolType::Pi] {
             let dirs = tool.well_known_install_dirs();
             assert!(
-                dirs.contains(&home.join(".npm-global/bin")),
+                dirs.contains(&home.join(".npm-global").join("bin")),
                 "{tool:?} fallback dirs missing ~/.npm-global/bin: {dirs:?}"
             );
         }

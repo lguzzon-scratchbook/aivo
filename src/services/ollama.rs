@@ -29,9 +29,8 @@ fn child_slot() -> &'static Mutex<Option<Child>> {
 
 fn state_dir() -> &'static Path {
     STATE_DIR.get_or_init(|| {
-        crate::services::system_env::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".config/aivo/ollama-pids")
+        let home = crate::services::system_env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        crate::services::system_env::join_segments(&home, &[".config", "aivo", "ollama-pids"])
     })
 }
 

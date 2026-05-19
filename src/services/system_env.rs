@@ -111,6 +111,17 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     expand_tilde_with_home(path, home_dir().as_deref())
 }
 
+/// Joins each segment onto `base` with `PathBuf::push`, so the result
+/// uses the platform separator. Plain `base.join("a/b/c")` preserves
+/// the embedded `/` on Windows and produces mixed-separator paths.
+pub fn join_segments(base: &Path, segments: &[&str]) -> PathBuf {
+    let mut p = base.to_path_buf();
+    for seg in segments {
+        p.push(seg);
+    }
+    p
+}
+
 /// Replaces a leading home directory with `~` for display purposes.
 /// Returns the path unchanged if it doesn't start with the user's home.
 pub fn collapse_tilde(path: &str) -> String {
@@ -238,7 +249,13 @@ fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = home
     {
-        return home.join(rest);
+        return rest
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .fold(home.to_path_buf(), |mut p, s| {
+                p.push(s);
+                p
+            });
     }
     PathBuf::from(path)
 }
@@ -268,10 +285,9 @@ mod tests {
     #[test]
     fn expand_tilde_replaces_home_prefix() {
         let home = Path::new("/tmp/example-home");
-        assert_eq!(
-            expand_tilde_with_home("~/config/aivo", Some(home)),
-            home.join("config/aivo")
-        );
+        let expanded = expand_tilde_with_home("~/config/aivo", Some(home));
+        let expected: PathBuf = home.join("config").join("aivo");
+        assert_eq!(expanded, expected);
         assert_eq!(expand_tilde_with_home("~", Some(home)), home);
     }
 
