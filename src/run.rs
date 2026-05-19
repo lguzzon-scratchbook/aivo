@@ -845,77 +845,64 @@ async fn load_bundle_index(
 /// Prints help information
 fn print_help() {
     println!(
-        "{} {} {}",
+        "{} {} — CLI for AI coding assistants",
         style::cyan("aivo"),
         style::dim(format!("v{}", version::VERSION)),
-        style::dim("— CLI for AI coding assistants")
     );
     println!();
     println!("{} aivo <command> [options]", style::bold("Usage:"));
     println!();
+
     println!("{}", style::bold("Commands:"));
     let print_cmd = |name: &str, desc: &str| {
-        let padded = format!("{:<10}", name);
-        println!("  {}{}", style::cyan(&padded), style::dim(desc));
+        println!("  {}  {}", style::cyan(format!("{:<8}", name)), desc);
     };
-    print_cmd("run", "Launch AI tool, or use the saved start flow");
-    print_cmd(
-        "keys",
-        "Manage API keys (use, add, rm, cat, edit, ping, reset-route)",
-    );
+    print_cmd("run", "Launch an AI tool, or the saved start flow");
+    print_cmd("keys", "Manage API keys");
     print_cmd("chat", "Start the interactive chat TUI");
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
-    print_cmd(
-        "hf",
-        "Manage cached HuggingFace GGUF files (list, pull, rm, clean)",
-    );
-    print_cmd(
-        "logs",
-        "Show recent local logs from chat, run, and serve (show, share, status)",
-    );
+    print_cmd("hf", "Manage cached HuggingFace GGUF files");
+    print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
     print_cmd("update", "Update to the latest version");
     println!();
+
     println!("{}", style::bold("Shortcuts:"));
-    let print_shortcut = |alias: &str, expansion: &str| {
-        let padded = format!("{:<10}", alias);
-        println!("  {}{}", style::cyan(&padded), style::dim(expansion));
-    };
-    print_shortcut(
-        "use",
-        "keys use            (run `aivo keys use --help` for flags)",
-    );
-    print_shortcut(
-        "ping",
-        "keys ping           (run `aivo keys ping --help` for flags)",
-    );
-    print_shortcut(
-        "share",
-        "logs share          (run `aivo logs share --help` for flags)",
-    );
-    print_shortcut(
-        "<tool>",
-        "run <tool>          (claude / codex / gemini / opencode / pi / amp)",
-    );
+    let shortcuts: &[(&str, &str, &str)] = &[
+        ("use", "keys use", "aivo keys use --help"),
+        ("ping", "keys ping", "aivo keys ping --help"),
+        ("share", "logs share", "aivo logs share --help"),
+        (
+            "<tool>",
+            "run <tool>",
+            "claude / codex / gemini / opencode / pi / amp",
+        ),
+    ];
+    let expansion_width = shortcuts.iter().map(|(_, e, _)| e.len()).max().unwrap_or(0);
+    for (alias, expansion, hint) in shortcuts {
+        let alias_col = style::cyan(format!("{alias:<8}"));
+        let hint_col = style::dim(format!("({hint})"));
+        println!("  {alias_col}  {expansion:<expansion_width$}  {hint_col}");
+    }
     println!();
+
     println!("{}", style::bold("Examples:"));
-    println!("  {}", style::dim("aivo claude -k aivo"));
-    println!("  {}", style::dim("aivo -x \"hello\""));
-    println!(
-        "  {}",
-        style::dim("git diff | aivo -x \"summarize changes\"")
-    );
-    println!("  {}", style::dim("aivo gemini -k mykey -m minimax-m2.7"));
+    for cmd in [
+        "aivo keys add",
+        "aivo chat",
+        "aivo chat hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "aivo -x \"hello\"",
+        "git diff | aivo -x \"summarize changes\"",
+    ] {
+        println!("  {}", style::dim(cmd));
+    }
     println!();
+
     println!("{}", style::bold("Options:"));
     let print_opt = |flag: &str, desc: &str| {
-        println!(
-            "  {}{}",
-            style::cyan(format!("{:<22}", flag)),
-            style::dim(desc)
-        );
+        println!("  {}  {}", style::bold(format!("{:<19}", flag)), desc);
     };
     print_opt(
         "-x, --execute [msg]",
@@ -953,10 +940,11 @@ async fn print_active_selection(session_store: &SessionStore) {
     println!();
     println!("{}", style::bold("Active key:"));
     println!(
-        "  {} {}  {}",
+        "  {} {}  {}  {}",
         style::bullet_symbol(),
         key_label,
         style::dim(model_display),
+        style::dim("(change with: aivo use)"),
     );
 }
 
