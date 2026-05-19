@@ -1002,14 +1002,11 @@ async fn head_content_length(url: &str) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("HEAD {url} did not return a Content-Length header"))
 }
 
-/// Atomic via `.partial` rename. A partial from an interrupted run is
-/// overwritten — resumed downloads aren't implemented.
+/// Atomic via `.partial` rename. Interrupted runs resume via HTTP Range
+/// against the existing `.partial`; if the server doesn't honor `Range`
+/// (returns `200` instead of `206`) we restart from zero.
 async fn download_with_progress(file: &ResolvedGgufFile, dest: &Path) -> Result<()> {
-    let label_text = format!(
-        " Downloading {} — 0B / {} (0%)",
-        file.filename,
-        human_size(file.size_bytes)
-    );
+    let label_text = format!(" 0% · 0B/{}", human_size(file.size_bytes));
     let label = Arc::new(Mutex::new(label_text));
     let (spinning, handle) = crate::style::start_spinner_with_label(label.clone());
     let started = Instant::now();
@@ -1028,9 +1025,29 @@ async fn stream_to_file(
     started: Instant,
 ) -> Result<()> {
     let tmp = dest.with_extension("partial");
+
+    // Resume if a `.partial` from a prior run is shorter than the expected size.
+    // A `.partial` that's already >= total is suspect (size changed upstream,
+    // or a prior run finished writing but failed to rename) — start fresh.
+    let resume_offset = match tokio::fs::metadata(&tmp).await {
+        Ok(meta) if meta.is_file() => {
+            let len = meta.len();
+            if file.size_bytes > 0 && len >= file.size_bytes {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                0
+            } else {
+                len
+            }
+        }
+        _ => 0,
+    };
+
     let client = http_utils::router_http_streaming_client(60);
-    let resp = client
-        .get(&file.download_url)
+    let mut req = client.get(&file.download_url);
+    if resume_offset > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={resume_offset}-"));
+    }
+    let resp = req
         .send_logged()
         .await
         .with_context(|| format!("GET {} failed", file.download_url))?;
@@ -1042,11 +1059,25 @@ async fn stream_to_file(
         );
     }
 
-    let mut out = tokio::fs::File::create(&tmp)
-        .await
-        .with_context(|| format!("Failed to create {}", tmp.display()))?;
+    // Server honored `Range` → append. Anything else (incl. 200 OK when we
+    // asked for a range) means we can't trust the partial; truncate and restart.
+    let resuming = resume_offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let starting_offset = if resuming { resume_offset } else { 0 };
+    let mut out = if resuming {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .await
+            .with_context(|| format!("Failed to open {} for append", tmp.display()))?
+    } else {
+        tokio::fs::File::create(&tmp)
+            .await
+            .with_context(|| format!("Failed to create {}", tmp.display()))?
+    };
+
     let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
+    let mut downloaded: u64 = starting_offset;
+    let mut session_downloaded: u64 = 0;
     let mut last_label = Instant::now();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| {
@@ -1056,12 +1087,13 @@ async fn stream_to_file(
             )
         })?;
         downloaded += chunk.len() as u64;
+        session_downloaded += chunk.len() as u64;
         out.write_all(&chunk)
             .await
             .with_context(|| format!("Failed to write {}", tmp.display()))?;
         if last_label.elapsed() >= Duration::from_millis(200) {
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let bytes_per_sec = downloaded as f64 / elapsed;
+            let bytes_per_sec = session_downloaded as f64 / elapsed;
             let speed_mb_s = bytes_per_sec / (1024.0 * 1024.0);
             let pct = if file.size_bytes > 0 {
                 (downloaded as f64 / file.size_bytes as f64 * 100.0) as u32
@@ -1070,14 +1102,13 @@ async fn stream_to_file(
             };
             let eta = if file.size_bytes > downloaded && bytes_per_sec > 0.0 {
                 let remaining = (file.size_bytes - downloaded) as f64 / bytes_per_sec;
-                format!(", ETA {}", format_eta(remaining as u64))
+                format!(" · {}", format_eta(remaining as u64))
             } else {
                 String::new()
             };
             if let Ok(mut s) = label.lock() {
                 *s = format!(
-                    " Downloading {} — {} / {} ({pct}%, {speed_mb_s:.1} MB/s{eta})",
-                    file.filename,
+                    " {pct}% · {}/{} · {speed_mb_s:.1}MB/s{eta}",
                     human_size(downloaded),
                     human_size(file.size_bytes)
                 );
