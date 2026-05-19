@@ -726,6 +726,17 @@ pub fn router_http_client() -> reqwest::Client {
     router_http_client_with_timeout(300)
 }
 
+/// Per-read inactivity timeout, no overall budget — for multi-GB body streams.
+pub fn router_http_streaming_client(read_timeout_secs: u64) -> reqwest::Client {
+    aivo_http_client_builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(read_timeout_secs))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Detects `X-Initiator` value from an Anthropic Messages API body.
 /// Returns `"user"` for genuine user messages, `"agent"` for tool results / follow-ups.
 pub fn copilot_initiator_from_anthropic(body: &Value) -> &'static str {

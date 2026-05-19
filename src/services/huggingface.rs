@@ -877,7 +877,7 @@ async fn stream_to_file(
     started: Instant,
 ) -> Result<()> {
     let tmp = dest.with_extension("partial");
-    let client = http_utils::router_http_client_with_timeout(60 * 60);
+    let client = http_utils::router_http_streaming_client(60);
     let resp = client
         .get(&file.download_url)
         .send_logged()
@@ -898,7 +898,12 @@ async fn stream_to_file(
     let mut downloaded: u64 = 0;
     let mut last_label = Instant::now();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Network error during model download")?;
+        let chunk = chunk.with_context(|| {
+            format!(
+                "Network error during model download after {} (stalled for >60s, or peer reset)",
+                human_size(downloaded)
+            )
+        })?;
         downloaded += chunk.len() as u64;
         out.write_all(&chunk)
             .await
