@@ -466,7 +466,7 @@ pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
 
     let bin = ensure_installed().await?;
     // Cache hit suppresses the "Starting / ready" status pair to keep
-    // one-shot `aivo -x hello -m hf:…` output uncluttered.
+    // one-shot `aivo -p hello -m hf:…` output uncluttered.
     let cache_hit = lookup_cached(model).is_some();
     let cached = ensure_cached(model).await?;
     let cache_path = cached.path;

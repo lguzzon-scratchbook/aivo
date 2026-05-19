@@ -144,23 +144,33 @@ fn keys_add_with_all_flags() {
 }
 
 #[test]
-fn chat_execute_short_flag() {
-    let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello world"]).unwrap();
+fn chat_prompt_short_flag() {
+    let cli = Cli::try_parse_from(["aivo", "chat", "-p", "hello world"]).unwrap();
     if let Some(Commands::Chat(args)) = cli.command {
-        assert_eq!(args.execute, Some("hello world".to_string()));
+        assert_eq!(args.prompt, Some("hello world".to_string()));
     } else {
         panic!("Expected Chat command");
     }
 }
 
 #[test]
-fn chat_model_key_and_execute() {
+fn chat_prompt_legacy_x_alias() {
+    let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello world"]).unwrap();
+    if let Some(Commands::Chat(args)) = cli.command {
+        assert_eq!(args.prompt, Some("hello world".to_string()));
+    } else {
+        panic!("Expected Chat command");
+    }
+}
+
+#[test]
+fn chat_model_key_and_prompt() {
     let cli =
-        Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-x", "hi"]).unwrap();
+        Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-p", "hi"]).unwrap();
     if let Some(Commands::Chat(args)) = cli.command {
         assert_eq!(args.key, Some("my-key".to_string()));
         assert_eq!(args.model, Some("gpt-4o".to_string()));
-        assert_eq!(args.execute, Some("hi".to_string()));
+        assert_eq!(args.prompt, Some("hi".to_string()));
     } else {
         panic!("Expected Chat command");
     }

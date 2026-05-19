@@ -53,7 +53,7 @@ pub(crate) fn rewrite_cli_args(
         return rewritten;
     }
 
-    if raw_args[1] == "-x" || raw_args[1] == "--execute" {
+    if matches!(raw_args[1].as_str(), "-p" | "--prompt" | "-x" | "--execute") {
         let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
@@ -79,7 +79,100 @@ pub(crate) fn rewrite_cli_args(
         return expand_bundle(&raw_args[0], bundle, &raw_args[2..]);
     }
 
+    // Bare-prompt shortcut. After tool/subcommand/bundle matches have failed,
+    // a top-level non-flag arg is interpreted as input to `chat`:
+    //   `aivo hf:Qwen/...` / `aivo https://...` → `aivo chat <ref>`
+    //     (chat's positional REF; opens TUI with that model)
+    //   `aivo "hello world"` / `aivo hello`     → `aivo chat -p <text>`
+    //     (one-shot prompt; trailing args pass through to chat)
+    // Reserved subcommand names (chat, keys, models, ...) and clap's built-in
+    // `help` fall through so real subcommands stay reachable. A typo gate
+    // (`looks_like_subcommand_typo`) also falls through inputs that are one
+    // edit away from a known subcommand so clap can surface "did you mean
+    // 'chat'?" instead of silently sending the typo to the AI.
+    let first = raw_args[1].as_str();
+    if !first.starts_with('-') && !RESERVED_ALIAS_NAMES.contains(&first) && first != "help" {
+        if first.starts_with("hf:") || first.starts_with("http://") || first.starts_with("https://")
+        {
+            let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
+            rewritten.extend_from_slice(&raw_args[1..]);
+            return rewritten;
+        }
+        if looks_like_subcommand_typo(first) {
+            return raw_args;
+        }
+        let mut rewritten = vec![raw_args[0].clone(), "chat".to_string(), "-p".to_string()];
+        rewritten.extend_from_slice(&raw_args[1..]);
+        return rewritten;
+    }
+
     raw_args
+}
+
+/// Returns true when `s` is plausibly a typo for a known top-level subcommand
+/// or tool name — Damerau-Levenshtein distance ≤ 1 (one edit OR one adjacent
+/// transposition) against the union of `RESERVED_ALIAS_NAMES`, `KNOWN_TOOLS`,
+/// and clap's built-in `help`. Used to gate the bare-prompt rewrite so
+/// `aivo chta` / `aivo kyes` reach clap's "did you mean" suggestion instead
+/// of silently becoming chat prompts.
+///
+/// Inputs that don't look subcommand-shaped — anything shorter than 3 chars,
+/// or containing characters other than `[a-z0-9-]` — bypass the gate entirely.
+/// That keeps short prompts (`hi`, `yo`) and punctuated prompts (`hi?`, `1+1`)
+/// out of the false-positive zone, where most typo candidates live.
+///
+/// Known false positives at distance ≤ 1: prompts like `what` (1 from `chat`)
+/// and `runs` (1 from `run`) fall through to clap. Users who hit this can
+/// type `aivo -p what` or quote a multi-word prompt to bypass.
+fn looks_like_subcommand_typo(s: &str) -> bool {
+    if s.chars().count() < 3 {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return false;
+    }
+    RESERVED_ALIAS_NAMES
+        .iter()
+        .copied()
+        .chain(KNOWN_TOOLS.iter().copied())
+        .chain(std::iter::once("help"))
+        .any(|name| damerau_levenshtein_at_most_one(s, name))
+}
+
+/// Damerau-Levenshtein distance check bounded at 1. Returns true iff `a` and
+/// `b` are equal, differ by one insert/delete/substitute, or differ by one
+/// adjacent transposition. Linear in `max(len(a), len(b))` — we only need to
+/// know "≤ 1", not the exact distance, so we avoid the full DP table.
+fn damerau_levenshtein_at_most_one(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (la, lb) = (a.len(), b.len());
+    if la.abs_diff(lb) > 1 {
+        return false;
+    }
+    // Walk in parallel to the first mismatch; classify the single allowed edit
+    // by length parity, then verify the suffixes match.
+    let mut i = 0;
+    while i < la && i < lb && a[i] == b[i] {
+        i += 1;
+    }
+    if i == la && i == lb {
+        return true; // exact match
+    }
+    match la.cmp(&lb) {
+        std::cmp::Ordering::Equal => {
+            // Substitution at i, or transposition of a[i]/a[i+1].
+            if i + 1 < la && a[i] == b[i + 1] && a[i + 1] == b[i] {
+                return a[i + 2..] == b[i + 2..];
+            }
+            a[i + 1..] == b[i + 1..]
+        }
+        std::cmp::Ordering::Less => a[i..] == b[i + 1..], // insertion in b
+        std::cmp::Ordering::Greater => a[i + 1..] == b[i..], // deletion in b
+    }
 }
 
 /// Builds the final argv for a Bundle launch:
@@ -1421,7 +1514,23 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_injects_chat_for_top_level_execute() {
+    fn rewrite_injects_chat_for_top_level_prompt() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "-p", "hello"]), &no_bundles()),
+            args(&["aivo", "chat", "-p", "hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_injects_chat_for_long_prompt() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "--prompt", "hello"]), &no_bundles()),
+            args(&["aivo", "chat", "--prompt", "hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_injects_chat_for_legacy_x_alias() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "-x", "hello"]), &no_bundles()),
             args(&["aivo", "chat", "-x", "hello"])
@@ -1429,10 +1538,137 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_injects_chat_for_long_execute() {
+    fn rewrite_injects_chat_for_legacy_execute_alias() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "--execute", "hello"]), &no_bundles()),
             args(&["aivo", "chat", "--execute", "hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_treats_multiword_top_level_arg_as_prompt() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "hello world"]), &no_bundles()),
+            args(&["aivo", "chat", "-p", "hello world"])
+        );
+    }
+
+    #[test]
+    fn rewrite_multiword_prompt_preserves_trailing_flags() {
+        // `aivo "hi" --model gpt-4o` should let --model pass through to chat.
+        assert_eq!(
+            rewrite_cli_args(
+                args(&["aivo", "hi there", "--model", "gpt-4o"]),
+                &no_bundles()
+            ),
+            args(&["aivo", "chat", "-p", "hi there", "--model", "gpt-4o"])
+        );
+    }
+
+    #[test]
+    fn rewrite_treats_hf_ref_as_chat_positional() {
+        assert_eq!(
+            rewrite_cli_args(
+                args(&["aivo", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
+                &no_bundles()
+            ),
+            args(&["aivo", "chat", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"])
+        );
+    }
+
+    #[test]
+    fn rewrite_treats_http_url_as_chat_positional() {
+        assert_eq!(
+            rewrite_cli_args(
+                args(&["aivo", "https://huggingface.co/foo/bar"]),
+                &no_bundles()
+            ),
+            args(&["aivo", "chat", "https://huggingface.co/foo/bar"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "http://example.com/m"]), &no_bundles()),
+            args(&["aivo", "chat", "http://example.com/m"])
+        );
+    }
+
+    #[test]
+    fn rewrite_treats_single_word_unknown_as_prompt() {
+        // `aivo hello` (no quotes/spaces) also becomes a one-shot prompt —
+        // the shell collapses `aivo "hello"` to the same argv, so the bare
+        // and quoted forms must behave identically.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "hello"]), &no_bundles()),
+            args(&["aivo", "chat", "-p", "hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_leaves_reserved_subcommand_unchanged() {
+        // `aivo chat`, `aivo keys`, etc. must reach clap as real subcommands,
+        // not get rewritten to `chat -p chat`. RESERVED_ALIAS_NAMES guards this.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "chat"]), &no_bundles()),
+            args(&["aivo", "chat"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "models"]), &no_bundles()),
+            args(&["aivo", "models"])
+        );
+    }
+
+    #[test]
+    fn rewrite_leaves_help_subcommand_unchanged() {
+        // `help` is clap-generated and not in RESERVED_ALIAS_NAMES, so it
+        // needs an explicit pass-through to remain reachable.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "help"]), &no_bundles()),
+            args(&["aivo", "help"])
+        );
+    }
+
+    #[test]
+    fn rewrite_typo_gate_passes_through_close_typos() {
+        // One-edit / one-transposition away from a real subcommand → fall
+        // through so clap can suggest "did you mean 'chat'?".
+        for typo in ["chta", "kyes", "claud", "logz", "modls"] {
+            assert_eq!(
+                rewrite_cli_args(args(&["aivo", typo]), &no_bundles()),
+                args(&["aivo", typo]),
+                "expected `aivo {typo}` to fall through to clap",
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_typo_gate_skips_short_inputs() {
+        // Under 3 chars never triggers the gate — short prompts like `aivo hi`
+        // would otherwise collide with short subcommand names (`hf`, `pi`).
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "hi"]), &no_bundles()),
+            args(&["aivo", "chat", "-p", "hi"])
+        );
+    }
+
+    #[test]
+    fn rewrite_typo_gate_skips_punctuated_inputs() {
+        // Anything that isn't `[a-z0-9-]` skips the gate — punctuation is a
+        // strong signal that this is a prompt, not a typo'd subcommand.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "hi?"]), &no_bundles()),
+            args(&["aivo", "chat", "-p", "hi?"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "Hello"]), &no_bundles()),
+            args(&["aivo", "chat", "-p", "Hello"])
+        );
+    }
+
+    #[test]
+    fn rewrite_typo_gate_does_not_catch_distant_words() {
+        // `hello` is 2+ edits from any subcommand → still rewritten as prompt.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "hello"]), &no_bundles()),
+            args(&["aivo", "chat", "-p", "hello"])
         );
     }
 

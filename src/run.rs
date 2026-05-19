@@ -246,7 +246,7 @@ pub async fn run() -> ! {
             command
                 .execute(
                     model,
-                    chat_args.execute,
+                    chat_args.prompt,
                     chat_args.attachments,
                     chat_args.refresh,
                     key_override,
@@ -874,6 +874,13 @@ fn print_help() {
         ("use", "keys use", "aivo keys use --help"),
         ("ping", "keys ping", "aivo keys ping --help"),
         ("share", "logs share", "aivo logs share --help"),
+        ("-p", "chat -p", "one-shot; reads stdin when no value"),
+        (
+            "<text>",
+            "chat -p <text>",
+            "any non-subcommand arg → one-shot chat",
+        ),
+        ("hf:/url", "chat <ref>", "open chat with a local HF model"),
         (
             "<tool>",
             "run <tool>",
@@ -890,11 +897,10 @@ fn print_help() {
 
     println!("{}", style::bold("Examples:"));
     for cmd in [
-        "aivo keys add",
-        "aivo chat",
-        "aivo chat hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        "aivo -x \"hello\"",
-        "git diff | aivo -x \"summarize changes\"",
+        "aivo \"tell me a short story\"",
+        "aivo pi -k openrouter",
+        "git diff | aivo \"summarize changes\"",
+        "aivo hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
     ] {
         println!("  {}", style::dim(cmd));
     }
@@ -902,12 +908,8 @@ fn print_help() {
 
     println!("{}", style::bold("Options:"));
     let print_opt = |flag: &str, desc: &str| {
-        println!("  {}  {}", style::bold(format!("{:<19}", flag)), desc);
+        println!("  {}  {}", style::bold(format!("{:<13}", flag)), desc);
     };
-    print_opt(
-        "-x, --execute [msg]",
-        "One-shot chat (shorthand for `chat -x`; reads stdin when no value)",
-    );
     print_opt("-h, --help", "Display help information");
     print_opt("--help-json", "Dump the full command tree as JSON");
     print_opt("-v, --version", "Display the current version");
@@ -936,16 +938,33 @@ async fn print_active_selection(session_store: &SessionStore) {
         .map(|k| k.display_name().to_string())
         .unwrap_or_else(|| sel.key_id.clone());
     let model_display = commands::models::model_display_label(sel.model.as_deref());
+    // HF models bypass the API key entirely (local llama-server with a
+    // synthetic loopback key). Showing `key  hf:...` implies a coupling that
+    // doesn't exist at runtime, so swap the line out for an HF-specific one.
+    let model_is_hf = sel
+        .model
+        .as_deref()
+        .is_some_and(services::huggingface::is_huggingface_ref);
 
     println!();
     println!("{}", style::bold("Active key:"));
-    println!(
-        "  {} {}  {}  {}",
-        style::bullet_symbol(),
-        key_label,
-        style::dim(model_display),
-        style::dim("(change with: aivo use)"),
-    );
+    if model_is_hf {
+        println!(
+            "  {} {}  {}  {}",
+            style::bullet_symbol(),
+            style::dim(model_display),
+            style::dim("(local, no API key)"),
+            style::dim("(change with: aivo use)"),
+        );
+    } else {
+        println!(
+            "  {} {}  {}  {}",
+            style::bullet_symbol(),
+            key_label,
+            style::dim(model_display),
+            style::dim("(change with: aivo use)"),
+        );
+    }
 }
 
 /// Dump the entire CLI command tree (commands, flags, descriptions, env hints)
@@ -961,7 +980,10 @@ fn print_help_json() {
             { "alias": "use", "expands_to": ["keys", "use"] },
             { "alias": "ping", "expands_to": ["keys", "ping"] },
             { "alias": "share", "expands_to": ["logs", "share"] },
-            { "alias": "-x", "expands_to": ["chat", "-x"] },
+            { "alias": "-p", "expands_to": ["chat", "-p"] },
+            { "alias": "-x", "expands_to": ["chat", "-x"], "deprecated": true, "replaced_by": "-p" },
+            { "alias": "<text>", "expands_to": ["chat", "-p", "<text>"], "note": "Any non-subcommand, non-flag top-level arg → one-shot chat prompt" },
+            { "alias": "hf:<ref> | http(s)://<url>", "expands_to": ["chat", "<ref>"], "note": "Top-level HF/URL arg → chat with that model" },
             { "alias": "claude", "expands_to": ["run", "claude"] },
             { "alias": "codex", "expands_to": ["run", "codex"] },
             { "alias": "gemini", "expands_to": ["run", "gemini"] },

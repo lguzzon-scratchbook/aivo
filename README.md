@@ -39,7 +39,7 @@ npm install -g @yuanchuan/aivo
 The built-in `aivo/starter` provider activates on first run, so no key is required to try it:
 
 ```bash
-aivo -x hello
+aivo "tell me a short story"
 aivo claude
 ```
 
@@ -105,6 +105,9 @@ Move keys between machines via a password-encrypted file:
 aivo keys export ~/keys.aivo     # prompts for password
 aivo keys import ~/keys.aivo     # same password on the other machine
 aivo keys import https://example.com/keys.aivo   # or from a URL
+
+# non-interactive with password on stdin
+aivo keys export ~/keys.aivo --password-stdin <<< "my secret password"
 ```
 
 ## models
@@ -120,17 +123,18 @@ aivo models --json | jq '.models[].id'
 
 ## chat
 
-Interactive chat TUI, or one-shot `-x` mode for scripting and pipelines.
+Interactive chat TUI, or one-shot `-p` mode for scripting and pipelines.
 
 ```bash
 aivo chat                                    # full-screen TUI
 aivo chat -m gpt-4o                          # pick a model (remembered per key)
 aivo chat --attach README.md --attach screenshot.png
 
-aivo -x "Summarize this repo"                # one-shot (shortcut for `aivo chat -x`)
-git diff | aivo -x "Write a commit message"  # piped stdin appended as context
-cat error.log | aivo -x                      # stdin alone becomes the prompt
-aivo -x "hi" --json | jq -r '.choices[0].message.content'
+aivo "Summarize this repo"                   # bare quoted prompt → one-shot chat
+aivo -p "Summarize this repo"                # same, via the explicit flag
+git diff | aivo -p "Write a commit message"  # piped stdin appended as context
+cat error.log | aivo -p                      # stdin alone becomes the prompt
+aivo -p "hi" --json | jq -r '.choices[0].message.content'
 ```
 
 Slash commands inside the TUI:
@@ -145,6 +149,30 @@ Slash commands inside the TUI:
 | `/detach <n>` | Remove a queued attachment |
 | `/help` · `/exit` | Help · Quit |
 | `//message` | Send a literal leading slash |
+
+## hf
+
+Run open-weight GGUF models locally, it fetches and caches them from HuggingFace repositories.
+
+```bash
+aivo chat hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF
+aivo https://huggingface.co/allenai/Olmo-3-1025-7B              # full URL also works
+aivo chat hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M        # pin a specific quant
+aivo pi -m hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF                   # any tool that accepts -m
+```
+
+The `hf:` form is accepted anywhere a model is — `-m`, chat's positional `REF`, and as a bare top-level arg (which rewrites to `aivo chat hf:...`). Full HuggingFace URLs (`https://huggingface.co/...`) work the same way.
+
+Manage the cached GGUF files (under `~/.aivo/cache/huggingface`):
+
+```bash
+aivo hf                                       # list cached repos
+aivo hf list --verbose                        # show individual files
+aivo hf pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF
+aivo hf rm <repo> --quant Q5_K_M              # delete one quant
+aivo hf rm <repo> --all -y                    # delete whole repo
+aivo hf clean -y                              # wipe everything
+```
 
 ## serve
 

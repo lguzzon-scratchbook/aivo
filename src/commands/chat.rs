@@ -510,7 +510,7 @@ impl ChatCommand {
 
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             anyhow::bail!(
-                "Interactive chat now uses a full-screen TUI. Run it in a terminal, or use -x/--execute for non-interactive mode."
+                "Interactive chat now uses a full-screen TUI. Run it in a terminal, or use -p/--prompt for non-interactive mode."
             );
         }
 
@@ -543,7 +543,7 @@ impl ChatCommand {
 
     pub fn print_help() {
         println!(
-            "{} aivo chat [REF] [--model <model>] [-x [message]] [--attach <path> ...]",
+            "{} aivo chat [REF] [--model <model>] [-p [prompt]] [--attach <path> ...]",
             style::bold("Usage:")
         );
         println!();
@@ -581,8 +581,8 @@ impl ChatCommand {
             "Select API key by ID or name (-k opens key picker)",
         );
         print_opt(
-            "-x, --execute [message]",
-            "Send one message and exit (reads stdin when no value given)",
+            "-p, --prompt [prompt]",
+            "Send one prompt and exit (reads stdin when no value given; -x is a legacy alias)",
         );
         print_opt(
             "-r, --refresh",
@@ -594,7 +594,7 @@ impl ChatCommand {
         );
         print_opt(
             "--json",
-            "Print upstream provider's raw JSON response (requires -x; useful for scripting)",
+            "Print upstream provider's raw JSON response (requires -p; useful for scripting)",
         );
         println!();
         println!("{}", style::bold("Slash Commands:"));
@@ -649,15 +649,19 @@ impl ChatCommand {
         );
         println!(
             "  {}",
-            style::dim("aivo chat -x \"Explain Rust lifetimes\"")
+            style::dim("aivo chat -p \"Explain Rust lifetimes\"")
         );
-        println!("  {}", style::dim("aivo chat -x"));
-        println!("  {}", style::dim("aivo -x \"Summarize this repository\""));
+        println!("  {}", style::dim("aivo chat -p"));
+        println!("  {}", style::dim("aivo -p \"Summarize this repository\""));
         println!(
             "  {}",
-            style::dim("git diff | aivo chat -x \"Summarize changes in one sentence\"")
+            style::dim("aivo \"Summarize this repository\"  # bare quoted prompt")
         );
-        println!("  {}", style::dim("cat error.log | aivo -x"));
+        println!(
+            "  {}",
+            style::dim("git diff | aivo chat -p \"Summarize changes in one sentence\"")
+        );
+        println!("  {}", style::dim("cat error.log | aivo -p"));
     }
 }
 
@@ -854,7 +858,7 @@ fn compose_one_shot_prompt(prompt: &str, stdin_context: Option<&str>) -> String 
 
 fn sanitize_one_shot_message(message: String) -> Result<String> {
     if message.trim().is_empty() {
-        anyhow::bail!("Message for -x/--execute cannot be empty");
+        anyhow::bail!("Prompt for -p/--prompt cannot be empty");
     }
     Ok(message)
 }

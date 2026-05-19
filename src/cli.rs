@@ -724,18 +724,20 @@ pub struct ChatArgs {
     #[arg(short = 'r', long)]
     pub refresh: bool,
 
-    /// Send one message and exit; reads stdin when no value given
+    /// Send one prompt and exit; reads stdin when no value given
     #[arg(
-        short = 'x',
-        long = "execute",
-        value_name = "MESSAGE",
+        short = 'p',
+        long = "prompt",
+        visible_short_alias = 'x',
+        visible_alias = "execute",
+        value_name = "PROMPT",
         num_args = 0..=1,
         default_missing_value = ""
     )]
-    pub execute: Option<String>,
+    pub prompt: Option<String>,
 
-    /// Print the upstream provider's raw JSON response (requires -x; useful for scripting)
-    #[arg(long, requires = "execute")]
+    /// Print the upstream provider's raw JSON response (requires -p; useful for scripting)
+    #[arg(long, requires = "prompt")]
     pub json: bool,
 
     /// Attach a file or image to the next chat message (repeatable)
@@ -1475,43 +1477,63 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_args_execute_short_flag() {
+    fn test_chat_args_prompt_short_flag() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-p", "hello"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.prompt, Some("hello".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_prompt_no_value() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-p"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.prompt, Some(String::new()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_prompt_long_flag() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "--prompt", "hello world"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert_eq!(chat_args.prompt, Some("hello world".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_prompt_legacy_short_alias_x() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello"]).unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
-            assert_eq!(chat_args.execute, Some("hello".to_string()));
+            assert_eq!(chat_args.prompt, Some("hello".to_string()));
         } else {
             panic!("Expected Chat command");
         }
     }
 
     #[test]
-    fn test_chat_args_execute_no_value() {
-        let cli = Cli::try_parse_from(["aivo", "chat", "-x"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
-            assert_eq!(chat_args.execute, Some(String::new()));
-        } else {
-            panic!("Expected Chat command");
-        }
-    }
-
-    #[test]
-    fn test_chat_args_execute_long_flag() {
+    fn test_chat_args_prompt_legacy_long_alias_execute() {
         let cli = Cli::try_parse_from(["aivo", "chat", "--execute", "hello world"]).unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
-            assert_eq!(chat_args.execute, Some("hello world".to_string()));
+            assert_eq!(chat_args.prompt, Some("hello world".to_string()));
         } else {
             panic!("Expected Chat command");
         }
     }
 
     #[test]
-    fn test_chat_args_execute_with_model_and_key() {
-        let cli = Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-x", "hi"])
+    fn test_chat_args_prompt_with_model_and_key() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-p", "hi"])
             .unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some("my-key".to_string()));
             assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
-            assert_eq!(chat_args.execute, Some("hi".to_string()));
+            assert_eq!(chat_args.prompt, Some("hi".to_string()));
         } else {
             panic!("Expected Chat command");
         }

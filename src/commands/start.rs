@@ -102,10 +102,20 @@ impl StartCommand {
             .resolve_model(model_arg, last_sel.as_ref(), &key, args.refresh, tool.value)
             .await?;
 
-        let _ = self
-            .session_store
-            .set_last_selection(&key.value, tool.value.as_str(), model.value.as_deref())
-            .await;
+        // HF models run against a synthetic local key — the user's actual API
+        // key is irrelevant. Skip persisting so the "Active key" footer doesn't
+        // show a misleading (real-key, hf:...) pairing on the next bare `aivo`.
+        // Matches chat.rs and run.rs.
+        let model_is_hf = model
+            .value
+            .as_deref()
+            .is_some_and(crate::services::huggingface::is_huggingface_ref);
+        if !model_is_hf {
+            let _ = self
+                .session_store
+                .set_last_selection(&key.value, tool.value.as_str(), model.value.as_deref())
+                .await;
+        }
 
         let launch_model = resolve_model_placeholder(model.value.clone());
 
