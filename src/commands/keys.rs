@@ -1127,12 +1127,8 @@ impl KeysCommand {
         let file = match file_arg {
             Some(p) if !p.is_empty() => crate::services::system_env::expand_tilde(p),
             _ => {
-                eprintln!(
-                    "{} `aivo keys export` requires a file path.",
-                    style::red("Error:")
-                );
                 Self::print_help(Some("export"));
-                return Ok(ExitCode::UserError);
+                return Ok(ExitCode::Success);
             }
         };
 
