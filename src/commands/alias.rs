@@ -228,7 +228,8 @@ impl AliasCommand {
         let name = match name {
             Some(n) => n,
             None => {
-                eprintln!("{} Expected: aivo alias rm <name>", style::red("Error:"));
+                eprintln!("{} `aivo alias rm` requires a name.", style::red("Error:"));
+                eprintln!("Run `aivo alias` to see available aliases.");
                 return Ok(ExitCode::UserError);
             }
         };
@@ -244,7 +245,8 @@ impl AliasCommand {
                 Ok(ExitCode::Success)
             }
             None => {
-                eprintln!("{} No alias named '{}'", style::red("Error:"), name);
+                eprintln!("{} Alias '{}' not found.", style::red("Error:"), name);
+                eprintln!("Run `aivo alias` to see available aliases.");
                 Ok(ExitCode::UserError)
             }
         }

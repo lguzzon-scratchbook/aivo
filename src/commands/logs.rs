@@ -244,7 +244,7 @@ impl LogsCommand {
             Some("share") => self.share_session(args).await,
             Some("prune") => self.prune_orphans(&args).await,
             Some(other) => anyhow::bail!(
-                "Unknown subcommand '{other}'. Valid: show <id>, share [id], status, prune. Use -s <query> to search."
+                "Unknown action '{other}'. Valid actions: show, share, status, prune.\nRun `aivo logs --help` for details (use -s <query> to search)."
             ),
             None => self.list_entries(&args).await,
         }
@@ -597,6 +597,7 @@ impl LogsCommand {
             Some("show") => print_help_show(),
             Some("share") => print_help_share(),
             Some("status") => print_help_status(),
+            Some("prune") => print_help_prune(),
             _ => print_help_overview(),
         }
     }
@@ -798,6 +799,26 @@ fn print_help_status() {
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo logs status"));
+}
+
+fn print_help_prune() {
+    println!("{} aivo logs prune [OPTIONS]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Delete chat events in logs.db whose underlying session file is gone. Prompts")
+    );
+    println!(
+        "{}",
+        style::dim("for confirmation unless --force is set. Native session files are not touched.")
+    );
+    println!();
+    println!("{}", style::bold("Options:"));
+    logs_help_row("-f, --force", "Skip the confirmation prompt and delete");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo logs prune"));
+    println!("  {}", style::dim("aivo logs prune --force"));
 }
 
 /// Drives `work` to completion while painting a delayed spinner whose

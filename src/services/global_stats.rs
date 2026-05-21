@@ -279,7 +279,7 @@ async fn collect_with_step(
     if !stale.is_empty() {
         let total = stale.len();
 
-        let show_progress = total > 5;
+        let show_progress = total > 5 && std::io::IsTerminal::is_terminal(&std::io::stderr());
         let update_interval = (total / 50).max(1);
         if show_progress {
             print_progress(0, total, step);

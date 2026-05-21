@@ -864,8 +864,12 @@ impl KeysCommand {
             Some("export") => self.export_keys_action(first, keys_args).await,
             Some("import") => self.import_keys_action(first, keys_args).await,
             Some(action) => {
-                eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
-                Self::print_help(None);
+                eprintln!(
+                    "{} Unknown action '{}'. Valid actions: use, add, rm, cat, edit, reauth, ping, reset-route, export, import.",
+                    style::red("Error:"),
+                    action
+                );
+                eprintln!("Run `aivo keys --help` for details.");
                 Ok(ExitCode::UserError)
             }
         }
@@ -2999,6 +3003,7 @@ impl KeysCommand {
             Some("rm") => print_help_rm(),
             Some("cat") => print_help_cat(),
             Some("edit") => print_help_edit(),
+            Some("reauth") => print_help_reauth(),
             Some("ping") => print_help_ping(),
             Some("reset-route") => print_help_reset_route(),
             Some("export") => print_help_export(),
@@ -3147,6 +3152,23 @@ fn print_help_edit() {
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo keys edit"));
     println!("  {}", style::dim("aivo keys edit openrouter"));
+}
+
+fn print_help_reauth() {
+    println!("{} aivo keys reauth [ID|NAME]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Re-authenticate a stored key: OAuth re-login for codex/gemini/claude/copilot,")
+    );
+    println!(
+        "{}",
+        style::dim("or in-place rotation for plain API keys. Bare form opens the picker.")
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys reauth"));
+    println!("  {}", style::dim("aivo keys reauth codex"));
 }
 
 fn print_help_ping() {

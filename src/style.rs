@@ -3,10 +3,17 @@
  * Provides cross-platform styling with ANSI fallback support.
  */
 use console::style;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
+
+/// Whether stderr is an interactive terminal. Spinners and other
+/// in-place progress writers are no-ops when this is false so piped
+/// output (`aivo logs 2>&1 | head`) stays clean.
+fn stderr_is_tty() -> bool {
+    io::stderr().is_terminal()
+}
 
 const BRAILLE_SPINNER_FRAMES: [&str; 10] = [
     "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -147,9 +154,17 @@ pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let spinning = Arc::new(AtomicBool::new(true));
     let spinning_clone = spinning.clone();
     let label = label.map(str::to_owned).unwrap_or_default();
-    let first_frame = spinner_frame(0);
 
-    // Paint the first frame synchronously so short operations still show feedback.
+    if !stderr_is_tty() {
+        let handle = tokio::task::spawn_blocking(move || {
+            while spinning_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+        return (spinning, handle);
+    }
+
+    let first_frame = spinner_frame(0);
     eprint!("\r{}{}", dim(first_frame), label);
     let _ = io::stderr().flush();
 
@@ -172,9 +187,18 @@ pub fn start_spinner(label: Option<&str>) -> (Arc<AtomicBool>, JoinHandle<()>) {
 pub fn start_spinner_with_label(label: Arc<Mutex<String>>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let spinning = Arc::new(AtomicBool::new(true));
     let spinning_clone = spinning.clone();
+
+    if !stderr_is_tty() {
+        let handle = tokio::task::spawn_blocking(move || {
+            while spinning_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+        return (spinning, handle);
+    }
+
     let first_label = label.lock().map(|s| s.clone()).unwrap_or_default();
     let first_frame = spinner_frame(0);
-
     eprint!("\r\x1b[2K{}{}", dim(first_frame), first_label);
     let _ = io::stderr().flush();
 
@@ -198,8 +222,10 @@ pub fn start_spinner_with_label(label: Arc<Mutex<String>>) -> (Arc<AtomicBool>, 
 pub fn stop_spinner(spinning: &Arc<AtomicBool>) {
     if spinning.swap(false, Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        eprint!("\r\x1b[2K");
-        let _ = io::stderr().flush();
+        if stderr_is_tty() {
+            eprint!("\r\x1b[2K");
+            let _ = io::stderr().flush();
+        }
     }
 }
 

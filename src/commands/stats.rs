@@ -297,10 +297,11 @@ impl StatsCommand {
         let tool = tool.to_lowercase();
         if !is_valid_tool(&tool) {
             eprintln!(
-                "{} Unknown tool '{}'. Valid tools: claude, codex, gemini, opencode, pi, amp, chat",
+                "{} Unknown tool '{}'. Valid tools: claude, codex, gemini, opencode, pi, amp, chat.",
                 style::red("Error:"),
                 tool
             );
+            eprintln!("Run `aivo stats --help` for details.");
             return ExitCode::UserError;
         }
 

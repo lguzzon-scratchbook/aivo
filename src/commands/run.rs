@@ -314,24 +314,12 @@ impl RunCommand {
         let ai_tool = match AIToolType::parse(tool) {
             Some(t) => t,
             None => {
-                eprintln!("{} Unknown AI tool '{}'", style::red("Error:"), tool);
-                eprintln!();
-                eprintln!("Available tools:");
                 eprintln!(
-                    "  {}    {}",
-                    style::cyan("claude"),
-                    style::dim("Claude Code")
+                    "{} Unknown tool '{}'. Valid tools: claude, codex, gemini, opencode, pi, amp.",
+                    style::red("Error:"),
+                    tool
                 );
-                eprintln!("  {}     {}", style::cyan("codex"), style::dim("Codex"));
-                eprintln!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
-                eprintln!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
-                eprintln!("  {}        {}", style::cyan("pi"), style::dim("Pi"));
-                eprintln!("  {}       {}", style::cyan("amp"), style::dim("Amp"));
-                eprintln!();
-                eprintln!(
-                    "{}",
-                    style::dim("Usage: aivo run <tool> [options] [args...]")
-                );
+                eprintln!("Run `aivo run --help` for details.");
                 return Ok(ExitCode::UserError);
             }
         };

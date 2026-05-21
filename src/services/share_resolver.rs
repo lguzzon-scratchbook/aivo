@@ -200,7 +200,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
 
     let Some(hit) = hits.into_iter().next() else {
         return Err(anyhow!(
-            "session id '{}' not found in any aivo-visible source",
+            "Session id '{}' not found.\nRun `aivo logs --all` to see available sessions across all projects.",
             session_id
         ));
     };
