@@ -775,14 +775,6 @@ impl CursorAcpSession {
         let _ = init.get("authMethods");
 
         let prompt_capabilities = PromptCapabilities::from_init_response(&init);
-        if crate::services::http_debug::is_debug_active() {
-            eprintln!(
-                "aivo: cursor-agent acp promptCapabilities {{ image: {}, audio: {}, embeddedContext: {} }}",
-                prompt_capabilities.image,
-                prompt_capabilities.audio,
-                prompt_capabilities.embedded_context
-            );
-        }
 
         let new_session = client
             .request(

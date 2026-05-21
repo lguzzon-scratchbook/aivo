@@ -172,11 +172,6 @@ impl RunCommand {
         }))
     }
 
-    /// Resolves the three Claude per-slot model overrides. Each slot follows
-    /// the same `--model` semantics: `None` → leave unset, `Some(non-empty)` →
-    /// use as-is, `Some("")` → show a picker. Bare-flag pickers are batched
-    /// into a single sequential flow with a `"Step N of M — <slot>"` header.
-    /// ESC at any picker step aborts the whole launch (parity with `-m`).
     /// Walks the per-slot Claude model flags. For each slot: leave unset,
     /// take the explicit value as-is, or open a sequential picker (with a
     /// `Step N of M — <slot>` header) for bare flags. ESC at any picker step
@@ -398,6 +393,7 @@ impl RunCommand {
         match resolve_amp_initial_mode(ai_tool, amp_modes.initial_mode.take())? {
             ModeOutcome::Resolved(m) => amp_modes.initial_mode = m,
             ModeOutcome::Cancelled => return Ok(ExitCode::Success),
+            ModeOutcome::Invalid => return Ok(ExitCode::UserError),
         }
 
         // Amp per-mode model flags (`--rush-model`, `--smart-model`, ...)
@@ -836,6 +832,9 @@ enum ModeOutcome {
     Resolved(Option<String>),
     /// User dismissed the picker — exit success without launching.
     Cancelled,
+    /// User passed `--mode <unknown>`; an error has already been printed
+    /// and the launch should exit with `UserError`.
+    Invalid,
 }
 
 /// Validate `--mode` and resolve the bare-flag picker.
@@ -876,7 +875,7 @@ fn resolve_amp_initial_mode(tool: AIToolType, value: Option<String>) -> Result<M
                     valid,
                     trimmed,
                 );
-                Ok(ModeOutcome::Cancelled)
+                Ok(ModeOutcome::Invalid)
             }
         };
     }

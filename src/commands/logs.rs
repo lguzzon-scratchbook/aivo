@@ -406,8 +406,11 @@ impl LogsCommand {
         let name_width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
         let max_count = rows.iter().map(|(_, c)| *c).max().unwrap_or(0);
         let count_width = max_count.to_string().len();
-        // `total` guards `count / total` in print_activity_row against zero.
-        let total = status.total_entries.max(1);
+        // Bar/percentage denominator: the merged total across logs.db,
+        // native sessions, and amp threads — the same number printed in
+        // the header — so a row counting native sessions isn't divided
+        // by the logs.db-only count. `.max(1)` guards against zero.
+        let total = grand_total.max(1);
         const BAR_WIDTH: usize = 32;
 
         println!();

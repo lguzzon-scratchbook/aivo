@@ -6,9 +6,11 @@
 //! out which one it belongs to, then runs the source-specific extractor.
 //!
 //! Cross-source collisions are surfaced as a hard error so a user with the
-//! same id in two stores has to disambiguate. The exact-match-only policy
-//! (no prefix matching for v1) keeps the implementation small and the error
-//! semantics crisp; prefix matching can come later if it earns its keep.
+//! same id in two stores has to disambiguate. Per-source resolution accepts
+//! unique id *prefixes* (matching how `aivo logs` truncates ids on display):
+//! logs.db rows via `SessionStore::find_by_id_prefix`, file-backed CLIs via
+//! `id_prefix_matches` over the session directory. Ambiguous prefixes are
+//! reported back to the user with the candidates that matched.
 
 use std::path::{Path, PathBuf};
 
