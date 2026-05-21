@@ -213,7 +213,6 @@ Unified activity feed across aivo's own events (`chat`, `run`, `serve`), native 
 aivo logs                                    # current cwd, newest first
 aivo logs -a                                 # all projects
 aivo logs show <id>                          # logs.db id, native session id, or T-… amp id
-aivo logs status                             # counts and storage paths across sources
 
 aivo logs --by claude -n 5                   # claude run-events + native sessions
 aivo logs --by native                        # only native CLI sessions

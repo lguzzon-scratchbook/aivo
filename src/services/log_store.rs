@@ -78,28 +78,6 @@ pub struct LogQuery {
     pub errors_only: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct LogStatus {
-    pub path: String,
-    pub total_entries: u64,
-    pub file_size_bytes: u64,
-    pub counts_by_source: Vec<SourceCount>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SourceCount {
-    pub source: String,
-    pub count: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolCount>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolCount {
-    pub tool: String,
-    pub count: u64,
-}
-
 /// Aivo-side metadata captured at launch and joined onto a native session
 /// row. Sourced from the `[run]` finished event whose `session_id` matches
 /// the native session file the launched CLI just produced.
@@ -433,35 +411,6 @@ impl LogStore {
         })
         .await
         .context("Failed to join run-model aggregation task")?
-    }
-
-    pub async fn status(&self) -> Result<LogStatus> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            if !path.exists() {
-                return Ok(LogStatus {
-                    path: path.display().to_string(),
-                    total_entries: 0,
-                    file_size_bytes: 0,
-                    counts_by_source: Vec::new(),
-                });
-            }
-            match open_read_connection(&path).and_then(|conn| status_with_connection(&conn, &path))
-            {
-                Ok(status) => Ok(status),
-                Err(direct_err) => with_snapshot_connection(&path, |conn| {
-                    status_with_connection(conn, &path)
-                })
-                .with_context(|| {
-                    format!(
-                        "Failed to read SQLite log status directly from {:?}: {direct_err:#}",
-                        path
-                    )
-                }),
-            }
-        })
-        .await
-        .context("Failed to join log status task")?
     }
 }
 
@@ -858,59 +807,6 @@ fn aggregate_run_models_with_connection(
         out.insert(model, count);
     }
     Ok(out)
-}
-
-fn status_with_connection(conn: &Connection, path: &Path) -> Result<LogStatus> {
-    let total_entries: u64 = conn
-        .query_row("select count(*) from events", [], |row| row.get(0))
-        .context("Failed to count log entries")?;
-
-    let mut statement = conn
-        .prepare(
-            "select source, coalesce(tool, ''), count(*) from events \
-             group by source, tool order by source, count(*) desc",
-        )
-        .context("Failed to prepare log status query")?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-            ))
-        })
-        .context("Failed to read log status rows")?;
-
-    let mut counts_by_source: Vec<SourceCount> = Vec::new();
-    for row in rows {
-        let (source, tool, count) = row?;
-        let entry = match counts_by_source.last_mut() {
-            Some(last) if last.source == source => last,
-            _ => {
-                counts_by_source.push(SourceCount {
-                    source: source.clone(),
-                    count: 0,
-                    tools: Vec::new(),
-                });
-                counts_by_source
-                    .last_mut()
-                    .expect("just pushed a SourceCount")
-            }
-        };
-        entry.count += count;
-        if !tool.is_empty() {
-            entry.tools.push(ToolCount { tool, count });
-        }
-    }
-
-    let file_size_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-
-    Ok(LogStatus {
-        path: path.display().to_string(),
-        total_entries,
-        file_size_bytes,
-        counts_by_source,
-    })
 }
 
 fn map_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {

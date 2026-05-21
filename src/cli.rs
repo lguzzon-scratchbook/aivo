@@ -627,7 +627,7 @@ pub struct InfoArgs {
 /// Arguments for the logs command
 #[derive(Args, Debug, Clone)]
 pub struct LogsArgs {
-    /// Action: show, path, or status
+    /// Action: show, share, or prune
     #[arg(value_name = "ACTION")]
     pub action: Option<String>,
 

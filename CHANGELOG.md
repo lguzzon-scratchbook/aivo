@@ -2,6 +2,10 @@
 
 ## v0.22.1
 
+## Breaking
+
+- Removed `aivo logs status` subcommand.
+
 ## Improvements
 
 - `aivo hf`: accept local `.gguf` paths anywhere an `hf:` ref is accepted.

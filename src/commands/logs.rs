@@ -3,8 +3,6 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cli::LogsArgs;
@@ -60,8 +58,6 @@ impl AmpRow {
         })
     }
 }
-
-const SEPARATOR: &str = "\u{00b7}";
 
 impl UnifiedRow {
     /// Stable identifier suitable for the share resolver. For `Log/run` this
@@ -239,12 +235,11 @@ impl LogsCommand {
     async fn execute_internal(&self, args: LogsArgs) -> Result<ExitCode> {
         validate_args(&args)?;
         match args.action.as_deref() {
-            Some("status") => self.show_status(&args).await,
             Some("show") => self.show_entry(&args).await,
             Some("share") => self.share_session(args).await,
             Some("prune") => self.prune_orphans(&args).await,
             Some(other) => anyhow::bail!(
-                "Unknown action '{other}'. Valid actions: show, share, status, prune.\nRun `aivo logs --help` for details (use -s <query> to search)."
+                "Unknown action '{other}'. Valid actions: show, share, prune.\nRun `aivo logs --help` for details (use -s <query> to search)."
             ),
             None => self.list_entries(&args).await,
         }
@@ -305,127 +300,6 @@ impl LogsCommand {
         };
         let cmd = ShareCommand::new(self.session_store.clone());
         Ok(cmd.execute(share_args).await)
-    }
-
-    async fn show_status(&self, args: &LogsArgs) -> Result<ExitCode> {
-        ensure_no_target(args, "status")?;
-
-        // Run the three reads concurrently — they touch independent
-        // backends (SQLite, native session dirs, amp threads dir) so
-        // there's no contention. A shared completion counter feeds the
-        // spinner's progress label as each phase finishes.
-        const PHASES: usize = 3;
-        let done = Arc::new(AtomicUsize::new(0));
-
-        let store = self.session_store.clone();
-        let done_a = done.clone();
-        let logs_fut = async move {
-            let r = store.logs().status().await;
-            done_a.fetch_add(1, Ordering::Relaxed);
-            r
-        };
-        let done_b = done.clone();
-        let native_fut = async move {
-            let r = native_session_counts().await;
-            done_b.fetch_add(1, Ordering::Relaxed);
-            r
-        };
-        let done_c = done.clone();
-        let amp_fut = async move {
-            let r = amp_threads::list_threads(&amp_threads::default_threads_dir(), 10_000)
-                .await
-                .len() as u64;
-            done_c.fetch_add(1, Ordering::Relaxed);
-            r
-        };
-        let work = async { tokio::join!(logs_fut, native_fut, amp_fut) };
-
-        // JSON callers want clean stdout — skip the spinner entirely.
-        let (status, native_counts, amp_count) = if args.json {
-            work.await
-        } else {
-            run_with_progress_spinner(work, done.clone(), PHASES).await
-        };
-        let status = status?;
-        let native_total: u64 = native_counts.iter().map(|(_, c)| *c).sum();
-        let grand_total = status.total_entries + native_total + amp_count;
-
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "logs_db": status,
-                    "native_sessions": native_counts
-                        .iter()
-                        .map(|(cli, count)| json!({"cli": cli, "count": count}))
-                        .collect::<Vec<_>>(),
-                    "amp_threads": amp_count,
-                    "grand_total": grand_total,
-                }))?
-            );
-            return Ok(ExitCode::Success);
-        }
-
-        println!(
-            "{} {} {} {} {} {}",
-            style::bold(grand_total.to_string()),
-            style::dim("rows"),
-            style::dim(SEPARATOR),
-            style::dim(format_bytes(status.file_size_bytes)),
-            style::dim(SEPARATOR),
-            style::dim(system_env::collapse_tilde(&status.path)),
-        );
-
-        if grand_total == 0 {
-            println!();
-            println!("{}", style::dim("Nothing recorded yet."));
-            return Ok(ExitCode::Success);
-        }
-
-        // Flatten the breakdown across all three sources into one ranking.
-        // Prefix logs.db rows with their source ("run claude" vs bare
-        // "claude") so they're distinguishable from native session counts.
-        let mut rows: Vec<(String, u64)> = Vec::new();
-        for source in status.counts_by_source {
-            if source.tools.len() >= 2 {
-                for tool in source.tools {
-                    rows.push((format!("{} {}", source.source, tool.tool), tool.count));
-                }
-            } else {
-                rows.push((source.source, source.count));
-            }
-        }
-        for (cli, count) in native_counts {
-            rows.push((format!("{cli} sessions"), count));
-        }
-        if amp_count > 0 {
-            rows.push(("amp threads".to_string(), amp_count));
-        }
-        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
-
-        let name_width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-        let max_count = rows.iter().map(|(_, c)| *c).max().unwrap_or(0);
-        let count_width = max_count.to_string().len();
-        // Bar/percentage denominator: the merged total across logs.db,
-        // native sessions, and amp threads — the same number printed in
-        // the header — so a row counting native sessions isn't divided
-        // by the logs.db-only count. `.max(1)` guards against zero.
-        let total = grand_total.max(1);
-        const BAR_WIDTH: usize = 32;
-
-        println!();
-        for (name, count) in rows {
-            print_activity_row(
-                &name,
-                count,
-                total,
-                max_count,
-                name_width,
-                count_width,
-                BAR_WIDTH,
-            );
-        }
-        Ok(ExitCode::Success)
     }
 
     async fn show_entry(&self, args: &LogsArgs) -> Result<ExitCode> {
@@ -599,7 +473,6 @@ impl LogsCommand {
         match action {
             Some("show") => print_help_show(),
             Some("share") => print_help_share(),
-            Some("status") => print_help_status(),
             Some("prune") => print_help_prune(),
             _ => print_help_overview(),
         }
@@ -643,7 +516,6 @@ fn print_help_overview() {
         "share [id]",
         "Share a session via tunneled viewer URL; omit id to open the picker",
     );
-    logs_help_row("status", "Show counts and storage paths across sources");
     logs_help_row(
         "prune",
         "Remove logs.db chat events whose session file was deleted",
@@ -790,20 +662,6 @@ fn print_help_share() {
     println!("  {}", style::dim("aivo logs share --live --open"));
 }
 
-fn print_help_status() {
-    println!("{} aivo logs status", style::bold("Usage:"));
-    println!();
-    println!(
-        "{}",
-        style::dim(
-            "Print row counts and storage paths across logs.db, native sessions, and amp threads."
-        )
-    );
-    println!();
-    println!("{}", style::bold("Examples:"));
-    println!("  {}", style::dim("aivo logs status"));
-}
-
 fn print_help_prune() {
     println!("{} aivo logs prune [OPTIONS]", style::bold("Usage:"));
     println!();
@@ -822,58 +680,6 @@ fn print_help_prune() {
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo logs prune"));
     println!("  {}", style::dim("aivo logs prune --force"));
-}
-
-/// Drives `work` to completion while painting a delayed spinner whose
-/// label tracks `done`/`total` progress. Mirrors the SPINNER_DELAY pattern
-/// used by `list_entries`: fast invocations finish before the spinner ever
-/// shows, so there's no flash on cheap calls.
-async fn run_with_progress_spinner<F>(work: F, done: Arc<AtomicUsize>, total: usize) -> F::Output
-where
-    F: std::future::Future,
-{
-    const SPINNER_DELAY: Duration = Duration::from_millis(250);
-    tokio::pin!(work);
-    tokio::select! {
-        r = &mut work => return r,
-        _ = tokio::time::sleep(SPINNER_DELAY) => {}
-    }
-
-    let label = Arc::new(Mutex::new(progress_label(
-        done.load(Ordering::Relaxed),
-        total,
-    )));
-    let (spinning, handle) = style::start_spinner_with_label(label.clone());
-
-    let updater = {
-        let label = label.clone();
-        let done = done.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok(mut s) = label.lock() {
-                    *s = progress_label(done.load(Ordering::Relaxed), total);
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-    };
-
-    let result = (&mut work).await;
-    updater.abort();
-    style::stop_spinner(&spinning);
-    let _ = handle.await;
-    result
-}
-
-fn progress_label(done: usize, total: usize) -> String {
-    format!(" loading log status ({done}/{total})…")
-}
-
-fn ensure_no_target(args: &LogsArgs, action: &str) -> Result<()> {
-    if args.target.is_some() {
-        anyhow::bail!("`aivo logs {}` does not take a target", action);
-    }
-    Ok(())
 }
 
 fn validate_args(args: &LogsArgs) -> Result<()> {
@@ -1177,51 +983,6 @@ fn format_token_summary(entry: &LogEntry) -> String {
             format!("({input}\u{2192}{output} tokens)")
         }
         _ => String::new(),
-    }
-}
-
-fn print_activity_row(
-    name: &str,
-    count: u64,
-    total: u64,
-    max_count: u64,
-    name_width: usize,
-    count_width: usize,
-    bar_width: usize,
-) {
-    let pct = ((count as f64 / total as f64) * 100.0).round() as u64;
-    let row = format!(
-        "  {:<name_w$}  {:>count_w$}  {:>2}%  {}",
-        name,
-        count,
-        pct,
-        style::bar(count, max_count, bar_width),
-        name_w = name_width,
-        count_w = count_width,
-    );
-    println!("{}", style::cyan(row));
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut idx = 0;
-    while value >= 1024.0 && idx + 1 < UNITS.len() {
-        value /= 1024.0;
-        idx += 1;
-    }
-    // Guard against rounding to "1024 X" when a larger unit exists.
-    if value >= 1023.95 && idx + 1 < UNITS.len() {
-        value /= 1024.0;
-        idx += 1;
-    }
-    if (value - value.round()).abs() < 0.05 {
-        format!("{:.0} {}", value, UNITS[idx])
-    } else {
-        format!("{:.1} {}", value, UNITS[idx])
     }
 }
 
@@ -1994,28 +1755,6 @@ fn unified_row_to_json(row: &UnifiedRow, run_meta: &RunMetaIndex) -> Value {
     }
 }
 
-/// Tally native session counts per CLI for `aivo logs status`. Walks the
-/// global ingester with caps lifted; capped at a sensible upper bound so
-/// status never spends too long on huge histories.
-async fn native_session_counts() -> Vec<(String, u64)> {
-    let opts = IngestOptions {
-        max_age_days: None,
-        min_updated_at: None,
-        max_per_source: Some(10_000),
-        include_short_first_user: true,
-    };
-    let threads = context_ingest::ingest_native_sessions_global(opts)
-        .await
-        .unwrap_or_default();
-    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for t in threads {
-        *counts.entry(t.cli).or_insert(0) += 1;
-    }
-    let mut out: Vec<(String, u64)> = counts.into_iter().collect();
-    out.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-    out
-}
-
 /// Stable identity per row for watch-mode dedup. Logs.db `run` events
 /// collapse on `event_group_id`; otherwise the row's own id is unique.
 fn unified_id_key(row: &UnifiedRow) -> String {
@@ -2402,19 +2141,6 @@ mod tests {
         };
 
         assert_eq!(display_id(&entry), "group123");
-    }
-
-    #[test]
-    fn format_bytes_ranges() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1 KB");
-        assert_eq!(format_bytes(688_128), "672 KB");
-        assert_eq!(format_bytes(1500), "1.5 KB");
-        assert_eq!(format_bytes(1_572_864), "1.5 MB");
-        assert_eq!(format_bytes(2_147_483_648), "2 GB");
-        // Boundary: would round to "1024 KB" under naive formatting — promote to MB.
-        assert_eq!(format_bytes(1_048_575), "1 MB");
     }
 
     fn test_thread(session_id: &str, ts: DateTime<Utc>) -> Thread {
