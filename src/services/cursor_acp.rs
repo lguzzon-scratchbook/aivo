@@ -32,19 +32,23 @@ pub fn is_legacy_cursor_login_secret(secret: &str) -> bool {
     secret == LEGACY_CURSOR_LOGIN_SENTINEL
 }
 
-/// Env var that flips Cursor's tool-execution policy from "graceful reject"
-/// to "allow_once" for every `session/request_permission`. Off by default —
-/// when aivo is the model provider, the launched tool (Claude/Codex) is
-/// already the agent, and letting cursor-agent run shell/file ops in parallel
-/// surprises users. Set to `1` to let cursor-agent execute its own tools.
+/// Env var controlling Cursor's tool-execution policy for
+/// `session/request_permission`. Allowed by default so the launched tool
+/// (Claude/Codex/etc.) can delegate through Cursor's agent normally; set to
+/// `0`, `false`, `no`, or `reject` to force graceful rejection.
 pub const CURSOR_ALLOW_TOOLS_ENV: &str = "AIVO_CURSOR_ALLOW_TOOLS";
 
 fn cursor_permission_decision(_params: &Value) -> PermissionDecision {
     match std::env::var(CURSOR_ALLOW_TOOLS_ENV) {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") => {
-            PermissionDecision::Allow
+        Ok(v)
+            if v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("reject") =>
+        {
+            PermissionDecision::Reject
         }
-        _ => PermissionDecision::Reject,
+        _ => PermissionDecision::Allow,
     }
 }
 
@@ -1165,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_decision_defaults_to_reject_and_flips_with_env() {
+    fn permission_decision_defaults_to_allow_and_can_be_forced_to_reject() {
         // Serialize against other env-var tests in the binary by saving the
         // prior value (if any) and restoring it on exit.
         let prior = std::env::var(CURSOR_ALLOW_TOOLS_ENV).ok();
@@ -1175,7 +1179,7 @@ mod tests {
         unsafe { std::env::remove_var(CURSOR_ALLOW_TOOLS_ENV) };
         assert_eq!(
             cursor_permission_decision(&Value::Null),
-            PermissionDecision::Reject
+            PermissionDecision::Allow
         );
         unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "1") };
         assert_eq!(
@@ -1188,6 +1192,11 @@ mod tests {
             PermissionDecision::Allow
         );
         unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "no") };
+        assert_eq!(
+            cursor_permission_decision(&Value::Null),
+            PermissionDecision::Reject
+        );
+        unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "reject") };
         assert_eq!(
             cursor_permission_decision(&Value::Null),
             PermissionDecision::Reject
