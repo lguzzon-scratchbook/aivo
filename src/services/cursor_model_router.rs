@@ -25,6 +25,7 @@ use crate::services::http_utils::{
     self, bind_local_listener, cors_header_block, extract_request_body, extract_request_path,
     format_http_chunk, http_chunked_response_head_with_extra, http_response_head_with_extra,
 };
+use crate::services::mcp_bridge::{BridgeEvent, BridgeSession, McpBridge, ToolUseIdStyle};
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::ApiKey;
 
@@ -67,6 +68,11 @@ type SessionSlot = Arc<Mutex<Option<CursorAcpSession>>>;
 struct RouterState {
     config: CursorRouterConfig,
     cached_models: Mutex<Option<Vec<String>>>,
+    /// HTTP MCP server that surfaces claude-cli's `/v1/messages` tools to
+    /// cursor-agent's model. Shared across all Anthropic-shaped turns;
+    /// other protocols (OpenAI, Responses, Gemini) ignore it because their
+    /// tool schemas already flatten cleanly into the text prompt.
+    mcp_bridge: Arc<McpBridge>,
     /// Pool of ACP session slots, grown lazily up to [`MAX_POOL_SESSIONS`].
     /// Each slot holds at most one session; concurrent requests fan out into
     /// idle slots and only block when every slot is busy.
@@ -93,10 +99,12 @@ impl CursorModelRouter {
     /// can stream.
     pub async fn start_background(&self) -> Result<(u16, JoinHandle<Result<()>>)> {
         let (listener, port) = bind_local_listener().await?;
+        let mcp_bridge = McpBridge::start_background().await?;
         let prewarm = self.config.prewarm_count;
         let state = Arc::new(RouterState {
             config: self.config.clone(),
             cached_models: Mutex::new(None),
+            mcp_bridge,
             pool: Mutex::new(Vec::new()),
             prewarming: AtomicUsize::new(0),
         });
@@ -562,12 +570,32 @@ async fn run_openai_chat(
     if body.get("messages").and_then(Value::as_array).is_none() {
         return Err(anyhow!("`messages` array is required"));
     }
+    let stream_flag = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // Non-streaming resumption: drain any parked call before falling
+    // through to the legacy path (see Anthropic equivalent for rationale).
+    if !stream_flag && let Some((call_id, output)) = extract_last_openai_tool_message(&body) {
+        state
+            .mcp_bridge
+            .deliver_and_drop_parked(
+                &call_id,
+                vec![json!({"type": "text", "text": output})],
+                false,
+            )
+            .await;
+    }
+
+    if stream_flag && openai_chat_request_uses_tools(&body) {
+        return run_openai_chat_bridged(socket, state, body, requested_model).await;
+    }
+
     let parsed = ParsedTurn {
-        stream_flag: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        requested_model: body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        stream_flag,
+        requested_model,
         image_blocks: extract_openai_image_blocks(&body)?,
         prompt: reduce_openai_request_to_prompt(&body),
     };
@@ -583,6 +611,432 @@ async fn run_openai_chat(
         openai_completion_body,
     )
     .await
+}
+
+// === OpenAI /chat/completions (opencode + pi) with MCP-bridged tools ===
+
+fn openai_chat_request_uses_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// Convert OpenAI chat-completions tools (`{type: "function", function:
+/// {name, description, parameters}}`) into the bridge's normalized
+/// `{name, description, input_schema}` shape.
+fn extract_openai_chat_tools_normalized(body: &Value) -> Vec<Value> {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let inner = tool.get("function").unwrap_or(tool);
+        let Some(name) = inner.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let description = inner
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let schema = inner
+            .get("parameters")
+            .or_else(|| inner.get("input_schema"))
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"}));
+        out.push(json!({
+            "name": name,
+            "description": description,
+            "input_schema": schema,
+        }));
+    }
+    out
+}
+
+/// Find the latest `role: "tool"` message and return its
+/// `(tool_call_id, content_string)`. Used by the resumption path.
+fn extract_last_openai_tool_message(body: &Value) -> Option<(String, String)> {
+    let messages = body.get("messages")?.as_array()?;
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(Value::as_str)? != "tool" {
+            continue;
+        }
+        let id = msg.get("tool_call_id").and_then(Value::as_str)?.to_string();
+        let content = match msg.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => {
+                let mut acc = String::new();
+                for p in parts {
+                    if let Some(t) = p.get("text").and_then(Value::as_str) {
+                        if !acc.is_empty() {
+                            acc.push('\n');
+                        }
+                        acc.push_str(t);
+                    }
+                }
+                acc
+            }
+            _ => String::new(),
+        };
+        return Some((id, content));
+    }
+    None
+}
+
+/// Variant of [`reduce_openai_request_to_prompt`] for the bridged route:
+/// drops the `Available tools:` header (the MCP server exposes them now)
+/// but keeps the message walk so prior tool loops stay in the prompt.
+fn reduce_openai_request_to_prompt_without_tools(body: &Value) -> String {
+    let mut parts = Vec::new();
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        let text = extract_openai_message_text(msg.get("content"));
+        match role {
+            "system" | "developer" => {
+                if !text.trim().is_empty() {
+                    parts.push(format!("System: {text}"));
+                }
+            }
+            "user" => {
+                if !text.trim().is_empty() {
+                    parts.push(format!("User: {text}"));
+                }
+            }
+            "assistant" => {
+                if !text.trim().is_empty() {
+                    parts.push(format!("Assistant: {text}"));
+                }
+                if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tcs {
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        let args = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(Value::as_str)
+                            .map(parse_loose_json)
+                            .unwrap_or(Value::Null);
+                        parts.push(format_tool_call_line(name, &args));
+                    }
+                }
+            }
+            "tool" => {
+                let name = msg
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                parts.push(format_tool_result_block(name, &text));
+            }
+            other => {
+                if !text.trim().is_empty() {
+                    parts.push(format!("{other}: {text}"));
+                }
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+async fn run_openai_chat_bridged(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    if let Some((call_id, output)) = extract_last_openai_tool_message(&body)
+        && let Some(session) = state
+            .mcp_bridge
+            .resume_with_tool_result(
+                &call_id,
+                vec![json!({"type": "text", "text": output})],
+                // OpenAI's tool messages have no first-class is_error flag;
+                // callers communicate failure inline in the content string.
+                // Defer interpretation to cursor's model rather than trying
+                // to substring-match here.
+                false,
+            )
+            .await
+    {
+        return run_openai_chat_bridged_resume(socket, state, session, &body, requested_model)
+            .await;
+    }
+    run_openai_chat_bridged_fresh(socket, state, body, requested_model).await
+}
+
+async fn run_openai_chat_bridged_fresh(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    let tools = extract_openai_chat_tools_normalized(&body);
+    let image_blocks = extract_openai_image_blocks(&body)?;
+    let prompt = reduce_openai_request_to_prompt_without_tools(&body);
+    if prompt.trim().is_empty() && image_blocks.is_empty() {
+        return Err(anyhow!("reduced prompt is empty; no user-visible message"));
+    }
+    let input_tokens = estimate_tokens(&prompt);
+
+    let (bridge_session, mcp_url) = state
+        .mcp_bridge
+        .open_session(tools, ToolUseIdStyle::OpenAi)
+        .await;
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+
+    let acp_result = CursorAcpSession::open_with_mcp(
+        &state.config.key,
+        requested_model.as_deref(),
+        &state.config.workspace_cwd,
+        Some(&mcp_url),
+    )
+    .await
+    .context("open cursor-agent ACP session with MCP bridge (openai chat)");
+
+    let mut acp = match acp_result {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e);
+        }
+    };
+
+    if let Some(model) = &requested_model {
+        let _ = acp.set_model(model).await;
+    }
+    if !image_blocks.is_empty() && !acp.supports_image_prompts() {
+        state.mcp_bridge.drop_session(&bridge_id).await;
+        return Err(anyhow!(image_capability_error()));
+    }
+
+    let response_model = acp
+        .model_id()
+        .map(str::to_string)
+        .or(requested_model.clone())
+        .unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+
+    let blocks = cursor_acp::assemble_prompt_blocks(&prompt, image_blocks);
+    let stream = match acp.prompt_with_blocks(blocks).await {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e).context("cursor-agent session/prompt");
+        }
+    };
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.attach_session(acp, stream);
+    }
+
+    stream_bridged_openai_chat_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+    )
+    .await
+}
+
+async fn run_openai_chat_bridged_resume(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    body: &Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+    let input_tokens = estimate_tokens(&reduce_openai_request_to_prompt_without_tools(body));
+    let response_model = requested_model.unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+    stream_bridged_openai_chat_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+    )
+    .await
+}
+
+async fn stream_bridged_openai_chat_turn(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    bridge_id: &str,
+    response_model: &str,
+    input_tokens: u64,
+) -> Result<Option<String>> {
+    let (acp, mut stream, mut event_rx) = match async {
+        let mut guard = bridge_session.lock().await;
+        let (acp, stream) = guard.take_active()?;
+        let rx = guard.attach_event_sink();
+        Ok::<_, anyhow::Error>((acp, stream, rx))
+    }
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            // Race: bridge session is in the sessions map but its ACP
+            // session / prompt stream was already taken (or never attached).
+            // Tear it down and surface as a 500 instead of panicking.
+            state.mcp_bridge.drop_session(bridge_id).await;
+            return Err(e).context("bridge session lost its active ACP slot");
+        }
+    };
+
+    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
+    if let Err(e) = socket.write_all(head.as_bytes()).await {
+        {
+            let mut guard = bridge_session.lock().await;
+            guard.detach_event_sink();
+        }
+        drop(acp);
+        drop(stream);
+        state.mcp_bridge.drop_session(bridge_id).await;
+        return Err(e).context("write OpenAI chat SSE head");
+    }
+
+    let chat_id = new_chat_completion_id();
+    let created = current_unix_timestamp();
+
+    let role_chunk = openai_chunk_frame(
+        &chat_id,
+        created,
+        response_model,
+        json!({"role": "assistant"}),
+        None,
+    );
+    let _ = write_sse_chunk(socket, &role_chunk).await;
+
+    let mut finish_reason = "stop".to_string();
+    let mut aggregated = String::new();
+    let mut parked = false;
+    let mut turn_errored = false;
+
+    'outer: loop {
+        tokio::select! {
+            biased;
+            ev = event_rx.recv() => {
+                match ev {
+                    Some(BridgeEvent::ToolCall { tool_use_id, name, arguments }) => {
+                        let args_json = arguments.to_string();
+                        let open_chunk = openai_chunk_frame(
+                            &chat_id,
+                            created,
+                            response_model,
+                            json!({
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": tool_use_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""},
+                                }],
+                            }),
+                            None,
+                        );
+                        let _ = write_sse_chunk(socket, &open_chunk).await;
+                        let args_chunk = openai_chunk_frame(
+                            &chat_id,
+                            created,
+                            response_model,
+                            json!({
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": {"arguments": args_json},
+                                }],
+                            }),
+                            None,
+                        );
+                        let _ = write_sse_chunk(socket, &args_chunk).await;
+                        finish_reason = "tool_calls".to_string();
+                        parked = true;
+                        break 'outer;
+                    }
+                    None => break 'outer,
+                }
+            }
+            ev = stream.next() => {
+                match ev {
+                    Some(PromptEvent::Update(value)) => {
+                        if let Some(text) = extract_agent_text(&value) {
+                            aggregated.push_str(text);
+                            let chunk = openai_chunk_frame(
+                                &chat_id,
+                                created,
+                                response_model,
+                                json!({"content": text}),
+                                None,
+                            );
+                            let _ = write_sse_chunk(socket, &chunk).await;
+                        } else {
+                            let _ = write_sse_chunk(socket, SSE_KEEPALIVE).await;
+                        }
+                    }
+                    Some(PromptEvent::Done(result)) => {
+                        if result.is_err() {
+                            // OpenAI finish_reason is documented as
+                            // stop|length|tool_calls|content_filter; emit
+                            // `stop` and signal the error via cancellation.
+                            turn_errored = true;
+                        }
+                        break 'outer;
+                    }
+                    None => break 'outer,
+                }
+            }
+        }
+    }
+
+    if turn_errored && !parked {
+        let _ = acp.cancel().await;
+    }
+
+    let final_chunk = openai_chunk_frame(
+        &chat_id,
+        created,
+        response_model,
+        json!({}),
+        Some(finish_reason.as_str()),
+    );
+    let _ = write_sse_chunk(socket, &final_chunk).await;
+    let output_tokens = estimate_tokens(&aggregated);
+    let usage_chunk = openai_usage_chunk(
+        &chat_id,
+        created,
+        response_model,
+        input_tokens,
+        output_tokens,
+    );
+    let _ = write_sse_chunk(socket, &usage_chunk).await;
+    let _ = write_sse_chunk(socket, "data: [DONE]\n\n").await;
+    let _ = write_chunk_terminator(socket).await;
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.detach_event_sink();
+        if parked {
+            guard.return_active(acp, stream);
+        } else {
+            drop(acp);
+            drop(stream);
+        }
+    }
+    if !parked {
+        state.mcp_bridge.drop_session(bridge_id).await;
+    }
+
+    Ok(if aggregated.is_empty() {
+        None
+    } else {
+        Some(aggregated)
+    })
 }
 
 /// Streams Cursor session/update events into the socket as an OpenAI
@@ -897,6 +1351,28 @@ async fn run_anthropic_messages(
         .await;
     }
 
+    // Non-streaming resumption: a `tool_result` for a previously-parked
+    // call must still be drained or cursor-agent's session sits idle for
+    // up to TOOL_CALL_PARK_TIMEOUT (10 min). Deliver the result, tear
+    // the bridge session down, and let the legacy text-flatten path
+    // handle the actual response.
+    if !stream_flag && let Some((tool_use_id, content, is_error)) = extract_last_tool_result(&body)
+    {
+        state
+            .mcp_bridge
+            .deliver_and_drop_parked(&tool_use_id, content, is_error)
+            .await;
+    }
+
+    // Streaming + tools array → bridge path: tools are exposed to the
+    // cursor model via an in-process MCP server, and tool_use blocks flow
+    // back as Anthropic SSE content blocks instead of being flattened to
+    // text. Resumption turns (whose last user message contains a
+    // tool_result) re-attach to the still-running ACP prompt.
+    if stream_flag && anthropic_request_uses_tools(&body) {
+        return run_anthropic_bridged(socket, state, body, requested_model).await;
+    }
+
     let parsed = ParsedTurn {
         stream_flag,
         requested_model,
@@ -916,6 +1392,509 @@ async fn run_anthropic_messages(
         anthropic_message_body,
     )
     .await
+}
+
+// === Anthropic /v1/messages with MCP-bridged client tools ===
+//
+// Path is taken whenever the inbound body declares `tools: [...]` and
+// `stream: true`. Tools flow to the cursor model via the [`McpBridge`] HTTP
+// server registered in `session/new`'s `mcpServers`; tool calls come back
+// out of cursor as MCP `tools/call` POSTs which we translate into
+// Anthropic `tool_use` content blocks on the SSE stream.
+
+fn anthropic_request_uses_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// Pulls `tools: [...]` from the inbound request body. The schemas are
+/// passed through unchanged to the MCP server, which performs the
+/// `input_schema` → `inputSchema` rename when cursor-agent calls
+/// `tools/list`.
+fn extract_anthropic_tools(body: &Value) -> Vec<Value> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// On the Anthropic resumption path, the cursor session is mid-prompt
+/// waiting on its MCP `tools/call`. Only the tool_result can be delivered
+/// back through MCP — any sibling content blocks (text, image, document)
+/// in the same user message would be silently dropped. Emit a one-shot
+/// stderr warning so the silent-loss case at least surfaces in logs.
+fn warn_if_resumption_drops_blocks(body: &Value) {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(last) = messages.last() else {
+        return;
+    };
+    if last.get("role").and_then(Value::as_str) != Some("user") {
+        return;
+    }
+    let Some(blocks) = last.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    let mut has_tool_result = false;
+    let mut dropped_kinds: Vec<&str> = Vec::new();
+    for block in blocks {
+        let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind == "tool_result" {
+            has_tool_result = true;
+        } else if !kind.is_empty() && !dropped_kinds.contains(&kind) {
+            dropped_kinds.push(kind);
+        }
+    }
+    if has_tool_result && !dropped_kinds.is_empty() {
+        eprintln!(
+            "aivo: cursor bridge resumption is dropping non-tool_result blocks in the user \
+             message: {dropped_kinds:?}. The cursor model only sees the tool_result; other \
+             content is lost. Send a fresh /v1/messages turn to deliver additional content."
+        );
+    }
+}
+
+/// Find the first `tool_result` block in the final user message and return
+/// (`tool_use_id`, MCP-shaped content array, `is_error`). Returns `None`
+/// when the last message isn't a user message or carries no `tool_result`.
+/// Multiple `tool_result` blocks in one user message (parallel tool_use)
+/// are not yet supported — we take the first.
+fn extract_last_tool_result(body: &Value) -> Option<(String, Vec<Value>, bool)> {
+    let messages = body.get("messages")?.as_array()?;
+    let last = messages.last()?;
+    if last.get("role").and_then(Value::as_str)? != "user" {
+        return None;
+    }
+    let blocks = last.get("content")?.as_array()?;
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str)? != "tool_result" {
+            continue;
+        }
+        let id = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)?
+            .to_string();
+        let is_error = block
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let content = match block.get("content") {
+            Some(Value::String(s)) => vec![json!({"type": "text", "text": s})],
+            Some(Value::Array(arr)) => arr.clone(),
+            _ => Vec::new(),
+        };
+        return Some((id, content, is_error));
+    }
+    None
+}
+
+async fn run_anthropic_bridged(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    // Resumption — claude-cli is delivering a tool_result for a previously
+    // parked tool_use. Try to match it to a still-running ACP session.
+    if let Some((tool_use_id, content, is_error)) = extract_last_tool_result(&body)
+        && let Some(session) = state
+            .mcp_bridge
+            .resume_with_tool_result(&tool_use_id, content, is_error)
+            .await
+    {
+        warn_if_resumption_drops_blocks(&body);
+        return run_anthropic_bridged_resume(socket, state, session, &body, requested_model).await;
+    }
+
+    // Fresh path — no matching parked call (or first turn). Open a new
+    // bridge session + cursor ACP session pinned to it.
+    run_anthropic_bridged_fresh(socket, state, body, requested_model).await
+}
+
+async fn run_anthropic_bridged_fresh(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    let tools = extract_anthropic_tools(&body);
+    let image_blocks = extract_anthropic_image_blocks(&body)?;
+    let prompt = reduce_anthropic_request_to_prompt_without_tools(&body);
+    if prompt.trim().is_empty() && image_blocks.is_empty() {
+        return Err(anyhow!("reduced prompt is empty; no user-visible message"));
+    }
+    let input_tokens = estimate_tokens(&prompt);
+
+    let (bridge_session, mcp_url) = state
+        .mcp_bridge
+        .open_session(tools, ToolUseIdStyle::Anthropic)
+        .await;
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+
+    let acp_result = CursorAcpSession::open_with_mcp(
+        &state.config.key,
+        requested_model.as_deref(),
+        &state.config.workspace_cwd,
+        Some(&mcp_url),
+    )
+    .await
+    .context("open cursor-agent ACP session with MCP bridge");
+
+    let mut acp = match acp_result {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e);
+        }
+    };
+
+    if let Some(model) = &requested_model {
+        let _ = acp.set_model(model).await;
+    }
+    if !image_blocks.is_empty() && !acp.supports_image_prompts() {
+        state.mcp_bridge.drop_session(&bridge_id).await;
+        return Err(anyhow!(image_capability_error()));
+    }
+
+    let response_model = acp
+        .model_id()
+        .map(str::to_string)
+        .or(requested_model.clone())
+        .unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+
+    let blocks = cursor_acp::assemble_prompt_blocks(&prompt, image_blocks);
+    let stream = match acp.prompt_with_blocks(blocks).await {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e).context("cursor-agent session/prompt");
+        }
+    };
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.attach_session(acp, stream);
+    }
+
+    stream_bridged_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+    )
+    .await
+}
+
+async fn run_anthropic_bridged_resume(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    body: &Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+    // Use the same metric as the OpenAI/Responses/Gemini resume paths so
+    // usage stats aggregated across protocols stay comparable per turn.
+    let input_tokens = estimate_tokens(&reduce_anthropic_request_to_prompt_without_tools(body));
+    let response_model = requested_model.unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+
+    stream_bridged_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+    )
+    .await
+}
+
+/// SSE loop that multiplexes ACP `session/update` events and MCP-bridge
+/// `tool_call` events onto the same Anthropic-format response. Exits on
+/// either `end_turn` (cleanup + drop bridge session) or `tool_use`
+/// (preserve bridge session so the next `/v1/messages` can resume it).
+async fn stream_bridged_turn(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    bridge_id: &str,
+    response_model: &str,
+    input_tokens: u64,
+) -> Result<Option<String>> {
+    let (acp, mut stream, mut event_rx) = match async {
+        let mut guard = bridge_session.lock().await;
+        let (acp, stream) = guard.take_active()?;
+        let rx = guard.attach_event_sink();
+        Ok::<_, anyhow::Error>((acp, stream, rx))
+    }
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            // Race: bridge session is in the sessions map but its ACP
+            // session / prompt stream was already taken (or never attached).
+            // Tear it down and surface as a 500 instead of panicking.
+            state.mcp_bridge.drop_session(bridge_id).await;
+            return Err(e).context("bridge session lost its active ACP slot");
+        }
+    };
+
+    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
+    if let Err(e) = socket.write_all(head.as_bytes()).await {
+        // Client closed on us before we wrote a byte; tear the bridge down
+        // wholesale — there's no resumption that could save this turn.
+        {
+            let mut guard = bridge_session.lock().await;
+            guard.detach_event_sink();
+        }
+        drop(acp);
+        drop(stream);
+        state.mcp_bridge.drop_session(bridge_id).await;
+        return Err(e).context("write SSE head");
+    }
+
+    let message_id = new_anthropic_message_id();
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": response_model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+            }),
+        ),
+    )
+    .await;
+
+    let mut block_state = AnthropicBlockState::default();
+    let mut stop_reason = "end_turn";
+    let mut output_tokens: u64 = 0;
+    let mut aggregated = String::new();
+    let mut parked = false;
+    let mut turn_errored = false;
+
+    'outer: loop {
+        tokio::select! {
+            biased;
+            // Drain MCP-bridge events first so a tool_call mid-stream
+            // doesn't get reordered behind a same-tick text chunk.
+            ev = event_rx.recv() => {
+                match ev {
+                    Some(BridgeEvent::ToolCall { tool_use_id, name, arguments }) => {
+                        // Close any open text/thinking block before opening
+                        // the tool_use one — Anthropic blocks don't nest.
+                        let _ = block_state.close(socket).await;
+                        let idx = block_state.allocate_index();
+                        let _ = write_sse_chunk(
+                            socket,
+                            &anthropic_content_block_start_tool_use(idx, &tool_use_id, &name),
+                        )
+                        .await;
+                        let _ = write_sse_chunk(
+                            socket,
+                            &anthropic_input_json_delta(idx, &arguments),
+                        )
+                        .await;
+                        let _ = write_sse_chunk(socket, &anthropic_content_block_stop(idx)).await;
+                        stop_reason = "tool_use";
+                        parked = true;
+                        break 'outer;
+                    }
+                    None => {
+                        // Bridge session was torn down — finish gracefully.
+                        break 'outer;
+                    }
+                }
+            }
+            ev = stream.next() => {
+                match ev {
+                    Some(PromptEvent::Update(value)) => {
+                        if let Some(text) = extract_agent_text(&value) {
+                            aggregated.push_str(text);
+                            output_tokens = output_tokens.saturating_add(estimate_tokens(text));
+                            let _ = block_state
+                                .ensure_kind(socket, AnthropicBlockKind::Text)
+                                .await;
+                            let _ = write_sse_chunk(
+                                socket,
+                                &anthropic_text_delta(block_state.index(), text),
+                            )
+                            .await;
+                        } else if let Some(thought) = extract_agent_thought(&value) {
+                            let _ = block_state
+                                .ensure_kind(socket, AnthropicBlockKind::Thinking)
+                                .await;
+                            let _ = write_sse_chunk(
+                                socket,
+                                &anthropic_thinking_delta(block_state.index(), thought),
+                            )
+                            .await;
+                        } else if let Some(marker) = extract_tool_call_marker(&value) {
+                            let _ = block_state
+                                .ensure_kind(socket, AnthropicBlockKind::Thinking)
+                                .await;
+                            let _ = write_sse_chunk(
+                                socket,
+                                &anthropic_thinking_delta(block_state.index(), &marker),
+                            )
+                            .await;
+                        }
+                    }
+                    Some(PromptEvent::Done(result)) => {
+                        if result.is_err() {
+                            // Anthropic's stop_reason enum is closed-set;
+                            // emit a spec-valid `end_turn` and surface the
+                            // upstream error via cancellation+logging.
+                            turn_errored = true;
+                        }
+                        break 'outer;
+                    }
+                    None => break 'outer,
+                }
+            }
+        }
+    }
+
+    if turn_errored && !parked {
+        // Tell cursor-agent's session/prompt to stop so its child doesn't
+        // keep generating output we'll never deliver. Best-effort: a dead
+        // session simply errors here and is dropped below.
+        let _ = acp.cancel().await;
+    }
+
+    let _ = block_state.close(socket).await;
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            }),
+        ),
+    )
+    .await;
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event("message_stop", &json!({"type": "message_stop"})),
+    )
+    .await;
+    let _ = write_chunk_terminator(socket).await;
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.detach_event_sink();
+        if parked {
+            // Preserve the ACP session for the resumption turn that will
+            // arrive on a follow-up `/v1/messages` carrying the matching
+            // `tool_result`.
+            guard.return_active(acp, stream);
+        } else {
+            // Drop the ACP session; the bridge session map entry is cleaned
+            // up below. Holding `acp`/`stream` past this scope would just
+            // delay the underlying child-process shutdown.
+            drop(acp);
+            drop(stream);
+        }
+    }
+    if !parked {
+        state.mcp_bridge.drop_session(bridge_id).await;
+    }
+
+    Ok(if aggregated.is_empty() {
+        None
+    } else {
+        Some(aggregated)
+    })
+}
+
+/// Open a fresh content_block_start for an Anthropic `tool_use` block.
+/// The `input` field must start empty — the actual JSON arguments arrive
+/// as an `input_json_delta` so the client streams the schema with the
+/// same incremental shape it expects from real upstream tool calls.
+fn anthropic_content_block_start_tool_use(index: u32, id: &str, name: &str) -> String {
+    sse_named_event(
+        "content_block_start",
+        &json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": {},
+            },
+        }),
+    )
+}
+
+/// Emit the full tool_use arguments as a single `input_json_delta`. We
+/// don't have to stream partial JSON because the MCP `tools/call` body
+/// arrived complete from cursor-agent before we entered the SSE loop.
+fn anthropic_input_json_delta(index: u32, arguments: &Value) -> String {
+    sse_named_event(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": arguments.to_string(),
+            },
+        }),
+    )
+}
+
+/// Variant of [`reduce_anthropic_request_to_prompt`] used by the bridged
+/// path: skips the `Available tools:` text header because tools now flow
+/// to the cursor model through the in-process MCP server instead. The
+/// `tool_use` / `tool_result` transcript markers are still kept so the
+/// model can see prior tool loops in the conversation history.
+fn reduce_anthropic_request_to_prompt_without_tools(body: &Value) -> String {
+    let mut parts = Vec::new();
+    let system_text = extract_anthropic_system_text(body.get("system"));
+    if !system_text.trim().is_empty() {
+        parts.push(format!("System: {system_text}"));
+    }
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return parts.join("\n\n");
+    };
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        let label = match role {
+            "user" => "User",
+            "assistant" => "Assistant",
+            other => other,
+        };
+        for entry in flatten_anthropic_message_blocks(label, msg.get("content")) {
+            parts.push(entry);
+        }
+    }
+    parts.join("\n\n")
 }
 
 /// Detects Claude Code's title-generation subagent request by its
@@ -1270,6 +2249,16 @@ impl AnthropicBlockState {
         }
         Ok(())
     }
+
+    /// Reserve a content-block index without opening a `text`/`thinking`
+    /// block. Used by the MCP-bridged path to emit a `tool_use` block,
+    /// which has its own `content_block_start` shape that
+    /// [`Self::ensure_kind`] can't produce.
+    fn allocate_index(&mut self) -> u32 {
+        let idx = self.next_index;
+        self.next_index += 1;
+        idx
+    }
 }
 
 fn anthropic_content_block_start(index: u32, kind: AnthropicBlockKind) -> String {
@@ -1534,12 +2523,35 @@ async fn run_responses(
 ) -> Result<Option<String>> {
     let body_str = extract_request_body(request).context("read request body")?;
     let body: Value = serde_json::from_str(body_str).context("parse Responses request body")?;
+    let stream_flag = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // Non-streaming resumption: drain any parked call before falling
+    // through to the legacy path (see Anthropic equivalent for rationale).
+    if !stream_flag && let Some((call_id, output)) = extract_last_function_call_output(&body) {
+        state
+            .mcp_bridge
+            .deliver_and_drop_parked(
+                &call_id,
+                vec![json!({"type": "text", "text": output})],
+                false,
+            )
+            .await;
+    }
+
+    // Same gate as the Anthropic path: tools + streaming → bridge route.
+    // Non-tool turns and non-streaming requests fall back to the existing
+    // flat-text-prompt flow.
+    if stream_flag && responses_request_uses_tools(&body) {
+        return run_responses_bridged(socket, state, body, requested_model).await;
+    }
+
     let parsed = ParsedTurn {
-        stream_flag: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        requested_model: body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        stream_flag,
+        requested_model,
         image_blocks: extract_responses_image_blocks(&body)?,
         prompt: reduce_responses_request_to_prompt(&body),
     };
@@ -1555,6 +2567,624 @@ async fn run_responses(
         responses_completion_body,
     )
     .await
+}
+
+// === Responses (codex) /responses with MCP-bridged client tools ===
+
+fn responses_request_uses_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// Convert codex's Responses-API tool schemas (`{type: "function", name,
+/// description, parameters}`) into the normalized `{name, description,
+/// input_schema}` shape the [`McpBridge`] expects. Tolerates both the flat
+/// Responses shape and the OpenAI-chat nested `{type: "function", function:
+/// {...}}` shape so the same helper covers both call sites if we wire chat
+/// later.
+fn extract_responses_tools_normalized(body: &Value) -> Vec<Value> {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let inner = tool.get("function").unwrap_or(tool);
+        let Some(name) = inner.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let description = inner
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let schema = inner
+            .get("parameters")
+            .or_else(|| inner.get("input_schema"))
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"}));
+        out.push(json!({
+            "name": name,
+            "description": description,
+            "input_schema": schema,
+        }));
+    }
+    out
+}
+
+/// Walk `input` items in reverse and return the latest `function_call_output`
+/// as `(call_id, output_string)`. Codex's tool-result shape uses a string
+/// payload directly (unlike Anthropic's structured content blocks).
+fn extract_last_function_call_output(body: &Value) -> Option<(String, String)> {
+    let items = body.get("input")?.as_array()?;
+    for item in items.iter().rev() {
+        if item.get("type").and_then(Value::as_str)? != "function_call_output" {
+            continue;
+        }
+        let call_id = item.get("call_id").and_then(Value::as_str)?.to_string();
+        let output = item
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return Some((call_id, output));
+    }
+    None
+}
+
+/// Variant of [`reduce_responses_request_to_prompt`] used by the bridged
+/// path: skips the `Available tools:` header (tools propagate via the MCP
+/// server now) but keeps the input-item walk so the cursor model sees prior
+/// tool loops in the conversation.
+fn reduce_responses_request_to_prompt_without_tools(body: &Value) -> String {
+    let mut parts = Vec::new();
+    let instructions = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !instructions.trim().is_empty() {
+        parts.push(format!("System: {instructions}"));
+    }
+    match body.get("input") {
+        Some(Value::String(s)) if !s.trim().is_empty() => {
+            parts.push(format!("User: {s}"));
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                match item_type {
+                    "function_call" => {
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let args = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .map(parse_loose_json)
+                            .unwrap_or(Value::Null);
+                        parts.push(format_tool_call_line(name, &args));
+                    }
+                    "function_call_output" => {
+                        let name = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        let output = item.get("output").and_then(Value::as_str).unwrap_or("");
+                        parts.push(format_tool_result_block(name, output));
+                    }
+                    "reasoning" => {}
+                    "message" | "" => {
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let label = match role {
+                            "system" | "developer" => "System",
+                            "user" => "User",
+                            "assistant" => "Assistant",
+                            other => other,
+                        };
+                        let text = extract_responses_item_text(item.get("content"));
+                        if !text.trim().is_empty() {
+                            parts.push(format!("{label}: {text}"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    parts.join("\n\n")
+}
+
+async fn run_responses_bridged(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    if let Some((call_id, output)) = extract_last_function_call_output(&body)
+        && let Some(session) = state
+            .mcp_bridge
+            .resume_with_tool_result(
+                &call_id,
+                vec![json!({"type": "text", "text": output})],
+                // Responses' function_call_output has no is_error field;
+                // failures flow as text in `output`. Same caveat as the
+                // OpenAI chat path — defer interpretation to the model.
+                false,
+            )
+            .await
+    {
+        return run_responses_bridged_resume(socket, state, session, &body, requested_model).await;
+    }
+    run_responses_bridged_fresh(socket, state, body, requested_model).await
+}
+
+async fn run_responses_bridged_fresh(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    let tools = extract_responses_tools_normalized(&body);
+    let image_blocks = extract_responses_image_blocks(&body)?;
+    let prompt = reduce_responses_request_to_prompt_without_tools(&body);
+    if prompt.trim().is_empty() && image_blocks.is_empty() {
+        return Err(anyhow!("reduced prompt is empty; no user-visible message"));
+    }
+    let input_tokens = estimate_tokens(&prompt);
+
+    let (bridge_session, mcp_url) = state
+        .mcp_bridge
+        .open_session(tools, ToolUseIdStyle::OpenAi)
+        .await;
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+
+    let acp_result = CursorAcpSession::open_with_mcp(
+        &state.config.key,
+        requested_model.as_deref(),
+        &state.config.workspace_cwd,
+        Some(&mcp_url),
+    )
+    .await
+    .context("open cursor-agent ACP session with MCP bridge (responses)");
+
+    let mut acp = match acp_result {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e);
+        }
+    };
+
+    if let Some(model) = &requested_model {
+        let _ = acp.set_model(model).await;
+    }
+    if !image_blocks.is_empty() && !acp.supports_image_prompts() {
+        state.mcp_bridge.drop_session(&bridge_id).await;
+        return Err(anyhow!(image_capability_error()));
+    }
+
+    let response_model = acp
+        .model_id()
+        .map(str::to_string)
+        .or(requested_model.clone())
+        .unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+
+    let blocks = cursor_acp::assemble_prompt_blocks(&prompt, image_blocks);
+    let stream = match acp.prompt_with_blocks(blocks).await {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e).context("cursor-agent session/prompt");
+        }
+    };
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.attach_session(acp, stream);
+    }
+
+    stream_bridged_responses_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+    )
+    .await
+}
+
+async fn run_responses_bridged_resume(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    body: &Value,
+    requested_model: Option<String>,
+) -> Result<Option<String>> {
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+    let input_tokens = estimate_tokens(&reduce_responses_request_to_prompt_without_tools(body));
+    let response_model = requested_model.unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+    stream_bridged_responses_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+    )
+    .await
+}
+
+async fn stream_bridged_responses_turn(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    bridge_id: &str,
+    response_model: &str,
+    input_tokens: u64,
+) -> Result<Option<String>> {
+    let (acp, mut stream, mut event_rx) = match async {
+        let mut guard = bridge_session.lock().await;
+        let (acp, stream) = guard.take_active()?;
+        let rx = guard.attach_event_sink();
+        Ok::<_, anyhow::Error>((acp, stream, rx))
+    }
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            // Race: bridge session is in the sessions map but its ACP
+            // session / prompt stream was already taken (or never attached).
+            // Tear it down and surface as a 500 instead of panicking.
+            state.mcp_bridge.drop_session(bridge_id).await;
+            return Err(e).context("bridge session lost its active ACP slot");
+        }
+    };
+
+    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
+    if let Err(e) = socket.write_all(head.as_bytes()).await {
+        {
+            let mut guard = bridge_session.lock().await;
+            guard.detach_event_sink();
+        }
+        drop(acp);
+        drop(stream);
+        state.mcp_bridge.drop_session(bridge_id).await;
+        return Err(e).context("write Responses SSE head");
+    }
+
+    let resp_id = new_responses_id();
+    let msg_id = new_anthropic_message_id();
+    let created = current_unix_timestamp();
+
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.created",
+            &json!({
+                "type": "response.created",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "model": response_model,
+                    "created_at": created,
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }),
+        ),
+    )
+    .await;
+    let mut message_item_opened = false;
+    let mut output_index: u32 = 0;
+    let mut full_text = String::new();
+    let mut function_call_item: Option<Value> = None;
+    let mut errored = false;
+    let mut parked = false;
+
+    'outer: loop {
+        tokio::select! {
+            biased;
+            ev = event_rx.recv() => {
+                match ev {
+                    Some(BridgeEvent::ToolCall { tool_use_id, name, arguments }) => {
+                        // Close the in-progress message block before opening
+                        // the function_call output item.
+                        if message_item_opened {
+                            let _ = emit_responses_message_close(
+                                socket, &resp_id, &msg_id, output_index, &full_text,
+                            ).await;
+                            output_index += 1;
+                            message_item_opened = false;
+                        }
+                        let args_json = arguments.to_string();
+                        let _ = write_sse_chunk(
+                            socket,
+                            &sse_named_event(
+                                "response.output_item.added",
+                                &json!({
+                                    "type": "response.output_item.added",
+                                    "response_id": resp_id,
+                                    "output_index": output_index,
+                                    "item": {
+                                        "id": tool_use_id,
+                                        "type": "function_call",
+                                        "status": "in_progress",
+                                        "call_id": tool_use_id,
+                                        "name": name,
+                                        "arguments": "",
+                                    },
+                                }),
+                            ),
+                        )
+                        .await;
+                        let _ = write_sse_chunk(
+                            socket,
+                            &sse_named_event(
+                                "response.function_call_arguments.delta",
+                                &json!({
+                                    "type": "response.function_call_arguments.delta",
+                                    "response_id": resp_id,
+                                    "item_id": tool_use_id,
+                                    "output_index": output_index,
+                                    "delta": args_json,
+                                }),
+                            ),
+                        )
+                        .await;
+                        let _ = write_sse_chunk(
+                            socket,
+                            &sse_named_event(
+                                "response.function_call_arguments.done",
+                                &json!({
+                                    "type": "response.function_call_arguments.done",
+                                    "response_id": resp_id,
+                                    "item_id": tool_use_id,
+                                    "output_index": output_index,
+                                    "arguments": args_json,
+                                }),
+                            ),
+                        )
+                        .await;
+                        let final_item = json!({
+                            "id": tool_use_id,
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": tool_use_id,
+                            "name": name,
+                            "arguments": args_json,
+                        });
+                        let _ = write_sse_chunk(
+                            socket,
+                            &sse_named_event(
+                                "response.output_item.done",
+                                &json!({
+                                    "type": "response.output_item.done",
+                                    "response_id": resp_id,
+                                    "output_index": output_index,
+                                    "item": final_item.clone(),
+                                }),
+                            ),
+                        )
+                        .await;
+                        function_call_item = Some(final_item);
+                        parked = true;
+                        break 'outer;
+                    }
+                    None => break 'outer,
+                }
+            }
+            ev = stream.next() => {
+                match ev {
+                    Some(PromptEvent::Update(value)) => {
+                        if let Some(text) = extract_agent_text(&value) {
+                            if !message_item_opened {
+                                let _ = emit_responses_message_open(
+                                    socket, &resp_id, &msg_id, output_index,
+                                ).await;
+                                message_item_opened = true;
+                            }
+                            full_text.push_str(text);
+                            let _ = write_sse_chunk(
+                                socket,
+                                &sse_named_event(
+                                    "response.output_text.delta",
+                                    &json!({
+                                        "type": "response.output_text.delta",
+                                        "response_id": resp_id,
+                                        "item_id": msg_id,
+                                        "output_index": output_index,
+                                        "content_index": 0,
+                                        "delta": text,
+                                    }),
+                                ),
+                            )
+                            .await;
+                        } else {
+                            // Keep the stream alive on non-text updates so
+                            // OpenAI SDK clients don't time out.
+                            let _ = write_sse_chunk(socket, SSE_KEEPALIVE).await;
+                        }
+                    }
+                    Some(PromptEvent::Done(result)) => {
+                        if result.is_err() {
+                            errored = true;
+                        }
+                        break 'outer;
+                    }
+                    None => break 'outer,
+                }
+            }
+        }
+    }
+
+    if errored && !parked {
+        let _ = acp.cancel().await;
+    }
+
+    if message_item_opened {
+        let _ =
+            emit_responses_message_close(socket, &resp_id, &msg_id, output_index, &full_text).await;
+    }
+
+    let mut output_array: Vec<Value> = Vec::new();
+    if !full_text.is_empty() {
+        output_array.push(json!({
+            "id": msg_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+        }));
+    }
+    if let Some(item) = function_call_item.clone() {
+        output_array.push(item);
+    }
+    let final_status = if errored { "failed" } else { "completed" };
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "model": response_model,
+                    "created_at": created,
+                    "status": final_status,
+                    "output": output_array,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": estimate_tokens(&full_text),
+                        "total_tokens": input_tokens.saturating_add(estimate_tokens(&full_text)),
+                    },
+                },
+            }),
+        ),
+    )
+    .await;
+    let _ = write_chunk_terminator(socket).await;
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.detach_event_sink();
+        if parked {
+            guard.return_active(acp, stream);
+        } else {
+            drop(acp);
+            drop(stream);
+        }
+    }
+    if !parked {
+        state.mcp_bridge.drop_session(bridge_id).await;
+    }
+
+    Ok(if full_text.is_empty() {
+        None
+    } else {
+        Some(full_text)
+    })
+}
+
+async fn emit_responses_message_open(
+    socket: &mut TcpStream,
+    resp_id: &str,
+    msg_id: &str,
+    output_index: u32,
+) -> Result<()> {
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "response_id": resp_id,
+                "output_index": output_index,
+                "item": {
+                    "id": msg_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+        ),
+    )
+    .await?;
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.content_part.added",
+            &json!({
+                "type": "response.content_part.added",
+                "response_id": resp_id,
+                "item_id": msg_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            }),
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn emit_responses_message_close(
+    socket: &mut TcpStream,
+    resp_id: &str,
+    msg_id: &str,
+    output_index: u32,
+    full_text: &str,
+) -> Result<()> {
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.output_text.done",
+            &json!({
+                "type": "response.output_text.done",
+                "response_id": resp_id,
+                "item_id": msg_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": full_text,
+            }),
+        ),
+    )
+    .await?;
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.content_part.done",
+            &json!({
+                "type": "response.content_part.done",
+                "response_id": resp_id,
+                "item_id": msg_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": full_text, "annotations": []},
+            }),
+        ),
+    )
+    .await?;
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "response_id": resp_id,
+                "output_index": output_index,
+                "item": {
+                    "id": msg_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+                },
+            }),
+        ),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn stream_responses_sse(
@@ -1929,6 +3559,30 @@ async fn run_gemini_generate(
     let body_str = extract_request_body(request).context("read request body")?;
     let body: Value =
         serde_json::from_str(body_str).context("parse Gemini generateContent request body")?;
+
+    // Non-streaming resumption: drain any parked call before falling
+    // through to the legacy path (see Anthropic equivalent for rationale).
+    if !generate.stream
+        && let Some((_name, id, text, is_error)) = extract_last_gemini_function_response(&body)
+    {
+        let content = vec![json!({"type": "text", "text": text})];
+        if let Some(id) = id.as_deref() {
+            state
+                .mcp_bridge
+                .deliver_and_drop_parked(id, content, is_error)
+                .await;
+        }
+        // For id-less Gemini responses we don't tear down by name in this
+        // non-stream path: the by-name fallback can cross-match concurrent
+        // sessions ([[reference_cursor_acp_mcp_propagation]]), so when in
+        // doubt we'd rather leak one parked call to its 600 s timeout
+        // than mis-deliver a tool result to another conversation.
+    }
+
+    if generate.stream && gemini_request_uses_tools(&body) {
+        return run_gemini_bridged(socket, state, body, generate.model.clone()).await;
+    }
+
     let parsed = ParsedTurn {
         stream_flag: generate.stream,
         requested_model: Some(generate.model.clone()),
@@ -1947,6 +3601,421 @@ async fn run_gemini_generate(
         gemini_response_body,
     )
     .await
+}
+
+// === Gemini generateContent (gemini-cli) with MCP-bridged tools ===
+
+fn gemini_request_uses_tools(body: &Value) -> bool {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+    tools.iter().any(|t| {
+        t.get("functionDeclarations")
+            .and_then(Value::as_array)
+            .is_some_and(|d| !d.is_empty())
+    })
+}
+
+/// Convert Gemini's `tools: [{functionDeclarations: [{name, description,
+/// parameters}]}]` shape into the bridge's normalized
+/// `{name, description, input_schema}` list. Multiple tool groups in
+/// `tools[]` are flattened.
+fn extract_gemini_tools_normalized(body: &Value) -> Vec<Value> {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tool in tools {
+        let Some(decls) = tool.get("functionDeclarations").and_then(Value::as_array) else {
+            continue;
+        };
+        for decl in decls {
+            let Some(name) = decl.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let description = decl
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let schema = decl
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object"}));
+            out.push(json!({
+                "name": name,
+                "description": description,
+                "input_schema": schema,
+            }));
+        }
+    }
+    out
+}
+
+/// Returns `(name, optional id, response_text)` for the latest
+/// `functionResponse` part in the request's `contents`. Gemini's old shape
+/// has only `name`; newer versions (1.5+) sometimes carry an `id` we can
+/// match against our synthetic tool_use_id.
+/// Returns `(name, optional id, response_text, is_error)`. The is_error
+/// signal is inferred from a top-level `error` key in the structured
+/// `response` (a soft convention in Gemini SDK examples; no formal spec).
+fn extract_last_gemini_function_response(
+    body: &Value,
+) -> Option<(String, Option<String>, String, bool)> {
+    let contents = body.get("contents")?.as_array()?;
+    for content in contents.iter().rev() {
+        let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts.iter().rev() {
+            let Some(resp) = part.get("functionResponse") else {
+                continue;
+            };
+            let name = resp
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let id = resp.get("id").and_then(Value::as_str).map(str::to_string);
+            let response = resp.get("response");
+            let is_error = response
+                .and_then(|v| v.as_object())
+                .is_some_and(|o| o.contains_key("error"));
+            let text = match response {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            };
+            return Some((name, id, text, is_error));
+        }
+    }
+    None
+}
+
+fn reduce_gemini_request_to_prompt_without_tools(body: &Value) -> String {
+    let mut parts = Vec::new();
+    let system_text = extract_gemini_system_text(body.get("systemInstruction"));
+    if !system_text.trim().is_empty() {
+        parts.push(format!("System: {system_text}"));
+    }
+    let Some(contents) = body.get("contents").and_then(Value::as_array) else {
+        return parts.join("\n\n");
+    };
+    for content in contents {
+        let role = content
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let label = match role {
+            "model" => "Assistant",
+            "user" => "User",
+            other => other,
+        };
+        for entry in flatten_gemini_content_parts(label, content.get("parts")) {
+            parts.push(entry);
+        }
+    }
+    parts.join("\n\n")
+}
+
+async fn run_gemini_bridged(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    model: String,
+) -> Result<Option<String>> {
+    if let Some((name, id, text, is_error)) = extract_last_gemini_function_response(&body) {
+        let content = vec![json!({"type": "text", "text": text})];
+        // When an id is present (Gemini 1.5+), it's authoritative. An
+        // id-miss means the request doesn't belong to any current parked
+        // call — fall through to fresh path rather than guessing by name
+        // across concurrent sessions (which could cross-deliver one user's
+        // answer to a different conversation parked on the same tool name).
+        let session = match id.as_deref() {
+            Some(id) => {
+                state
+                    .mcp_bridge
+                    .resume_with_tool_result(id, content, is_error)
+                    .await
+            }
+            None => {
+                state
+                    .mcp_bridge
+                    .resume_with_tool_result_by_name(&name, content, is_error)
+                    .await
+            }
+        };
+        if let Some(session) = session {
+            return run_gemini_bridged_resume(socket, state, session, &body, model).await;
+        }
+    }
+    run_gemini_bridged_fresh(socket, state, body, model).await
+}
+
+async fn run_gemini_bridged_fresh(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    body: Value,
+    model: String,
+) -> Result<Option<String>> {
+    let tools = extract_gemini_tools_normalized(&body);
+    let image_blocks = extract_gemini_image_blocks(&body)?;
+    let prompt = reduce_gemini_request_to_prompt_without_tools(&body);
+    if prompt.trim().is_empty() && image_blocks.is_empty() {
+        return Err(anyhow!("reduced prompt is empty; no user-visible message"));
+    }
+    let input_tokens = estimate_tokens(&prompt);
+
+    let (bridge_session, mcp_url) = state
+        .mcp_bridge
+        .open_session(tools, ToolUseIdStyle::Gemini)
+        .await;
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+
+    let acp_result = CursorAcpSession::open_with_mcp(
+        &state.config.key,
+        Some(&model),
+        &state.config.workspace_cwd,
+        Some(&mcp_url),
+    )
+    .await
+    .context("open cursor-agent ACP session with MCP bridge (gemini)");
+
+    let mut acp = match acp_result {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e);
+        }
+    };
+
+    let _ = acp.set_model(&model).await;
+    if !image_blocks.is_empty() && !acp.supports_image_prompts() {
+        state.mcp_bridge.drop_session(&bridge_id).await;
+        return Err(anyhow!(image_capability_error()));
+    }
+
+    let response_model = acp
+        .model_id()
+        .map(str::to_string)
+        .unwrap_or_else(|| model.clone());
+
+    let blocks = cursor_acp::assemble_prompt_blocks(&prompt, image_blocks);
+    let stream = match acp.prompt_with_blocks(blocks).await {
+        Ok(s) => s,
+        Err(e) => {
+            state.mcp_bridge.drop_session(&bridge_id).await;
+            return Err(e).context("cursor-agent session/prompt");
+        }
+    };
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.attach_session(acp, stream);
+    }
+
+    stream_bridged_gemini_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+    )
+    .await
+}
+
+async fn run_gemini_bridged_resume(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    body: &Value,
+    model: String,
+) -> Result<Option<String>> {
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+    let input_tokens = estimate_tokens(&reduce_gemini_request_to_prompt_without_tools(body));
+    stream_bridged_gemini_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &model,
+        input_tokens,
+    )
+    .await
+}
+
+async fn stream_bridged_gemini_turn(
+    socket: &mut TcpStream,
+    state: &RouterState,
+    bridge_session: Arc<tokio::sync::Mutex<BridgeSession>>,
+    bridge_id: &str,
+    response_model: &str,
+    input_tokens: u64,
+) -> Result<Option<String>> {
+    let (acp, mut stream, mut event_rx) = match async {
+        let mut guard = bridge_session.lock().await;
+        let (acp, stream) = guard.take_active()?;
+        let rx = guard.attach_event_sink();
+        Ok::<_, anyhow::Error>((acp, stream, rx))
+    }
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            // Race: bridge session is in the sessions map but its ACP
+            // session / prompt stream was already taken (or never attached).
+            // Tear it down and surface as a 500 instead of panicking.
+            state.mcp_bridge.drop_session(bridge_id).await;
+            return Err(e).context("bridge session lost its active ACP slot");
+        }
+    };
+
+    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
+    if let Err(e) = socket.write_all(head.as_bytes()).await {
+        {
+            let mut guard = bridge_session.lock().await;
+            guard.detach_event_sink();
+        }
+        drop(acp);
+        drop(stream);
+        state.mcp_bridge.drop_session(bridge_id).await;
+        return Err(e).context("write Gemini SSE head");
+    }
+
+    let mut aggregated = String::new();
+    let mut output_tokens: u64 = 0;
+    let mut finish_reason = "STOP";
+    let mut parked = false;
+    // Captured tool-call data for the final frame. We emit it together
+    // with finishReason in a single candidate frame so strict gemini-cli
+    // parsers (which key dispatch off "functionCall part AND finishReason
+    // in the same chunk") see them atomically.
+    let mut parked_call: Option<(String, String, Value)> = None;
+
+    'outer: loop {
+        tokio::select! {
+            biased;
+            ev = event_rx.recv() => {
+                match ev {
+                    Some(BridgeEvent::ToolCall { tool_use_id, name, arguments }) => {
+                        finish_reason = "STOP";
+                        parked = true;
+                        parked_call = Some((tool_use_id, name, arguments));
+                        break 'outer;
+                    }
+                    None => break 'outer,
+                }
+            }
+            ev = stream.next() => {
+                match ev {
+                    Some(PromptEvent::Update(value)) => {
+                        if let Some(text) = extract_agent_text(&value) {
+                            aggregated.push_str(text);
+                            output_tokens = output_tokens.saturating_add(estimate_tokens(text));
+                            let frame = gemini_stream_text_frame(response_model, text);
+                            let _ = write_sse_chunk(socket, &frame).await;
+                        } else {
+                            let _ = write_sse_chunk(socket, SSE_KEEPALIVE).await;
+                        }
+                    }
+                    Some(PromptEvent::Done(result)) => {
+                        if result.is_err() {
+                            finish_reason = "OTHER";
+                        }
+                        break 'outer;
+                    }
+                    None => break 'outer,
+                }
+            }
+        }
+    }
+
+    if finish_reason == "OTHER" && !parked {
+        let _ = acp.cancel().await;
+    }
+
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    let final_frame = match parked_call.as_ref() {
+        Some((tool_use_id, name, arguments)) => gemini_stream_function_call_final_frame(
+            response_model,
+            tool_use_id,
+            name,
+            arguments,
+            finish_reason,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        ),
+        None => gemini_stream_final_frame(
+            response_model,
+            finish_reason,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        ),
+    };
+    let _ = write_sse_chunk(socket, &final_frame).await;
+    let _ = write_chunk_terminator(socket).await;
+
+    {
+        let mut guard = bridge_session.lock().await;
+        guard.detach_event_sink();
+        if parked {
+            guard.return_active(acp, stream);
+        } else {
+            drop(acp);
+            drop(stream);
+        }
+    }
+    if !parked {
+        state.mcp_bridge.drop_session(bridge_id).await;
+    }
+
+    Ok(if aggregated.is_empty() {
+        None
+    } else {
+        Some(aggregated)
+    })
+}
+
+/// One-shot Gemini stream frame carrying the `functionCall` part and the
+/// final `finishReason`+`usageMetadata` in the same candidate. Combining
+/// the two avoids the split-frame bug where strict gemini-cli parsers
+/// only dispatch a tool call when both signals appear atomically.
+#[allow(clippy::too_many_arguments)]
+fn gemini_stream_function_call_final_frame(
+    model: &str,
+    tool_use_id: &str,
+    name: &str,
+    args: &Value,
+    finish_reason: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+) -> String {
+    let payload = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "id": tool_use_id,
+                        "name": name,
+                        "args": args,
+                    }
+                }],
+            },
+            "finishReason": finish_reason,
+            "index": 0,
+        }],
+        "usageMetadata": {
+            "promptTokenCount": input_tokens,
+            "candidatesTokenCount": output_tokens,
+            "totalTokenCount": total_tokens,
+        },
+        "modelVersion": model,
+    });
+    format!("data: {payload}\n\n")
 }
 
 /// Reduces a Gemini `GenerateContentRequest` body to a flat ACP prompt.
@@ -2832,6 +4901,7 @@ mod tests {
                 prewarm_count: 0,
             },
             cached_models: Mutex::new(Some(models.into_iter().map(String::from).collect())),
+            mcp_bridge: McpBridge::for_tests(),
             pool: Mutex::new(Vec::new()),
             prewarming: AtomicUsize::new(0),
         })
@@ -2962,6 +5032,7 @@ mod tests {
             // In-memory cache deliberately empty so the lookup falls through
             // to the disk-backed branch.
             cached_models: Mutex::new(None),
+            mcp_bridge: McpBridge::for_tests(),
             pool: Mutex::new(Vec::new()),
             prewarming: AtomicUsize::new(0),
         });
@@ -3725,6 +5796,166 @@ mod tests {
         assert_eq!(body["usage"]["output_tokens"], 3);
         assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);
         assert_eq!(body["usage"]["cache_read_input_tokens"], 0);
+    }
+
+    #[test]
+    fn extract_openai_chat_tools_normalized_unwraps_function_wrapper() {
+        let body = json!({
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ask",
+                        "description": "Ask.",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                // Flat shape (some clients emit this)
+                {"type": "function", "name": "noop"},
+            ],
+        });
+        let out = extract_openai_chat_tools_normalized(&body);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["name"], "ask");
+        assert_eq!(out[0]["input_schema"]["type"], "object");
+        assert_eq!(out[1]["name"], "noop");
+    }
+
+    #[test]
+    fn extract_last_openai_tool_message_picks_latest_tool_role() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_old", "function": {"name": "x", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "call_old", "content": "ignored"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_new", "function": {"name": "y", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "call_new", "content": "blue"},
+            ],
+        });
+        let (id, content) = extract_last_openai_tool_message(&body).unwrap();
+        assert_eq!(id, "call_new");
+        assert_eq!(content, "blue");
+    }
+
+    #[test]
+    fn extract_gemini_tools_normalized_flattens_function_declarations() {
+        let body = json!({
+            "tools": [
+                {"functionDeclarations": [
+                    {"name": "ask", "description": "Ask.", "parameters": {"type": "object"}},
+                    {"name": "noop"},
+                ]},
+                {"functionDeclarations": [
+                    {"name": "second", "parameters": {"type": "object"}},
+                ]},
+            ],
+        });
+        let out = extract_gemini_tools_normalized(&body);
+        let names: Vec<_> = out.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["ask", "noop", "second"]);
+    }
+
+    #[test]
+    fn extract_last_gemini_function_response_finds_id_and_name() {
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "ask", "args": {"q": "x"}}},
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {
+                        "id": "call_42",
+                        "name": "ask",
+                        "response": "blue",
+                    }},
+                ]},
+            ],
+        });
+        let (name, id, text, is_error) = extract_last_gemini_function_response(&body).unwrap();
+        assert_eq!(name, "ask");
+        assert_eq!(id.as_deref(), Some("call_42"));
+        assert_eq!(text, "blue");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn extract_last_gemini_function_response_handles_missing_id() {
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "ask", "response": "blue"}},
+                ]},
+            ],
+        });
+        let (name, id, text, is_error) = extract_last_gemini_function_response(&body).unwrap();
+        assert_eq!(name, "ask");
+        assert!(id.is_none());
+        assert_eq!(text, "blue");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn extract_last_gemini_function_response_detects_error_in_structured_response() {
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"functionResponse": {
+                        "name": "ask",
+                        "response": {"error": "tool exploded"},
+                    }},
+                ]},
+            ],
+        });
+        let (_name, _id, _text, is_error) = extract_last_gemini_function_response(&body).unwrap();
+        assert!(is_error, "top-level `error` key should mark is_error");
+    }
+
+    #[test]
+    fn extract_responses_tools_normalized_renames_parameters_to_input_schema() {
+        let body = json!({
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "request_user_input",
+                    "description": "Ask the user.",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                },
+                {"type": "function", "name": "Noop"},
+            ],
+        });
+        let out = extract_responses_tools_normalized(&body);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["name"], "request_user_input");
+        assert_eq!(out[0]["description"], "Ask the user.");
+        assert_eq!(out[0]["input_schema"]["type"], "object");
+        assert_eq!(out[1]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn extract_last_function_call_output_finds_last_match() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": []},
+                {"type": "function_call", "call_id": "call_a", "name": "x", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "ignored"},
+                {"type": "function_call", "call_id": "call_b", "name": "y", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "blue"},
+            ],
+        });
+        let (id, output) = extract_last_function_call_output(&body).unwrap();
+        assert_eq!(id, "call_b");
+        assert_eq!(output, "blue");
+    }
+
+    #[test]
+    fn extract_last_function_call_output_returns_none_without_output_item() {
+        let body = json!({"input": [{"role": "user", "content": []}]});
+        assert!(extract_last_function_call_output(&body).is_none());
     }
 
     #[test]

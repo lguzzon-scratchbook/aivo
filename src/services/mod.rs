@@ -61,6 +61,7 @@ pub mod last_selection;
 pub mod launch_args;
 pub mod launch_runtime;
 pub mod log_store;
+pub mod mcp_bridge;
 pub mod media_io;
 pub mod model_compat;
 pub mod model_names;

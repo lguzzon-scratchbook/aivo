@@ -752,6 +752,19 @@ impl CursorAcpSession {
         requested_model: Option<&str>,
         workspace_cwd: &str,
     ) -> Result<Self> {
+        Self::open_with_mcp(key, requested_model, workspace_cwd, None).await
+    }
+
+    /// Variant of [`Self::open`] that registers an MCP server in
+    /// `session/new`'s `mcpServers` array. The cursor router uses this to
+    /// expose claude-cli's `/v1/messages` tools to the cursor model via the
+    /// [`mcp_bridge`](crate::services::mcp_bridge) HTTP server.
+    pub async fn open_with_mcp(
+        key: &ApiKey,
+        requested_model: Option<&str>,
+        workspace_cwd: &str,
+        mcp_url: Option<&str>,
+    ) -> Result<Self> {
         ensure_cursor_agent_installed()?;
         let mut cmd = cursor_agent_command_for_key(key)?;
         cmd.arg("acp");
@@ -780,10 +793,20 @@ impl CursorAcpSession {
 
         let prompt_capabilities = PromptCapabilities::from_init_response(&init);
 
+        let mcp_servers: Vec<Value> = mcp_url
+            .map(|url| {
+                vec![json!({
+                    "type": "http",
+                    "name": "aivo-cursor-bridge",
+                    "url": url,
+                    "headers": [],
+                })]
+            })
+            .unwrap_or_default();
         let new_session = client
             .request(
                 "session/new",
-                json!({"cwd": workspace_cwd, "mcpServers": []}),
+                json!({"cwd": workspace_cwd, "mcpServers": mcp_servers}),
             )
             .await
             .with_context(|| {
