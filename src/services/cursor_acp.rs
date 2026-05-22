@@ -823,6 +823,9 @@ impl CursorAcpSession {
     ) -> Result<Self> {
         ensure_cursor_agent_installed()?;
         let mut cmd = cursor_agent_command_for_key(key)?;
+        if let Some(model) = requested_model.filter(|s| !s.is_empty()) {
+            cmd.args(["--model", model]);
+        }
         cmd.arg("acp");
 
         let permission_fn: PermissionFn = match tool_policy {
@@ -880,19 +883,10 @@ impl CursorAcpSession {
             .to_string();
 
         let models = new_session.get("models").cloned().unwrap_or(Value::Null);
-        let active_model =
-            pick_model_id_from_models(&models, requested_model, model_pick_preference);
-        if let Some(model_id) = &active_model {
-            let current = models.get("currentModelId").and_then(Value::as_str);
-            if current != Some(model_id.as_str()) {
-                let _ = client
-                    .request(
-                        "session/set_model",
-                        json!({"sessionId": session_id, "modelId": model_id}),
-                    )
-                    .await;
-            }
-        }
+        let active_model = models
+            .get("currentModelId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         Ok(Self {
             client,
