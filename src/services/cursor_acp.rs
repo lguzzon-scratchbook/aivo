@@ -1064,41 +1064,37 @@ where
 
 /// Look up the encoded modelId for `requested` against an ACP `models` object
 /// (the `models` field of a `session/new` response). Match by user-facing
-/// `name` (what `aivo models` shows). Falls back to `currentModelId`, then to
-/// `None` if neither side surfaced a usable identifier.
+/// `name` (what `aivo models` shows). With `requested=None` returns
+/// `currentModelId`; with an unknown `requested` returns `None` so callers can
+/// distinguish "catalog miss" from "no change needed" — the previous
+/// fall-back-to-current behavior silently no-op'd `set_model` whenever the
+/// picker offered a name that wasn't in `session/new`'s `availableModels`.
 fn pick_model_id_from_models(
     models: &Value,
     requested: Option<&str>,
     preference: ModelPickPreference,
 ) -> Option<String> {
-    let current = models
-        .get("currentModelId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
     let Some(requested) = requested.filter(|s| !s.is_empty()) else {
-        return current;
+        return models
+            .get("currentModelId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
     };
 
-    let available = models.get("availableModels").and_then(Value::as_array);
-    if let Some(list) = available {
-        if preference == ModelPickPreference::PreferNoThinking
-            && let Some(id) = pick_prefer_no_thinking(list, requested)
-        {
-            return Some(id);
-        }
-        for entry in list {
-            let name = entry.get("name").and_then(Value::as_str);
-            let id = entry.get("modelId").and_then(Value::as_str);
-            if name == Some(requested) {
-                return id.map(str::to_string);
-            }
-            if id == Some(requested) {
-                return id.map(str::to_string);
-            }
+    let available = models.get("availableModels").and_then(Value::as_array)?;
+    if preference == ModelPickPreference::PreferNoThinking
+        && let Some(id) = pick_prefer_no_thinking(available, requested)
+    {
+        return Some(id);
+    }
+    for entry in available {
+        let name = entry.get("name").and_then(Value::as_str);
+        let id = entry.get("modelId").and_then(Value::as_str);
+        if name == Some(requested) || id == Some(requested) {
+            return id.map(str::to_string);
         }
     }
-    current
+    None
 }
 
 fn model_id_prefers_no_thinking(model_id: &str) -> bool {
@@ -1552,18 +1548,21 @@ mod tests {
     }
 
     #[test]
-    fn pick_model_id_falls_back_to_current_when_no_match() {
+    fn pick_model_id_returns_none_for_unknown_name_but_current_for_no_request() {
+        // Unknown names must return None so `set_model` can fall through to
+        // sending the raw `requested` to cursor-agent (or, on error, drop the
+        // session). Falling back to currentModelId silently no-op'd model
+        // switches whenever the picker offered a name that session/new's
+        // availableModels didn't include.
         let models = serde_json::json!({
             "currentModelId": "composer-2.5[fast=true]",
             "availableModels": [
                 {"modelId": "composer-2.5[fast=true]", "name": "composer-2.5"},
             ],
         });
-        // Unknown name → use current; null request → use current.
         assert_eq!(
-            pick_model_id_from_models(&models, Some("totally-bogus"), ModelPickPreference::Default)
-                .as_deref(),
-            Some("composer-2.5[fast=true]")
+            pick_model_id_from_models(&models, Some("totally-bogus"), ModelPickPreference::Default),
+            None
         );
         assert_eq!(
             pick_model_id_from_models(&models, None, ModelPickPreference::Default).as_deref(),
