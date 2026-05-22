@@ -26,18 +26,13 @@ impl ChatTuiApp {
             }
             match message.role.as_str() {
                 "user" => render_user_message(&mut lines, &message.content, &message.attachments),
-                "assistant" => render_assistant_message(
-                    &mut lines,
-                    message.reasoning_content.as_deref(),
-                    &message.content,
-                ),
+                "assistant" => render_assistant_message(&mut lines, None, &message.content),
                 other => render_system_message(&mut lines, other, &message.content),
             }
             previous_role = Some(message.role.as_str());
         }
 
-        let has_visible_streaming =
-            !self.pending_response.is_empty() || !self.pending_reasoning.is_empty();
+        let has_visible_streaming = !self.pending_response.is_empty();
         if self.sending && !has_visible_streaming {
             if should_add_message_spacing(previous_role, "assistant") {
                 push_message_spacing(&mut lines);
@@ -54,11 +49,7 @@ impl ChatTuiApp {
             if should_add_message_spacing(previous_role, "assistant") {
                 push_message_spacing(&mut lines);
             }
-            render_assistant_message(
-                &mut lines,
-                (!self.pending_reasoning.is_empty()).then_some(self.pending_reasoning.as_str()),
-                &self.pending_response,
-            );
+            render_assistant_message(&mut lines, None, &self.pending_response);
         }
 
         if let Some((color, text)) = notice_display(self.notice.as_ref()) {

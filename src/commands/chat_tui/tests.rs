@@ -671,11 +671,12 @@ fn test_build_transcript_shows_pending_status_without_visible_stream() {
 }
 
 #[test]
-fn test_build_transcript_shows_streaming_reasoning_before_content() {
+fn test_build_transcript_ignores_streaming_reasoning_in_chat() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
     app.pending_reasoning = "Inspecting the request".to_string();
+    app.pending_response = "Working on it".to_string();
 
     let transcript = app.build_transcript();
     let plain = transcript
@@ -686,9 +687,9 @@ fn test_build_transcript_shows_streaming_reasoning_before_content() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plain.contains("Thinking"));
-    assert!(plain.contains("Inspecting the request"));
-    assert!(!plain.contains("esc to interrupt"));
+    assert!(!plain.contains("Thinking"));
+    assert!(!plain.contains("Inspecting the request"));
+    assert!(plain.contains("Working on it"));
 }
 
 #[test]

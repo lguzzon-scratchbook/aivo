@@ -176,6 +176,7 @@ impl ChatTuiApp {
                         &cwd,
                         None,
                         ToolPolicy::Reject,
+                        cursor_acp::ModelPickPreference::PreferNoThinking,
                     )
                     .await
                     {
@@ -360,7 +361,7 @@ impl ChatTuiApp {
     }
 
     pub(super) async fn interrupt_inflight_request(&mut self) -> Result<()> {
-        if self.pending_response.is_empty() && self.pending_reasoning.is_empty() {
+        if self.pending_response.is_empty() {
             self.cancel_inflight_request();
             return Ok(());
         }
@@ -370,7 +371,7 @@ impl ChatTuiApp {
         }
 
         let partial = std::mem::take(&mut self.pending_response);
-        let reasoning = std::mem::take(&mut self.pending_reasoning);
+        self.pending_reasoning.clear();
         self.pending_submit = None;
         self.cursor = self.draft.len();
         self.sync_command_menu_state();
@@ -380,7 +381,7 @@ impl ChatTuiApp {
         self.history.push(ChatMessage {
             role: "assistant".to_string(),
             content: partial,
-            reasoning_content: normalize_reasoning_content(reasoning),
+            reasoning_content: None,
             attachments: vec![],
         });
         self.context_tokens = estimate_context_tokens(&self.history);
@@ -492,7 +493,6 @@ async fn drive_cursor_turn(
 
     Ok(ChatTurnResult {
         content: turn_result.content,
-        reasoning_content: turn_result.reasoning_content,
         usage: None,
         model: model_id,
         raw_body: None,

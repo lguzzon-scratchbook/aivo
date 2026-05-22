@@ -291,7 +291,7 @@ pub(super) fn render_pending_status(
 ) {
     let spinner = spinner_frame_indexed(frame_tick, reduce_motion);
     let text = format!(
-        "{spinner} Thinking ({} • esc to interrupt)",
+        "{spinner} Generating ({} • esc to interrupt)",
         format_request_elapsed(elapsed)
     );
     push_styled_line(

@@ -34,9 +34,8 @@ impl ChatTuiApp {
     }
 
     fn apply_runtime_delta(&mut self, delta: ChatResponseChunk) {
-        match delta {
-            ChatResponseChunk::Content(text) => self.pending_response.push_str(&text),
-            ChatResponseChunk::Reasoning(text) => self.pending_reasoning.push_str(&text),
+        if let ChatResponseChunk::Content(text) = delta {
+            self.pending_response.push_str(&text);
         }
     }
 
@@ -64,18 +63,13 @@ impl ChatTuiApp {
         } else {
             self.pending_response.clone()
         };
-        let reasoning_content = if self.pending_reasoning.is_empty() {
-            turn.reasoning_content.clone()
-        } else {
-            Some(self.pending_reasoning.clone())
-        };
         self.pending_submit = None;
         self.pending_response.clear();
         self.pending_reasoning.clear();
         self.history.push(ChatMessage {
             role: "assistant".to_string(),
             content,
-            reasoning_content,
+            reasoning_content: None,
             attachments: vec![],
         });
 
@@ -114,10 +108,6 @@ impl ChatTuiApp {
             .last()
             .map(|message| message.content.clone())
             .unwrap_or_default();
-        let assistant_reasoning = self
-            .history
-            .last()
-            .and_then(|message| message.reasoning_content.clone());
         let user_message = self
             .history
             .iter()
@@ -134,7 +124,7 @@ impl ChatTuiApp {
                 Some(&self.session_id),
                 &user_message,
                 &assistant_content,
-                assistant_reasoning.as_deref(),
+                None,
                 &usage,
             )
             .await;
@@ -237,14 +227,13 @@ impl ChatTuiApp {
         // If the response was still streaming at exit, salvage the partial
         // assistant text the same way an explicit interrupt does — otherwise
         // the user's prompt and any visible reply would be lost.
-        if self.sending && (!self.pending_response.is_empty() || !self.pending_reasoning.is_empty())
-        {
+        if self.sending && !self.pending_response.is_empty() {
             let partial = std::mem::take(&mut self.pending_response);
-            let reasoning = std::mem::take(&mut self.pending_reasoning);
+            self.pending_reasoning.clear();
             self.history.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: partial,
-                reasoning_content: normalize_reasoning_content(reasoning),
+                reasoning_content: None,
                 attachments: vec![],
             });
         }

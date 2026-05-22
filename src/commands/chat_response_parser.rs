@@ -70,7 +70,6 @@ impl TokenUsage {
 #[derive(Debug, Default)]
 pub(crate) struct ChatTurnResult {
     pub content: String,
-    pub reasoning_content: Option<String>,
     pub usage: Option<TokenUsage>,
     /// Upstream model echoed by the provider's response. `None` when the
     /// response didn't carry a `model` field (e.g. Google streaming, where

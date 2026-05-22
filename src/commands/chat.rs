@@ -411,21 +411,14 @@ impl ChatCommand {
                     return Ok(());
                 }
                 match chunk {
-                    ChatResponseChunk::Reasoning(text) => {
-                        if current_section != Some("thinking") {
+                    ChatResponseChunk::Reasoning(_) => {}
+                    ChatResponseChunk::Content(text) => {
+                        if current_section != Some("answer") {
                             if current_section.is_some() {
                                 print!("\n\n");
                             }
-                            println!("Thinking:");
-                            current_section = Some("thinking");
+                            current_section = Some("answer");
                         }
-                        print!("{text}");
-                    }
-                    ChatResponseChunk::Content(text) => {
-                        if current_section == Some("thinking") {
-                            print!("\n\nAnswer:\n");
-                        }
-                        current_section = Some("answer");
                         print!("{text}");
                     }
                 }
@@ -459,7 +452,6 @@ impl ChatCommand {
                         &mut forward,
                     ) => res.map(|cur| ChatTurnResult {
                         content: cur.content,
-                        reasoning_content: cur.reasoning_content,
                         usage: None,
                         model: cur.model,
                         raw_body: None,
@@ -520,14 +512,14 @@ impl ChatCommand {
                         Some(&chat_session_id),
                         &history[0],
                         &turn.content,
-                        turn.reasoning_content.as_deref(),
+                        None,
                         &usage,
                     )
                     .await;
                     let (stored, title, preview) = build_one_shot_persist_inputs(
                         &history,
                         turn.content.clone(),
-                        turn.reasoning_content.clone(),
+                        None,
                         &raw_model,
                     );
                     let session_tokens = SessionTokens {
@@ -1418,7 +1410,6 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
-        reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
         model: response_model,
         raw_body: None,
@@ -1474,7 +1465,6 @@ where
 
     Ok(ChatTurnResult {
         content: response.content,
-        reasoning_content: response.reasoning_content,
         usage,
         model: response_model,
         raw_body: Some(body),
@@ -1647,7 +1637,6 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
-        reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
         model: response_model,
         raw_body: None,
@@ -1709,7 +1698,6 @@ where
 
     Ok(ChatTurnResult {
         content: response.content,
-        reasoning_content: response.reasoning_content,
         usage,
         model: response_model,
         raw_body: Some(body),
@@ -1841,7 +1829,6 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
-        reasoning_content: None,
         usage,
         model: response_model,
         raw_body: None,
@@ -1897,7 +1884,6 @@ where
 
     Ok(ChatTurnResult {
         content: response.content,
-        reasoning_content: None,
         usage,
         model: response_model,
         raw_body: Some(body),
@@ -2054,7 +2040,6 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
-        reasoning_content: None,
         usage,
         model: response_model,
         raw_body: None,
@@ -2105,7 +2090,6 @@ where
 
     Ok(ChatTurnResult {
         content: response.content,
-        reasoning_content: None,
         usage,
         model: response_model,
         raw_body: Some(body),
@@ -2222,7 +2206,6 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
-        reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
         model: response_model,
         raw_body: None,
@@ -2294,16 +2277,12 @@ where
     }
 
     style::stop_spinner(spinning);
-    if let Some(reasoning) = reasoning_content.clone() {
-        on_chunk(ChatResponseChunk::Reasoning(reasoning))?;
-    }
     if !content.is_empty() {
         on_chunk(ChatResponseChunk::Content(content.clone()))?;
     }
 
     Ok(ChatTurnResult {
         content,
-        reasoning_content,
         usage,
         model: response_model,
         raw_body: Some(body),
@@ -2335,7 +2314,7 @@ where
     let native_model = google_native_model_name(model);
     let url = build_google_stream_generate_content_url(&key.base_url, native_model);
 
-    let request = build_google_request(messages)?;
+    let request = build_google_request(model, messages)?;
 
     let mut response = send_with_retry(|| {
         with_auth_google(client.post(&url), key)
@@ -2406,7 +2385,6 @@ where
 
     Ok(ChatTurnResult {
         content: full_content,
-        reasoning_content: None,
         usage,
         // Google's stream chunks don't include the model name; the request
         // model was already substituted into the URL. Recording falls back
@@ -2434,7 +2412,7 @@ where
     let native_model = google_native_model_name(model);
     let url = build_google_generate_content_url(&key.base_url, native_model);
 
-    let request = build_google_request(messages)?;
+    let request = build_google_request(model, messages)?;
 
     let response = send_with_retry(|| {
         with_auth_google(client.post(&url), key)
@@ -2465,7 +2443,6 @@ where
 
     Ok(ChatTurnResult {
         content: google_response.content,
-        reasoning_content: None,
         usage,
         model: response_model,
         raw_body: Some(body),

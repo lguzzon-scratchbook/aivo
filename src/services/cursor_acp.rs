@@ -710,6 +710,16 @@ pub enum CursorChunk<'a> {
     Reasoning(&'a str),
 }
 
+/// How to resolve a user-facing model name against cursor-agent's encoded
+/// `modelId` catalog. Chat prefers non-thinking variants; bridged routes keep
+/// the default first-match behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelPickPreference {
+    #[default]
+    Default,
+    PreferNoThinking,
+}
+
 /// Live `cursor-agent acp` connection scoped to a single ACP session.
 ///
 /// Reuses one spawned child for many prompts so the TUI doesn't pay Node.js
@@ -722,6 +732,7 @@ pub struct CursorAcpSession {
     model_id: Option<String>,
     models: Value,
     prompt_capabilities: PromptCapabilities,
+    model_pick_preference: ModelPickPreference,
 }
 
 /// Parsed `agentCapabilities.promptCapabilities` from the ACP `initialize`
@@ -772,6 +783,7 @@ impl CursorAcpSession {
             workspace_cwd,
             None,
             ToolPolicy::EnvDefault,
+            ModelPickPreference::Default,
         )
         .await
     }
@@ -792,6 +804,7 @@ impl CursorAcpSession {
             workspace_cwd,
             mcp_url,
             ToolPolicy::EnvDefault,
+            ModelPickPreference::Default,
         )
         .await
     }
@@ -806,6 +819,7 @@ impl CursorAcpSession {
         workspace_cwd: &str,
         mcp_url: Option<&str>,
         tool_policy: ToolPolicy,
+        model_pick_preference: ModelPickPreference,
     ) -> Result<Self> {
         ensure_cursor_agent_installed()?;
         let mut cmd = cursor_agent_command_for_key(key)?;
@@ -866,7 +880,8 @@ impl CursorAcpSession {
             .to_string();
 
         let models = new_session.get("models").cloned().unwrap_or(Value::Null);
-        let active_model = pick_model_id_from_models(&models, requested_model);
+        let active_model =
+            pick_model_id_from_models(&models, requested_model, model_pick_preference);
         if let Some(model_id) = &active_model {
             let current = models.get("currentModelId").and_then(Value::as_str);
             if current != Some(model_id.as_str()) {
@@ -885,6 +900,7 @@ impl CursorAcpSession {
             model_id: active_model,
             models,
             prompt_capabilities,
+            model_pick_preference,
         })
     }
 
@@ -922,8 +938,9 @@ impl CursorAcpSession {
     /// request body (`composer-2.5`) never equals the stored encoded id
     /// (`composer-2.5[fast=true]`) under direct string comparison.
     pub async fn set_model(&mut self, requested: &str) -> Result<()> {
-        let model_id = pick_model_id_from_models(&self.models, Some(requested))
-            .unwrap_or_else(|| requested.to_string());
+        let model_id =
+            pick_model_id_from_models(&self.models, Some(requested), self.model_pick_preference)
+                .unwrap_or_else(|| requested.to_string());
         if self.model_id.as_deref() == Some(model_id.as_str()) {
             return Ok(());
         }
@@ -976,7 +993,15 @@ pub async fn run_cursor_acp_turn<F>(
 where
     F: FnMut(CursorChunk<'_>) -> Result<()>,
 {
-    let session = CursorAcpSession::open(key, requested_model, workspace_cwd).await?;
+    let session = CursorAcpSession::open_with_options(
+        key,
+        requested_model,
+        workspace_cwd,
+        None,
+        ToolPolicy::EnvDefault,
+        ModelPickPreference::PreferNoThinking,
+    )
+    .await?;
     ensure_image_attachments_supported(session.prompt_capabilities(), attachments)?;
     let blocks = build_prompt_blocks(prompt_text, attachments)?;
     let mut stream = session.prompt_with_blocks(blocks).await?;
@@ -1047,7 +1072,11 @@ where
 /// (the `models` field of a `session/new` response). Match by user-facing
 /// `name` (what `aivo models` shows). Falls back to `currentModelId`, then to
 /// `None` if neither side surfaced a usable identifier.
-fn pick_model_id_from_models(models: &Value, requested: Option<&str>) -> Option<String> {
+fn pick_model_id_from_models(
+    models: &Value,
+    requested: Option<&str>,
+    preference: ModelPickPreference,
+) -> Option<String> {
     let current = models
         .get("currentModelId")
         .and_then(Value::as_str)
@@ -1059,6 +1088,11 @@ fn pick_model_id_from_models(models: &Value, requested: Option<&str>) -> Option<
 
     let available = models.get("availableModels").and_then(Value::as_array);
     if let Some(list) = available {
+        if preference == ModelPickPreference::PreferNoThinking
+            && let Some(id) = pick_prefer_no_thinking(list, requested)
+        {
+            return Some(id);
+        }
         for entry in list {
             let name = entry.get("name").and_then(Value::as_str);
             let id = entry.get("modelId").and_then(Value::as_str);
@@ -1071,6 +1105,34 @@ fn pick_model_id_from_models(models: &Value, requested: Option<&str>) -> Option<
         }
     }
     current
+}
+
+fn model_id_prefers_no_thinking(model_id: &str) -> bool {
+    !model_id.contains("[thinking=true]")
+}
+
+fn pick_prefer_no_thinking(list: &[Value], requested: &str) -> Option<String> {
+    let mut fallback = None;
+    for entry in list {
+        let name = entry.get("name").and_then(Value::as_str);
+        // Skip — not abort — entries missing a modelId: cursor's catalog has
+        // included partially-formed rows in the past, and `?` here would
+        // short-circuit the whole search and silently degrade to the
+        // first-match (thinking-variant) path.
+        let Some(id) = entry.get("modelId").and_then(Value::as_str) else {
+            continue;
+        };
+        if name != Some(requested) && id != requested {
+            continue;
+        }
+        if model_id_prefers_no_thinking(id) {
+            return Some(id.to_string());
+        }
+        if fallback.is_none() {
+            fallback = Some(id.to_string());
+        }
+    }
+    fallback
 }
 
 #[cfg(test)]
@@ -1421,8 +1483,58 @@ mod tests {
             ],
         });
         assert_eq!(
-            pick_model_id_from_models(&models, Some("claude-sonnet-4-6")).as_deref(),
+            pick_model_id_from_models(
+                &models,
+                Some("claude-sonnet-4-6"),
+                ModelPickPreference::Default
+            )
+            .as_deref(),
             Some("claude-sonnet-4-6[thinking=true]")
+        );
+    }
+
+    #[test]
+    fn pick_model_id_prefers_non_thinking_for_chat() {
+        let models = serde_json::json!({
+            "currentModelId": "claude-sonnet-4-6[thinking=true]",
+            "availableModels": [
+                {"modelId": "claude-sonnet-4-6[thinking=true]", "name": "claude-sonnet-4-6"},
+                {"modelId": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
+            ],
+        });
+        assert_eq!(
+            pick_model_id_from_models(
+                &models,
+                Some("claude-sonnet-4-6"),
+                ModelPickPreference::PreferNoThinking
+            )
+            .as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn pick_model_id_prefers_non_thinking_skips_entries_missing_model_id() {
+        // Regression: an earlier version of `pick_prefer_no_thinking` used `?`
+        // on the modelId lookup, which short-circuited the whole search when
+        // any catalog row was missing the field — silently degrading
+        // PreferNoThinking back to the first-match (thinking) behavior.
+        let models = serde_json::json!({
+            "currentModelId": "claude-sonnet-4-6[thinking=true]",
+            "availableModels": [
+                {"name": "partially-formed-row"},
+                {"modelId": "claude-sonnet-4-6[thinking=true]", "name": "claude-sonnet-4-6"},
+                {"modelId": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
+            ],
+        });
+        assert_eq!(
+            pick_model_id_from_models(
+                &models,
+                Some("claude-sonnet-4-6"),
+                ModelPickPreference::PreferNoThinking
+            )
+            .as_deref(),
+            Some("claude-sonnet-4-6")
         );
     }
 
@@ -1435,7 +1547,12 @@ mod tests {
             ],
         });
         assert_eq!(
-            pick_model_id_from_models(&models, Some("composer-2.5[fast=true]")).as_deref(),
+            pick_model_id_from_models(
+                &models,
+                Some("composer-2.5[fast=true]"),
+                ModelPickPreference::Default
+            )
+            .as_deref(),
             Some("composer-2.5[fast=true]")
         );
     }
@@ -1450,11 +1567,12 @@ mod tests {
         });
         // Unknown name → use current; null request → use current.
         assert_eq!(
-            pick_model_id_from_models(&models, Some("totally-bogus")).as_deref(),
+            pick_model_id_from_models(&models, Some("totally-bogus"), ModelPickPreference::Default)
+                .as_deref(),
             Some("composer-2.5[fast=true]")
         );
         assert_eq!(
-            pick_model_id_from_models(&models, None).as_deref(),
+            pick_model_id_from_models(&models, None, ModelPickPreference::Default).as_deref(),
             Some("composer-2.5[fast=true]")
         );
     }
