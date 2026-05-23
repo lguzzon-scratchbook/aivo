@@ -921,20 +921,18 @@ impl CursorAcpSession {
         self.client.clone()
     }
 
-    /// Switch the active model on the live session. `requested` accepts either
-    /// the user-facing name (e.g. `composer-2.5`) or the encoded modelId
-    /// (e.g. `composer-2.5[fast=true]`); falls back to passing `requested`
-    /// through verbatim when the catalog has no matching entry.
-    ///
-    /// Short-circuits when the resolved id matches the current `model_id`.
-    /// Without this, every router HTTP request would send an extra
-    /// `session/set_model` round trip because the user-facing name from the
-    /// request body (`composer-2.5`) never equals the stored encoded id
-    /// (`composer-2.5[fast=true]`) under direct string comparison.
+    /// Switch the active model. `requested` accepts the user-facing name
+    /// (`composer-2.5`) or encoded modelId (`composer-2.5[fast=true]`).
+    /// Names absent from `availableModels` no-op rather than forwarding —
+    /// cursor-agent rejects them with JSON-RPC `-32602`, notably `"auto"`.
+    /// Short-circuits matching ids so router requests don't trigger a
+    /// `session/set_model` round trip on every call.
     pub async fn set_model(&mut self, requested: &str) -> Result<()> {
-        let model_id =
+        let Some(model_id) =
             pick_model_id_from_models(&self.models, Some(requested), self.model_pick_preference)
-                .unwrap_or_else(|| requested.to_string());
+        else {
+            return Ok(());
+        };
         if self.model_id.as_deref() == Some(model_id.as_str()) {
             return Ok(());
         }
@@ -1549,11 +1547,8 @@ mod tests {
 
     #[test]
     fn pick_model_id_returns_none_for_unknown_name_but_current_for_no_request() {
-        // Unknown names must return None so `set_model` can fall through to
-        // sending the raw `requested` to cursor-agent (or, on error, drop the
-        // session). Falling back to currentModelId silently no-op'd model
-        // switches whenever the picker offered a name that session/new's
-        // availableModels didn't include.
+        // `"auto"` is the real-world catalog miss: `cursor-agent models`
+        // lists it but ACP `session/set_model` rejects it with `-32602`.
         let models = serde_json::json!({
             "currentModelId": "composer-2.5[fast=true]",
             "availableModels": [
@@ -1562,6 +1557,10 @@ mod tests {
         });
         assert_eq!(
             pick_model_id_from_models(&models, Some("totally-bogus"), ModelPickPreference::Default),
+            None
+        );
+        assert_eq!(
+            pick_model_id_from_models(&models, Some("auto"), ModelPickPreference::Default),
             None
         );
         assert_eq!(

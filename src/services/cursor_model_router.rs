@@ -2306,9 +2306,8 @@ fn anthropic_thinking_delta(index: u32, thinking: &str) -> String {
 }
 
 /// Renders a cursor `tool_call` / `tool_call_update` event as a one-line
-/// "[kind] title" string suitable for streaming into a thinking block. Falls
-/// back to `None` for events that carry no human-readable hint (we drop
-/// those silently so the thinking panel stays clean).
+/// "[kind] title — summary" string for the thinking block. Returns `None`
+/// for events with no human-readable hint so the panel stays clean.
 fn extract_tool_call_marker(value: &Value) -> Option<String> {
     let update = value.get("update")?;
     let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
@@ -2318,12 +2317,48 @@ fn extract_tool_call_marker(value: &Value) -> Option<String> {
     let title = update.get("title").and_then(Value::as_str);
     let status = update.get("status").and_then(Value::as_str);
     let tool_kind = update.get("kind").and_then(Value::as_str);
-    match (title, status, tool_kind) {
-        (Some(t), Some(s), _) => Some(format!("\n[{s}] {t}\n")),
-        (Some(t), None, _) => Some(format!("\n[tool] {t}\n")),
-        (None, Some(s), Some(k)) => Some(format!("\n[{k} → {s}]\n")),
-        (None, _, Some(k)) => Some(format!("\n[tool: {k}]\n")),
+    let summary = format_tool_call_summary(update);
+    let suffix = summary
+        .as_deref()
+        .map(|s| format!(" — {s}"))
+        .unwrap_or_default();
+    match (title, status, tool_kind, summary.as_deref()) {
+        (Some(t), Some(s), _, _) => Some(format!("\n[{s}] {t}{suffix}\n")),
+        (Some(t), None, _, _) => Some(format!("\n[tool] {t}{suffix}\n")),
+        (None, Some(s), Some(k), _) => Some(format!("\n[{k} → {s}]{suffix}\n")),
+        (None, _, Some(k), _) => Some(format!("\n[tool: {k}]{suffix}\n")),
+        // Bare completion (status + rawOutput) — surface the summary even
+        // when the matching tool_call start carried only a generic title.
+        (None, Some(s), None, Some(_)) => Some(format!("\n[{s}]{suffix}\n")),
         _ => None,
+    }
+}
+
+/// One-line summary of a `tool_call_update.rawOutput` payload — covers the
+/// shapes cursor-agent emits (search/grep, read, execute, list/glob).
+fn format_tool_call_summary(update: &Value) -> Option<String> {
+    let raw = update.get("rawOutput").and_then(Value::as_object)?;
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(n) = raw.get("totalMatches").and_then(Value::as_u64) {
+        bits.push(format!("{n} match{}", if n == 1 { "" } else { "es" }));
+    }
+    if let Some(n) = raw.get("totalFiles").and_then(Value::as_u64) {
+        bits.push(format!("{n} file{}", if n == 1 { "" } else { "s" }));
+    }
+    if raw.get("truncated").and_then(Value::as_bool) == Some(true) {
+        bits.push("truncated".to_string());
+    }
+    if let Some(code) = raw.get("exitCode").and_then(Value::as_i64) {
+        bits.push(format!("exit {code}"));
+    }
+    if let Some(content) = raw.get("content").and_then(Value::as_str) {
+        let lines = content.lines().count().max(1);
+        bits.push(format!("{lines} line{}", if lines == 1 { "" } else { "s" }));
+    }
+    if bits.is_empty() {
+        None
+    } else {
+        Some(bits.join(", "))
     }
 }
 
@@ -5226,6 +5261,84 @@ mod tests {
             "update": {"sessionUpdate": "session_info_update"},
         });
         assert!(extract_tool_call_marker(&irrelevant).is_none());
+    }
+
+    #[test]
+    fn extract_tool_call_marker_appends_summary_from_raw_output() {
+        // Bare completion (no title, no kind) — must still surface.
+        let search_done = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "toolCallId": "tool_5c71212",
+                "rawOutput": {"totalMatches": 19, "truncated": false},
+            },
+        });
+        let s = extract_tool_call_marker(&search_done).unwrap();
+        assert!(s.contains("completed"), "got: {s:?}");
+        assert!(s.contains("19 matches"), "got: {s:?}");
+
+        let one_match = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "rawOutput": {"totalMatches": 1, "truncated": false},
+            },
+        });
+        let s = extract_tool_call_marker(&one_match).unwrap();
+        assert!(s.contains("1 match\n"), "expected singular: {s:?}");
+        assert!(!s.contains("1 matches"), "expected singular: {s:?}");
+
+        let truncated = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "rawOutput": {"totalMatches": 200, "truncated": true},
+            },
+        });
+        let s = extract_tool_call_marker(&truncated).unwrap();
+        assert!(s.contains("200 matches"));
+        assert!(s.contains("truncated"));
+
+        let exec_done = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "rawOutput": {"exitCode": 1, "stderr": "...", "stdout": "..."},
+            },
+        });
+        assert!(
+            extract_tool_call_marker(&exec_done)
+                .unwrap()
+                .contains("exit 1")
+        );
+
+        let read_done = json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "rawOutput": {"content": "a\nb\nc\n"},
+            },
+        });
+        assert!(
+            extract_tool_call_marker(&read_done)
+                .unwrap()
+                .contains("3 lines")
+        );
+
+        // Title + rawOutput together: suffix appends without dropping title.
+        let start_with_summary = json!({
+            "update": {
+                "sessionUpdate": "tool_call",
+                "kind": "search",
+                "status": "pending",
+                "title": "grep",
+                "rawOutput": {"totalMatches": 5, "truncated": false},
+            },
+        });
+        let s = extract_tool_call_marker(&start_with_summary).unwrap();
+        assert!(s.contains("[pending] grep"));
+        assert!(s.contains("5 matches"));
     }
 
     #[tokio::test]
