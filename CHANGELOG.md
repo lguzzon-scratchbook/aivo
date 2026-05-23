@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.23.0
+
+## Features
+
+- New provider: **Cursor** with invisible ACP integration. Run `aivo cursor` to drive cursor-agent as a normal chat/code session; auth and config are sandboxed per key.
+- New provider: **Command Code gateway** (Cohere).
+- `aivo hf`: auto-install `llama-server` from upstream release on Linux/Windows (previously macOS-only).
+- `aivo pi --transform`: force aivo's router for Pi launches.
+- `aivo chat`: suppress thinking output without breaking non-reasoning models; sandbox cursor cwd and reject tool execution.
+
+## Fixes
+
+- Windows: fix build regression.
+- `aivo logs`: prevent UUIDv7 prefix collisions; show picker on ambiguous `aivo logs show <prefix>`; ingest gemini-cli's new jsonl session format.
+- `aivo keys export`: show help instead of error when called with no path.
+- CLI: polish command UX (TTY spinners, help drill-down, errors).
+
+## Internal
+
+- CI: add cargo-deny supply-chain gate, pin release toolchain to 1.95.0, add `[lints]` table, enforce fmt.
+- Patch `rustls-webpki` and `rand` for RUSTSEC advisories.
+- Convert JSDoc-style doc comments to rustdoc syntax.
+
+---
+
 ## v0.22.1
 
 ## Breaking
