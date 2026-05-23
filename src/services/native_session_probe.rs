@@ -21,7 +21,7 @@
 //! Layout per CLI is mirrored from `context_ingest`:
 //!   claude   ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
 //!   codex    ~/.codex/sessions/YYYY/MM/DD/rollout-...-<uuid>.jsonl
-//!   gemini   ~/.gemini/tmp/<sha256-cwd>/chats/session-*.json
+//!   gemini   ~/.gemini/tmp/<sha256-cwd>/chats/session-*.json{,l}
 //!   pi       ~/.pi/agent/sessions/<encoded-cwd>/<ts>_<uuid>.jsonl
 //!   opencode ~/.local/share/opencode/opencode.db (sqlite `session` table)
 //!   amp      ~/.config/aivo/amp-threads/T-<id>.json (aivo's bridge cache)
@@ -31,12 +31,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use tokio::fs;
 
 use crate::services::ai_launcher::AIToolType;
 use crate::services::context_ingest::{
-    encode_claude_dir, gemini_matching_session_files_in, pi_session_dir,
+    encode_claude_dir, gemini_matching_session_files_in, normalize_gemini_session, pi_session_dir,
 };
 use crate::services::system_env;
 
@@ -282,7 +281,8 @@ async fn gemini_all_session_files(tmp_root: &Path) -> Vec<PathBuf> {
         while let Ok(Some(f)) = sub.next_entry().await {
             let p = f.path();
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.starts_with("session-") && name.ends_with(".json") {
+            if name.starts_with("session-") && (name.ends_with(".json") || name.ends_with(".jsonl"))
+            {
                 out.push(p);
             }
         }
@@ -292,7 +292,7 @@ async fn gemini_all_session_files(tmp_root: &Path) -> Vec<PathBuf> {
 
 async fn read_gemini_session_id(path: &Path) -> Option<String> {
     let content = fs::read_to_string(path).await.ok()?;
-    let v: Value = serde_json::from_str(&content).ok()?;
+    let v = normalize_gemini_session(&content)?;
     v.get("sessionId")
         .and_then(|s| s.as_str())
         .map(str::to_string)

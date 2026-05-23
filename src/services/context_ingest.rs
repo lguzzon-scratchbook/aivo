@@ -391,7 +391,7 @@ async fn ingest_gemini_global(
         while let Ok(Some(f)) = sub.next_entry().await {
             let p = f.path();
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if !name.starts_with("session-") || !name.ends_with(".json") {
+            if !is_gemini_session_file(name) {
                 continue;
             }
             let mtime = f
@@ -869,7 +869,7 @@ pub(crate) async fn gemini_matching_session_files_in(
         while let Ok(Some(f)) = chats_rd.next_entry().await {
             let path = f.path();
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if !name.starts_with("session-") || !name.ends_with(".json") {
+            if !is_gemini_session_file(name) {
                 continue;
             }
             let mtime = f
@@ -891,6 +891,76 @@ pub(crate) async fn gemini_matching_session_files_in(
     entries.into_iter().map(|(p, _)| p).collect()
 }
 
+/// Accept both the legacy `.json` and the newer `.jsonl` gemini session
+/// files. gemini-cli switched the per-message storage format around early
+/// 2026; ignoring `.jsonl` silently hides every recent session.
+fn is_gemini_session_file(name: &str) -> bool {
+    name.starts_with("session-") && (name.ends_with(".json") || name.ends_with(".jsonl"))
+}
+
+/// Normalize a gemini session file into the legacy `{sessionId, lastUpdated,
+/// messages: [...]}` Value, regardless of on-disk format. Returns `None`
+/// when the content doesn't carry a `sessionId`.
+///
+/// The `.jsonl` format is: header line (`{sessionId, projectHash, …}`),
+/// then message/$set lines. `$set` is a mongo-style header patch — we fold
+/// it into the header so downstream code sees the latest `lastUpdated`.
+pub(crate) fn normalize_gemini_session(content: &str) -> Option<Value> {
+    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(content)
+        && obj.contains_key("sessionId")
+        && obj.contains_key("messages")
+    {
+        return Some(Value::Object(obj));
+    }
+    let mut header: Option<serde_json::Map<String, Value>> = None;
+    let mut messages: Vec<Value> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if header.is_none() && obj.contains_key("sessionId") {
+            header = Some(obj);
+            continue;
+        }
+        if let Some(set) = obj.get("$set").and_then(|s| s.as_object())
+            && let Some(h) = header.as_mut()
+        {
+            for (k, v) in set {
+                h.insert(k.clone(), v.clone());
+            }
+            continue;
+        }
+        if obj.contains_key("type") {
+            messages.push(Value::Object(obj));
+        }
+    }
+    let mut header = header?;
+    header.insert("messages".to_string(), Value::Array(messages));
+    Some(Value::Object(header))
+}
+
+/// Read the project root recorded by gemini-cli next to the `chats/`
+/// directory. Newer gemini-cli layouts write a `.project_root` plaintext
+/// file holding the absolute cwd; older sha256-hashed layouts omit it,
+/// in which case we leave cwd unknown.
+async fn gemini_project_root_for_session(session_path: &Path) -> Option<String> {
+    let chats_dir = session_path.parent()?;
+    let project_dir = chats_dir.parent()?;
+    let content = fs::read_to_string(project_dir.join(".project_root"))
+        .await
+        .ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 async fn extract_gemini_thread(path: &Path, permissive: bool) -> Option<Thread> {
     let content = match fs::read_to_string(path).await {
         Ok(c) => c,
@@ -899,10 +969,10 @@ async fn extract_gemini_thread(path: &Path, permissive: bool) -> Option<Thread> 
             return None;
         }
     };
-    let v: Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(err) => {
-            warn_unreadable_session(path, &err.to_string());
+    let v = match normalize_gemini_session(&content) {
+        Some(v) => v,
+        None => {
+            warn_unreadable_session(path, "not a recognized gemini session format");
             return None;
         }
     };
@@ -953,8 +1023,7 @@ async fn extract_gemini_thread(path: &Path, permissive: bool) -> Option<Thread> 
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
-        // Gemini's per-cwd dir is sha256(cwd) — irreversible. Leave None.
-        cwd: None,
+        cwd: gemini_project_root_for_session(path).await,
     })
 }
 
@@ -989,7 +1058,7 @@ pub async fn list_gemini_sessions_for_cwd(
 /// blobs but we still only need a handful of fields.
 async fn extract_gemini_session_stub(path: &Path) -> Option<Thread> {
     let content = fs::read_to_string(path).await.ok()?;
-    let v: Value = serde_json::from_str(&content).ok()?;
+    let v = normalize_gemini_session(&content)?;
     let session_id = v.get("sessionId").and_then(|s| s.as_str())?.to_string();
 
     let mut latest_ts: Option<DateTime<Utc>> = None;
@@ -1025,7 +1094,7 @@ async fn extract_gemini_session_stub(path: &Path) -> Option<Thread> {
         topic: String::new(),
         last_response: String::new(),
         updated_at,
-        cwd: None,
+        cwd: gemini_project_root_for_session(path).await,
     })
 }
 
@@ -2446,6 +2515,48 @@ mod tests {
         let ids: Vec<&str> = threads.iter().map(|t| t.session_id.as_str()).collect();
         assert!(ids.contains(&"NEW-G"), "short session missing; got {ids:?}");
         assert!(ids.contains(&"OLD-G"), "long session missing; got {ids:?}");
+    }
+
+    /// Regression: gemini-cli switched its session storage from one-JSON-per-file
+    /// (`session-*.json`) to JSONL (`session-*.jsonl`, header line + message
+    /// lines + `$set` patches) in early 2026. The ingester used to filter on
+    /// `.json` only and parse with `serde_json::from_str`, so every recent
+    /// session vanished from `aivo logs`. Both formats must now be ingested.
+    #[tokio::test]
+    async fn list_gemini_sessions_for_cwd_includes_jsonl_format() {
+        let gemini_tmp = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let project_path = std::fs::canonicalize(project.path()).unwrap();
+        let project_str = project_path.to_string_lossy().to_string();
+        let project_hash = hex_sha256(project_str.as_bytes());
+
+        let chats_dir = gemini_tmp.path().join(&project_hash).join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        let jsonl_path = chats_dir.join("session-new.jsonl");
+        let header = serde_json::json!({
+            "sessionId": "JSONL-G",
+            "projectHash": project_hash,
+            "startTime": "2026-05-22T02:37:02.231Z",
+            "lastUpdated": "2026-05-22T02:37:02.231Z",
+            "kind": "main",
+        });
+        let user_msg = serde_json::json!({
+            "id": "u1",
+            "timestamp": "2026-05-22T02:37:58.725Z",
+            "type": "user",
+            "content": [{"text": "say hi in 5 words"}],
+        });
+        let set_patch = serde_json::json!({"$set": {"lastUpdated": "2026-05-22T02:37:58.726Z"}});
+        let jsonl = format!("{}\n{}\n{}\n", header, user_msg, set_patch);
+        fs::write(&jsonl_path, jsonl).await.unwrap();
+
+        let threads = list_gemini_sessions_for_cwd(gemini_tmp.path(), project.path()).await;
+        let ids: Vec<&str> = threads.iter().map(|t| t.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"JSONL-G"),
+            "jsonl-format session must be ingested; got {ids:?}"
+        );
     }
 
     /// Gemini dirs with a different `projectHash` must not leak in.
