@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.23.1
+
+- Fix logs and imporove cursor support.
+
 ## v0.23.0
 
 ## Features
