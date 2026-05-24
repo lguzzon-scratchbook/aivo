@@ -19,8 +19,8 @@ pub const AIVO_STARTER_MODEL: &str = "aivo/starter";
 pub const AIVO_STARTER_KEY_NAME: &str = "aivo";
 pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
 
-/// Signing key for starter endpoint request authentication.
-/// Not a secret — raises the bar from "copy a URL" to "implement the protocol."
+/// Vestigial HMAC key — superseded by Ed25519. Kept until the gateway drops HMAC verification.
+#[allow(dead_code)]
 pub const AIVO_STARTER_SIGNING_KEY: &str =
     "39de0d498e4c6fe7f28f7ccc9956e8e34978188a7d2e122fe3c512fe22863f35";
 
