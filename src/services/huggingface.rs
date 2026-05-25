@@ -904,24 +904,34 @@ pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
     let cached = ensure_cached(model).await?;
     let cache_path = cached.path;
 
-    let port = match try_spawn_and_warmup(&bin, &cache_path, cache_hit, &[]).await? {
+    // `--jinja` keeps `tools:` routing alive — llama-server returns 500
+    // ("tools param requires --jinja") for any tool request without it.
+    let port = match try_spawn_and_warmup(&bin, &cache_path, cache_hit, &["--jinja"]).await? {
         WarmupOutcome::Ready(p) => p,
         WarmupOutcome::JinjaFailed { .. } => {
-            // Some GGUFs ship Jinja chat templates that use filters
-            // (e.g. `tojson`) that llama.cpp's embedded minijinja can't
-            // parse. llama-server's own hint is to retry with --no-jinja.
+            // Some GGUFs ship templates that use filters (e.g. `tojson`)
+            // that llama.cpp's embedded minijinja can't parse. Override
+            // with chatml — first-class in llama.cpp and tool-capable —
+            // instead of `--no-jinja` (which kills tool routing).
             eprintln!(
                 "  {} Model's embedded jinja chat template failed to parse; \
-                 retrying with --no-jinja (tool-call template fidelity may be reduced)",
+                 retrying with --chat-template chatml",
                 crate::style::yellow("!"),
             );
             stop_if_we_started();
-            match try_spawn_and_warmup(&bin, &cache_path, cache_hit, &["--no-jinja"]).await? {
+            match try_spawn_and_warmup(
+                &bin,
+                &cache_path,
+                cache_hit,
+                &["--jinja", "--chat-template", "chatml"],
+            )
+            .await?
+            {
                 WarmupOutcome::Ready(p) => p,
                 WarmupOutcome::JinjaFailed { stderr_tail } => {
                     stop_if_we_started();
                     anyhow::bail!(
-                        "llama-server failed even with --no-jinja:\n--- last stderr ---\n{stderr_tail}"
+                        "llama-server failed even with --chat-template chatml:\n--- last stderr ---\n{stderr_tail}"
                     )
                 }
             }
