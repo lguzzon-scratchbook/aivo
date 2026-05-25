@@ -434,14 +434,14 @@ async fn find_codex(codex_root: &Path, session_id: &str) -> Vec<Match> {
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            // The codex filename contains the session id; substring-match
-            // either the dashed input or its dashes-stripped form so display
-            // ids work whether or not the user pastes them with dashes.
+            // The codex filename embeds the session id with dashes intact
+            // (rollout-…-019e5d69-fea7-…). Strip dashes from both sides
+            // before substring-matching so a display id pasted without
+            // dashes (`019e5d69fe`) still gates in the right files.
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let name_no_dashes: String = name.chars().filter(|c| *c != '-').collect();
             let input_no_dashes: String = session_id.chars().filter(|c| *c != '-').collect();
-            if !name.contains(session_id)
-                && (input_no_dashes.is_empty() || !name.contains(&input_no_dashes))
-            {
+            if input_no_dashes.is_empty() || !name_no_dashes.contains(&input_no_dashes) {
                 continue;
             }
             if codex_session_id_matches_prefix(&path, session_id).await {
@@ -1047,5 +1047,35 @@ mod tests {
         assert!(err.to_string().contains("ambiguous"));
         assert!(err.to_string().contains("T-aaaa1"));
         assert!(err.to_string().contains("T-aaaa2"));
+    }
+
+    #[tokio::test]
+    async fn resolve_codex_via_dashes_stripped_uuid_prefix() {
+        // Regression: codex filenames embed the session UUID with dashes
+        // (`…-019e5d69-fea7-…`). When a user copies a dashes-stripped display
+        // id from `aivo logs` (`019e5d69fe`), the substring sits across a
+        // dash in the filename and the file gate must still admit it.
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().to_path_buf();
+        let ctx = ctx_with_tempdirs(&temp, project_root.clone());
+        let day_dir = ctx.codex_sessions_root.join("2026").join("05").join("25");
+        fs::create_dir_all(&day_dir).await.unwrap();
+
+        let full_id = "019e5d69-fea7-72b2-a794-7da3a44485a6";
+        let path =
+            day_dir.join("rollout-2026-05-25T12-34-48-019e5d69-fea7-72b2-a794-7da3a44485a6.jsonl");
+        let proj_json = project_root.to_string_lossy().replace('\\', "\\\\");
+        let lines = [
+            format!(
+                r#"{{"type":"session_meta","timestamp":"2026-05-25T12:34:48Z","payload":{{"id":"{}","cwd":"{}","timestamp":"2026-05-25T12:34:48Z"}}}}"#,
+                full_id, proj_json
+            ),
+            r#"{"type":"response_item","timestamp":"2026-05-25T12:35:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#.to_string(),
+        ];
+        fs::write(&path, lines.join("\n")).await.unwrap();
+
+        let resolved = resolve_session("019e5d69fe", &ctx).await.unwrap();
+        assert_eq!(resolved.payload.source_cli, "codex");
+        assert_eq!(resolved.payload.session_id, full_id);
     }
 }
