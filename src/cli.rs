@@ -586,10 +586,6 @@ pub struct StatsArgs {
     #[arg(short = 'd', long)]
     pub detailed: bool,
 
-    /// Show the heaviest native session files for supported tools
-    #[arg(long)]
-    pub top_sessions: bool,
-
     /// Output stats as JSON (always uses exact numbers; includes all models)
     #[arg(long)]
     pub json: bool,

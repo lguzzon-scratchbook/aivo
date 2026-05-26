@@ -6,7 +6,7 @@ use crate::cli::StatsArgs;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
 use crate::services::ai_launcher::AIToolType;
-use crate::services::global_stats::{self, NativeSessionSummary, normalize_model_for_display};
+use crate::services::global_stats::{self, normalize_model_for_display};
 use crate::services::session_store::{ChatTokenWindow, UsageStats};
 use crate::style;
 
@@ -361,11 +361,11 @@ impl StatsCommand {
             return ExitCode::Success;
         }
 
-        let (mut view, top_sessions) = if let Some(gs) = global
+        let mut view = if let Some(gs) = global
             .as_ref()
             .filter(|gs| gs.total_tokens() > 0 || gs.sessions > 0)
         {
-            let view = ToolView {
+            ToolView {
                 source: StatsSource::Global,
                 count: gs.sessions,
                 input_tokens: gs.input_tokens,
@@ -387,32 +387,9 @@ impl StatsCommand {
                         )
                     })
                     .collect(),
-            };
-            // top_sessions ranks by lifetime totals from the per-file cache, so
-            // suppress it when --since is set rather than mixing a filtered
-            // overview with an unfiltered ranking.
-            let top = if args.top_sessions
-                && cutoff.is_none()
-                && matches!(tool.as_str(), "codex" | "claude" | "gemini")
-            {
-                match global_stats::top_sessions(&tool, args.refresh, 10).await {
-                    Ok(sessions) => Some(sessions),
-                    Err(e) => {
-                        eprintln!(
-                            "{} Failed to read {} sessions: {}",
-                            style::red("Error:"),
-                            global_stats::tool_display_name(&tool),
-                            e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            (view, top)
+            }
         } else if aivo_available {
-            let view = ToolView {
+            ToolView {
                 source: StatsSource::Aivo,
                 count: aivo.launches,
                 input_tokens: aivo.prompt_tokens,
@@ -420,12 +397,11 @@ impl StatsCommand {
                 cache_read: aivo.cache_read,
                 cache_write: aivo.cache_write,
                 models: aivo.models,
-            };
-            (view, None)
+            }
         } else {
             // --since is set and global has no matching files. Render an empty
             // window-scoped view rather than falling back to lifetime totals.
-            let view = ToolView {
+            ToolView {
                 source: StatsSource::Global,
                 count: 0,
                 input_tokens: 0,
@@ -433,8 +409,7 @@ impl StatsCommand {
                 cache_read: 0,
                 cache_write: 0,
                 models: HashMap::new(),
-            };
-            (view, None)
+            }
         };
 
         // Same logs.db augmentation as the overview: scoped to this tool so a
@@ -458,7 +433,6 @@ impl StatsCommand {
             return print_json(&build_tool_view_json(
                 &tool,
                 &view,
-                top_sessions.as_deref(),
                 args,
                 window,
                 omitted_sources,
@@ -466,9 +440,6 @@ impl StatsCommand {
         }
 
         print_tool_view(&view, fmt, args);
-        if let Some(sessions) = top_sessions {
-            render_top_sessions(&sessions, fmt);
-        }
         render_since_footer(args.since.as_deref(), omitted_sources);
 
         ExitCode::Success
@@ -546,7 +517,6 @@ impl StatsCommand {
             "-d, --detailed",
             "Expand By model to input/output/cached/total columns",
         );
-        print_opt("--top-sessions", "Show the heaviest native session files");
         print_opt(
             "--since <DURATION>",
             "Filter to the last N units (7d, 24h, 30m, 2w)",
@@ -678,7 +648,6 @@ fn build_overview_json(
 fn build_tool_view_json(
     tool: &str,
     view: &ToolView,
-    top_sessions: Option<&[NativeSessionSummary]>,
     args: &StatsArgs,
     window: Option<(&str, chrono::DateTime<chrono::Utc>)>,
     omitted_sources: &[&str],
@@ -735,27 +704,6 @@ fn build_tool_view_json(
             "since": raw,
             "since_iso": cutoff.to_rfc3339(),
         });
-    }
-    // Always emit `top_sessions` when --top-sessions was requested, so consumers
-    // see a stable schema (empty array means "tool doesn't expose native sessions").
-    if args.top_sessions {
-        let sessions_json: Vec<Value> = top_sessions
-            .unwrap_or(&[])
-            .iter()
-            .map(|s| {
-                json!({
-                    "path": s.path.display().to_string(),
-                    "label": session_label(s),
-                    "model": s.model,
-                    "tokens": s.total_tokens(),
-                    "input_tokens": s.input_tokens,
-                    "output_tokens": s.output_tokens,
-                    "cache_read_tokens": s.cache_read_tokens,
-                    "cache_write_tokens": s.cache_write_tokens,
-                })
-            })
-            .collect();
-        payload["top_sessions"] = Value::Array(sessions_json);
     }
     payload
 }
@@ -1168,84 +1116,6 @@ fn render_since_footer(since: Option<&str>, omitted_sources: &[&str]) {
     }
     println!();
     println!("{}", style::dim(bits.join(" · ")));
-}
-
-fn render_top_sessions(sessions: &[NativeSessionSummary], fmt: fn(u64) -> String) {
-    if sessions.is_empty() {
-        return;
-    }
-
-    println!();
-    println!("{}", style::bold("Top sessions"));
-
-    let labels: Vec<String> = sessions.iter().map(session_label).collect();
-    let label_w = labels
-        .iter()
-        .map(|label| label.len())
-        .max()
-        .unwrap_or(0)
-        .max("session".len());
-    let tok_w = sessions
-        .iter()
-        .map(|s| fmt(s.total_tokens()).len())
-        .max()
-        .unwrap_or(0)
-        .max("tokens".len());
-    let cache_w = sessions
-        .iter()
-        .map(|s| fmt(s.cache_read_tokens.saturating_add(s.cache_write_tokens)).len())
-        .max()
-        .unwrap_or(0)
-        .max("cached".len());
-
-    println!(
-        "{} {} {} {}",
-        style::bold(format!("{:<label_w$}", "session")),
-        style::dim(format!("{:>tok_w$}", "tokens")),
-        style::dim(format!("{:>cache_w$}", "cached")),
-        style::dim("model"),
-    );
-
-    for (summary, label) in sessions.iter().zip(labels.iter()) {
-        let total = colorize_unit(&format!(
-            "{:>width$}",
-            fmt(summary.total_tokens()),
-            width = tok_w
-        ));
-        let cached = colorize_unit(&format!(
-            "{:>width$}",
-            fmt(summary
-                .cache_read_tokens
-                .saturating_add(summary.cache_write_tokens)),
-            width = cache_w
-        ));
-        let model = summary.model.as_deref().unwrap_or("-");
-        println!(
-            "{} {} {} {}",
-            style::cyan(format!("{:<width$}", label, width = label_w)),
-            total,
-            cached,
-            style::dim(model),
-        );
-    }
-}
-
-fn session_label(summary: &NativeSessionSummary) -> String {
-    let path = summary.path.to_string_lossy();
-    if let Some(pos) = path.find("/sessions/") {
-        let relative = &path[pos + "/sessions/".len()..];
-        return relative
-            .strip_suffix(".jsonl")
-            .unwrap_or(relative)
-            .to_string();
-    }
-    let label = summary
-        .path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    label.strip_suffix(".jsonl").unwrap_or(&label).to_string()
 }
 
 /// Combines per-model usage from native tool data and aivo-tracked data.
@@ -1846,12 +1716,10 @@ mod tests {
             search: None,
             all: false,
             detailed: false,
-            top_sessions: false,
             json: true,
             since: Some("24h".to_string()),
         };
-        let payload =
-            build_tool_view_json("claude", &view, None, &args, Some(("24h", cutoff)), &[]);
+        let payload = build_tool_view_json("claude", &view, &args, Some(("24h", cutoff)), &[]);
         let window = payload.get("window").expect("window block");
         assert_eq!(window.get("since").and_then(|v| v.as_str()), Some("24h"));
         assert!(window.get("since_iso").and_then(|v| v.as_str()).is_some());
@@ -1880,11 +1748,10 @@ mod tests {
             search: None,
             all: false,
             detailed: false,
-            top_sessions: false,
             json: true,
             since: None,
         };
-        let payload = build_tool_view_json("claude", &view, None, &args, None, &[]);
+        let payload = build_tool_view_json("claude", &view, &args, None, &[]);
         assert!(payload.get("window").is_none());
         let omitted = payload
             .get("omitted_sources")

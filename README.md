@@ -1,6 +1,7 @@
 [![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
 
-> Aivo is a command-line tool that connects your favorite coding agent to almost any model. It includes starter models to get you going — no API key required.
+> Aivo is a command-line tool that connects your existing coding agent to the model you want.
+> It includes starter models to get you going — no API key required.
 
 
 ## Docs
@@ -237,7 +238,6 @@ Aggregates token counts from aivo chat, Claude Code, Codex, Gemini, OpenCode, an
 aivo stats
 aivo stats claude --since 7d                 # one tool, recent window
 aivo stats -s openrouter -n                  # filter, exact numbers
-aivo stats --top-sessions                    # heaviest native session files
 aivo stats --json | jq '.totals.tokens'
 ```
 
