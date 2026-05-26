@@ -892,6 +892,132 @@ impl CachedFile {
     }
 }
 
+/// Reads `general.architecture` from a GGUF v2/v3 header. Returns `None`
+/// on any parse failure or if the key is missing — the probe is best-effort
+/// and must never block a legitimate model.
+fn read_gguf_architecture(path: &Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut r = std::io::BufReader::new(f);
+    let mut budget: usize = 2 * 1024 * 1024;
+    read_gguf_architecture_from(&mut r, &mut budget)
+}
+
+fn read_gguf_architecture_from<R: std::io::Read>(r: &mut R, budget: &mut usize) -> Option<String> {
+    fn take<R: std::io::Read>(r: &mut R, buf: &mut [u8], budget: &mut usize) -> Option<()> {
+        if buf.len() > *budget {
+            return None;
+        }
+        r.read_exact(buf).ok()?;
+        *budget -= buf.len();
+        Some(())
+    }
+    fn u32_le<R: std::io::Read>(r: &mut R, budget: &mut usize) -> Option<u32> {
+        let mut b = [0u8; 4];
+        take(r, &mut b, budget)?;
+        Some(u32::from_le_bytes(b))
+    }
+    fn u64_le<R: std::io::Read>(r: &mut R, budget: &mut usize) -> Option<u64> {
+        let mut b = [0u8; 8];
+        take(r, &mut b, budget)?;
+        Some(u64::from_le_bytes(b))
+    }
+    fn gguf_string<R: std::io::Read>(r: &mut R, budget: &mut usize) -> Option<String> {
+        let len = u64_le(r, budget)? as usize;
+        if len > 64 * 1024 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        take(r, &mut buf, budget)?;
+        String::from_utf8(buf).ok()
+    }
+    fn skip_value<R: std::io::Read>(r: &mut R, ty: u32, budget: &mut usize) -> Option<()> {
+        let scalar = match ty {
+            0 | 1 | 7 => Some(1usize),
+            2 | 3 => Some(2),
+            4..=6 => Some(4),
+            10..=12 => Some(8),
+            _ => None,
+        };
+        if let Some(n) = scalar {
+            let mut tmp = vec![0u8; n];
+            return take(r, &mut tmp, budget);
+        }
+        if ty == 8 {
+            gguf_string(r, budget)?;
+            return Some(());
+        }
+        if ty == 9 {
+            let elem_ty = u32_le(r, budget)?;
+            let len = u64_le(r, budget)? as usize;
+            if len > 1 << 24 {
+                return None;
+            }
+            for _ in 0..len {
+                skip_value(r, elem_ty, budget)?;
+            }
+            return Some(());
+        }
+        None
+    }
+
+    let mut magic = [0u8; 4];
+    take(r, &mut magic, budget)?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+    let version = u32_le(r, budget)?;
+    if version < 2 {
+        return None;
+    }
+    let _tensor_count = u64_le(r, budget)?;
+    let kv_count = u64_le(r, budget)?;
+
+    for _ in 0..kv_count.min(4096) {
+        let key = gguf_string(r, budget)?;
+        let ty = u32_le(r, budget)?;
+        if key == "general.architecture" {
+            if ty != 8 {
+                return None;
+            }
+            return gguf_string(r, budget);
+        }
+        skip_value(r, ty, budget)?;
+    }
+    None
+}
+
+/// Returns a short user-facing label when `arch` is a llama.cpp architecture
+/// that can't drive `/v1/chat/completions` (encoder-only families and
+/// classifier heads). `None` means the arch is either generative or unknown
+/// — we let the unknown case through rather than guess wrong.
+fn non_chat_arch_label(arch: &str) -> Option<&'static str> {
+    match arch {
+        "bert" | "roberta" | "xlm-roberta" => Some("BERT/RoBERTa encoder"),
+        "nomic-bert" | "nomic-bert-moe" => Some("Nomic-BERT encoder"),
+        "jina-bert-v2" => Some("Jina-BERT encoder"),
+        "t5encoder" => Some("T5 encoder-only"),
+        _ => None,
+    }
+}
+
+fn ensure_arch_is_chat_capable(cache_path: &Path) -> Result<()> {
+    let Some(arch) = read_gguf_architecture(cache_path) else {
+        return Ok(());
+    };
+    let Some(label) = non_chat_arch_label(&arch) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "This GGUF declares architecture `{arch}` ({label}). Encoder-only models don't \
+         compute next-token logits, so llama-server's /v1/chat/completions can't generate \
+         from them — chat requests fail with HTTP 500 `the current context does not logits \
+         computation. skipping`. aivo only routes chat traffic to llama-server, so this \
+         model can't be used here.\n  \
+         Pick a generative GGUF instead (HuggingFace `text-generation` — Llama, Qwen, \
+         Mistral, Gemma, …)."
+    );
+}
+
 pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
     if let Some(port) = SERVER_PORT.get().copied() {
         return Ok(port);
@@ -903,6 +1029,7 @@ pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
     let cache_hit = lookup_cached(model).is_some();
     let cached = ensure_cached(model).await?;
     let cache_path = cached.path;
+    ensure_arch_is_chat_capable(&cache_path)?;
 
     // `--jinja` keeps `tools:` routing alive — llama-server returns 500
     // ("tools param requires --jinja") for any tool request without it.
@@ -2614,5 +2741,97 @@ mod tests {
         let p = local_cache_path("bartowski/Llama-3.2-3B-Instruct-GGUF", "main", "x.gguf").unwrap();
         let s = p.to_string_lossy();
         assert!(s.contains(&dir_segment), "got {s}");
+    }
+
+    fn build_gguf_header(kvs: &[(&str, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes()); // version
+        out.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        out.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+        for (key, ty, val) in kvs {
+            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(val);
+        }
+        out
+    }
+
+    fn gguf_string_val(s: &str) -> Vec<u8> {
+        let mut v = (s.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    #[test]
+    fn read_gguf_architecture_pulls_arch_after_skipping_other_kvs() {
+        // u32 value (type 4), then a string array (type 9 of type 8, len 2),
+        // then the architecture string — exercises scalar + array skips.
+        let mut array_val = Vec::new();
+        array_val.extend_from_slice(&8u32.to_le_bytes()); // element type = string
+        array_val.extend_from_slice(&2u64.to_le_bytes()); // 2 elements
+        array_val.extend(gguf_string_val("hello"));
+        array_val.extend(gguf_string_val("world"));
+
+        let bytes = build_gguf_header(&[
+            (
+                "general.quantization_version",
+                4,
+                2u32.to_le_bytes().to_vec(),
+            ),
+            ("tokenizer.ggml.tokens", 9, array_val),
+            ("general.architecture", 8, gguf_string_val("bert")),
+        ]);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut budget = 2 * 1024 * 1024;
+        assert_eq!(
+            read_gguf_architecture_from(&mut cursor, &mut budget).as_deref(),
+            Some("bert")
+        );
+    }
+
+    #[test]
+    fn read_gguf_architecture_returns_none_on_bad_magic() {
+        let bytes = b"NOPE\x03\x00\x00\x00".to_vec();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut budget = 2 * 1024 * 1024;
+        assert_eq!(read_gguf_architecture_from(&mut cursor, &mut budget), None);
+    }
+
+    #[test]
+    fn non_chat_arch_label_flags_encoder_families() {
+        assert!(non_chat_arch_label("bert").is_some());
+        assert!(non_chat_arch_label("roberta").is_some());
+        assert!(non_chat_arch_label("xlm-roberta").is_some());
+        assert!(non_chat_arch_label("nomic-bert").is_some());
+        assert!(non_chat_arch_label("jina-bert-v2").is_some());
+        assert!(non_chat_arch_label("t5encoder").is_some());
+        // Generative families must pass through.
+        assert!(non_chat_arch_label("llama").is_none());
+        assert!(non_chat_arch_label("qwen2").is_none());
+        assert!(non_chat_arch_label("mistral").is_none());
+        // Unknown arches default to "let it through" so new generative
+        // models aren't blocked.
+        assert!(non_chat_arch_label("brand-new-arch").is_none());
+    }
+
+    #[test]
+    fn ensure_arch_is_chat_capable_rejects_bert_gguf() {
+        let bytes = build_gguf_header(&[("general.architecture", 8, gguf_string_val("bert"))]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        let err = ensure_arch_is_chat_capable(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`bert`"), "got: {msg}");
+        assert!(msg.contains("logits computation"), "got: {msg}");
+    }
+
+    #[test]
+    fn ensure_arch_is_chat_capable_passes_llama_gguf() {
+        let bytes = build_gguf_header(&[("general.architecture", 8, gguf_string_val("llama"))]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        ensure_arch_is_chat_capable(tmp.path()).unwrap();
     }
 }
