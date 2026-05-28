@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.23.5
+
+- `aivo codex-app`: add partial support for launching Codex App, macOS only.
+
 ## v0.23.4
 
 - `aivo stats`: hide unsupported tools from the by-tool table; drop the `--top-sessions` flag.

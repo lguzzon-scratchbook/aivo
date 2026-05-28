@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
 const APP_NAME: &str = "Codex.app";
 const BUNDLED_CODEX: &str = "Contents/Resources/codex";
 
