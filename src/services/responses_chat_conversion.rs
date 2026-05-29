@@ -800,7 +800,6 @@ pub fn convert_chat_response_to_responses_sse(
     } else {
         // Text message response
         let msg_id = gen_id("msg");
-        let has_reasoning = !reasoning_content.is_empty();
         let i = next_output_index;
 
         sse.push_str(&sse_event(
@@ -852,35 +851,11 @@ pub fn convert_chat_response_to_responses_sse(
             }),
         ));
 
-        // Legacy non-standard reasoning content part. Kept so existing aivo
-        // round-trips that look for it keep working; Codex CLI ignores it and
-        // reads from the standalone reasoning item emitted above.
-        if has_reasoning {
-            sse.push_str(&sse_event(
-                "response.content_part.added",
-                &json!({
-                    "type": "response.content_part.added",
-                    "response_id": resp_id, "item_id": msg_id,
-                    "output_index": i, "content_index": 1,
-                    "part": {"type": "reasoning", "reasoning": ""}
-                }),
-            ));
-            sse.push_str(&sse_event(
-                "response.content_part.done",
-                &json!({
-                    "type": "response.content_part.done",
-                    "response_id": resp_id, "item_id": msg_id,
-                    "output_index": i, "content_index": 1,
-                    "part": {"type": "reasoning", "reasoning": reasoning_content}
-                }),
-            ));
-        }
-
-        let mut content_parts =
+        // Reasoning lives in the standalone reasoning item, not here: a
+        // `reasoning` part inside `message.content` makes Codex.app reject the
+        // whole message ("Unexpected content item in agent message").
+        let content_parts =
             vec![json!({"type": "output_text", "text": content, "annotations": []})];
-        if has_reasoning {
-            content_parts.push(json!({"type": "reasoning", "reasoning": reasoning_content}));
-        }
         let done_item = json!({
             "id": msg_id, "type": "message", "status": "completed",
             "role": "assistant",
@@ -1065,7 +1040,6 @@ impl ResponsesStreamConverter {
 
         if let Some(message) = &self.message {
             let text = message.text.clone();
-            let has_reasoning = reasoning_text.as_deref().is_some_and(|t| !t.is_empty());
             out.push_str(&sse_event(
                 "response.output_text.done",
                 &json!({
@@ -1083,34 +1057,10 @@ impl ResponsesStreamConverter {
                     "part": {"type": "output_text", "text": text}
                 }),
             ));
-            // Legacy non-standard reasoning content part — kept for aivo round-trips.
-            if has_reasoning {
-                let reasoning_content = reasoning_text.clone().unwrap_or_default();
-                out.push_str(&sse_event(
-                    "response.content_part.added",
-                    &json!({
-                        "type": "response.content_part.added",
-                        "response_id": self.resp_id, "item_id": message.id,
-                        "output_index": message.output_index, "content_index": 1,
-                        "part": {"type": "reasoning", "reasoning": ""}
-                    }),
-                ));
-                out.push_str(&sse_event(
-                    "response.content_part.done",
-                    &json!({
-                        "type": "response.content_part.done",
-                        "response_id": self.resp_id, "item_id": message.id,
-                        "output_index": message.output_index, "content_index": 1,
-                        "part": {"type": "reasoning", "reasoning": reasoning_content}
-                    }),
-                ));
-            }
-            let mut content_parts =
+            // Reasoning stays in the standalone reasoning item; a `reasoning`
+            // part in `message.content` makes Codex.app reject the message.
+            let content_parts =
                 vec![json!({"type": "output_text", "text": text, "annotations": []})];
-            if has_reasoning {
-                content_parts
-                    .push(json!({"type": "reasoning", "reasoning": reasoning_text.clone()}));
-            }
             let item = json!({
                 "id": message.id, "type": "message", "status": "completed",
                 "role": "assistant", "content": content_parts
@@ -2036,6 +1986,33 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_response_sse_message_content_excludes_reasoning_part() {
+        // A `reasoning` part inside message.content makes Codex.app drop the
+        // whole message; reasoning must only ride the standalone reasoning item.
+        let chat = json!({
+            "choices": [{"message": {
+                "content": "Once upon a time.",
+                "reasoning_content": "the user wants a story"
+            }}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "deepseek-reasoner");
+        assert!(sse.contains("response.reasoning_summary_text.delta"));
+
+        let completed = sse
+            .split("event: response.completed\ndata: ")
+            .nth(1)
+            .unwrap();
+        let completed: Value = serde_json::from_str(completed.trim()).unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        let message = output.iter().find(|i| i["type"] == "message").unwrap();
+        let content = message["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "output_text");
+        assert!(!content.iter().any(|p| p["type"] == "reasoning"));
+    }
+
+    #[test]
     fn test_convert_request_function_call_without_call_id_falls_back_to_id() {
         let body = json!({
             "model": "gpt-4",
@@ -2933,7 +2910,12 @@ mod tests {
         assert_eq!(output[0]["type"], "reasoning");
         assert_eq!(output[0]["summary"][0]["text"], "thinking");
         assert_eq!(output[1]["type"], "message");
-        assert_eq!(output[1]["content"][0]["text"], "Hello");
+        // Message content is output_text only — a reasoning part would make
+        // Codex.app drop the message.
+        let content = output[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "Hello");
+        assert!(!content.iter().any(|p| p["type"] == "reasoning"));
     }
 
     #[test]

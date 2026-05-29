@@ -610,7 +610,10 @@ async fn handle_responses_api_via_chat(
     // recovery skip the wasted first attempt — without this, every request in
     // the same launch pays one 400 + retry round-trip until process exit.
     let mut chat_config = (**config).clone();
-    chat_config.actual_model = Some(original_model.clone());
+    // Don't clobber a configured upstream model with the client's display name.
+    if chat_config.actual_model.is_none() {
+        chat_config.actual_model = Some(original_model.clone());
+    }
     chat_config.requires_reasoning_content =
         config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
     let chat_body = convert_responses_to_chat_request(body, &chat_config);
@@ -659,8 +662,13 @@ async fn stream_responses_via_chat(
     socket: &mut tokio::net::TcpStream,
 ) -> Result<()> {
     let (protocol, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
-    if protocol != ProviderProtocol::Openai {
-        anyhow::bail!("streaming conversion only for OpenAI protocol");
+    // Openai and ResponsesApi both hit /v1/chat/completions; codex pins
+    // ResponsesApi, so gating on Openai alone dropped every turn to buffered.
+    if !matches!(
+        protocol,
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi
+    ) {
+        anyhow::bail!("streaming conversion only for OpenAI-compatible protocols");
     }
 
     let original_model = body
@@ -674,7 +682,10 @@ async fn stream_responses_via_chat(
     // Mirror handle_responses_api_via_chat's body construction, then force a
     // streaming request and ask for a trailing usage chunk.
     let mut chat_config = (**config).clone();
-    chat_config.actual_model = Some(original_model.clone());
+    // Don't clobber a configured upstream model with the client's display name.
+    if chat_config.actual_model.is_none() {
+        chat_config.actual_model = Some(original_model.clone());
+    }
     chat_config.requires_reasoning_content = effective_requires_reasoning;
     let mut chat_body = convert_responses_to_chat_request(body, &chat_config);
     chat_body["stream"] = json!(true);

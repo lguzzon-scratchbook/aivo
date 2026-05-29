@@ -329,7 +329,10 @@ pub struct AttemptClassification {
 pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification {
     let is_terminal = is_terminal_upstream_error(status);
     let is_rate_limited = status == 429;
-    let is_semantic_rejection = matches!(status, 400 | 422) && is_request_error_envelope(body);
+    // Wrong model is a semantic rejection at any status (404 included) — probing
+    // other protocols/paths can't help, so don't let the cascade thrash on it.
+    let is_semantic_rejection = (matches!(status, 400 | 422) && is_request_error_envelope(body))
+        || is_model_not_found_error(body);
     let quirk_hint = if is_semantic_rejection {
         quirk_hint_for_error_body(body)
     } else {
@@ -341,6 +344,28 @@ pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification
         is_semantic_rejection,
         quirk_hint,
     }
+}
+
+/// True when an error body names a *model* problem (`{"error":"Model not found"}`)
+/// rather than a generic path-missing 404 (`{"error":"Not found"}`): the former
+/// must be surfaced immediately, the latter should keep probing paths. Works on
+/// bare string errors, which gateways often return here.
+pub fn is_model_not_found_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("model") {
+        return false;
+    }
+    [
+        "not found",
+        "does not exist",
+        "no such model",
+        "unknown model",
+        "invalid model",
+        "model_not_found",
+        "unsupported model",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
 }
 
 /// Returns fallback protocol candidates to try after `current` fails.
@@ -625,6 +650,48 @@ mod tests {
             quirk_hint_for_error_body(r#"{"error":{"message":"something else"}}"#),
             None
         );
+    }
+
+    #[test]
+    fn model_not_found_detects_model_errors() {
+        for body in [
+            r#"{"error":"Model not found"}"#,
+            r#"{"error":{"message":"The model `gpt-5.4-mini` does not exist","code":"model_not_found"}}"#,
+            r#"{"error":{"message":"Unknown model: foo"}}"#,
+            r#"{"error":"invalid model"}"#,
+            r#"{"error":"unsupported model for this endpoint"}"#,
+        ] {
+            assert!(is_model_not_found_error(body), "should match: {body}");
+        }
+    }
+
+    #[test]
+    fn model_not_found_ignores_generic_path_404s() {
+        // No "model" mention → a path-missing 404 the cascade must keep probing.
+        for body in [
+            r#"{"error":"Not found"}"#,
+            r#"{"error":"Upstream request failed"}"#,
+            "<html>404</html>",
+            "",
+            r#"{"error":{"message":"rate limit exceeded"}}"#,
+        ] {
+            assert!(!is_model_not_found_error(body), "should not match: {body}");
+        }
+    }
+
+    #[test]
+    fn classify_marks_model_not_found_404_as_semantic_rejection() {
+        // Regression: a 404 "Model not found" was treated as a missing endpoint,
+        // so the cascade probed every protocol (OpenAI/Anthropic/Google) and the
+        // real error never reached the client. It must bail as a semantic
+        // rejection instead.
+        let c = classify_failed_attempt(404, r#"{"error":"Model not found"}"#);
+        assert!(c.is_semantic_rejection);
+        assert!(c.quirk_hint.is_none());
+
+        // A generic path 404 still keeps probing.
+        let c = classify_failed_attempt(404, r#"{"error":"Not found"}"#);
+        assert!(!c.is_semantic_rejection);
     }
 
     #[test]
