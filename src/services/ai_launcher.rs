@@ -782,11 +782,22 @@ impl AILauncher {
         } else {
             model
         };
+        // Pi's /model picker only lists what's in its models.json; fetch the
+        // provider catalog so it shows the whole list, not just the pinned
+        // model. Soft-fails to empty (build_pi_models_json then writes the
+        // single pinned entry). Gated on `persist` so dry-run skips the live
+        // fetch; cursor keys use an ACP whitelist, not /v1/models.
+        let pi_models = if options.tool == AIToolType::Pi && persist && !key.is_cursor_acp() {
+            self.fetch_pi_models(&key).await
+        } else {
+            Vec::new()
+        };
         let tool_config = self.get_tool_config(
             options.tool,
             &key,
             model.as_deref(),
             opencode_models.as_deref(),
+            &pi_models,
             &options.claude_overrides,
             &options.amp_modes,
         );
@@ -971,13 +982,38 @@ impl AILauncher {
         Ok((Some(selected_model), models))
     }
 
+    /// Fetches the key's available model ids for Pi's `/model` picker. Soft
+    /// failure returns empty so the launch still works against the single
+    /// pinned model (build_pi_models_json's fallback).
+    ///
+    /// Reads the `#all` namespace via `fetch_all_models_cached` — the same
+    /// source the pre-launch model picker (`run`/`start`) warms. Reading the
+    /// plain namespace here would always miss the picker's entry and re-fetch
+    /// right after the user selected a model. Cache-first so the spinner only
+    /// shows on a genuine miss.
+    async fn fetch_pi_models(&self, key: &ApiKey) -> Vec<String> {
+        let cache_key = crate::commands::models::full_catalog_cache_key_for_key(key);
+        if let Some(cached) = self.cache.get(&cache_key).await {
+            return cached;
+        }
+        let client = crate::services::http_utils::router_http_client();
+        let (spinning, spinner_handle) = crate::style::start_spinner(Some(" Fetching models..."));
+        let result =
+            crate::commands::models::fetch_all_models_cached(&client, key, &self.cache, true).await;
+        crate::style::stop_spinner(&spinning);
+        let _ = spinner_handle.await;
+        result.unwrap_or_default()
+    }
+
     /// Gets tool-specific configuration including command and environment variables
+    #[allow(clippy::too_many_arguments)]
     fn get_tool_config(
         &self,
         tool: AIToolType,
         key: &ApiKey,
         model: Option<&str>,
         opencode_models: Option<&[String]>,
+        pi_models: &[String],
         claude_overrides: &ClaudeModelOverrides,
         amp_modes: &AmpModeModels,
     ) -> ToolConfig {
@@ -993,7 +1029,7 @@ impl AILauncher {
             AIToolType::Codex | AIToolType::CodexApp => self.env_injector.for_codex(key, model),
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
             AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
-            AIToolType::Pi => self.env_injector.for_pi(key, model),
+            AIToolType::Pi => self.env_injector.for_pi(key, model, pi_models),
             AIToolType::Amp => self.env_injector.for_amp(key, model, amp_modes),
         };
 
