@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.25.0
+
+### Changes
+
+- Drop support for the Sourcegraph Amp CLI.
+
+### Fixes
+
+- `aivo chat` now shares the launcher's protocol fallback, so the cascade keeps
+  probing other wire formats when a provider rejects one as unsupported (e.g. OpenCode Zen).
+
+
 ## v0.24.0
 
 ### Features
