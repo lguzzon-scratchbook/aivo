@@ -1700,12 +1700,26 @@ fn freshened_path_for_lookup() -> Option<std::ffi::OsString> {
     FRESHENED_PATH.get().map(std::ffi::OsString::from)
 }
 
-/// If a freshened PATH was captured, override the child's PATH with it.
-/// Otherwise the child inherits the parent's PATH unchanged.
+/// Merge any freshened install dirs into the child's PATH, else inherit as-is.
 fn apply_refreshed_path(cmd: &mut Command) {
     if let Some(fresh) = FRESHENED_PATH.get() {
-        cmd.env("PATH", fresh);
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        cmd.env("PATH", merge_path_dirs(&inherited, fresh));
     }
+}
+
+/// Append `fresh` dirs missing from `inherited`, preserving `inherited`'s
+/// order. Clobbering instead would let the login-`sh` PATH front a broken
+/// Homebrew `node` over the working one the interactive shell resolves.
+fn merge_path_dirs(inherited: &std::ffi::OsStr, fresh: &str) -> std::ffi::OsString {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(inherited).collect();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = dirs.iter().cloned().collect();
+    for dir in std::env::split_paths(fresh) {
+        if seen.insert(dir.clone()) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(&dirs).unwrap_or_else(|_| inherited.to_os_string())
 }
 
 fn preferred_claude_protocol(base_url: &str) -> ClaudeProviderProtocol {
@@ -1816,6 +1830,26 @@ mod tests {
                 "{tool:?} fallback dirs missing ~/.npm-global/bin: {dirs:?}"
             );
         }
+    }
+
+    #[test]
+    fn merge_path_dirs_keeps_inherited_order_and_appends_new() {
+        let inherited = std::env::join_paths(["/a", "/b"]).unwrap();
+        let fresh = std::env::join_paths(["/b", "/c", "/d"]).unwrap();
+        let merged = merge_path_dirs(&inherited, fresh.to_str().unwrap());
+        let expected = std::env::join_paths(["/a", "/b", "/c", "/d"]).unwrap();
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn merge_path_dirs_never_lets_fresh_shadow_inherited_node() {
+        // Inherited fronts a working node; fresh fronts brew's. Inherited wins.
+        let inherited = std::env::join_paths(["/Users/me/.nvm/v20/bin", "/usr/local/bin"]).unwrap();
+        let fresh = std::env::join_paths(["/usr/local/bin", "/usr/bin"]).unwrap();
+        let merged = merge_path_dirs(&inherited, fresh.to_str().unwrap());
+        let expected =
+            std::env::join_paths(["/Users/me/.nvm/v20/bin", "/usr/local/bin", "/usr/bin"]).unwrap();
+        assert_eq!(merged, expected);
     }
 
     #[test]
