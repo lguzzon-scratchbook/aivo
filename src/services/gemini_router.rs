@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
@@ -25,7 +25,8 @@ use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
     should_bail_on_mismatch,
 };
-use crate::services::provider_protocol::{ProviderProtocol, classify_failed_attempt};
+use crate::services::provider_protocol::{PathVariant, ProviderProtocol, classify_failed_attempt};
+use crate::services::route_cache::{PersistedRoute, RouteCache, RouteSlot};
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
@@ -47,6 +48,9 @@ pub struct GeminiRouterConfig {
 
 pub struct GeminiRouter {
     config: GeminiRouterConfig,
+    /// Per-model routes learned for `gemini` (`""` = default), seeding the
+    /// `RouteCache`. On the router (not config) so test literals stay untouched.
+    seed_routes: BTreeMap<String, PersistedRoute>,
 }
 
 enum ForwardResult {
@@ -61,13 +65,9 @@ enum ForwardResult {
 struct GeminiRouterState {
     config: Arc<GeminiRouterConfig>,
     client: Arc<reqwest::Client>,
-    active_protocol: Arc<AtomicU8>,
-    request_succeeded: Arc<AtomicBool>,
-    /// Set by the cascade when an upstream returned an authoritative response
-    /// (2xx success or 4xx with a parseable LLM-API error envelope). Used by
-    /// `persist_runtime_discoveries` to persist `gemini_path_variant` even
-    /// when no 2xx was seen.
-    saw_authoritative_response: Arc<AtomicBool>,
+    /// Per-(model) learned routes; the cascade reads/writes the resolved slot's
+    /// atom and `slot.confirm()` marks authoritative outcomes for write-behind.
+    route_cache: Arc<RouteCache>,
     /// Set by the cascade when an upstream returned an error envelope matching
     /// the `requires_reasoning_content` quirk. Persisted to `ApiKey` so future
     /// launches inject strict mode without hardcoding the host.
@@ -76,43 +76,51 @@ struct GeminiRouterState {
 
 impl GeminiRouter {
     pub fn new(config: GeminiRouterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            seed_routes: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_seed_routes(mut self, seed_routes: BTreeMap<String, PersistedRoute>) -> Self {
+        self.seed_routes = seed_routes;
+        self
+    }
+
+    fn build_seed(&self) -> BTreeMap<String, PersistedRoute> {
+        let mut seed = self.seed_routes.clone();
+        seed.entry(String::new()).or_insert_with(|| {
+            PersistedRoute::from_route(self.config.upstream_protocol, PathVariant::Default)
+        });
+        seed
     }
 
     pub async fn start_background(
         &self,
     ) -> Result<(
         u16,
-        Arc<AtomicU8>,
-        Arc<AtomicBool>,
-        Arc<AtomicBool>,
+        Arc<RouteCache>,
         Arc<AtomicBool>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
-        let active_protocol = Arc::new(AtomicU8::new(self.config.upstream_protocol.to_u8()));
-        let request_succeeded = Arc::new(AtomicBool::new(false));
-        let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+        // Tool-native protocol for `aivo gemini`: prefer Google.
+        let route_cache = Arc::new(RouteCache::new(
+            "gemini",
+            ProviderProtocol::Google,
+            self.build_seed(),
+        ));
         let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let state = GeminiRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
-            active_protocol: active_protocol.clone(),
-            request_succeeded: request_succeeded.clone(),
-            saw_authoritative_response: saw_authoritative_response.clone(),
+            route_cache: route_cache.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
         });
-        Ok((
-            port,
-            active_protocol,
-            request_succeeded,
-            saw_authoritative_response,
-            learned_requires_reasoning,
-            handle,
-        ))
+        Ok((port, route_cache, learned_requires_reasoning, handle))
     }
 }
 
@@ -121,9 +129,7 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
         &request,
         &state.config,
         &state.client,
-        &state.active_protocol,
-        &state.request_succeeded,
-        &state.saw_authoritative_response,
+        &state.route_cache,
         &state.learned_requires_reasoning,
     )
     .await
@@ -137,9 +143,7 @@ async fn handle_request(
     request: &str,
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
-    saw_authoritative_response: &Arc<AtomicBool>,
+    route_cache: &Arc<RouteCache>,
     learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<String> {
     let path = http_utils::extract_request_path(request);
@@ -147,6 +151,7 @@ async fn handle_request(
     match parse_gemini_path(&path) {
         Some((extracted_model, is_streaming)) => {
             let model = config.forced_model.clone().unwrap_or(extracted_model);
+            let slot = route_cache.resolve(&model);
             let body: Value = serde_json::from_str(http_utils::extract_request_body(request)?)?;
             let tool_schemas = extract_tool_schemas(&body);
             // OR in the runtime-learned flag so requests after a successful
@@ -165,15 +170,13 @@ async fn handle_request(
                 openai_req,
                 config,
                 client,
-                active_protocol,
-                saw_authoritative_response,
+                &slot,
                 learned_requires_reasoning,
             )
             .await?
             {
                 ForwardResult::Success(openai_response) => {
-                    request_succeeded.store(true, Ordering::Relaxed);
-                    saw_authoritative_response.store(true, Ordering::Relaxed);
+                    slot.confirm();
                     let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
                     if is_streaming {
                         let sse = convert_openai_to_gemini_sse(&openai_response);
@@ -218,10 +221,10 @@ async fn forward_to_provider(
     openai_req: Value,
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
-    active_protocol: &Arc<AtomicU8>,
-    saw_authoritative_response: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<ForwardResult> {
+    let active_protocol = slot.route_atom();
     let candidates = protocol_candidates(active_protocol);
     let mut first_error: Option<(u16, String)> = None;
     let original_openai_req = openai_req;
@@ -276,10 +279,12 @@ async fn forward_to_provider(
                     &config.target_base_url,
                     variant.apply("/v1/messages"),
                 );
+                // Anthropic /v1/messages uses `x-api-key` only; an extra
+                // `Authorization: Bearer` makes some gateways (opencode-go's
+                // qwen) reject as InvalidApiKey. Mirrors the claude router.
                 let response = device_fingerprint::maybe_with_starter_headers(
                     client
                         .post(&target_url)
-                        .header("Authorization", format!("Bearer {}", config.api_key))
                         .header("x-api-key", config.api_key.as_str())
                         .header("anthropic-version", "2023-06-01")
                         .header("Content-Type", CONTENT_TYPE_JSON)
@@ -398,7 +403,7 @@ async fn forward_to_provider(
         match classify_attempt(status, body_text, parsed) {
             AttemptOutcome::Success(result) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                saw_authoritative_response.store(true, Ordering::Relaxed);
+                slot.confirm();
                 return Ok(ForwardResult::Success(result));
             }
             AttemptOutcome::Mismatch { status, body } => {
@@ -412,7 +417,7 @@ async fn forward_to_provider(
                     first_error = Some((status, body));
                 }
                 if classification.is_semantic_rejection {
-                    saw_authoritative_response.store(true, Ordering::Relaxed);
+                    slot.confirm();
                     if classification.quirk_hint == Some("requires_reasoning_content") {
                         learned_requires_reasoning.store(true, Ordering::Relaxed);
                         if !retried_with_strict && !effective_requires_reasoning {
@@ -453,11 +458,7 @@ async fn forward_to_provider(
                 // real answer — not a wrong-protocol guess. Surface it
                 // rather than fan out across 4 unrelated protocol shapes
                 // and pay 4 wasted gateway hits per failure.
-                if should_bail_on_mismatch(
-                    attempt,
-                    &classification,
-                    saw_authoritative_response.load(Ordering::Relaxed),
-                ) {
+                if should_bail_on_mismatch(attempt, &classification, slot.is_confirmed()) {
                     break;
                 }
             }

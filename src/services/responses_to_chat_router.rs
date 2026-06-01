@@ -31,16 +31,20 @@ use crate::services::openai_gemini_bridge::{
 };
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    record_request_outcome,
 };
 use crate::services::provider_profile::is_openrouter_base;
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, is_endpoint_missing,
+    PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, encode_route,
+    is_endpoint_missing,
 };
 use crate::services::responses_chat_conversion;
+use crate::services::route_cache::{PersistedRoute, RouteCache, RouteSlot};
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Re-export public conversion functions used by other modules
 pub use responses_chat_conversion::{
@@ -90,6 +94,12 @@ pub struct ResponsesToChatRouterConfig {
 
 pub struct ResponsesToChatRouter {
     config: ResponsesToChatRouterConfig,
+    /// `(tool, key, model)` namespace this router persists under — the same
+    /// router serves codex/opencode/pi.
+    tool: &'static str,
+    /// Learned per-model seed for the `RouteCache`. On the router (not the
+    /// config) so the conversion-test config literals don't need a new field.
+    seed_routes: BTreeMap<String, PersistedRoute>,
 }
 
 enum ForwardedChatResponse {
@@ -100,32 +110,57 @@ enum ForwardedChatResponse {
 struct ResponsesToChatRouterState {
     config: Arc<ResponsesToChatRouterConfig>,
     client: Arc<reqwest::Client>,
-    active_protocol: Arc<AtomicU8>,
-    /// Tri-state: 0 = unknown, 1 = supported, 2 = not supported
-    responses_api_supported: Arc<AtomicU8>,
-    /// Flipped to `true` once any request returns a non-error response. Read
-    /// by `persist_runtime_discoveries` to gate protocol pinning.
-    request_succeeded: Arc<AtomicBool>,
-    /// Flipped to `true` when the cascade observes an authoritative response
-    /// (2xx success or a 4xx with a parseable LLM-API error envelope). Used
-    /// by `persist_runtime_discoveries` to persist `claude_path_variant`
-    /// even when no 2xx was seen — the path responded, so it's safe to
-    /// remember which variant won.
-    saw_authoritative_response: Arc<AtomicBool>,
+    /// Per-model learned routes; the cascade reads/writes the resolved slot's
+    /// atom and `slot.confirm()` marks authoritative outcomes for write-behind.
+    /// `ResponsesApi` on a slot = native `/v1/responses`; `Openai` = chat.
+    route_cache: Arc<RouteCache>,
     /// Flipped to `true` when an upstream returns an error envelope matching
     /// the `requires_reasoning_content` quirk. Persisted to `ApiKey` so future
     /// launches enable strict mode without hardcoding the host.
     learned_requires_reasoning: Arc<AtomicBool>,
-    /// Consecutive non-2xx responses against the active route. After
-    /// `CONSECUTIVE_FAILURES_BEFORE_RESET`, the active route is reset so the
-    /// next request re-probes from the configured default — recovers when an
-    /// upstream changes shape mid-session.
-    consecutive_failures: Arc<AtomicU8>,
 }
 
 impl ResponsesToChatRouter {
     pub fn new(config: ResponsesToChatRouterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            tool: "codex",
+            seed_routes: BTreeMap::new(),
+        }
+    }
+
+    /// Stamp the `(tool, key, model)` namespace ("codex" | "opencode" | "pi").
+    pub fn with_tool(mut self, tool: &'static str) -> Self {
+        self.tool = tool;
+        self
+    }
+
+    pub fn with_seed_routes(mut self, seed_routes: BTreeMap<String, PersistedRoute>) -> Self {
+        self.seed_routes = seed_routes;
+        self
+    }
+
+    /// Per-model seed: learned routes plus a `""` default (the configured /
+    /// detected protocol) so a migrated `codexResponsesApi` informs request #1.
+    fn build_seed(&self) -> BTreeMap<String, PersistedRoute> {
+        let mut seed = self.seed_routes.clone();
+        seed.entry(String::new()).or_insert_with(|| {
+            // Codex is responses-native → default to ResponsesApi (probe
+            // /v1/responses first). Known chat-only keys (codexResponsesApi=false)
+            // and non-codex tools (opencode/pi are chat clients) keep chat.
+            let proto = match (self.tool, self.config.responses_api_supported) {
+                ("codex", Some(false)) => self.config.target_protocol,
+                ("codex", _) => ProviderProtocol::ResponsesApi,
+                _ => self.config.target_protocol,
+            };
+            PersistedRoute::from_route(
+                proto,
+                self.config
+                    .target_path_variant
+                    .unwrap_or(PathVariant::Default),
+            )
+        });
+        seed
     }
 
     /// Binds to a random available port and starts the router in the background.
@@ -134,40 +169,24 @@ impl ResponsesToChatRouter {
         &self,
     ) -> Result<(
         u16,
-        Arc<AtomicU8>,
-        Arc<AtomicU8>,
-        Arc<AtomicBool>,
-        Arc<AtomicBool>,
+        Arc<RouteCache>,
         Arc<AtomicBool>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
-        let initial_route = crate::services::provider_protocol::encode_route(
-            self.config.target_protocol,
-            self.config
-                .target_path_variant
-                .unwrap_or(PathVariant::Default),
-        );
-        let active_protocol = Arc::new(AtomicU8::new(initial_route));
-        let initial_responses = match self.config.responses_api_supported {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        };
-        let responses_api_supported = Arc::new(AtomicU8::new(initial_responses));
-        let request_succeeded = Arc::new(AtomicBool::new(false));
-        let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+        // Tool-native protocol for the codex family: OpenAI chat first; native
+        // `/v1/responses` is the learned fallback.
+        let route_cache = Arc::new(RouteCache::new(
+            self.tool,
+            ProviderProtocol::Openai,
+            self.build_seed(),
+        ));
         let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
-        let consecutive_failures = Arc::new(AtomicU8::new(0));
         let state = ResponsesToChatRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
-            active_protocol: active_protocol.clone(),
-            responses_api_supported: responses_api_supported.clone(),
-            request_succeeded: request_succeeded.clone(),
-            saw_authoritative_response: saw_authoritative_response.clone(),
+            route_cache: route_cache.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
-            consecutive_failures,
         };
         let handle = tokio::spawn(async move {
             http_utils::run_streaming_router(
@@ -177,15 +196,7 @@ impl ResponsesToChatRouter {
             )
             .await
         });
-        Ok((
-            port,
-            active_protocol,
-            responses_api_supported,
-            request_succeeded,
-            saw_authoritative_response,
-            learned_requires_reasoning,
-            handle,
-        ))
+        Ok((port, route_cache, learned_requires_reasoning, handle))
     }
 }
 
@@ -195,13 +206,22 @@ pub(crate) async fn forward_chat_completions_with_fallback(
     client: &reqwest::Client,
     force_non_streaming: bool,
 ) -> Result<(Value, ProviderProtocol)> {
-    let initial_route = crate::services::provider_protocol::encode_route(
-        config.target_protocol,
-        config.target_path_variant.unwrap_or(PathVariant::Default),
+    // One-shot (non-router) path: a single throwaway cache slot seeded from the
+    // configured default route lets us reuse the cascade unchanged.
+    let mut seed = BTreeMap::new();
+    seed.insert(
+        String::new(),
+        PersistedRoute::from_route(
+            config.target_protocol,
+            config.target_path_variant.unwrap_or(PathVariant::Default),
+        ),
     );
-    let active_protocol = Arc::new(AtomicU8::new(initial_route));
-    let request_succeeded = Arc::new(AtomicBool::new(false));
-    let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+    let cache = RouteCache::new("codex", config.target_protocol, seed);
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    let slot = cache.resolve(model);
     let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
     let config = Arc::new(config);
 
@@ -210,15 +230,13 @@ pub(crate) async fn forward_chat_completions_with_fallback(
         &config,
         client,
         force_non_streaming,
-        &active_protocol,
-        &request_succeeded,
-        &saw_authoritative_response,
+        &slot,
         &learned_requires_reasoning,
     )
     .await?
     {
         ForwardedChatResponse::Success(value) => {
-            let (protocol, _) = decode_route(active_protocol.load(Ordering::Relaxed));
+            let (protocol, _) = slot.current();
             Ok((value, protocol))
         }
         ForwardedChatResponse::HttpError { status, body } => {
@@ -236,22 +254,7 @@ async fn handle_router_request_streaming(
     mut socket: tokio::net::TcpStream,
 ) {
     use tokio::io::AsyncWriteExt;
-    let response = handle_router_request(request, &state, &mut socket).await;
-    if let Some(response) = response {
-        // Track success/failure for the auto-clear-on-N-failures heuristic.
-        // Streamed responses (where `response` is None) bypass this — they
-        // already updated `request_succeeded` from inside the streamer.
-        let succeeded = response_is_2xx(&response);
-        crate::services::protocol_fallback::record_request_outcome(
-            state.active_protocol.as_ref(),
-            state.consecutive_failures.as_ref(),
-            state.config.target_protocol,
-            state
-                .config
-                .target_path_variant
-                .unwrap_or(PathVariant::Default),
-            succeeded,
-        );
+    if let Some(response) = handle_router_request(request, &state, &mut socket).await {
         let _ = socket.write_all(response.as_bytes()).await;
     }
 }
@@ -282,15 +285,20 @@ async fn handle_router_request(
     );
 
     if is_api_path {
-        match handle_api_request(
+        // Resolve this request's per-model route slot up front so the cascade
+        // and the failure-streak accounting below share one atom.
+        let model = http_utils::extract_request_body(&request)
+            .ok()
+            .and_then(|b| serde_json::from_str::<Value>(b).ok())
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        let slot = state.route_cache.resolve(&model);
+        let response = match handle_api_request(
             &path,
             &request,
             &state.config,
             state.client.as_ref(),
-            &state.active_protocol,
-            &state.responses_api_supported,
-            &state.request_succeeded,
-            &state.saw_authoritative_response,
+            &slot,
             &state.learned_requires_reasoning,
             socket,
         )
@@ -301,7 +309,21 @@ async fn handle_router_request(
                 500,
                 &format!("Internal Server Error: {e:#}"),
             )),
+        };
+        // Failure-streak demotion for buffered responses; streamed responses
+        // (None) already recorded success via `slot.confirm()` inside the
+        // streamer.
+        if let Some(resp) = &response {
+            let (seed_proto, seed_variant) = slot.seed_route();
+            record_request_outcome(
+                slot.route_atom(),
+                slot.failures_atom(),
+                seed_proto,
+                seed_variant,
+                response_is_2xx(resp),
+            );
         }
+        response
     } else {
         match forward_request(&path, &request, &state.config, state.client.as_ref()).await {
             Ok(r) => Some(r),
@@ -318,16 +340,12 @@ async fn handle_router_request(
 /// - Chat Completions format: filter non-function tools and forward
 ///
 /// Returns `None` if the response was streamed directly to the socket.
-#[allow(clippy::too_many_arguments)]
 async fn handle_api_request(
     path: &str,
     request: &str,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    responses_api_supported: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
-    saw_authoritative_response: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<Option<String>> {
@@ -335,33 +353,27 @@ async fn handle_api_request(
     let body: Value = serde_json::from_str(body_str)?;
 
     if is_responses_api_format(&body) {
-        // When the upstream supports the Responses API natively, forward directly
-        // to preserve IDs and avoid lossy Chat Completions round-trip conversion.
-        let (current, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
-        if current == ProviderProtocol::Openai
-            && let Some(result) = try_responses_api_passthrough(
-                variant,
-                &body,
-                config,
-                client,
-                responses_api_supported,
-                request_succeeded,
-                socket,
-            )
-            .await
-        {
-            return result;
+        // Responses-first: probe /v1/responses while the route is ResponsesApi
+        // (prior or learned). On miss, demote to chat so the cascade pins
+        // openai/anthropic and the next launch won't re-probe responses.
+        if slot.current().0 == ProviderProtocol::ResponsesApi {
+            if let Some(result) =
+                try_responses_api_passthrough(&body, config, client, slot, socket).await
+            {
+                return result;
+            }
+            slot.route_atom().store(
+                encode_route(ProviderProtocol::Openai, PathVariant::Default),
+                Ordering::Relaxed,
+            );
         }
-        // Provider has no native /v1/responses — convert via Chat Completions.
-        // Try streaming first so output reaches Codex live; fall back to the
-        // buffered cascade on any pre-stream failure (wrong protocol, non-200,
-        // non-SSE) since nothing has been written to the socket yet.
+        // Chat fallback: stream the converted request first; on any pre-stream
+        // failure use the buffered cascade (which can escalate to /v1/messages).
         if stream_responses_via_chat(
             &body,
             config,
             client,
-            active_protocol,
-            request_succeeded,
+            slot,
             learned_requires_reasoning,
             socket,
         )
@@ -370,19 +382,16 @@ async fn handle_api_request(
         {
             return Ok(None); // already streamed to socket
         }
-        Ok(Some(
-            handle_responses_api_via_chat(
-                path,
-                &body,
-                config,
-                client,
-                active_protocol,
-                request_succeeded,
-                saw_authoritative_response,
-                learned_requires_reasoning,
-            )
-            .await?,
-        ))
+        let response = handle_responses_api_via_chat(
+            path,
+            &body,
+            config,
+            client,
+            slot,
+            learned_requires_reasoning,
+        )
+        .await?;
+        Ok(Some(response))
     } else {
         // For streaming Chat Completions, stream directly from upstream to client
         if body
@@ -393,8 +402,7 @@ async fn handle_api_request(
                 &body,
                 config,
                 client,
-                active_protocol,
-                request_succeeded,
+                slot,
                 learned_requires_reasoning,
                 socket,
             )
@@ -409,9 +417,7 @@ async fn handle_api_request(
                 &body,
                 config,
                 client,
-                active_protocol,
-                request_succeeded,
-                saw_authoritative_response,
+                slot,
                 learned_requires_reasoning,
             )
             .await?,
@@ -423,64 +429,24 @@ async fn handle_api_request(
 // RESPONSES API PATH: passthrough or convert
 // =============================================================================
 
-/// Decision returned by `classify_responses_passthrough_error` for a non-200
-/// response received while probing or using the native Responses API endpoint.
-#[derive(Debug, PartialEq, Eq)]
-enum ResponsesPassthroughDecision {
-    /// Path is genuinely missing — latch `responses_api_supported = 2` and fall
-    /// through to chat conversion.
-    LatchUnsupported,
-    /// Transient error during the unknown-state probe — leave state at 0 so the
-    /// next request re-probes; fall through to chat for this request.
-    Reprobe,
-    /// Already-known supported (or non-mismatch) — surface the error to the client.
-    PassError,
-}
-
-/// Decide what to do with a non-200 response from `/v1/responses` based on the
-/// current `responses_api_supported` state byte. The state encoding is:
-///   0 = unknown (probing)
-///   1 = supported
-///   2 = unsupported
-///
-/// Only `(unknown, endpoint-missing)` should latch unsupported. Every other
-/// non-200 in the unknown state should re-probe — a transient 429/5xx must not
-/// permanently disable Responses API for the key.
-fn classify_responses_passthrough_error(state: u8, status: u16) -> ResponsesPassthroughDecision {
-    let unknown = state == 0;
-    if unknown {
-        if is_endpoint_missing(status) {
-            ResponsesPassthroughDecision::LatchUnsupported
-        } else {
-            ResponsesPassthroughDecision::Reprobe
-        }
-    } else {
-        ResponsesPassthroughDecision::PassError
-    }
-}
-
-/// Tries to forward a Responses API request directly to the upstream `/v1/responses`
-/// endpoint.
+/// Forward a Responses request to the upstream `/v1/responses`.
 ///
 /// Return shape:
 /// - `Some(Ok(Some(response)))` — buffered HTTP response the caller writes.
 /// - `Some(Ok(None))` — already streamed chunked SSE to `socket`.
 /// - `Some(Err(_))` — surfaced to the caller.
-/// - `None` — upstream doesn't support the Responses API (404/405/415 or shape
-///   mismatch), fall back to Chat Completions conversion.
-#[allow(clippy::too_many_arguments)]
+/// - `None` — endpoint missing / wrong shape; fall back to Chat Completions.
 async fn try_responses_api_passthrough(
-    variant: PathVariant,
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
-    responses_api_supported: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     socket: &mut tokio::net::TcpStream,
 ) -> Option<Result<Option<String>>> {
-    if responses_api_supported.load(Ordering::Relaxed) == 2 {
-        return None;
-    }
+    let variant = slot.current().1;
+    // Confirmed-responses routes surface their errors; an unprobed (prior-only)
+    // route falls back to chat on any miss so a blip isn't taken as the answer.
+    let committed = slot.is_confirmed();
 
     let mut body = body.clone();
     // Don't filter_tools here — the upstream Responses API supports all tool types
@@ -526,23 +492,16 @@ async fn try_responses_api_passthrough(
 
     if status != 200 {
         let response_body = response.text().await.ok()?;
-        match classify_responses_passthrough_error(
-            responses_api_supported.load(Ordering::Relaxed),
-            status,
-        ) {
-            ResponsesPassthroughDecision::LatchUnsupported => {
-                responses_api_supported.store(2, Ordering::Relaxed);
-                return None;
-            }
-            ResponsesPassthroughDecision::Reprobe => return None,
-            ResponsesPassthroughDecision::PassError => {
-                return Some(Ok(Some(http_utils::http_response(
-                    status,
-                    &content_type,
-                    &response_body,
-                ))));
-            }
+        // A committed (learned) Responses route surfaces its real errors; an
+        // uncommitted probe falls back to chat on anything non-200.
+        if committed && !is_endpoint_missing(status) {
+            return Some(Ok(Some(http_utils::http_response(
+                status,
+                &content_type,
+                &response_body,
+            ))));
         }
+        return None;
     }
 
     if is_sse {
@@ -551,9 +510,8 @@ async fn try_responses_api_passthrough(
         // it under Content-Length, which froze codex's UI until upstream
         // produced `response.completed` — turning a live stream into a single
         // blob at the end of the turn.
-        let known_supported = responses_api_supported.load(Ordering::Relaxed) == 1;
         let mut prefix: Vec<u8> = Vec::new();
-        if !known_supported {
+        if !committed {
             // First-probe validation: read until we see a Responses-API event
             // signature, or until 4 KiB without one (latch unsupported). We
             // must not write headers to the socket before we know the upstream
@@ -584,12 +542,16 @@ async fn try_responses_api_passthrough(
                 }
             }
             if !validated {
-                responses_api_supported.store(2, Ordering::Relaxed);
                 return None;
             }
-            responses_api_supported.store(1, Ordering::Relaxed);
         }
-        request_succeeded.store(true, Ordering::Relaxed);
+        // Native /v1/responses works for this model — pin it so the next
+        // request prefers the passthrough, and mark it proven for write-behind.
+        slot.route_atom().store(
+            encode_route(ProviderProtocol::ResponsesApi, variant),
+            Ordering::Relaxed,
+        );
+        slot.confirm();
         match http_utils::write_streaming_response_with_prefix(
             socket,
             status,
@@ -606,16 +568,18 @@ async fn try_responses_api_passthrough(
         // Non-streaming JSON response — keep the buffered path so the
         // shape-validation step can inspect the full body.
         let response_body = response.text().await.ok()?;
-        if responses_api_supported.load(Ordering::Relaxed) != 1 {
+        if !committed {
             let looks_like_responses_api = response_body.contains("\"object\":\"response\"")
                 || response_body.contains("\"object\": \"response\"");
             if !looks_like_responses_api {
-                responses_api_supported.store(2, Ordering::Relaxed);
                 return None;
             }
-            responses_api_supported.store(1, Ordering::Relaxed);
         }
-        request_succeeded.store(true, Ordering::Relaxed);
+        slot.route_atom().store(
+            encode_route(ProviderProtocol::ResponsesApi, variant),
+            Ordering::Relaxed,
+        );
+        slot.confirm();
         Some(Ok(Some(http_utils::http_response(
             status,
             &content_type,
@@ -627,15 +591,12 @@ async fn try_responses_api_passthrough(
 /// Handles Responses API requests by converting to Chat Completions format,
 /// forwarding to the provider, and converting the response back to Responses
 /// API SSE format that the Codex CLI expects.
-#[allow(clippy::too_many_arguments)]
 async fn handle_responses_api_via_chat(
     _path: &str,
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
-    saw_authoritative_response: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<String> {
     // Extract original model before conversion
@@ -663,9 +624,7 @@ async fn handle_responses_api_via_chat(
         config,
         client,
         false,
-        active_protocol,
-        request_succeeded,
-        saw_authoritative_response,
+        slot,
         learned_requires_reasoning,
     )
     .await?
@@ -697,12 +656,11 @@ async fn stream_responses_via_chat(
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<()> {
-    let (protocol, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
+    let (protocol, variant) = slot.current();
     // Openai and ResponsesApi both hit /v1/chat/completions; codex pins
     // ResponsesApi, so gating on Openai alone dropped every turn to buffered.
     if !matches!(
@@ -767,7 +725,7 @@ async fn stream_responses_via_chat(
         anyhow::bail!("upstream did not return an SSE stream");
     }
 
-    request_succeeded.store(true, Ordering::Relaxed);
+    slot.confirm();
 
     use tokio::io::AsyncWriteExt;
     let headers = http_utils::http_chunked_response_head(200, "text/event-stream");
@@ -826,13 +784,12 @@ async fn stream_chat_completions(
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<()> {
     // Only stream for OpenAI protocol (the common case for DeepSeek, etc.)
-    let (protocol, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
+    let (protocol, variant) = slot.current();
     if protocol != ProviderProtocol::Openai {
         anyhow::bail!("streaming passthrough only for OpenAI protocol");
     }
@@ -875,7 +832,7 @@ async fn stream_chat_completions(
         .unwrap_or("text/event-stream")
         .to_string();
 
-    request_succeeded.store(true, Ordering::Relaxed);
+    slot.confirm();
     http_utils::write_streaming_response(socket, 200, &content_type, response).await
 }
 
@@ -883,25 +840,18 @@ async fn stream_chat_completions(
 // CHAT COMPLETIONS PATH: filter tools and forward (buffered)
 // =============================================================================
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_chat_completions_with_filter(
     _path: &str,
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
-    saw_authoritative_response: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<String> {
     let effective_requires_reasoning =
         config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
-    let body = prepare_chat_completions_body(
-        body,
-        config,
-        ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed)),
-        effective_requires_reasoning,
-    );
+    let body =
+        prepare_chat_completions_body(body, config, slot.current().0, effective_requires_reasoning);
     let requested_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -912,9 +862,7 @@ async fn handle_chat_completions_with_filter(
         config,
         client,
         requested_stream,
-        active_protocol,
-        request_succeeded,
-        saw_authoritative_response,
+        slot,
         learned_requires_reasoning,
     )
     .await?
@@ -969,17 +917,15 @@ async fn forward_request(
     http_utils::buffered_reqwest_to_http_response(response).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn forward_openai_chat_request(
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
     force_non_streaming: bool,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
-    saw_authoritative_response: &Arc<AtomicBool>,
+    slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<ForwardedChatResponse> {
+    let active_protocol = slot.route_atom();
     // Openai and ResponsesApi both route through `forward_openai_protocol`,
     // so one is a byte-identical duplicate of the other. Drop the non-active.
     let active_proto = decode_route(active_protocol.load(Ordering::Relaxed)).0;
@@ -1018,8 +964,7 @@ async fn forward_openai_chat_request(
         {
             AttemptOutcome::Success(value) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                request_succeeded.store(true, Ordering::Relaxed);
-                saw_authoritative_response.store(true, Ordering::Relaxed);
+                slot.confirm();
                 return Ok(ForwardedChatResponse::Success(value));
             }
             AttemptOutcome::Mismatch {
@@ -1037,7 +982,7 @@ async fn forward_openai_chat_request(
                     first_error = Some((status, response_body));
                 }
                 if classification.is_semantic_rejection {
-                    saw_authoritative_response.store(true, Ordering::Relaxed);
+                    slot.confirm();
                     if classification.quirk_hint == Some("requires_reasoning_content") {
                         learned_requires_reasoning.store(true, Ordering::Relaxed);
                         if !retried_with_strict && !effective_requires_reasoning {
@@ -1436,56 +1381,6 @@ mod tests {
         assert!(!response_is_2xx("HTTP/1.1 502 Bad Gateway\r\n"));
         assert!(!response_is_2xx("HTTP/1.1 429 Too Many Requests\r\n"));
         assert!(!response_is_2xx("garbage"));
-    }
-
-    #[test]
-    fn classify_passthrough_error_latches_only_on_endpoint_missing_when_unknown() {
-        for status in [404, 405, 415, 501] {
-            assert_eq!(
-                classify_responses_passthrough_error(0, status),
-                ResponsesPassthroughDecision::LatchUnsupported,
-                "endpoint-missing status {status} should latch when state is unknown",
-            );
-        }
-    }
-
-    #[test]
-    fn classify_passthrough_error_reprobes_on_transient_when_unknown() {
-        // Transient errors (rate-limit, 5xx, server timeout) on the first probe
-        // must NOT latch the key as unsupported. The next request should re-probe.
-        for status in [400, 401, 403, 408, 422, 429, 500, 502, 503, 504] {
-            assert_eq!(
-                classify_responses_passthrough_error(0, status),
-                ResponsesPassthroughDecision::Reprobe,
-                "transient status {status} should re-probe when state is unknown",
-            );
-        }
-    }
-
-    #[test]
-    fn classify_passthrough_error_passes_error_to_client_when_known_supported() {
-        // Once we've confirmed the upstream supports Responses API, any non-200
-        // is the upstream's real answer — surface it to the client unchanged.
-        for status in [400, 401, 403, 404, 422, 429, 500, 502, 503] {
-            assert_eq!(
-                classify_responses_passthrough_error(1, status),
-                ResponsesPassthroughDecision::PassError,
-                "status {status} should pass through when state is known-supported",
-            );
-        }
-    }
-
-    #[test]
-    fn classify_passthrough_error_passes_error_when_known_unsupported() {
-        // State == 2 means we've already given up on /v1/responses for this key,
-        // so the chat-fallback path should be in use; this branch only fires
-        // when something weird sends us back through the passthrough function.
-        // Either way, treat as PassError (not Reprobe) so we don't accidentally
-        // re-enable.
-        assert_eq!(
-            classify_responses_passthrough_error(2, 500),
-            ResponsesPassthroughDecision::PassError,
-        );
     }
 
     #[test]

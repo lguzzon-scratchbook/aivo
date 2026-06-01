@@ -1,8 +1,8 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
@@ -14,9 +14,8 @@ use crate::services::gemini_oauth::{
     ensure_fresh as gemini_ensure_fresh,
 };
 use crate::services::provider_protocol::ProviderProtocol;
-use crate::services::session_store::{
-    ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, SessionStore,
-};
+use crate::services::route_cache::{PersistedRoute, RouteCache};
+use crate::services::session_store::{ApiKey, SessionStore};
 use crate::services::symlink_util::{symlink_dir, symlink_file};
 
 /// Holds the shadow `CODEX_HOME` dir + metadata needed to sync refreshed
@@ -42,21 +41,10 @@ pub(crate) struct LaunchRuntimeState {
     /// `_AIVO_INTERNAL_ENV_UNSET` carrier emitted by the injector for the
     /// Claude OAuth path — see `environment_injector::AIVO_INTERNAL_ENV_UNSET`.
     pub(crate) env_unset: Vec<String>,
-    pub(crate) router_protocol: Option<Arc<AtomicU8>>,
-    pub(crate) responses_api_support: Option<Arc<AtomicU8>>,
-    /// Set to `true` by a router after any non-error upstream response. Read
-    /// by `persist_runtime_discoveries` to skip protocol pinning when no
-    /// request actually succeeded — prevents bad keys / transient errors from
-    /// silently rewriting `claude_protocol` to the wrong value.
-    pub(crate) request_succeeded: Option<Arc<AtomicBool>>,
-    /// Set to `true` by a router after observing an authoritative upstream
-    /// response — a 2xx success or a 4xx with a parseable LLM-API error
-    /// envelope. Read by `persist_runtime_discoveries` to persist the
-    /// `claude_path_variant` / `gemini_path_variant` even when no 2xx was
-    /// seen, so a session that fails semantically still teaches the next
-    /// launch which path variant works. Excluded: terminal 401/403/429
-    /// (cross-protocol auth-shape ambiguity) and endpoint-missing 404/405.
-    pub(crate) saw_authoritative_response: Option<Arc<AtomicBool>>,
+    /// The started router's per-(model) route cache, if any. After the child
+    /// exits, `persist_runtime_discoveries` reads `dirty_routes()` and merges
+    /// the confirmed routes back into the key under `cache.tool()`.
+    pub(crate) route_cache: Option<Arc<RouteCache>>,
     /// Set to `true` by a router after observing a `reasoning_content` semantic
     /// rejection from the upstream. Persisted to the key so subsequent launches
     /// inject `_REQUIRE_REASONING=1` without needing the host in the static
@@ -77,10 +65,7 @@ pub(crate) async fn prepare_runtime_env(
     mut env: HashMap<String, String>,
     session_store: &SessionStore,
 ) -> Result<LaunchRuntimeState> {
-    let mut router_protocol = None;
-    let mut responses_api_support = None;
-    let mut request_succeeded: Option<Arc<AtomicBool>> = None;
-    let mut saw_authoritative_response: Option<Arc<AtomicBool>> = None;
+    let mut route_cache: Option<Arc<RouteCache>> = None;
     let mut learned_requires_reasoning: Option<Arc<AtomicBool>> = None;
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
@@ -89,11 +74,8 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER") {
-        let (port, active, success, authoritative, learned) =
-            start_anthropic_to_openai_router(&env).await?;
-        router_protocol = Some(active);
-        request_succeeded = Some(success);
-        saw_authoritative_response = Some(authoritative);
+        let (port, cache, learned) = start_anthropic_to_openai_router(&env).await?;
+        route_cache = Some(cache);
         learned_requires_reasoning = Some(learned);
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
@@ -132,11 +114,8 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool.is_codex_family() && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
-        let (port, _active, responses_api, success, authoritative, learned) =
-            start_responses_to_chat_router(&env).await?;
-        responses_api_support = Some(responses_api);
-        request_succeeded = Some(success);
-        saw_authoritative_response = Some(authoritative);
+        let (port, cache, learned) = start_responses_to_chat_router("codex", &env).await?;
+        route_cache = Some(cache);
         learned_requires_reasoning = Some(learned);
         set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
     }
@@ -147,10 +126,8 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_ROUTER") {
-        let (port, active, success, authoritative, learned) = start_gemini_router(&env).await?;
-        router_protocol = Some(active);
-        request_succeeded = Some(success);
-        saw_authoritative_response = Some(authoritative);
+        let (port, cache, learned) = start_gemini_router(&env).await?;
+        route_cache = Some(cache);
         learned_requires_reasoning = Some(learned);
         set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
         clear_node_proxy_env(&mut env);
@@ -168,8 +145,9 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
-        let (port, _active, _responses_api, _success, _auth, _learned) =
-            start_responses_to_chat_router(&env).await?;
+        let (port, cache, learned) = start_responses_to_chat_router("opencode", &env).await?;
+        route_cache = Some(cache);
+        learned_requires_reasoning = Some(learned);
         patch_opencode_config_content(&mut env, port);
     }
 
@@ -184,14 +162,16 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_STARTER_ROUTER") {
-        let (port, _active, _responses_api, _success, _auth, _learned) =
-            start_responses_to_chat_router(&env).await?;
+        let (port, cache, learned) = start_responses_to_chat_router("pi", &env).await?;
+        route_cache = Some(cache);
+        learned_requires_reasoning = Some(learned);
         write_pi_agent_dir(&mut env, Some(port)).await?;
     }
 
     if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_ROUTER") {
-        let (port, _active, _responses_api, _success, _auth, _learned) =
-            start_responses_to_chat_router(&env).await?;
+        let (port, cache, learned) = start_responses_to_chat_router("pi", &env).await?;
+        route_cache = Some(cache);
+        learned_requires_reasoning = Some(learned);
         write_pi_agent_dir(&mut env, Some(port)).await?;
     }
 
@@ -235,10 +215,7 @@ pub(crate) async fn prepare_runtime_env(
     Ok(LaunchRuntimeState {
         env,
         env_unset,
-        router_protocol,
-        responses_api_support,
-        request_succeeded,
-        saw_authoritative_response,
+        route_cache,
         learned_requires_reasoning,
         pi_agent_dir,
         codex_oauth_sync,
@@ -648,56 +625,84 @@ pub(crate) async fn record_launch_state(
         .await;
 }
 
-/// Apply one-shot migrations to routing-related fields on `key`.
+/// One-shot migration of routing fields on `key`, run before any router reads
+/// them. Mutates `key` in place and persists the same change (persist failures
+/// are ignored — the in-memory mutation still benefits this launch).
 ///
-/// Called early in the launch flow (before any router reads
-/// `responses_api_supported` etc.) so that older fields written under buggy
-/// logic don't keep poisoning new launches.
-///
-/// Mutates `key` in place when fields change, and persists the same change to
-/// the session store. Failures to persist are logged-and-ignored: the
-/// in-memory mutation still benefits this launch.
-///
-/// Migration history:
-/// - **v1**: pre-fix builds latched `responses_api_supported = Some(false)` on
-///   any non-200 (incl. transient 429/5xx). Clear it so the next request
-///   re-probes under the new endpoint-missing-only rule.
+/// - **v1**: cleared a latched `responses_api_supported = Some(false)`.
+/// - **v2**: fold the five per-CLI scalar pins into the per-`(tool, model)`
+///   `protocol_routes` map under each tool's `""` default, then drop them
+///   (lossless — the scalars were already per-CLI defaults).
 pub(crate) async fn migrate_routing_schema_for_key(session_store: &SessionStore, key: &mut ApiKey) {
     use crate::services::session_store::CURRENT_ROUTING_SCHEMA_VERSION;
     if key.routing_schema_version >= CURRENT_ROUTING_SCHEMA_VERSION {
         return;
     }
 
-    if key.routing_schema_version < 1 && key.responses_api_supported == Some(false) {
-        key.responses_api_supported = None;
-        let _ = session_store
-            .set_key_responses_api_supported(&key.id, None)
-            .await;
+    let mut migrated: BTreeMap<String, BTreeMap<String, PersistedRoute>> = BTreeMap::new();
+    if let Some(p) = key.claude_protocol {
+        migrated.entry("claude".to_string()).or_default().insert(
+            String::new(),
+            PersistedRoute {
+                protocol: p.as_str().to_string(),
+                path_variant: key
+                    .claude_path_variant
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+            },
+        );
+    }
+    if let Some(p) = key.gemini_protocol {
+        migrated.entry("gemini".to_string()).or_default().insert(
+            String::new(),
+            PersistedRoute {
+                protocol: p.as_str().to_string(),
+                path_variant: key
+                    .gemini_path_variant
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+            },
+        );
+    }
+    if let Some(supported) = key.responses_api_supported {
+        migrated.entry("codex".to_string()).or_default().insert(
+            String::new(),
+            PersistedRoute {
+                protocol: if supported { "responses" } else { "openai" }.to_string(),
+                path_variant: "default".to_string(),
+            },
+        );
     }
 
+    // Mirror into the in-memory key so this launch seeds the routers correctly,
+    // then drop the legacy scalars (existing routes win over migrated defaults).
+    for (tool, models) in &migrated {
+        let dst = key.protocol_routes.entry(tool.clone()).or_default();
+        for (model, route) in models {
+            dst.entry(model.clone()).or_insert_with(|| route.clone());
+        }
+    }
+    key.claude_protocol = None;
+    key.gemini_protocol = None;
+    key.responses_api_supported = None;
+    key.claude_path_variant = None;
+    key.gemini_path_variant = None;
     key.routing_schema_version = CURRENT_ROUTING_SCHEMA_VERSION;
+
     let _ = session_store
-        .set_key_routing_schema_version(&key.id, CURRENT_ROUTING_SCHEMA_VERSION)
+        .migrate_key_to_routes_v2(&key.id, migrated, CURRENT_ROUTING_SCHEMA_VERSION)
         .await;
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_runtime_discoveries(
     session_store: &SessionStore,
-    tool: AIToolType,
     key: &ApiKey,
-    router_protocol: Option<Arc<AtomicU8>>,
-    responses_api_support: Option<Arc<AtomicU8>>,
-    request_succeeded: Option<Arc<AtomicBool>>,
-    saw_authoritative_response: Option<Arc<AtomicBool>>,
+    route_cache: Option<Arc<RouteCache>>,
     learned_requires_reasoning: Option<Arc<AtomicBool>>,
 ) {
-    // Persist a learned `requires_reasoning_content` quirk regardless of the
-    // success gate below: the upstream's *parseable* error envelope is itself
-    // proof the protocol matches and the quirk is real, even if no 2xx
-    // response was ever seen this session. Without this, a key with a strict
-    // thinking-mode upstream that fails on first launch never learns and
-    // re-cascades on every subsequent launch.
+    // Persist a learned `requires_reasoning_content` quirk: the upstream's
+    // *parseable* error envelope is itself proof the quirk is real, even if no
+    // 2xx response was ever seen this session.
     if let Some(flag) = learned_requires_reasoning.as_ref()
         && flag.load(Ordering::Relaxed)
         && key.requires_reasoning_content != Some(true)
@@ -707,135 +712,14 @@ pub(crate) async fn persist_runtime_discoveries(
             .await;
     }
 
-    let saw_success = request_succeeded
-        .as_ref()
-        .map(|flag| flag.load(Ordering::Relaxed))
-        .unwrap_or(true);
-    let saw_authoritative = saw_authoritative_response
-        .as_ref()
-        .map(|flag| flag.load(Ordering::Relaxed))
-        .unwrap_or(false);
-
-    // Persist path-variant alone when the cascade observed an authoritative
-    // response (2xx OR a 4xx with a parseable LLM-API error envelope) but no
-    // 2xx ever happened. The path responded — we can confidently remember
-    // which variant won, even though the request body was rejected. Protocol
-    // pinning still requires real success below: a 401/403 from a
-    // cross-protocol gateway shouldn't be enough to rewrite `claude_protocol`.
-    if !saw_success
-        && saw_authoritative
-        && let Some(active) = router_protocol.as_ref()
-    {
-        let (_, final_variant) =
-            crate::services::provider_protocol::decode_route(active.load(Ordering::Relaxed));
-        let final_variant_str = final_variant.as_str().to_string();
-        match tool {
-            AIToolType::Claude => {
-                let current = key.claude_path_variant.as_deref().unwrap_or("default");
-                if final_variant_str != current {
-                    let _ = session_store
-                        .set_key_claude_path_variant(&key.id, Some(final_variant_str))
-                        .await;
-                }
-            }
-            AIToolType::Gemini => {
-                let current = key.gemini_path_variant.as_deref().unwrap_or("default");
-                if final_variant_str != current {
-                    let _ = session_store
-                        .set_key_gemini_path_variant(&key.id, Some(final_variant_str))
-                        .await;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Gate protocol/responses-api persistence on at least one successful
-    // upstream response. Without this, a session that only saw failures (bad
-    // API key, transient 5xx, rate limits) could silently rewrite the
-    // persisted protocol to whatever the runtime *guessed* — and lock the
-    // user into a permanently broken configuration.
-    if !saw_success {
-        return;
-    }
-
-    if let Some(active) = router_protocol {
-        let (final_protocol, final_variant) =
-            crate::services::provider_protocol::decode_route(active.load(Ordering::Relaxed));
-        match tool {
-            AIToolType::Claude => {
-                let current = key
-                    .claude_protocol
-                    .map(|p| match p {
-                        ClaudeProviderProtocol::Openai => ProviderProtocol::Openai,
-                        ClaudeProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
-                        ClaudeProviderProtocol::Google => ProviderProtocol::Google,
-                    })
-                    .unwrap_or(ProviderProtocol::Openai);
-                if final_protocol != current {
-                    let protocol = match final_protocol {
-                        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
-                            ClaudeProviderProtocol::Openai
-                        }
-                        ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
-                        ProviderProtocol::Google => ClaudeProviderProtocol::Google,
-                    };
-                    let _ = session_store
-                        .set_key_claude_protocol(&key.id, Some(protocol))
-                        .await;
-                }
-                // Persist the path variant separately so stripped-path wins
-                // are remembered across launches.
-                let final_variant_str = final_variant.as_str().to_string();
-                let current_variant = key.claude_path_variant.as_deref().unwrap_or("default");
-                if final_variant_str != current_variant {
-                    let _ = session_store
-                        .set_key_claude_path_variant(&key.id, Some(final_variant_str))
-                        .await;
-                }
-            }
-            AIToolType::Gemini => {
-                let current = key
-                    .gemini_protocol
-                    .map(|p| match p {
-                        GeminiProviderProtocol::Google => ProviderProtocol::Google,
-                        GeminiProviderProtocol::Openai => ProviderProtocol::Openai,
-                        GeminiProviderProtocol::Anthropic => ProviderProtocol::Anthropic,
-                    })
-                    .unwrap_or(ProviderProtocol::Openai);
-                if final_protocol != current {
-                    let protocol = match final_protocol {
-                        ProviderProtocol::Google => GeminiProviderProtocol::Google,
-                        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
-                            GeminiProviderProtocol::Openai
-                        }
-                        ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
-                    };
-                    let _ = session_store
-                        .set_key_gemini_protocol(&key.id, Some(protocol))
-                        .await;
-                }
-                let final_variant_str = final_variant.as_str().to_string();
-                let current_variant = key.gemini_path_variant.as_deref().unwrap_or("default");
-                if final_variant_str != current_variant {
-                    let _ = session_store
-                        .set_key_gemini_path_variant(&key.id, Some(final_variant_str))
-                        .await;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(active) = responses_api_support {
-        let final_val = match active.load(Ordering::Relaxed) {
-            1 => Some(true),
-            2 => Some(false),
-            _ => None,
-        };
-        if final_val.is_some() && final_val != key.responses_api_supported {
+    // Merge confirmed per-model routes back into the key. `dirty_routes` only
+    // returns proven, new-or-changed slots, so a failures-only session can't
+    // poison the store and unchanged routes aren't rewritten.
+    if let Some(cache) = route_cache {
+        let dirty = cache.dirty_routes();
+        if !dirty.is_empty() {
             let _ = session_store
-                .set_key_responses_api_supported(&key.id, final_val)
+                .merge_routes(&key.id, cache.tool(), &dirty)
                 .await;
         }
     }
@@ -1252,16 +1136,17 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
     Ok(port)
 }
 
+/// Parse a `*_ROUTES_JSON` env var into a router's per-model seed; empty on a
+/// missing/unparseable value (the router then uses its tool-native prior).
+fn parse_seed_routes(env: &HashMap<String, String>, var: &str) -> BTreeMap<String, PersistedRoute> {
+    env.get(var)
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
 async fn start_anthropic_to_openai_router(
     env: &HashMap<String, String>,
-) -> Result<(
-    u16,
-    Arc<AtomicU8>,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-)> {
-    use crate::services::provider_protocol::detect_provider_protocol;
+) -> Result<(u16, Arc<RouteCache>, Arc<AtomicBool>)> {
     use crate::services::{AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig};
 
     let api_key = env
@@ -1284,13 +1169,6 @@ async fn start_anthropic_to_openai_router(
     let max_tokens_cap = env
         .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAX_TOKENS_CAP")
         .and_then(|v| v.parse::<u64>().ok());
-    let target_protocol = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL")
-        .and_then(|value| ProviderProtocol::parse(value))
-        .unwrap_or_else(|| detect_provider_protocol(&base_url));
-    let target_path_variant = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_PATH_VARIANT")
-        .and_then(|s| crate::services::provider_protocol::PathVariant::parse(s));
     let strip_cache_control = env
         .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_STRIP_CACHE_CONTROL")
         .map(|v| v == "1")
@@ -1298,8 +1176,7 @@ async fn start_anthropic_to_openai_router(
     let config = AnthropicToOpenAIRouterConfig {
         target_base_url: base_url,
         target_api_key: api_key,
-        target_protocol,
-        target_path_variant,
+        seed_routes: parse_seed_routes(env, "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_ROUTES_JSON"),
         strip_cache_control,
         model_prefix,
         requires_reasoning_content,
@@ -1311,38 +1188,19 @@ async fn start_anthropic_to_openai_router(
     };
 
     let router = AnthropicToOpenAIRouter::new(config);
-    let (
-        port,
-        active_protocol,
-        request_succeeded,
-        saw_authoritative_response,
-        learned_requires_reasoning,
-        handle,
-    ) = router.start_background().await?;
+    let (port, route_cache, learned_requires_reasoning, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: anthropic-to-openai router exited unexpectedly: {e}");
         }
     });
-    Ok((
-        port,
-        active_protocol,
-        request_succeeded,
-        saw_authoritative_response,
-        learned_requires_reasoning,
-    ))
+    Ok((port, route_cache, learned_requires_reasoning))
 }
 
 async fn start_responses_to_chat_router(
+    tool_name: &'static str,
     env: &HashMap<String, String>,
-) -> Result<(
-    u16,
-    Arc<AtomicU8>,
-    Arc<AtomicU8>,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-)> {
+) -> Result<(u16, Arc<RouteCache>, Arc<AtomicBool>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
     use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
 
@@ -1407,40 +1265,24 @@ async fn start_responses_to_chat_router(
             .map(|v| v == "1")
             .unwrap_or(false),
         aivo_prefix_models,
-    });
-    let (
-        port,
-        active_protocol,
-        responses_api,
-        request_succeeded,
-        saw_authoritative_response,
-        learned_requires_reasoning,
-        handle,
-    ) = router.start_background().await?;
+    })
+    .with_tool(tool_name)
+    .with_seed_routes(parse_seed_routes(
+        env,
+        "AIVO_RESPONSES_TO_CHAT_ROUTER_ROUTES_JSON",
+    ));
+    let (port, route_cache, learned_requires_reasoning, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: responses-to-chat router exited unexpectedly: {e}");
         }
     });
-    Ok((
-        port,
-        active_protocol,
-        responses_api,
-        request_succeeded,
-        saw_authoritative_response,
-        learned_requires_reasoning,
-    ))
+    Ok((port, route_cache, learned_requires_reasoning))
 }
 
 async fn start_gemini_router(
     env: &HashMap<String, String>,
-) -> Result<(
-    u16,
-    Arc<AtomicU8>,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-)> {
+) -> Result<(u16, Arc<RouteCache>, Arc<AtomicBool>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
     use crate::services::{GeminiRouter, GeminiRouterConfig};
 
@@ -1477,27 +1319,15 @@ async fn start_gemini_router(
             .get("AIVO_IS_STARTER")
             .map(|v| v == "1")
             .unwrap_or(false),
-    });
-    let (
-        port,
-        active_protocol,
-        request_succeeded,
-        saw_authoritative_response,
-        learned_requires_reasoning,
-        handle,
-    ) = router.start_background().await?;
+    })
+    .with_seed_routes(parse_seed_routes(env, "AIVO_GEMINI_ROUTER_ROUTES_JSON"));
+    let (port, route_cache, learned_requires_reasoning, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: gemini router exited unexpectedly: {e}");
         }
     });
-    Ok((
-        port,
-        active_protocol,
-        request_succeeded,
-        saw_authoritative_response,
-        learned_requires_reasoning,
-    ))
+    Ok((port, route_cache, learned_requires_reasoning))
 }
 
 async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
@@ -1529,14 +1359,7 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         max_tokens_cap: None,
         is_starter: false,
     });
-    let (
-        port,
-        _active_protocol,
-        _request_succeeded,
-        _saw_authoritative_response,
-        _learned_requires_reasoning,
-        handle,
-    ) = router.start_background().await?;
+    let (port, _route_cache, _learned, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: gemini copilot router exited unexpectedly: {e}");
@@ -1595,6 +1418,7 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
         claude_path_variant: None,
         gemini_path_variant: None,
         requires_reasoning_content: None,
+        protocol_routes: Default::default(),
         routing_schema_version: 0,
         key: Zeroizing::new(key_secret),
         created_at: String::new(),
@@ -1679,15 +1503,7 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
         is_starter: false,
         aivo_prefix_models: Vec::new(),
     });
-    let (
-        port,
-        _active_protocol,
-        _responses_api,
-        _request_succeeded,
-        _saw_authoritative_response,
-        _learned_requires_reasoning,
-        handle,
-    ) = router.start_background().await?;
+    let (port, _route_cache, _learned, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: responses-to-chat copilot router exited unexpectedly: {e}");
@@ -1702,7 +1518,9 @@ mod tests {
         clear_node_proxy_env, is_oauth_invalid_grant, patch_opencode_config_content,
         prepare_gemini_api_key_settings_override,
     };
-    use std::collections::HashMap;
+    use crate::services::provider_protocol::ProviderProtocol;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
     #[test]
     fn is_oauth_invalid_grant_matches_4xx_refresh_failures() {
@@ -1950,313 +1768,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_runtime_discoveries_skips_protocol_write_when_no_request_succeeded() {
-        // Reproduces the bug where a real-Anthropic endpoint with a bad API
-        // key would flip `claude_protocol` to Openai because the failed native
-        // probe poisoned the active_protocol atomic before exit. With the
-        // success gate, the persisted protocol must remain Anthropic.
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::provider_protocol::ProviderProtocol;
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU8};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://api.anthropic.com",
-                Some(ClaudeProviderProtocol::Anthropic),
-                "sk-bad",
-            )
-            .await
-            .unwrap();
-        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-
-        // Simulate the post-probe state: active_protocol got optimistically
-        // flipped to Openai (legacy behavior) but no request ever succeeded.
-        let active = Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8()));
-        let succeeded = Arc::new(AtomicBool::new(false));
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            Some(active),
-            None,
-            Some(succeeded),
-            None,
-            None,
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(
-            reloaded.claude_protocol,
-            Some(ClaudeProviderProtocol::Anthropic),
-            "claude_protocol must NOT be rewritten to Openai when no request succeeded"
-        );
-    }
-
-    #[tokio::test]
-    async fn persist_runtime_discoveries_writes_protocol_when_request_succeeded() {
-        // Counterpart: when a request did succeed, the learned protocol
-        // change must persist normally.
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::provider_protocol::ProviderProtocol;
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU8};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://gateway.example.com/v1",
-                Some(ClaudeProviderProtocol::Anthropic),
-                "sk-good",
-            )
-            .await
-            .unwrap();
-        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-
-        let active = Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8()));
-        let succeeded = Arc::new(AtomicBool::new(true));
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            Some(active),
-            None,
-            Some(succeeded),
-            None,
-            None,
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(
-            reloaded.claude_protocol,
-            Some(ClaudeProviderProtocol::Openai),
-            "claude_protocol must be rewritten to the learned protocol after a successful request"
-        );
-    }
-
-    #[tokio::test]
-    async fn persist_runtime_discoveries_writes_google_pin_for_google_host_key() {
-        // Mirrors the live user flow: claude key against
-        // generativelanguage.googleapis.com. resolve_claude_protocol pre-fills
-        // the in-memory key.claude_protocol with Anthropic (the cli-native bet);
-        // the router fallback then learns Google. Persistence must rewrite the
-        // claude_protocol pin to Google so the next launch skips the probe.
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::provider_protocol::ProviderProtocol;
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU8};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "google",
-                "https://generativelanguage.googleapis.com",
-                None,
-                "ya29-test",
-            )
-            .await
-            .unwrap();
-        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        // resolve_claude_protocol fills this in-memory before launch.
-        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
-
-        // Router observed Google success; pin advanced to Google.
-        let active = Arc::new(AtomicU8::new(ProviderProtocol::Google.to_u8()));
-        let succeeded = Arc::new(AtomicBool::new(true));
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            Some(active),
-            None,
-            Some(succeeded),
-            None,
-            None,
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(
-            reloaded.claude_protocol,
-            Some(ClaudeProviderProtocol::Google),
-            "google host pin must persist to disk so the next launch skips the probe"
-        );
-    }
-
-    #[tokio::test]
-    async fn persist_runtime_discoveries_stores_path_variant_for_claude() {
-        // A stripped-path win (e.g., upstream serves `/messages` instead of
-        // `/v1/messages`) must be persisted as well, otherwise it has to be
-        // re-probed every launch.
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::provider_protocol::{PathVariant, ProviderProtocol, encode_route};
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU8};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://gateway.example.com",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-good",
-            )
-            .await
-            .unwrap();
-        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-
-        // Router pinned (Openai, Stripped) after a successful probe.
-        let active = Arc::new(AtomicU8::new(encode_route(
-            ProviderProtocol::Openai,
-            PathVariant::Stripped,
-        )));
-        let succeeded = Arc::new(AtomicBool::new(true));
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            Some(active),
-            None,
-            Some(succeeded),
-            None,
-            None,
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(
-            reloaded.claude_path_variant.as_deref(),
-            Some("stripped"),
-            "stripped path variant must persist so the next launch skips re-probing"
-        );
-    }
-
-    #[tokio::test]
-    async fn migrate_routing_schema_clears_stale_responses_api_false_and_bumps_version() {
-        use crate::services::session_store::{
-            CURRENT_ROUTING_SCHEMA_VERSION, ClaudeProviderProtocol, SessionStore,
-        };
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://api.example.com",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-1",
-            )
-            .await
-            .unwrap();
-
-        // Force the legacy state: pre-fix builds wrote responses_api_supported =
-        // Some(false) on transient errors. Simulate that by writing it directly,
-        // then resetting routing_schema_version to 0 (legacy).
-        store
-            .set_key_responses_api_supported(&key_id, Some(false))
-            .await
-            .unwrap();
-        store
-            .set_key_routing_schema_version(&key_id, 0)
-            .await
-            .unwrap();
-
-        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(key.responses_api_supported, Some(false));
-        assert_eq!(key.routing_schema_version, 0);
-
-        super::migrate_routing_schema_for_key(&store, &mut key).await;
-
-        // In-memory key is updated.
-        assert_eq!(key.responses_api_supported, None);
-        assert_eq!(key.routing_schema_version, CURRENT_ROUTING_SCHEMA_VERSION);
-
-        // Persisted key matches.
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(reloaded.responses_api_supported, None);
-        assert_eq!(
-            reloaded.routing_schema_version,
-            CURRENT_ROUTING_SCHEMA_VERSION
-        );
-    }
-
-    #[tokio::test]
-    async fn migrate_routing_schema_preserves_some_true_and_some_none() {
-        use crate::services::session_store::{
-            CURRENT_ROUTING_SCHEMA_VERSION, ClaudeProviderProtocol, SessionStore,
-        };
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://api.example.com",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-1",
-            )
-            .await
-            .unwrap();
-
-        // Some(true) means the upstream really does support responses — must
-        // not be cleared.
-        store
-            .set_key_responses_api_supported(&key_id, Some(true))
-            .await
-            .unwrap();
-        store
-            .set_key_routing_schema_version(&key_id, 0)
-            .await
-            .unwrap();
-
-        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        super::migrate_routing_schema_for_key(&store, &mut key).await;
-
-        assert_eq!(key.responses_api_supported, Some(true));
-        assert_eq!(key.routing_schema_version, CURRENT_ROUTING_SCHEMA_VERSION);
-    }
-
-    #[tokio::test]
-    async fn migrate_routing_schema_is_idempotent_when_already_current() {
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://api.example.com",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-1",
-            )
-            .await
-            .unwrap();
-
-        // New keys are stamped at the current version, so migration is a no-op.
-        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        let before = key.clone();
-        super::migrate_routing_schema_for_key(&store, &mut key).await;
-        assert_eq!(key, before);
-    }
-
-    #[tokio::test]
     async fn prepare_gemini_api_key_settings_override_pins_selected_type() {
         let mut env = HashMap::from([
             (
@@ -2304,199 +1815,6 @@ mod tests {
 
         drop(dir);
         assert!(!std::path::Path::new(path).exists());
-    }
-
-    #[tokio::test]
-    async fn persist_runtime_discoveries_persists_learned_requires_reasoning_even_without_success()
-    {
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://example-strict-thinking.dev",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-test",
-            )
-            .await
-            .unwrap();
-        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(key.requires_reasoning_content, None);
-
-        // The cascade observed a parseable `reasoning_content` rejection but
-        // never saw a 2xx — `request_succeeded` stays false. The learned
-        // quirk must still persist so the next launch enables strict mode
-        // for this key without growing the static substring list.
-        let succeeded = Arc::new(AtomicBool::new(false));
-        let learned = Arc::new(AtomicBool::new(true));
-        learned.store(true, Ordering::Relaxed);
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            None,
-            None,
-            Some(succeeded),
-            None,
-            Some(learned),
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(reloaded.requires_reasoning_content, Some(true));
-    }
-
-    #[tokio::test]
-    async fn persist_runtime_discoveries_skips_learning_when_flag_unset() {
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://api.example.com",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-test",
-            )
-            .await
-            .unwrap();
-        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-
-        let succeeded = Arc::new(AtomicBool::new(true));
-        let learned = Arc::new(AtomicBool::new(false));
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            None,
-            None,
-            Some(succeeded),
-            None,
-            Some(learned),
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(reloaded.requires_reasoning_content, None);
-    }
-
-    #[tokio::test]
-    async fn persist_runtime_discoveries_persists_path_variant_after_authoritative_4xx() {
-        // Scenario: cascade probed (Openai, Default) → 404 (path missing),
-        // then (Openai, Stripped) → 400 with parseable error envelope.
-        // No 2xx ever happened so request_succeeded is false, but the path
-        // responded — the next launch should start at Stripped instead of
-        // re-probing Default.
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::provider_protocol::{PathVariant, ProviderProtocol, encode_route};
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU8};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://api.stripped-path-gateway.example/v1",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-test",
-            )
-            .await
-            .unwrap();
-        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(key.claude_path_variant, None);
-
-        // commit_protocol_switch moved the in-memory pin to (Openai, Stripped)
-        // after the second attempt observed a parseable 400.
-        let active = Arc::new(AtomicU8::new(encode_route(
-            ProviderProtocol::Openai,
-            PathVariant::Stripped,
-        )));
-        let succeeded = Arc::new(AtomicBool::new(false));
-        let authoritative = Arc::new(AtomicBool::new(true));
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            Some(active),
-            None,
-            Some(succeeded),
-            Some(authoritative),
-            None,
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(reloaded.claude_path_variant.as_deref(), Some("stripped"));
-        // Protocol must NOT be persisted — saw_success is false, the success
-        // gate still protects against cross-protocol auth-shape rejections
-        // silently rewriting the configured protocol.
-        assert_eq!(
-            reloaded.claude_protocol,
-            Some(ClaudeProviderProtocol::Openai),
-            "protocol must stay at the configured value when no 2xx was seen"
-        );
-    }
-
-    #[tokio::test]
-    async fn persist_runtime_discoveries_skips_path_variant_when_no_authoritative_response() {
-        // Scenario: cascade exhausted with only terminal errors (e.g., 401
-        // cross-protocol auth-shape). saw_authoritative stays false, no
-        // path-variant should be written — we don't actually know if the
-        // path responded or just rejected the auth header shape.
-        use crate::services::ai_launcher::AIToolType;
-        use crate::services::provider_protocol::{PathVariant, ProviderProtocol, encode_route};
-        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU8};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let key_id = store
-            .add_key_with_protocol(
-                "test",
-                "https://api.example.com",
-                Some(ClaudeProviderProtocol::Openai),
-                "sk-test",
-            )
-            .await
-            .unwrap();
-        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-
-        let active = Arc::new(AtomicU8::new(encode_route(
-            ProviderProtocol::Openai,
-            PathVariant::Stripped,
-        )));
-        let succeeded = Arc::new(AtomicBool::new(false));
-        let authoritative = Arc::new(AtomicBool::new(false));
-
-        super::persist_runtime_discoveries(
-            &store,
-            AIToolType::Claude,
-            &key,
-            Some(active),
-            None,
-            Some(succeeded),
-            Some(authoritative),
-            None,
-        )
-        .await;
-
-        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
-        assert_eq!(reloaded.claude_path_variant, None);
     }
 
     #[tokio::test]
@@ -2781,5 +2099,156 @@ mod tests {
         )
         .unwrap();
         assert!(models["providers"]["aivo"].is_object());
+    }
+
+    #[tokio::test]
+    async fn migrate_v2_folds_scalars_into_per_tool_routes() {
+        use crate::services::session_store::{
+            CURRENT_ROUTING_SCHEMA_VERSION, ClaudeProviderProtocol, SessionStore,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol(
+                "test",
+                "https://api.anthropic.com",
+                Some(ClaudeProviderProtocol::Anthropic),
+                "sk",
+            )
+            .await
+            .unwrap();
+        store
+            .set_key_claude_path_variant(&key_id, Some("stripped".to_string()))
+            .await
+            .unwrap();
+        store
+            .set_key_responses_api_supported(&key_id, Some(false))
+            .await
+            .unwrap();
+        // Force a pre-v2 key so the migration runs.
+        store
+            .set_key_routing_schema_version(&key_id, 0)
+            .await
+            .unwrap();
+        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+        super::migrate_routing_schema_for_key(&store, &mut key).await;
+
+        // In-memory key: scalars folded into per-tool "" defaults and cleared.
+        assert!(key.claude_protocol.is_none());
+        assert!(key.responses_api_supported.is_none());
+        assert!(key.claude_path_variant.is_none());
+        assert_eq!(key.routing_schema_version, CURRENT_ROUTING_SCHEMA_VERSION);
+        assert_eq!(key.protocol_routes["claude"][""].protocol, "anthropic");
+        assert_eq!(key.protocol_routes["claude"][""].path_variant, "stripped");
+        assert_eq!(key.protocol_routes["codex"][""].protocol, "openai");
+
+        // Persisted to disk likewise; the scalar fields no longer serialize.
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert!(reloaded.claude_protocol.is_none());
+        assert_eq!(reloaded.protocol_routes["claude"][""].protocol, "anthropic");
+        assert_eq!(reloaded.protocol_routes["codex"][""].protocol, "openai");
+        assert_eq!(
+            reloaded.routing_schema_version,
+            CURRENT_ROUTING_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_v2_is_idempotent_when_already_current() {
+        use crate::services::session_store::{CURRENT_ROUTING_SCHEMA_VERSION, SessionStore};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol("test", "https://openrouter.ai/api/v1", None, "sk")
+            .await
+            .unwrap();
+        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert_eq!(key.routing_schema_version, CURRENT_ROUTING_SCHEMA_VERSION);
+        super::migrate_routing_schema_for_key(&store, &mut key).await;
+        assert!(key.protocol_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_merges_confirmed_per_model_route() {
+        use crate::services::route_cache::RouteCache;
+        use crate::services::session_store::SessionStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol("test", "https://opencode-go.example/v1", None, "sk")
+            .await
+            .unwrap();
+        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+        let cache = Arc::new(RouteCache::new(
+            "claude",
+            ProviderProtocol::Anthropic,
+            BTreeMap::new(),
+        ));
+        // qwen confirmed on the tool-native Anthropic route.
+        cache.resolve("qwen3.7-max").confirm();
+        super::persist_runtime_discoveries(&store, &key, Some(cache), None).await;
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.protocol_routes["claude"]["qwen3.7-max"].protocol,
+            "anthropic"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_skips_unconfirmed_route() {
+        use crate::services::provider_protocol::{PathVariant, encode_route};
+        use crate::services::route_cache::RouteCache;
+        use crate::services::session_store::SessionStore;
+        use std::sync::atomic::Ordering;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol("test", "https://gw.example/v1", None, "sk-bad")
+            .await
+            .unwrap();
+        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+        let cache = Arc::new(RouteCache::new(
+            "claude",
+            ProviderProtocol::Anthropic,
+            BTreeMap::new(),
+        ));
+        // Route switched but never confirmed (e.g. a bad-key session) — must not persist.
+        let slot = cache.resolve("m");
+        slot.route_atom().store(
+            encode_route(ProviderProtocol::Openai, PathVariant::Default),
+            Ordering::Relaxed,
+        );
+        super::persist_runtime_discoveries(&store, &key, Some(cache), None).await;
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert!(reloaded.protocol_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_writes_learned_requires_reasoning() {
+        use crate::services::session_store::SessionStore;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol("test", "https://gw.example/v1", None, "sk")
+            .await
+            .unwrap();
+        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+        let learned = Arc::new(AtomicBool::new(true));
+        super::persist_runtime_discoveries(&store, &key, None, Some(learned)).await;
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.requires_reasoning_content, Some(true));
     }
 }

@@ -31,9 +31,23 @@ use crate::services::provider_profile::{
     is_copilot_base, is_direct_openai_base, is_ollama_base, provider_profile_for_base_url,
 };
 use crate::services::provider_protocol::ProviderProtocol;
+use crate::services::route_cache::PersistedRoute;
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode, SessionStore,
 };
+
+/// Seed a tool's default (`""`) route in-memory so the router starts on the
+/// cli-native protocol; per-model learning then writes the durable result.
+fn seed_default_route(key: &mut ApiKey, tool: &str, protocol: &str) {
+    key.protocol_routes
+        .entry(tool.to_string())
+        .or_default()
+        .entry(String::new())
+        .or_insert_with(|| PersistedRoute {
+            protocol: protocol.to_string(),
+            path_variant: String::new(),
+        });
+}
 
 /// Supported AI tool types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,12 +578,8 @@ impl AILauncher {
 
         persist_runtime_discoveries(
             &self.session_store,
-            options.tool,
             &resolved.key,
-            runtime.router_protocol,
-            runtime.responses_api_support,
-            runtime.request_succeeded,
-            runtime.saw_authoritative_response,
+            runtime.route_cache,
             runtime.learned_requires_reasoning,
         )
         .await;
@@ -826,11 +836,10 @@ impl AILauncher {
         if profile.serve_flags.is_copilot || profile.serve_flags.is_openrouter {
             return Ok(key);
         }
-        if key.claude_protocol.is_none() {
-            // Default guess only; persist_runtime_discoveries writes the pin
-            // to disk after the router confirms the working protocol.
-            key.claude_protocol = Some(preferred_claude_protocol(&key.base_url));
-        }
+        // Default guess only; the router learns/persists the working route
+        // per model after confirming it.
+        let proto = preferred_claude_protocol(&key.base_url);
+        seed_default_route(&mut key, "claude", proto.as_str());
         Ok(key)
     }
 
@@ -860,10 +869,9 @@ impl AILauncher {
         if key.is_gemini_oauth() {
             return Ok(key);
         }
-        if key.gemini_protocol.is_none() {
-            // Default guess only — see resolve_claude_protocol.
-            key.gemini_protocol = Some(preferred_gemini_protocol(&key.base_url));
-        }
+        // Default guess only — see resolve_claude_protocol.
+        let proto = preferred_gemini_protocol(&key.base_url);
+        seed_default_route(&mut key, "gemini", proto.as_str());
         Ok(key)
     }
 
@@ -1993,13 +2001,11 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_claude_protocol_populates_in_memory_only() {
-        // A generic OpenAI-compatible host with no pin. After resolve_* the
-        // returned key must carry the guess in-memory, but the store on disk
-        // must stay clean — persist_runtime_discoveries is the sole writer
-        // once the router confirms a working protocol.
+        // resolve_* seeds the default route in-memory; disk stays clean until
+        // the route cache's write-behind confirms a route.
         let (store, launcher, _tmp) = test_launcher_with_store().await;
         let key = test_insert_key(&store, "https://api.example.com/v1").await;
-        assert!(key.claude_protocol.is_none(), "precondition: no pin");
+        assert!(key.protocol_routes.is_empty(), "precondition: no routes");
 
         let resolved = launcher
             .resolve_claude_protocol(key.clone(), None)
@@ -2007,14 +2013,17 @@ mod tests {
             .unwrap();
 
         assert!(
-            resolved.claude_protocol.is_some(),
-            "in-memory pin must be populated for this launch"
+            resolved
+                .protocol_routes
+                .get("claude")
+                .is_some_and(|m| m.contains_key("")),
+            "in-memory default route must be populated for this launch"
         );
 
         let reloaded = store.get_key_by_id(&key.id).await.unwrap().unwrap();
         assert!(
-            reloaded.claude_protocol.is_none(),
-            "disk pin must stay None — persist_runtime_discoveries is the sole writer"
+            reloaded.protocol_routes.is_empty(),
+            "disk must stay clean — write-behind is the sole writer"
         );
     }
 
@@ -2022,19 +2031,22 @@ mod tests {
     async fn resolve_gemini_protocol_populates_in_memory_only() {
         let (store, launcher, _tmp) = test_launcher_with_store().await;
         let key = test_insert_key(&store, "https://api.example.com/v1").await;
-        assert!(key.gemini_protocol.is_none(), "precondition: no pin");
+        assert!(key.protocol_routes.is_empty(), "precondition: no routes");
 
         let resolved = launcher.resolve_gemini_protocol(key.clone()).await.unwrap();
 
         assert!(
-            resolved.gemini_protocol.is_some(),
-            "in-memory pin must be populated for this launch"
+            resolved
+                .protocol_routes
+                .get("gemini")
+                .is_some_and(|m| m.contains_key("")),
+            "in-memory default route must be populated for this launch"
         );
 
         let reloaded = store.get_key_by_id(&key.id).await.unwrap().unwrap();
         assert!(
-            reloaded.gemini_protocol.is_none(),
-            "disk pin must stay None — persist_runtime_discoveries is the sole writer"
+            reloaded.protocol_routes.is_empty(),
+            "disk must stay clean — write-behind is the sole writer"
         );
     }
 

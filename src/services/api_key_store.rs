@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use rand::Rng;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use zeroize::Zeroizing;
 
 use crate::errors::{CLIError, ErrorCategory};
+use crate::services::route_cache::PersistedRoute;
 use crate::services::session_crypto::{decrypt, encrypt, is_current_encryption, is_encrypted};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, ConfigContext, GeminiProviderProtocol, OpenAICompatibilityMode,
@@ -428,6 +429,60 @@ impl ApiKeyStore {
     ) -> Result<bool> {
         self.update_key_field(id, |entry| {
             entry.requires_reasoning_content = requires_reasoning_content
+        })
+        .await
+    }
+
+    /// Merge learned routes for one tool under the config lock — each
+    /// `(model, route)` overwrites only its own entry, so a concurrent `serve`
+    /// and `run` can't clobber each other via the wholesale `save_raw`.
+    pub(crate) async fn merge_routes(
+        &self,
+        id: &str,
+        tool: &str,
+        routes: &[(String, PersistedRoute)],
+    ) -> Result<bool> {
+        if routes.is_empty() {
+            return Ok(true);
+        }
+        self.update_key_field(id, |entry| {
+            let tool_map = entry.protocol_routes.entry(tool.to_string()).or_default();
+            for (model, route) in routes {
+                tool_map.insert(model.clone(), route.clone());
+            }
+        })
+        .await
+    }
+
+    /// Drop all learned per-model routes for a key (the `reset-route` flow), so
+    /// the next launch re-learns from the tool-native protocol.
+    pub(crate) async fn clear_protocol_routes(&self, id: &str) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.protocol_routes.clear())
+            .await
+    }
+
+    /// One-shot schema-v2 write under one lock: install the caller's migrated
+    /// per-tool routes (existing entries win), drop the scalar pins, stamp the
+    /// version.
+    pub(crate) async fn migrate_key_to_routes_v2(
+        &self,
+        id: &str,
+        migrated: BTreeMap<String, BTreeMap<String, PersistedRoute>>,
+        version: u32,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| {
+            for (tool, models) in migrated {
+                let dst = entry.protocol_routes.entry(tool).or_default();
+                for (model, route) in models {
+                    dst.entry(model).or_insert(route);
+                }
+            }
+            entry.claude_protocol = None;
+            entry.gemini_protocol = None;
+            entry.responses_api_supported = None;
+            entry.claude_path_variant = None;
+            entry.gemini_path_variant = None;
+            entry.routing_schema_version = version;
         })
         .await
     }

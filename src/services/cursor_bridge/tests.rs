@@ -27,6 +27,7 @@ fn fake_key() -> ApiKey {
         claude_path_variant: None,
         gemini_path_variant: None,
         requires_reasoning_content: None,
+        protocol_routes: Default::default(),
         routing_schema_version: 0,
         key: Zeroizing::new("cursor-login".to_string()),
         created_at: "2026-01-01T00:00:00Z".to_string(),

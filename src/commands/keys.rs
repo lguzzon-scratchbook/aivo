@@ -771,14 +771,11 @@ pub(crate) fn key_metadata_json(key: &ApiKey, selected_id: Option<&str>) -> Valu
 /// pin is invisible until something breaks.
 fn learned_routing_json(key: &ApiKey) -> Value {
     json!({
-        "claude_protocol": key.claude_protocol.map(|p| p.as_str()),
-        "claude_path_variant": key.claude_path_variant.clone(),
-        "gemini_protocol": key.gemini_protocol.map(|p| p.as_str()),
-        "gemini_path_variant": key.gemini_path_variant.clone(),
+        // Learned upstream protocol per (tool, model); "" = the tool's default.
+        "protocol_routes": key.protocol_routes,
         "codex_mode": key.codex_mode.map(|m| m.as_str()),
         "opencode_mode": key.opencode_mode.map(|m| m.as_str()),
         "pi_mode": key.pi_mode.map(|m| m.as_str()),
-        "responses_api_supported": key.responses_api_supported,
     })
 }
 
@@ -1284,8 +1281,9 @@ impl KeysCommand {
             KeySelection::Empty => return Ok(ExitCode::Success),
             KeySelection::NotFound => return Ok(ExitCode::UserError),
         };
-        // Clear each routing field independently so a partial failure leaves
-        // state predictable. Each setter no-ops if the key has been removed.
+        // Drop learned routes (and any pre-v2 scalar pins) so the next launch
+        // re-learns. Each call no-ops if the key was removed.
+        let _ = self.session_store.clear_protocol_routes(&key.id).await;
         let _ = self
             .session_store
             .set_key_claude_protocol(&key.id, None)
@@ -1755,6 +1753,8 @@ impl KeysCommand {
             .await?;
 
         if updated && base_url != key.base_url {
+            // A new upstream invalidates everything learned for the old one.
+            let _ = self.session_store.clear_protocol_routes(&key.id).await;
             let _ = self
                 .session_store
                 .set_key_gemini_protocol(&key.id, None)
@@ -3690,6 +3690,21 @@ mod tests {
             .set_key_responses_api_supported(&key_id, Some(true))
             .await
             .unwrap();
+        // The v2 per-model routes are the primary thing reset-route must clear.
+        store
+            .merge_routes(
+                &key_id,
+                "claude",
+                &[(
+                    "qwen3.7-max".to_string(),
+                    crate::services::route_cache::PersistedRoute {
+                        protocol: "anthropic".to_string(),
+                        path_variant: String::new(),
+                    },
+                )],
+            )
+            .await
+            .unwrap();
 
         let cmd = KeysCommand::new(store.clone());
         let code = cmd
@@ -3703,6 +3718,7 @@ mod tests {
         assert_eq!(reloaded.claude_path_variant, None);
         assert_eq!(reloaded.gemini_path_variant, None);
         assert_eq!(reloaded.responses_api_supported, None);
+        assert!(reloaded.protocol_routes.is_empty());
     }
 
     #[tokio::test]
@@ -4254,15 +4270,26 @@ mod tests {
             "abc".to_string(),
             "test".to_string(),
             "https://api.example.com".to_string(),
-            Some(crate::services::session_store::ClaudeProviderProtocol::Anthropic),
+            None,
             "sk".to_string(),
         );
+        key.protocol_routes
+            .entry("claude".to_string())
+            .or_default()
+            .insert(
+                "qwen3.7-max".to_string(),
+                crate::services::route_cache::PersistedRoute {
+                    protocol: "anthropic".to_string(),
+                    path_variant: String::new(),
+                },
+            );
         key.codex_mode = Some(crate::services::session_store::OpenAICompatibilityMode::Router);
-        key.responses_api_supported = Some(true);
         let payload = key_metadata_json(&key, None);
-        assert_eq!(payload["learned"]["claude_protocol"], "anthropic");
+        assert_eq!(
+            payload["learned"]["protocol_routes"]["claude"]["qwen3.7-max"]["protocol"],
+            "anthropic"
+        );
         assert_eq!(payload["learned"]["codex_mode"], "router");
-        assert_eq!(payload["learned"]["responses_api_supported"], true);
     }
 
     #[test]

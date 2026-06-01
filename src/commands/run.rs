@@ -16,9 +16,7 @@ use crate::services::http_utils;
 use crate::services::huggingface;
 use crate::services::models_cache::ModelsCache;
 use crate::services::project_id::Thread;
-use crate::services::session_store::{
-    ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode, SessionStore,
-};
+use crate::services::session_store::{ApiKey, OpenAICompatibilityMode, SessionStore};
 use crate::services::system_env;
 use crate::style;
 
@@ -298,10 +296,24 @@ impl RunCommand {
                     "aivo-hf-local".to_string(),
                     format!("hf:{}", hf_ref.repo),
                     huggingface::local_openai_base_url(port),
-                    Some(ClaudeProviderProtocol::Openai),
+                    None,
                     "huggingface".to_string(),
                 );
-                k.gemini_protocol = Some(GeminiProviderProtocol::Openai);
+                // The local llama-server is OpenAI-compatible for every tool, so
+                // pin claude/gemini off their native protocols (codex is already
+                // OpenAI-native) to skip the wasted first-attempt probe.
+                for tool in ["claude", "gemini"] {
+                    k.protocol_routes
+                        .entry(tool.to_string())
+                        .or_default()
+                        .insert(
+                            String::new(),
+                            crate::services::route_cache::PersistedRoute {
+                                protocol: "openai".to_string(),
+                                path_variant: String::new(),
+                            },
+                        );
+                }
                 k.codex_mode = Some(OpenAICompatibilityMode::Router);
                 k.opencode_mode = Some(OpenAICompatibilityMode::Router);
                 key_override = Some(k);

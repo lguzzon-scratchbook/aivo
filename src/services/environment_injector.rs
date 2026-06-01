@@ -16,9 +16,7 @@ use crate::services::provider_profile::{
 use crate::services::provider_protocol::{
     ProviderProtocol, is_anthropic_endpoint, is_google_endpoint, is_official_anthropic_endpoint,
 };
-use crate::services::session_store::{
-    ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
-};
+use crate::services::session_store::{ApiKey, OpenAICompatibilityMode};
 
 /// Describes which env vars a tool uses for base URL, auth, and router configuration.
 struct ToolEnvConfig {
@@ -27,6 +25,18 @@ struct ToolEnvConfig {
     router_flag: &'static str,
     router_prefix: &'static str,
     copilot_flag: &'static str,
+}
+
+/// Tool a router (by env prefix) persists per-model routes under, for the
+/// `inject_connection` path. `None` for cache-less routers (Ollama/Copilot/
+/// OpenRouter). opencode/pi seed their own namespaces in `for_opencode`/`for_pi`.
+fn router_tool_name(router_prefix: &str) -> Option<&'static str> {
+    match router_prefix {
+        "AIVO_ANTHROPIC_TO_OPENAI_ROUTER" => Some("claude"),
+        "AIVO_RESPONSES_TO_CHAT_ROUTER" => Some("codex"),
+        "AIVO_GEMINI_ROUTER" => Some("gemini"),
+        _ => None,
+    }
 }
 
 /// How the tool should connect to the upstream provider.
@@ -165,10 +175,19 @@ impl EnvironmentInjector {
         if !is_anthropic_endpoint(&key.base_url) {
             return false;
         }
-        match key.claude_protocol {
-            Some(ClaudeProviderProtocol::Anthropic) | None => true,
-            Some(ClaudeProviderProtocol::Openai | ClaudeProviderProtocol::Google) => false,
+        match Self::tool_default_protocol(key, "claude") {
+            Some(ProviderProtocol::Anthropic) | None => true,
+            Some(_) => false,
         }
+    }
+
+    /// The tool's default upstream protocol (the route map's `""` entry) —
+    /// drives the Direct/Routed decision, replacing the old scalar pins.
+    fn tool_default_protocol(key: &ApiKey, tool: &str) -> Option<ProviderProtocol> {
+        key.protocol_routes
+            .get(tool)
+            .and_then(|models| models.get(""))
+            .and_then(|route| ProviderProtocol::parse(&route.protocol))
     }
 
     fn use_direct_openai_for_codex(key: &ApiKey) -> bool {
@@ -197,9 +216,9 @@ impl EnvironmentInjector {
         if !is_google_endpoint(&key.base_url) {
             return false;
         }
-        match key.gemini_protocol {
-            Some(GeminiProviderProtocol::Google) | None => true,
-            Some(GeminiProviderProtocol::Openai | GeminiProviderProtocol::Anthropic) => false,
+        match Self::tool_default_protocol(key, "gemini") {
+            Some(ProviderProtocol::Google) | None => true,
+            Some(_) => false,
         }
     }
 
@@ -214,25 +233,15 @@ impl EnvironmentInjector {
     }
 
     fn routed_protocol_for_claude(key: &ApiKey) -> ProviderProtocol {
-        match key.claude_protocol {
-            Some(ClaudeProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
-            Some(ClaudeProviderProtocol::Openai) => ProviderProtocol::Openai,
-            Some(ClaudeProviderProtocol::Google) => ProviderProtocol::Google,
-            None => {
-                provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Anthropic)
-            }
-        }
+        Self::tool_default_protocol(key, "claude").unwrap_or_else(|| {
+            provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Anthropic)
+        })
     }
 
     fn routed_protocol_for_gemini(key: &ApiKey) -> ProviderProtocol {
-        match key.gemini_protocol {
-            Some(GeminiProviderProtocol::Google) => ProviderProtocol::Google,
-            Some(GeminiProviderProtocol::Openai) => ProviderProtocol::Openai,
-            Some(GeminiProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
-            None => {
-                provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Google)
-            }
-        }
+        Self::tool_default_protocol(key, "gemini").unwrap_or_else(|| {
+            provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Google)
+        })
     }
 
     fn should_disable_claude_nonessential_traffic(key: &ApiKey) -> bool {
@@ -328,6 +337,16 @@ impl EnvironmentInjector {
                     format!("{}_UPSTREAM_PROTOCOL", cfg.router_prefix),
                     protocol.as_str().to_string(),
                 );
+                // Seed the router's RouteCache with this tool's learned routes
+                // (omitted when none → it falls back to the tool-native prior).
+                if let Some(tool) = router_tool_name(cfg.router_prefix) {
+                    let routes = key.routes_for_tool(tool);
+                    if !routes.is_empty()
+                        && let Ok(json) = serde_json::to_string(&routes)
+                    {
+                        env.insert(format!("{}_ROUTES_JSON", cfg.router_prefix), json);
+                    }
+                }
                 // Per-key learned override merges into the static profile so
                 // the env-var contract stays single-sourced in `inject`.
                 let mut quirks = profile.quirks;
@@ -959,6 +978,17 @@ impl EnvironmentInjector {
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 profile.default_protocol.as_str().to_string(),
             );
+            // Seed the router's per-model RouteCache with what opencode learned
+            // before (its own `(opencode, key, model)` namespace).
+            let opencode_routes = key.routes_for_tool("opencode");
+            if !opencode_routes.is_empty()
+                && let Ok(json) = serde_json::to_string(&opencode_routes)
+            {
+                env.insert(
+                    "AIVO_RESPONSES_TO_CHAT_ROUTER_ROUTES_JSON".to_string(),
+                    json,
+                );
+            }
             if let Some(supported) = key.responses_api_supported {
                 env.insert(
                     "AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API".to_string(),
@@ -1168,6 +1198,16 @@ impl EnvironmentInjector {
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
                 profile.default_protocol.as_str().to_string(),
             );
+            // Seed the router with pi's own `(pi, key, model)` routes.
+            let pi_routes = key.routes_for_tool("pi");
+            if !pi_routes.is_empty()
+                && let Ok(json) = serde_json::to_string(&pi_routes)
+            {
+                env.insert(
+                    "AIVO_RESPONSES_TO_CHAT_ROUTER_ROUTES_JSON".to_string(),
+                    json,
+                );
+            }
         } else {
             // Direct connection — pi talks to the upstream natively.
             // Map aivo's ProviderProtocol to pi's API type string.
@@ -1294,6 +1334,22 @@ pub(crate) fn redact_env_value(key: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::route_cache::PersistedRoute;
+
+    /// Pin a tool's default (`""`) route, the v2 equivalent of the old
+    /// per-CLI `claude_protocol` / `gemini_protocol` scalar pins.
+    fn pin_route(key: &mut ApiKey, tool: &str, protocol: &str) {
+        key.protocol_routes
+            .entry(tool.to_string())
+            .or_default()
+            .insert(
+                String::new(),
+                PersistedRoute {
+                    protocol: protocol.to_string(),
+                    path_variant: String::new(),
+                },
+            );
+    }
 
     fn test_key() -> ApiKey {
         ApiKey::new_with_protocol(
@@ -1327,7 +1383,7 @@ mod tests {
     fn use_direct_anthropic_false_for_generic_openai_host_with_anthropic_pin() {
         let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.example.com/v1");
-        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        pin_route(&mut key, "claude", "anthropic");
         assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
     }
 
@@ -1342,7 +1398,7 @@ mod tests {
     fn use_direct_anthropic_true_for_anthropic_host_with_anthropic_pin() {
         let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.anthropic.com");
-        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        pin_route(&mut key, "claude", "anthropic");
         assert!(EnvironmentInjector::use_direct_anthropic_for_claude(&key));
     }
 
@@ -1350,7 +1406,7 @@ mod tests {
     fn use_direct_anthropic_false_for_anthropic_host_with_openai_pin() {
         let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.anthropic.com");
-        key.claude_protocol = Some(ClaudeProviderProtocol::Openai);
+        pin_route(&mut key, "claude", "openai");
         assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
     }
 
@@ -1358,7 +1414,7 @@ mod tests {
     fn use_google_native_false_for_generic_openai_host_with_google_pin() {
         let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.example.com/v1");
-        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        pin_route(&mut key, "gemini", "google");
         assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
     }
 
@@ -1373,7 +1429,7 @@ mod tests {
     fn use_google_native_true_for_google_host_with_google_pin() {
         let _guard = debug_off_guard();
         let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
-        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        pin_route(&mut key, "gemini", "google");
         assert!(EnvironmentInjector::use_google_native_for_gemini(&key));
     }
 
@@ -1381,7 +1437,7 @@ mod tests {
     fn use_google_native_false_for_google_host_with_openai_pin() {
         let _guard = debug_off_guard();
         let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
-        key.gemini_protocol = Some(GeminiProviderProtocol::Openai);
+        pin_route(&mut key, "gemini", "openai");
         assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
     }
 
@@ -1562,7 +1618,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        pin_route(&mut key, "claude", "anthropic");
         let env = injector.for_claude(&key, None);
 
         assert_eq!(
@@ -1904,7 +1960,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.example.com/v1".to_string();
-        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        pin_route(&mut key, "claude", "anthropic");
         let env = injector.for_claude(&key, Some("claude-sonnet-4-6"));
 
         assert_eq!(
@@ -1932,7 +1988,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.minimax.io/anthropic".to_string();
-        key.claude_protocol = Some(ClaudeProviderProtocol::Openai);
+        pin_route(&mut key, "claude", "openai");
         let env = injector.for_claude(&key, Some("MiniMax-M1"));
 
         assert_eq!(
@@ -1950,7 +2006,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://example.com/custom".to_string();
-        key.claude_protocol = Some(ClaudeProviderProtocol::Google);
+        pin_route(&mut key, "claude", "google");
 
         let env = injector.for_claude(&key, None);
         assert_eq!(
@@ -2755,7 +2811,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        pin_route(&mut key, "gemini", "google");
         let env = injector.for_gemini(&key, None);
 
         assert_eq!(
@@ -2825,7 +2881,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.example.com".to_string();
-        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        pin_route(&mut key, "gemini", "google");
         let env = injector.for_gemini(&key, None);
 
         assert_eq!(env.get("AIVO_USE_GEMINI_ROUTER"), Some(&"1".to_string()));
@@ -2859,7 +2915,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://example.com/custom".to_string();
-        key.gemini_protocol = Some(GeminiProviderProtocol::Anthropic);
+        pin_route(&mut key, "gemini", "anthropic");
 
         let env = injector.for_gemini(&key, None);
         assert_eq!(

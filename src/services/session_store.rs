@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -15,6 +15,7 @@ use crate::services::atomic_write::atomic_write_secure;
 use crate::services::chat_session_store::ChatSessionStore;
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
+use crate::services::route_cache::PersistedRoute;
 use crate::services::usage_stats_store::UsageStatsStore;
 
 /// Bump when one-shot migrations of routing fields on `ApiKey` are needed.
@@ -24,7 +25,10 @@ use crate::services::usage_stats_store::UsageStatsStore;
 /// Version history:
 ///   1: clear `responses_api_supported = Some(false)` written by pre-fix
 ///      builds that latched on any non-200 (incl. transient 429/5xx).
-pub const CURRENT_ROUTING_SCHEMA_VERSION: u32 = 1;
+///   2: replace the per-(tool, key) scalar route pins with the per-(tool, key,
+///      model) `protocol_routes` map. The old scalars are folded into per-tool
+///      `""` defaults (lossless under per-tool keying) and then dropped.
+pub const CURRENT_ROUTING_SCHEMA_VERSION: u32 = 2;
 
 /// Serde module for serializing/deserializing Zeroizing<String> as regular String
 mod zeroizing_string {
@@ -167,6 +171,15 @@ pub struct ApiKey {
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_reasoning_content: Option<bool>,
+    /// Learned upstream protocol per `(tool, model)` (inner `""` = the tool's
+    /// default). Replaces the five scalar pins above, which a multi-model key
+    /// would thrash; those linger only so a v1 config can be migrated (schema v2).
+    #[serde(
+        rename = "protocolRoutes",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub protocol_routes: BTreeMap<String, BTreeMap<String, PersistedRoute>>,
     /// Schema version for one-shot migrations of routing-related fields. Bumped
     /// when older builds may have written values under buggy logic that should
     /// be cleared on first launch by a newer build. Missing/zero = legacy.
@@ -207,10 +220,16 @@ impl ApiKey {
             claude_path_variant: None,
             gemini_path_variant: None,
             requires_reasoning_content: None,
+            protocol_routes: BTreeMap::new(),
             routing_schema_version: CURRENT_ROUTING_SCHEMA_VERSION,
             key: Zeroizing::new(key),
             created_at: Utc::now().to_rfc3339(),
         }
+    }
+
+    /// Persisted routes for one tool, for seeding that router's `RouteCache`.
+    pub fn routes_for_tool(&self, tool: &str) -> BTreeMap<String, PersistedRoute> {
+        self.protocol_routes.get(tool).cloned().unwrap_or_default()
     }
 
     pub fn short_id(&self) -> &str {
@@ -1422,6 +1441,33 @@ impl SessionStore {
             .await
     }
 
+    /// See [`ApiKeyStore::clear_protocol_routes`].
+    pub async fn clear_protocol_routes(&self, id: &str) -> Result<bool> {
+        self.api_keys.clear_protocol_routes(id).await
+    }
+
+    /// See [`ApiKeyStore::merge_routes`].
+    pub async fn merge_routes(
+        &self,
+        id: &str,
+        tool: &str,
+        routes: &[(String, PersistedRoute)],
+    ) -> Result<bool> {
+        self.api_keys.merge_routes(id, tool, routes).await
+    }
+
+    /// See [`ApiKeyStore::migrate_key_to_routes_v2`].
+    pub async fn migrate_key_to_routes_v2(
+        &self,
+        id: &str,
+        migrated: BTreeMap<String, BTreeMap<String, PersistedRoute>>,
+        version: u32,
+    ) -> Result<bool> {
+        self.api_keys
+            .migrate_key_to_routes_v2(id, migrated, version)
+            .await
+    }
+
     pub async fn set_key_codex_mode(
         &self,
         id: &str,
@@ -1835,6 +1881,7 @@ mod tests {
             claude_path_variant: None,
             gemini_path_variant: None,
             requires_reasoning_content: None,
+            protocol_routes: Default::default(),
             routing_schema_version: 0,
             key: Zeroizing::new("{}".into()),
             created_at: Utc::now().to_rfc3339(),

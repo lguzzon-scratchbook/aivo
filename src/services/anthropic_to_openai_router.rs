@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -52,6 +52,7 @@ use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, is_endpoint_missing,
     is_protocol_mismatch, is_terminal_upstream_error,
 };
+use crate::services::route_cache::{PersistedRoute, RouteCache};
 use crate::services::serve_upstream::disable_stream_for_inception_with_tools;
 
 #[derive(Clone)]
@@ -60,11 +61,9 @@ pub struct AnthropicToOpenAIRouterConfig {
     pub target_base_url: String,
     /// API key for the target provider
     pub target_api_key: String,
-    /// The upstream protocol spoken by the provider.
-    pub target_protocol: ProviderProtocol,
-    /// Persisted path-variant pin from a prior launch ("default" / "stripped").
-    /// When set, the router skips re-probing the alternate variant.
-    pub target_path_variant: Option<PathVariant>,
+    /// Per-model routes learned for `claude` (`""` = default). Seeds the
+    /// `RouteCache`; absent a route, the tool-native Anthropic prior applies.
+    pub seed_routes: BTreeMap<String, PersistedRoute>,
     /// When `true`, strip Anthropic-specific `cache_control` keys from the
     /// request before forwarding (Bedrock-style shims reject them) and skip
     /// the inject step that would otherwise add them.
@@ -87,20 +86,10 @@ pub struct AnthropicToOpenAIRouter {
 struct AnthropicToOpenAIRouterState {
     config: Arc<AnthropicToOpenAIRouterConfig>,
     client: reqwest::Client,
-    active_protocol: Arc<AtomicU8>,
+    /// Per-model learned routes; each request resolves its slot and runs the
+    /// cascade against it. A confirmed slot persists on exit via `dirty_routes`.
+    route_cache: Arc<RouteCache>,
     probe: ProbeState,
-    /// Flipped to `true` once any request returns a non-error response. Read by
-    /// `persist_runtime_discoveries` to gate protocol pinning so a session that
-    /// only saw failures (e.g., bad API key) can't poison the persisted route.
-    request_succeeded: Arc<AtomicBool>,
-    /// Flipped to `true` when the cascade observes an authoritative response —
-    /// a 2xx success OR a 4xx with a parseable LLM-API error envelope. Both
-    /// prove the active path is real. `persist_runtime_discoveries` reads this
-    /// to persist the learned `claude_path_variant` even when no 2xx was seen,
-    /// so a session that only ever fails semantically still teaches the next
-    /// launch which path variant to start at. Excluded: terminal 401/403/429
-    /// (cross-protocol auth-shape ambiguity) and endpoint-missing 404/405.
-    saw_authoritative_response: Arc<AtomicBool>,
     /// Flipped to `true` when a cascade attempt sees an upstream error envelope
     /// matching the `requires_reasoning_content` quirk. `persist_runtime_discoveries`
     /// reads this and writes `ApiKey::requires_reasoning_content = Some(true)`,
@@ -239,41 +228,28 @@ impl AnthropicToOpenAIRouter {
         &self,
     ) -> Result<(
         u16,
-        Arc<AtomicU8>,
-        Arc<AtomicBool>,
-        Arc<AtomicBool>,
+        Arc<RouteCache>,
         Arc<AtomicBool>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
-        let initial_route = crate::services::provider_protocol::encode_route(
-            self.config.target_protocol,
-            self.config
-                .target_path_variant
-                .unwrap_or(PathVariant::Default),
-        );
-        let active_protocol = Arc::new(AtomicU8::new(initial_route));
-        let request_succeeded = Arc::new(AtomicBool::new(false));
-        let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+        // Tool-native protocol for `aivo claude`: try Anthropic `/v1/messages`
+        // first for any model without a learned route.
+        let route_cache = Arc::new(RouteCache::new(
+            "claude",
+            ProviderProtocol::Anthropic,
+            self.config.seed_routes.clone(),
+        ));
         let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let state = AnthropicToOpenAIRouterState {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
-            active_protocol: active_protocol.clone(),
+            route_cache: route_cache.clone(),
             probe: ProbeState::new(),
-            request_succeeded: request_succeeded.clone(),
-            saw_authoritative_response: saw_authoritative_response.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
-        Ok((
-            port,
-            active_protocol,
-            request_succeeded,
-            saw_authoritative_response,
-            learned_requires_reasoning,
-            handle,
-        ))
+        Ok((port, route_cache, learned_requires_reasoning, handle))
     }
 }
 
@@ -285,10 +261,8 @@ async fn run_router(
         let (mut socket, _) = listener.accept().await?;
         let config = state.config.clone();
         let client = state.client.clone();
-        let active_protocol = state.active_protocol.clone();
+        let route_cache = state.route_cache.clone();
         let probe = state.probe.clone();
-        let request_succeeded = state.request_succeeded.clone();
-        let saw_authoritative_response = state.saw_authoritative_response.clone();
         let learned_requires_reasoning = state.learned_requires_reasoning.clone();
 
         tokio::spawn(async move {
@@ -315,10 +289,8 @@ async fn run_router(
                 &request,
                 &config,
                 &client,
-                &active_protocol,
+                &route_cache,
                 &probe,
-                &request_succeeded,
-                &saw_authoritative_response,
                 &learned_requires_reasoning,
                 &mut socket,
             )
@@ -588,15 +560,10 @@ async fn try_native_anthropic(
     }
 }
 
-/// Skip the probe once the active pin has moved off Anthropic — re-probing
-/// would short-circuit to `EndpointMissing` and undo the learned pin.
-fn should_try_native_anthropic(
-    target_protocol: ProviderProtocol,
-    active_protocol: &AtomicU8,
-) -> bool {
-    if target_protocol != ProviderProtocol::Anthropic {
-        return false;
-    }
+/// Probe native `/v1/messages` only while this model's route is still Anthropic
+/// (claude's tool-native default); once it's moved off, re-probing would
+/// short-circuit to `EndpointMissing` and undo the learned pin.
+fn should_try_native_anthropic(active_protocol: &AtomicU8) -> bool {
     decode_route(active_protocol.load(Ordering::Relaxed)).0 == ProviderProtocol::Anthropic
 }
 
@@ -606,10 +573,8 @@ async fn handle_anthropic_to_upstream(
     request: &str,
     config: &Arc<AnthropicToOpenAIRouterConfig>,
     client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
+    route_cache: &Arc<RouteCache>,
     probe: &ProbeState,
-    request_succeeded: &Arc<AtomicBool>,
-    saw_authoritative_response: &Arc<AtomicBool>,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<RouterResponse> {
@@ -645,6 +610,16 @@ async fn handle_anthropic_to_upstream(
         .and_then(|m| m.as_str())
         .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
 
+    // Per-model route slot: the cascade reads/writes its atom (not a shared
+    // pin) so models on one key don't clobber each other; `confirm()` persists.
+    let req_model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let slot = route_cache.resolve(&req_model);
+    let active_protocol: &AtomicU8 = slot.route_atom();
+
     // Stashed Terminal response from the native-Anthropic preflight. Some
     // hosts (e.g., Cloudflare's AI gateway, OpenAI-only proxies) reject
     // /v1/messages with 401/403 and a host-shaped error envelope rather than
@@ -653,11 +628,10 @@ async fn handle_anthropic_to_upstream(
     // surfaced error only if every chat candidate also fails.
     let mut native_anthropic_terminal: Option<RouterResponse> = None;
 
-    if should_try_native_anthropic(config.target_protocol, active_protocol) {
+    if should_try_native_anthropic(active_protocol) {
         match try_native_anthropic(&body, config, client, &passthrough_headers, probe).await? {
             NativeAnthropicResult::Success(response) => {
-                request_succeeded.store(true, Ordering::Relaxed);
-                saw_authoritative_response.store(true, Ordering::Relaxed);
+                slot.confirm();
                 return Ok(response);
             }
             NativeAnthropicResult::Terminal(response) => {
@@ -868,8 +842,7 @@ async fn handle_anthropic_to_upstream(
                         }
                         socket.write_all(b"0\r\n\r\n").await?;
                         commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                        request_succeeded.store(true, Ordering::Relaxed);
-                        saw_authoritative_response.store(true, Ordering::Relaxed);
+                        slot.confirm();
                         return Ok(RouterResponse::AlreadyStreamed);
                     }
 
@@ -905,8 +878,7 @@ async fn handle_anthropic_to_upstream(
         match outcome {
             AttemptOutcome::Success(r) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                request_succeeded.store(true, Ordering::Relaxed);
-                saw_authoritative_response.store(true, Ordering::Relaxed);
+                slot.confirm();
                 return Ok(r);
             }
             AttemptOutcome::Mismatch {
@@ -934,7 +906,7 @@ async fn handle_anthropic_to_upstream(
                     });
                 }
                 if classification.is_semantic_rejection {
-                    saw_authoritative_response.store(true, Ordering::Relaxed);
+                    slot.confirm();
                     if classification.quirk_hint == Some("requires_reasoning_content") {
                         learned_requires_reasoning.store(true, Ordering::Relaxed);
                         // Same-launch recovery: if the upstream told us it
@@ -1821,45 +1793,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_try_native_anthropic_when_target_and_active_are_anthropic() {
+    fn should_try_native_anthropic_when_route_is_anthropic() {
+        // Tool-native default for `aivo claude`: an Anthropic slot route probes
+        // /v1/messages first.
         let active = AtomicU8::new(ProviderProtocol::Anthropic.to_u8());
-        assert!(should_try_native_anthropic(
-            ProviderProtocol::Anthropic,
-            &active
-        ));
+        assert!(should_try_native_anthropic(&active));
     }
 
     #[test]
-    fn should_skip_native_anthropic_when_target_is_not_anthropic() {
-        let active = AtomicU8::new(ProviderProtocol::Anthropic.to_u8());
-        for target in [
+    fn should_skip_native_anthropic_when_route_moved_off_anthropic() {
+        // Once a model's route is learned/pinned to a non-Anthropic protocol,
+        // re-probing /v1/messages would short-circuit to EndpointMissing and
+        // undo the learned pin.
+        for pin in [
             ProviderProtocol::Openai,
             ProviderProtocol::ResponsesApi,
             ProviderProtocol::Google,
         ] {
-            assert!(
-                !should_try_native_anthropic(target, &active),
-                "target={target:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn should_skip_native_anthropic_when_active_pin_moved_off_anthropic() {
-        // Regression: after a prior request learned that the host speaks
-        // (e.g.) Google, re-probing /v1/messages would short-circuit to
-        // EndpointMissing and the unconditional pre-pin used to reset the
-        // learned Google pin back to Openai.
-        for active_pin in [
-            ProviderProtocol::Openai,
-            ProviderProtocol::ResponsesApi,
-            ProviderProtocol::Google,
-        ] {
-            let active = AtomicU8::new(active_pin.to_u8());
-            assert!(
-                !should_try_native_anthropic(ProviderProtocol::Anthropic, &active),
-                "active_pin={active_pin:?}"
-            );
+            let active = AtomicU8::new(pin.to_u8());
+            assert!(!should_try_native_anthropic(&active), "pin={pin:?}");
         }
     }
 
@@ -2234,8 +2186,7 @@ mod tests {
         let config = AnthropicToOpenAIRouterConfig {
             target_base_url: "https://api.ai.example-gateway.net/endpoint".to_string(),
             target_api_key: "test".to_string(),
-            target_protocol: ProviderProtocol::Openai,
-            target_path_variant: None,
+            seed_routes: BTreeMap::new(),
             strip_cache_control: false,
             model_prefix: None,
             requires_reasoning_content: false,
@@ -2245,7 +2196,7 @@ mod tests {
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();
 
-        prepare_gateway_model_metadata(&mut body, &mut headers, &config, config.target_protocol);
+        prepare_gateway_model_metadata(&mut body, &mut headers, &config, ProviderProtocol::Openai);
 
         assert_eq!(body["model"], "claude-sonnet-4-6");
         assert_eq!(
@@ -2259,8 +2210,7 @@ mod tests {
         let config = AnthropicToOpenAIRouterConfig {
             target_base_url: "https://api.openai.com/v1".to_string(),
             target_api_key: "test".to_string(),
-            target_protocol: ProviderProtocol::Openai,
-            target_path_variant: None,
+            seed_routes: BTreeMap::new(),
             strip_cache_control: false,
             model_prefix: None,
             requires_reasoning_content: false,
@@ -2270,7 +2220,7 @@ mod tests {
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();
 
-        prepare_gateway_model_metadata(&mut body, &mut headers, &config, config.target_protocol);
+        prepare_gateway_model_metadata(&mut body, &mut headers, &config, ProviderProtocol::Openai);
 
         assert_eq!(body["model"], "gpt-4o");
         assert!(headers.get("x-provider").is_none());

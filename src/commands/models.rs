@@ -1248,6 +1248,7 @@ mod tests {
             claude_path_variant: None,
             gemini_path_variant: None,
             requires_reasoning_content: None,
+            protocol_routes: Default::default(),
             routing_schema_version: 0,
             key: Zeroizing::new("sk-test".to_string()),
             created_at: "2026-01-01".to_string(),
