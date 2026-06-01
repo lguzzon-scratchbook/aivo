@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.25.1
+
+- Per-`(tool, key, model)` protocol routes: each tool/model learns and persists its own wire format, seeded from tool-native priors.
+- `aivo chat`: persist the learned protocol route per `(key, model)` so a warm start skips the failed-probe round-trip.
+- `aivo pi`: route through aivo's transform router by default; pass `--transparent` to talk to the upstream natively.
+- Merge install dirs into the child `PATH` instead of clobbering it.
+
+
 ## v0.25.0
 
 ### Changes
