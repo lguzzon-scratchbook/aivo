@@ -36,6 +36,10 @@ pub(crate) fn preview_args(
         return inject_pi_model(model, &args);
     }
     if !tool.is_codex_family() {
+        if tool == AIToolType::Claude {
+            // Preview has no runtime env; the pre-merge tool env is both key and value source.
+            return inject_claude_env_pin(env, env, args);
+        }
         return args;
     }
 
@@ -171,6 +175,7 @@ pub(crate) async fn build_runtime_args(
     model: Option<&str>,
     codex_app_models: Option<&[String]>,
     env: &HashMap<String, String>,
+    aivo_env: &HashMap<String, String>,
 ) -> Result<RuntimeArgs> {
     let args = inject_claude_teammate_mode(tool, raw_args);
     if tool == AIToolType::Pi {
@@ -180,6 +185,11 @@ pub(crate) async fn build_runtime_args(
         });
     }
     if !tool.is_codex_family() {
+        let args = if tool == AIToolType::Claude {
+            inject_claude_env_pin(aivo_env, env, args)
+        } else {
+            args
+        };
         return Ok(RuntimeArgs {
             args,
             codex_model_catalog_path: None,
@@ -514,6 +524,52 @@ fn should_preview_codex_model_catalog(model: Option<&str>, uses_non_openai_route
         || name_only.starts_with("o4"))
 }
 
+/// Bearer-token vars never pinned via `--settings`: the payload lands in argv
+/// (world-readable via `ps`), so secrets stay in the owner-only child env.
+const CLAUDE_PIN_SECRET_DENYLIST: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+/// Re-assert the env aivo overwrote via `--settings` (CLI-args precedence), since
+/// `~/.claude/settings.json`'s `env` block otherwise shadows every var aivo injects.
+/// Keys come from `aivo_env`, so the user's inherited shell vars are never pinned;
+/// values come from `final_env`. Skips `AIVO_*` internals, the secret denylist, and any
+/// non-empty `ANTHROPIC_API_KEY`.
+/// Prepended (Claude honors only the first `--settings`); skipped if the user passes one.
+fn inject_claude_env_pin(
+    aivo_env: &HashMap<String, String>,
+    final_env: &HashMap<String, String>,
+    args: Vec<String>,
+) -> Vec<String> {
+    if args
+        .iter()
+        .any(|a| a == "--settings" || a.starts_with("--settings="))
+    {
+        return args;
+    }
+    let mut pinned_env = serde_json::Map::new();
+    for k in aivo_env.keys() {
+        if k.starts_with("AIVO_") || k.starts_with("_AIVO_") {
+            continue;
+        }
+        if CLAUDE_PIN_SECRET_DENYLIST.contains(&k.as_str()) {
+            continue;
+        }
+        if let Some(v) = final_env.get(k) {
+            // `--env` can fill the empty ANTHROPIC_API_KEY suppressor with a real key; never put a secret in argv/logs.
+            if k == "ANTHROPIC_API_KEY" && !v.is_empty() {
+                continue;
+            }
+            pinned_env.insert(k.clone(), json!(v));
+        }
+    }
+    if pinned_env.is_empty() {
+        return args;
+    }
+    let settings = json!({ "env": pinned_env }).to_string();
+    let mut pinned = vec!["--settings".to_string(), settings];
+    pinned.extend(args);
+    pinned
+}
+
 fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String> {
     if tool != AIToolType::Claude {
         return args.to_vec();
@@ -837,6 +893,7 @@ mod tests {
             Some("composer-2.5"),
             None,
             &env,
+            &env,
         )
         .await
         .unwrap();
@@ -877,6 +934,7 @@ mod tests {
             &[".".to_string()],
             Some("gpt-5"),
             None,
+            &env,
             &env,
         )
         .await
@@ -962,6 +1020,155 @@ mod tests {
         let args: Vec<String> = vec![];
         let result = inject_claude_teammate_mode(AIToolType::Claude, &args);
         assert_eq!(result, vec!["--teammate-mode", "in-process"]);
+    }
+
+    // Parse the `--settings` JSON payload's `env` object out of an arg vec.
+    fn pinned_env(args: &[String]) -> serde_json::Value {
+        let idx = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings injected");
+        let payload: serde_json::Value = serde_json::from_str(&args[idx + 1]).unwrap();
+        payload["env"].clone()
+    }
+
+    #[test]
+    fn test_inject_claude_env_pin_prepends_settings() {
+        let env = HashMap::from([(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://127.0.0.1:4123".to_string(),
+        )]);
+        let args = vec!["--teammate-mode".to_string(), "in-process".to_string()];
+        let result = inject_claude_env_pin(&env, &env, args);
+        assert_eq!(result[0], "--settings");
+        assert_eq!(
+            result[2..],
+            ["--teammate-mode".to_string(), "in-process".to_string()]
+        );
+        assert_eq!(
+            pinned_env(&result)["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:4123"
+        );
+    }
+
+    #[test]
+    fn test_inject_claude_env_pin_keys_from_aivo_values_from_final() {
+        // aivo overwrote BASE_URL + MODEL; ANTHROPIC_SMALL_FAST_MODEL is a shell var aivo never touched.
+        let aivo_env = HashMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                PLACEHOLDER_LOOPBACK_URL.to_string(),
+            ),
+            ("ANTHROPIC_MODEL".to_string(), "glm-4.6".to_string()),
+        ]);
+        let final_env = HashMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:4123".to_string(),
+            ),
+            ("ANTHROPIC_MODEL".to_string(), "glm-4.6".to_string()),
+            (
+                "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
+                "haiku".to_string(),
+            ),
+        ]);
+        let pinned = pinned_env(&inject_claude_env_pin(&aivo_env, &final_env, vec![]));
+        // value comes from the port-patched final env, not the placeholder
+        assert_eq!(pinned["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4123");
+        assert_eq!(pinned["ANTHROPIC_MODEL"], "glm-4.6");
+        // inherited shell var aivo never set must NOT be elevated over settings.json
+        assert!(pinned.get("ANTHROPIC_SMALL_FAST_MODEL").is_none());
+    }
+
+    #[test]
+    fn test_inject_claude_env_pin_excludes_secrets_and_internals() {
+        let env = HashMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:4123".to_string(),
+            ),
+            ("ANTHROPIC_API_KEY".to_string(), String::new()),
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "tok".to_string()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "oauth".to_string()),
+            ("BASH_DEFAULT_TIMEOUT_MS".to_string(), "2400000".to_string()),
+            (
+                "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER".to_string(),
+                "1".to_string(),
+            ),
+        ]);
+        let pinned = pinned_env(&inject_claude_env_pin(&env, &env, vec![]));
+        // empty API key is pinned — suppresses a user's stray key, exposes no secret
+        assert_eq!(pinned["ANTHROPIC_API_KEY"], "");
+        // every aivo-overwritten var aivo set gets pinned, including preference vars
+        assert_eq!(pinned["BASH_DEFAULT_TIMEOUT_MS"], "2400000");
+        // bearer tokens stay in the owner-only env, never argv (ps leak)
+        assert!(pinned.get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert!(pinned.get("CLAUDE_CODE_OAUTH_TOKEN").is_none());
+        // AIVO_* internals aren't read by Claude (and some carry secrets)
+        assert!(pinned.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER").is_none());
+    }
+
+    #[test]
+    fn test_inject_claude_env_pin_drops_user_overridden_api_key() {
+        // a user `--env` override turns the empty suppressor into a real key — keep it out of the argv payload.
+        let aivo_env = HashMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:4123".to_string(),
+            ),
+            ("ANTHROPIC_API_KEY".to_string(), String::new()),
+        ]);
+        let final_env = HashMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:4123".to_string(),
+            ),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string()),
+        ]);
+        let pinned = pinned_env(&inject_claude_env_pin(&aivo_env, &final_env, vec![]));
+        assert_eq!(pinned["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4123");
+        assert!(pinned.get("ANTHROPIC_API_KEY").is_none());
+    }
+
+    #[test]
+    fn test_inject_claude_env_pin_noop_without_pinned_vars() {
+        // only an AIVO_* internal — nothing Claude-facing to pin
+        let env = HashMap::from([("AIVO_USE_ROUTER".to_string(), "1".to_string())]);
+        let args = vec!["-p".to_string(), "hi".to_string()];
+        let result = inject_claude_env_pin(&env, &env, args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_inject_claude_env_pin_respects_user_settings() {
+        let env = HashMap::from([(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://127.0.0.1:4123".to_string(),
+        )]);
+        let args = vec!["--settings".to_string(), "/my/settings.json".to_string()];
+        let result = inject_claude_env_pin(&env, &env, args.clone());
+        assert_eq!(result, args);
+
+        let args = vec!["--settings=/my/settings.json".to_string()];
+        let result = inject_claude_env_pin(&env, &env, args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[tokio::test]
+    async fn build_runtime_args_pins_env_for_claude() {
+        let env = HashMap::from([(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://127.0.0.1:4123".to_string(),
+        )]);
+        let runtime = build_runtime_args(AIToolType::Claude, &[], None, None, &env, &env)
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned_env(&runtime.args)["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:4123"
+        );
+        // pin and teammate-mode injection coexist
+        assert!(runtime.args.iter().any(|a| a == "--teammate-mode"));
     }
 
     #[test]
@@ -1226,7 +1433,7 @@ mod tests {
     async fn opencode_prompt_passes_through_build_runtime_args() {
         let args = vec!["explain this code".to_string()];
         let env = HashMap::new();
-        let result = build_runtime_args(AIToolType::Opencode, &args, None, None, &env)
+        let result = build_runtime_args(AIToolType::Opencode, &args, None, None, &env, &env)
             .await
             .unwrap();
         assert_eq!(result.args, vec!["explain this code"]);

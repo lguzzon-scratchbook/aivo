@@ -304,6 +304,7 @@ impl AILauncher {
             resolved.model.as_deref(),
             resolved.codex_app_models.as_deref(),
             &runtime.env,
+            &resolved.tool_config.env_vars,
         )
         .await?;
 
