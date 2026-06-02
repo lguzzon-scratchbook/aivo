@@ -7,6 +7,7 @@ pub mod commands;
 pub mod constants;
 pub mod errors;
 pub mod key_resolution;
+pub mod plugin;
 pub mod run;
 pub mod services;
 pub mod style;

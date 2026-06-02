@@ -8,13 +8,13 @@ use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum KeyResolution {
+pub enum KeyResolution {
     Selected(ApiKey),
     Cancelled,
     MissingAuth,
 }
 
-pub(crate) enum KeyLookupMode {
+pub enum KeyLookupMode {
     RequireActiveOrPrompt,
     PreferActiveAllowNone,
 }
@@ -31,7 +31,7 @@ pub(crate) fn key_or_exit(result: anyhow::Result<KeyResolution>) -> Option<ApiKe
     }
 }
 
-pub(crate) async fn resolve_key_override(
+pub async fn resolve_key_override(
     session_store: &SessionStore,
     key_flag: Option<&str>,
     mode: KeyLookupMode,

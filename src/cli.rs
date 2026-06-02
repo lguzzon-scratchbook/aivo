@@ -75,6 +75,10 @@ pub enum Commands {
     /// Inspect or manage cached HuggingFace GGUF files
     Hf(HfArgs),
 
+    /// Install, list, or remove plugins (sibling `aivo-<name>` binaries)
+    #[command(alias = "plugin")]
+    Plugins(PluginsArgs),
+
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
@@ -182,6 +186,66 @@ pub struct HfRmArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct HfCleanArgs {
+    /// Skip the confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+/// Arguments for `aivo plugins`. No subcommand → defaults to `list`. Plugins
+/// are sibling `aivo-<name>` executables; `aivo <name>` runs the matching one.
+#[derive(Args, Debug, Clone)]
+pub struct PluginsArgs {
+    #[command(subcommand)]
+    pub command: Option<PluginsSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PluginsSubcommand {
+    /// List installed plugins and where each resolves
+    #[command(alias = "ls")]
+    List,
+
+    /// Install a plugin from a local file or an http(s):// URL
+    Install(PluginInstallArgs),
+
+    /// Re-install a plugin from the source it was installed from
+    Update(PluginUpdateArgs),
+
+    /// Remove an installed plugin by name
+    #[command(alias = "rm")]
+    Remove(PluginRemoveArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PluginInstallArgs {
+    /// Path to a local executable, or an `http(s)://` URL to download.
+    #[arg(value_name = "PATH_OR_URL", value_parser = non_empty())]
+    pub source: String,
+
+    /// Plugin name (default: inferred from the source file name). The binary
+    /// is stored as `aivo-<name>` and invoked as `aivo <name>`.
+    #[arg(long, value_name = "NAME", value_parser = non_empty())]
+    pub name: Option<String>,
+
+    /// Overwrite an existing plugin of the same name.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PluginUpdateArgs {
+    /// Plugin to update, with or without the `aivo-` prefix. Omit to update
+    /// every plugin with a recorded install source.
+    #[arg(value_name = "NAME", value_parser = non_empty())]
+    pub name: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PluginRemoveArgs {
+    /// Plugin name, with or without the `aivo-` prefix (e.g. `amp`).
+    #[arg(value_name = "NAME", value_parser = non_empty())]
+    pub name: String,
+
     /// Skip the confirmation prompt.
     #[arg(short = 'y', long)]
     pub yes: bool,

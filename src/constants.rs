@@ -54,6 +54,8 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "mcp-serve",
     "share",
     "hf",
+    "plugins",
+    "plugin",
     // Shortcut keywords rewritten in `rewrite_cli_args`
     "use",
     "ping",

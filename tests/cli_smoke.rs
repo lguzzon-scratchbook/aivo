@@ -211,3 +211,193 @@ fn cursor_key_and_models_use_cursor_agent() {
     assert_eq!(payload["models"][0]["id"], "composer-2.5");
     assert_eq!(payload["models"][1]["id"], "gpt-5");
 }
+
+#[cfg(unix)]
+fn fake_plugin(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.path().join(name);
+    std::fs::write(&path, body).expect("write fake plugin");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// Echoes its argv + the handoff env vars, then exits 7 so we can assert the
+/// child's exit code propagates through aivo.
+#[cfg(unix)]
+const PLUGIN_ECHO: &str = "#!/bin/sh\n\
+echo \"ARGS: $*\"\n\
+echo \"CONFIG: $AIVO_CONFIG_DIR\"\n\
+echo \"DEBUGLOG: $AIVO_DEBUG_LOG\"\n\
+exit 7\n";
+
+#[cfg(unix)]
+#[test]
+fn plugin_dispatch_forwards_args_env_and_exit_code() {
+    let home = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    fake_plugin(&bin, "aivo-foo", PLUGIN_ECHO);
+
+    let mut cmd = aivo(&home);
+    prepend_path(&mut cmd, bin.path());
+    let output = cmd
+        .args(["foo", "trust", "list"])
+        .output()
+        .expect("spawn aivo foo");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(7), "stdout:\n{stdout}");
+    assert!(stdout.contains("ARGS: trust list"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains(".config/aivo"),
+        "config dir must be handed to the plugin\nstdout:\n{stdout}"
+    );
+    // No --debug → AIVO_DEBUG_LOG unset.
+    assert!(!stdout.contains(".jsonl"), "stdout:\n{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_dispatch_via_run_form_and_debug_handoff() {
+    let home = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    fake_plugin(&bin, "aivo-foo", PLUGIN_ECHO);
+
+    // `aivo run foo …` forwards to the same sibling, stripping `run foo`.
+    let mut run_form = aivo(&home);
+    prepend_path(&mut run_form, bin.path());
+    let output = run_form
+        .args(["run", "foo", "--debug", "x"])
+        .output()
+        .expect("spawn aivo run foo");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(7), "stdout:\n{stdout}");
+    assert!(stdout.contains("ARGS: --debug x"), "stdout:\n{stdout}");
+    // `--debug` in the passthrough args → AIVO_DEBUG_LOG resolved for the plugin.
+    assert!(
+        stdout.contains(".jsonl"),
+        "--debug must yield a debug-log path\nstdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_never_shadows_a_builtin_command() {
+    let home = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    // A plugin colliding with the built-in `keys` must be ignored.
+    fake_plugin(&bin, "aivo-keys", "#!/bin/sh\necho PLUGIN_RAN\nexit 99\n");
+
+    let mut cmd = aivo(&home);
+    prepend_path(&mut cmd, bin.path());
+    let output = cmd
+        .args(["keys", "--json"])
+        .output()
+        .expect("spawn aivo keys");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("PLUGIN_RAN"),
+        "built-in `keys` must win over an aivo-keys plugin\nstdout:\n{stdout}"
+    );
+    // Built-in keys --json emits a JSON array.
+    serde_json::from_str::<Vec<Value>>(&stdout).expect("keys json");
+}
+
+#[cfg(unix)]
+#[test]
+fn plugins_install_makes_it_discoverable_then_remove() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let plugin_src = fake_plugin(
+        &src,
+        "aivo-greet",
+        "#!/bin/sh\necho \"greet: $*\"\nexit 0\n",
+    );
+
+    // Install from a local path → lands in ~/.config/aivo/plugins (name inferred).
+    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+
+    // It shows up in `plugins list`.
+    let list = run_ok(&home, &["plugins", "list"]);
+    assert!(list.contains("greet"), "list:\n{list}");
+
+    // It dispatches WITHOUT being on PATH — the managed dir is searched first.
+    let greet = run_ok(&home, &["greet", "hi", "there"]);
+    assert!(greet.contains("greet: hi there"), "greet:\n{greet}");
+
+    // Remove it (-y: the test runs non-interactively); it leaves the listing.
+    run_ok(&home, &["plugins", "remove", "greet", "-y"]);
+    let after = run_ok(&home, &["plugins", "list"]);
+    assert!(!after.contains("greet"), "after:\n{after}");
+}
+
+#[cfg(unix)]
+#[test]
+fn plugins_remove_without_yes_is_non_interactive_safe() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let plugin_src = fake_plugin(&src, "aivo-greet", "#!/bin/sh\nexit 0\n");
+    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+
+    // No -y and no TTY → refuse rather than delete; the plugin survives.
+    let output = aivo(&home)
+        .args(["plugins", "remove", "greet"])
+        .output()
+        .expect("spawn aivo plugins remove");
+    assert!(
+        !output.status.success(),
+        "must refuse without --yes when non-interactive"
+    );
+    assert!(run_ok(&home, &["plugins", "list"]).contains("greet"));
+}
+
+#[cfg(unix)]
+#[test]
+fn plugins_install_rejects_a_reserved_name() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let plugin_src = fake_plugin(&src, "aivo-x", "#!/bin/sh\nexit 0\n");
+
+    let output = aivo(&home)
+        .args([
+            "plugins",
+            "install",
+            plugin_src.to_str().unwrap(),
+            "--name",
+            "keys",
+        ])
+        .output()
+        .expect("spawn aivo plugins install");
+    assert!(
+        !output.status.success(),
+        "installing under a built-in name must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("built-in"), "stderr:\n{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn plugins_update_reinstalls_from_recorded_source() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+
+    // Install v1 from a local path; aivo records the source.
+    fake_plugin(&src, "aivo-greet", "#!/bin/sh\necho v1\n");
+    let plugin_src = src.path().join("aivo-greet");
+    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+    assert!(run_ok(&home, &["greet"]).contains("v1"));
+
+    // Change the source on disk, then `update` re-fetches from it.
+    fake_plugin(&src, "aivo-greet", "#!/bin/sh\necho v2\n");
+    run_ok(&home, &["plugins", "update", "greet"]);
+    assert!(
+        run_ok(&home, &["greet"]).contains("v2"),
+        "update should pick up the rebuilt source"
+    );
+}

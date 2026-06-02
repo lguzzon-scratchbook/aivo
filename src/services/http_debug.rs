@@ -303,7 +303,7 @@ pub(crate) static DEBUG_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new
 /// `environment_injector` consults this to force routing through the local
 /// bridge for native-protocol upstreams (otherwise the child tool talks
 /// straight to upstream and `--debug` captures nothing).
-pub(crate) fn is_debug_active() -> bool {
+pub fn is_debug_active() -> bool {
     #[cfg(test)]
     if FORCE_DEBUG_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
         return true;

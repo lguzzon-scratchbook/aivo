@@ -15,13 +15,14 @@ use crate::cli_args::{
 };
 use crate::commands::{
     self, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LogsCommand, ModelsCommand,
-    RunCommand, ServeCommand, ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand,
-    UpdateCommand,
+    PluginsCommand, RunCommand, ServeCommand, ServeParams, ShareCommand, StartCommand,
+    StartFlowArgs, StatsCommand, UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
     KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override, resolve_key_override_info,
 };
+use crate::plugin;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::environment_injector::ClaudeSlotFlags;
 use crate::services::key_compat::KeyCompatContext;
@@ -107,6 +108,14 @@ pub async fn run() -> ! {
         std::collections::HashMap::new()
     };
 
+    // Route an unowned `aivo <name>` / `aivo run <name>` to its `aivo-<name>`
+    // plugin before clap can reject it (see `crate::plugin`).
+    if let Some(code) =
+        plugin::try_dispatch(&raw_args, &bundle_index, session_store.config_dir()).await
+    {
+        process::exit(code);
+    }
+
     let args = Cli::parse_from(rewrite_cli_args(raw_args, &bundle_index));
 
     // Handle --version and subcommand --help early, before any further service initialization.
@@ -137,6 +146,7 @@ pub async fn run() -> ! {
             Commands::Stats(_) => StatsCommand::print_help(),
             Commands::Update(_) => UpdateCommand::print_help(),
             Commands::Hf(_) => crate::commands::hf::HfCommand::print_help(),
+            Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
         }
         process::exit(0);
@@ -690,6 +700,11 @@ pub async fn run() -> ! {
             command.execute(hf_args).await
         }
 
+        Commands::Plugins(plugin_args) => {
+            let command = PluginsCommand::new();
+            command.execute(plugin_args).await
+        }
+
         Commands::Share(share_args) => {
             let command = ShareCommand::new(session_store);
             command.execute(share_args).await
@@ -762,6 +777,7 @@ fn print_help() {
     print_cmd("hf", "Manage cached HuggingFace GGUF files");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
+    print_cmd("plugins", "Install, list, or remove plugins");
     print_cmd("update", "Update to the latest version");
     println!();
 
@@ -784,6 +800,17 @@ fn print_help() {
         println!("  {alias_col}  {expansion:<expansion_width$}  {hint_col}");
     }
     println!();
+
+    let plugins = plugin::installed_plugin_names();
+    if !plugins.is_empty() {
+        println!("{}", style::bold("Plugins:"));
+        for name in &plugins {
+            let name_col = style::cyan(format!("{name:<8}"));
+            let hint_col = style::dim(format!("(aivo-{name})"));
+            println!("  {name_col}  {hint_col}");
+        }
+        println!();
+    }
 
     println!("{}", style::bold("Examples:"));
     for cmd in [
@@ -901,6 +928,10 @@ fn print_help_json() {
             { "name": "AIVO_SHARE_BASE_URL", "desc": "Override the public tunnel endpoint used by `aivo logs share`" },
             { "name": "AIVO_DEBUG", "desc": "Surface upstream HTTP request/response detail in some flows (=1)" }
         ],
+        "plugins": plugin::installed_plugin_names()
+            .into_iter()
+            .map(|name| json!({ "name": name, "binary": format!("aivo-{name}") }))
+            .collect::<Vec<_>>(),
         "tree": tree,
     });
     match serde_json::to_string_pretty(&payload) {
