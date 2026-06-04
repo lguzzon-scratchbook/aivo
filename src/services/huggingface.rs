@@ -1539,8 +1539,18 @@ fn quant_tag_of(filename: &str) -> Option<String> {
     quant_from_filename(filename)
 }
 
-/// Best-effort top-3 GGUF mirror search. Returns empty on any error so
+/// How many mirror suggestions to surface in the picker (it's type-to-filter,
+/// so a handful is plenty without crowding the terminal).
+const MIRROR_SUGGESTION_LIMIT: usize = 8;
+
+/// Best-effort GGUF mirror search for the picker. Returns empty on any error so
 /// the error path renders even when the network is flaky.
+///
+/// Uses HuggingFace's default *relevance* ranking, NOT `sort=downloads`: a
+/// just-released model's GGUF mirrors all have ~0 downloads, so download-sorting
+/// buries the correct-version converts under older same-family repos (e.g. a
+/// `gemma-4` query returned only `gemma-3` repos). Trusted converters are then
+/// floated to the top of the relevance order.
 async fn search_gguf_mirrors(basename: &str) -> Vec<String> {
     #[derive(Deserialize)]
     struct SearchHit {
@@ -1550,7 +1560,7 @@ async fn search_gguf_mirrors(basename: &str) -> Vec<String> {
     }
 
     let url = format!(
-        "https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=10",
+        "https://huggingface.co/api/models?search={}&limit=20",
         urlencode(&format!("{basename} GGUF"))
     );
     let client = http_utils::router_http_client();
@@ -1565,14 +1575,39 @@ async fn search_gguf_mirrors(basename: &str) -> Vec<String> {
     };
     // HF's `gguf` tag coverage is patchy for older uploads — fall back
     // to a name-substring match.
-    hits.into_iter()
+    let ids: Vec<String> = hits
+        .into_iter()
         .filter(|h| {
             h.tags.iter().any(|t| t.eq_ignore_ascii_case("gguf"))
                 || h.id.to_ascii_uppercase().contains("GGUF")
         })
-        .take(3)
         .map(|h| h.id)
-        .collect()
+        .collect();
+    rank_gguf_mirrors(ids)
+}
+
+/// Stable-promotes well-known converters ahead of noisier community uploads
+/// (preserving relevance order within each group), then truncates. Never
+/// excludes anything — only reorders.
+fn rank_gguf_mirrors(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort_by_key(|id| !is_trusted_gguf_converter(id));
+    ids.truncate(MIRROR_SUGGESTION_LIMIT);
+    ids
+}
+
+/// Owners that reliably publish faithful GGUF conversions. Used only to order
+/// the mirror picker.
+fn is_trusted_gguf_converter(id: &str) -> bool {
+    const TRUSTED: &[&str] = &[
+        "unsloth",
+        "ggml-org",
+        "bartowski",
+        "lmstudio-community",
+        "google",
+        "TheBloke",
+    ];
+    let owner = id.split('/').next().unwrap_or("");
+    TRUSTED.iter().any(|t| owner.eq_ignore_ascii_case(t))
 }
 
 /// Minimal percent-encoder for query strings; avoids a percent-encode dep.
@@ -2993,5 +3028,45 @@ mod tests {
         let blank = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(blank.path(), "\n  \n").unwrap();
         assert_eq!(read_hf_token_file(Some(blank.path().to_path_buf())), None);
+    }
+
+    #[test]
+    fn is_trusted_gguf_converter_matches_owner_only() {
+        assert!(is_trusted_gguf_converter("unsloth/gemma-4-12b-it-GGUF"));
+        assert!(is_trusted_gguf_converter("bartowski/whatever-GGUF"));
+        assert!(is_trusted_gguf_converter("LMStudio-Community/x")); // case-insensitive
+        assert!(!is_trusted_gguf_converter(
+            "llmfan46/gemma-3-uncensored-GGUF"
+        ));
+        // "unsloth" must be the owner, not a substring of the repo name.
+        assert!(!is_trusted_gguf_converter("someone/unsloth-clone-GGUF"));
+    }
+
+    #[test]
+    fn rank_gguf_mirrors_floats_trusted_then_truncates() {
+        // Mimics the relevance-ordered, download-blind result for a fresh model:
+        // trusted converters interleaved with noise; order preserved per group.
+        let ids = vec![
+            "Dampfinchen/gemma-3-12b-it-qat-q4_0-gguf-small-fix".to_string(),
+            "unsloth/gemma-4-12b-it-GGUF".to_string(),
+            "llmfan46/gemma-3-12b-it-heretic-GGUF".to_string(),
+            "bartowski/gemma-4-12B-it-GGUF".to_string(),
+        ];
+        let ranked = rank_gguf_mirrors(ids);
+        assert_eq!(
+            ranked,
+            vec![
+                "unsloth/gemma-4-12b-it-GGUF".to_string(),
+                "bartowski/gemma-4-12B-it-GGUF".to_string(),
+                "Dampfinchen/gemma-3-12b-it-qat-q4_0-gguf-small-fix".to_string(),
+                "llmfan46/gemma-3-12b-it-heretic-GGUF".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_gguf_mirrors_truncates_to_limit() {
+        let ids: Vec<String> = (0..20).map(|i| format!("owner{i}/m-GGUF")).collect();
+        assert_eq!(rank_gguf_mirrors(ids).len(), MIRROR_SUGGESTION_LIMIT);
     }
 }
