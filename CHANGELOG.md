@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.26.0
+
+### Features
+
+- Plugins: external-subcommand plugins (`aivo <x>` → `aivo-<x>` sibling) with managed `install`/`update`/`remove`.
+- Plugins: surface plugin-tool runs in `aivo logs` and clean up the share message.
+- `aivo cursor`: honor JSON-output requests on the cursor bridge.
+- `aivo hf`: authenticate to HuggingFace for gated/private GGUF repos (`HF_TOKEN` and friends).
+
+### Fixes
+
+- `aivo hf`: rank GGUF mirrors by relevance instead of download count.
+- `aivo hf`: don't pin a failed pull to its source; add `--refresh` to re-resolve.
+- `aivo pi`: create a writable temp bin dir on first-time use.
+- `aivo claude`: pin aivo-overwritten env via `--settings` so `settings.json` can't shadow the injected routing/model.
+
+
 ## v0.25.1
 
 - Per-`(tool, key, model)` protocol routes: each tool/model learns and persists its own wire format, seeded from tool-native priors.
