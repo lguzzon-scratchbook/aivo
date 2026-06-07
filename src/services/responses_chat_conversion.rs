@@ -118,22 +118,13 @@ pub fn convert_responses_to_chat_request(
         messages.push(json!({"role": "system", "content": instructions}));
     }
 
-    // Standard Responses-API `type:"reasoning"` items sit on their own,
-    // immediately before the assistant message or function_call they belong
-    // to. Buffer their text and attach as `reasoning_content` on the next
-    // assistant-side Chat message so deepseek-thinking and similar upstreams
-    // don't reject the turn with "The reasoning_content in the thinking mode
-    // must be passed back to the API." Falls back to the non-standard
-    // `item.reasoning_content` field carried by aivo's own Chat → Responses
-    // round-trip when no standalone reasoning item was provided.
+    // A DeepSeek thinking-mode turn arrives split across Responses items
+    // (reasoning + message + one function_call per parallel call); re-merge
+    // them into ONE Chat assistant message, else strict upstreams reject the
+    // split (tool results detached from their call, reasoning_content dropped).
+    // `current_assistant` indexes the open turn; non-assistant items close it.
     let mut pending_reasoning: String = String::new();
-    fn take_pending(buf: &mut String) -> Option<String> {
-        if buf.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(buf))
-        }
-    }
+    let mut current_assistant: Option<usize> = None;
 
     // Convert "input" array items
     if let Some(input) = body.get("input").and_then(|v| v.as_array()) {
@@ -163,19 +154,21 @@ pub fn convert_responses_to_chat_request(
                     // collapses to a string when no non-text part is present so
                     // the wire format is unchanged for the common case.
                     let content = convert_responses_content_to_chat(item.get("content"));
-                    let mut msg = json!({"role": role, "content": content});
                     if role == "assistant" {
-                        if let Some(rc) = take_pending(&mut pending_reasoning) {
-                            msg["reasoning_content"] = json!(rc);
-                        } else {
-                            attach_reasoning_content(
-                                &mut msg,
-                                item,
-                                config.requires_reasoning_content,
-                            );
-                        }
+                        // Fold text emitted alongside tool calls into the open
+                        // turn instead of splitting it into its own message.
+                        let idx = open_assistant_turn(&mut messages, &mut current_assistant);
+                        fold_assistant_content(&mut messages[idx]["content"], content);
+                        flush_reasoning_into(
+                            &mut messages[idx],
+                            &mut pending_reasoning,
+                            item,
+                            config.requires_reasoning_content,
+                        );
+                    } else {
+                        current_assistant = None;
+                        messages.push(json!({"role": role, "content": content}));
                     }
-                    messages.push(msg);
                 }
                 Some("function_call") => {
                     // Use call_id as the Chat Completions tool_calls[].id so it matches
@@ -192,50 +185,22 @@ pub fn convert_responses_to_chat_request(
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
                     let tool_call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
-                    // Coalesce parallel calls: when the previous item was also a
-                    // function_call, append to that assistant message's
-                    // tool_calls array instead of starting a new one. Chat
-                    // Completions requires every assistant tool_calls message to
-                    // be immediately followed by tool messages — splitting
-                    // parallel calls across two assistant messages produces
-                    // "insufficient tool messages following tool_calls message"
-                    // from strict OpenAI validators.
-                    if let Some(last) = messages.last_mut()
-                        && last.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                        && last.get("content").is_some_and(|c| c.is_null())
-                        && let Some(arr) = last.get_mut("tool_calls").and_then(|v| v.as_array_mut())
-                    {
-                        arr.push(tool_call);
-                        if last.get("reasoning_content").is_none() {
-                            if let Some(rc) = take_pending(&mut pending_reasoning) {
-                                last["reasoning_content"] = json!(rc);
-                            } else {
-                                attach_reasoning_content(
-                                    last,
-                                    item,
-                                    config.requires_reasoning_content,
-                                );
-                            }
-                        }
-                    } else {
-                        let mut msg = json!({
-                            "role": "assistant",
-                            "content": null,
-                            "tool_calls": [tool_call]
-                        });
-                        if let Some(rc) = take_pending(&mut pending_reasoning) {
-                            msg["reasoning_content"] = json!(rc);
-                        } else {
-                            attach_reasoning_content(
-                                &mut msg,
-                                item,
-                                config.requires_reasoning_content,
-                            );
-                        }
-                        messages.push(msg);
+                    // Append to the open turn so parallel calls and post-narration calls share one message.
+                    let idx = open_assistant_turn(&mut messages, &mut current_assistant);
+                    let msg = &mut messages[idx];
+                    match msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+                        Some(arr) => arr.push(tool_call),
+                        None => msg["tool_calls"] = json!([tool_call]),
                     }
+                    flush_reasoning_into(
+                        msg,
+                        &mut pending_reasoning,
+                        item,
+                        config.requires_reasoning_content,
+                    );
                 }
                 Some("function_call_output") => {
+                    current_assistant = None;
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                     let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
                     messages
@@ -244,6 +209,7 @@ pub fn convert_responses_to_chat_request(
                 None => {
                     // Simple string input
                     if let Some(s) = item.as_str() {
+                        current_assistant = None;
                         messages.push(json!({"role": "user", "content": s}));
                     }
                 }
@@ -332,6 +298,56 @@ fn attach_reasoning_content(msg: &mut Value, source: &Value, requires: bool) {
         .or_else(|| requires.then(|| " ".to_string()));
     if let Some(rc) = rc {
         msg["reasoning_content"] = json!(rc);
+    }
+}
+
+/// Returns the index of the open assistant turn, opening a fresh assistant
+/// message (null content) if none is active.
+fn open_assistant_turn(messages: &mut Vec<Value>, current: &mut Option<usize>) -> usize {
+    if let Some(idx) = *current {
+        return idx;
+    }
+    messages.push(json!({"role": "assistant", "content": null}));
+    let idx = messages.len() - 1;
+    *current = Some(idx);
+    idx
+}
+
+/// Drains buffered standalone-`reasoning` text onto an open assistant turn.
+/// Appends to reasoning already collected for the turn (so a reasoning item
+/// arriving mid-turn isn't carried to a later message) and upgrades a
+/// single-space sentinel to real text. With nothing buffered, falls back to
+/// the item's own non-standard `reasoning_content` field (or the sentinel the
+/// provider requires).
+fn flush_reasoning_into(msg: &mut Value, pending: &mut String, source: &Value, requires: bool) {
+    if pending.is_empty() {
+        if msg.get("reasoning_content").is_none() {
+            attach_reasoning_content(msg, source, requires);
+        }
+        return;
+    }
+    let rc = std::mem::take(pending);
+    match msg.get("reasoning_content").and_then(|v| v.as_str()) {
+        Some(existing) if !existing.is_empty() && existing != " " => {
+            msg["reasoning_content"] = json!(format!("{existing}\n{rc}"));
+        }
+        _ => msg["reasoning_content"] = json!(rc),
+    }
+}
+
+/// Folds assistant text into an open turn's `content`: two strings append with
+/// a newline, and a null/empty existing value adopts the addition. Assistant
+/// turns here are text-only, so the exotic cases where either side is a
+/// multimodal array keep the existing value and drop the addition.
+fn fold_assistant_content(existing: &mut Value, addition: Value) {
+    match existing {
+        Value::String(s) if !s.is_empty() => {
+            if let Some(add) = addition.as_str().filter(|a| !a.is_empty()) {
+                *existing = Value::String(format!("{s}\n{add}"));
+            }
+        }
+        Value::Null | Value::String(_) => *existing = addition,
+        _ => {}
     }
 }
 
@@ -1926,6 +1942,53 @@ mod tests {
         let tool_calls = msgs[0]["tool_calls"].as_array().unwrap();
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(msgs[0]["reasoning_content"], "shared trace");
+    }
+
+    #[test]
+    fn test_convert_request_merges_assistant_text_alongside_tool_call() {
+        // Codex replays a content+tool_calls turn as separate message and
+        // function_call items; they must re-merge so strict upstreams accept it.
+        let body = json!({
+            "model": "deepseek-thinking",
+            "input": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "why"}]},
+                {"type": "message", "role": "assistant", "content": "Checking that file."},
+                {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "one assistant turn + one tool result");
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["content"], "Checking that file.");
+        assert_eq!(msgs[0]["reasoning_content"], "why");
+        let tool_calls = msgs[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "c1");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn test_convert_request_does_not_coalesce_tool_calls_across_user_boundary() {
+        // A user message between two tool calls closes the first assistant turn;
+        // the second call must start a fresh assistant message.
+        let body = json!({
+            "model": "deepseek-thinking",
+            "input": [
+                {"type": "function_call", "call_id": "a", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "a", "output": "r"},
+                {"type": "message", "role": "user", "content": "next"},
+                {"type": "function_call", "call_id": "b", "name": "g", "arguments": "{}"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        let assistants: Vec<_> = msgs.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants[0]["tool_calls"][0]["id"], "a");
+        assert_eq!(assistants[1]["tool_calls"][0]["id"], "b");
     }
 
     #[test]
