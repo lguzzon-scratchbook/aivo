@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.27.0
+
+- feat(plugins): typed plugins + capability-gated key/endpoint handoff (33734f6)
+- feat(stats): filter by tool with --by, dropping the positional (af2b2f0)
+- fix(responses): merge split assistant turn into one Chat message (446e370)
+- fix(router): learn requires_reasoning_content from the streaming bail (5144df3)
+- fix(pi): install maintained @earendil-works/pi-coding-agent (b407cad)
+- test(share): gate Unix-only pi transcript test on cfg(unix) (873b26a)
+
+
 ## v0.26.0
 
 ### Features
