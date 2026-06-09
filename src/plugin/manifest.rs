@@ -64,12 +64,14 @@ pub(crate) struct PluginManifest {
     pub requires: Vec<Requirement>,
 }
 
-/// A plugin's transcript location, for `aivo share`. `format` must be a session
-/// format aivo already reads (`pi`, `codex`, `gemini`, `opencode`); `dir` is the
-/// sessions root (a leading `~` is expanded).
+/// A plugin's transcript source for `aivo share`: either a built-in `format`
+/// (`pi`/`codex`/`gemini`/`opencode`) aivo reads from `dir`, or `format:
+/// "native"` — the plugin emits its own transcript via `--aivo-export-transcript`
+/// (no `dir`), keeping its own `source_cli`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TranscriptSource {
     pub format: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dir: String,
 }
 

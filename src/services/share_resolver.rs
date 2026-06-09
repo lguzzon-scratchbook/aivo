@@ -35,11 +35,14 @@ use crate::services::share_payload::{
 };
 use crate::services::system_env;
 
-/// A plugin tool's transcript source: a format aivo can read + the sessions
-/// root. Lets `aivo share` resolve a plugin run by reusing a built-in reader.
+/// A plugin tool's transcript source: a built-in `format` aivo reads from `dir`,
+/// or `format == "native"` (the plugin emits its own via `bin
+/// --aivo-export-transcript`). Lets `aivo share` resolve a plugin run.
 pub struct PluginTranscript {
     pub format: String,
     pub dir: PathBuf,
+    /// The `aivo-<name>` binary for `native` export; `None` if not located.
+    pub bin: Option<PathBuf>,
 }
 
 /// Inputs the resolver needs that aren't on the user's command line. All
@@ -586,6 +589,10 @@ async fn find_opencode(db_path: &Path, session_id: &str) -> Vec<Match> {
 /// shareable. The `match` in `resolve_run_event` dispatches each to its reader.
 const SHAREABLE_PLUGIN_FORMATS: &[&str] = &["pi", "codex", "gemini", "opencode"];
 
+/// Sentinel `format` for a plugin that emits its own transcript (via
+/// `--aivo-export-transcript`) instead of using a built-in reader.
+const NATIVE_TRANSCRIPT_FORMAT: &str = "native";
+
 /// The sessions root for a run: the plugin's declared dir, or the native default.
 fn reader_root<'a>(plugin_src: Option<&'a PluginTranscript>, default: &'a Path) -> &'a Path {
     plugin_src.map_or(default, |s| s.dir.as_path())
@@ -611,12 +618,28 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     } else {
         ctx.plugin_transcripts.get(tool)
     };
+    let run_cwd: String = entry
+        .cwd
+        .clone()
+        .unwrap_or_else(|| ctx.project_root.to_string_lossy().to_string());
+    let run_ts = parse_log_timestamp(&entry.ts_utc);
     if !is_native {
         match plugin_src {
             None => {
                 return Err(anyhow!(
                     "'{tool}' is a plugin tool — aivo logs its launches but doesn't store a transcript, so this run can't be shared"
                 ));
+            }
+            // `native`: the plugin emits its own transcript for this run.
+            Some(src) if src.format == NATIVE_TRANSCRIPT_FORMAT => {
+                return export_native_plugin_transcript(
+                    src,
+                    tool,
+                    &run_cwd,
+                    &entry.ts_utc,
+                    ctx.session_store.config_dir(),
+                )
+                .await;
             }
             Some(src) if !SHAREABLE_PLUGIN_FORMATS.contains(&src.format.as_str()) => {
                 return Err(anyhow!(
@@ -628,11 +651,6 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
             _ => {}
         }
     }
-    let run_cwd: String = entry
-        .cwd
-        .clone()
-        .unwrap_or_else(|| ctx.project_root.to_string_lossy().to_string());
-    let run_ts = parse_log_timestamp(&entry.ts_utc);
 
     // Native CLIs: project-scoped enumeration, then closest-mtime match within
     // the matching cli.
@@ -705,6 +723,48 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     });
     let closest = candidates[0];
     extract_thread_full(closest).await
+}
+
+/// Run `aivo-<name> --aivo-export-transcript --cwd <cwd> --ts <ts_utc>` and parse
+/// the one `SharePayload` JSON it prints. Best-effort with a hard timeout —
+/// missing binary, non-zero exit, timeout, or bad output all become a share error.
+async fn export_native_plugin_transcript(
+    src: &PluginTranscript,
+    tool: &str,
+    run_cwd: &str,
+    run_ts_utc: &str,
+    config_dir: &Path,
+) -> Result<SharePayload> {
+    let bin = src.bin.as_deref().ok_or_else(|| {
+        anyhow!("'{tool}' declares a native transcript but aivo couldn't locate its binary")
+    })?;
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--aivo-export-transcript")
+        .arg("--cwd")
+        .arg(run_cwd)
+        .arg("--ts")
+        .arg(run_ts_utc)
+        // Plugin reads its own store; same config dir dispatch hands children.
+        .env("AIVO_CONFIG_DIR", config_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("launching '{tool}' transcript export failed: {e}"))?;
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow!("'{tool}' transcript export timed out"))?
+        .map_err(|e| anyhow!("'{tool}' transcript export failed: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "'{tool}' transcript export exited with {}",
+            out.status
+        ));
+    }
+    serde_json::from_slice::<SharePayload>(&out.stdout)
+        .map_err(|e| anyhow!("'{tool}' produced an invalid transcript: {e}"))
 }
 
 async fn infer_chat_session_id(entry: &LogEntry, ctx: &ResolverContext) -> Result<String> {
@@ -1036,6 +1096,7 @@ mod tests {
             PluginTranscript {
                 format: "pi".to_string(),
                 dir: omp_root,
+                bin: None,
             },
         );
 
@@ -1126,6 +1187,7 @@ mod tests {
             PluginTranscript {
                 format: "opencode".to_string(),
                 dir: plugin_db,
+                bin: None,
             },
         );
 
@@ -1145,5 +1207,60 @@ mod tests {
 
         let err = resolve_session(&event_id, &ctx).await.unwrap_err();
         assert!(err.to_string().contains("doesn't store a transcript"));
+    }
+
+    /// A `native`-format plugin run is resolved by invoking the plugin's
+    /// `--aivo-export-transcript` subcommand and parsing the `SharePayload` it
+    /// prints — so the share carries the plugin's own `source_cli`, not a
+    /// borrowed format label. Uses a fake plugin binary (a shell script).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_native_plugin_run_event_invokes_export_subcommand() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("aivo-myplugin");
+        let payload_json = r#"{"schema_version":"1","source_cli":"myplugin","session_id":"T-native-1","project":{},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"text","text":"hello"}]}],"meta":{"aivo_version":"test","redacted":false,"live":false,"served_at":"2026-06-09T00:00:00Z"}}"#;
+        fs::write(
+            &bin,
+            format!("#!/bin/sh\ncat <<'JSON'\n{payload_json}\nJSON\n"),
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
+        ctx.plugin_transcripts.insert(
+            "myplugin".to_string(),
+            PluginTranscript {
+                format: "native".to_string(),
+                dir: PathBuf::new(),
+                bin: Some(bin),
+            },
+        );
+        let event_id = append_run_event(&ctx, "myplugin", &temp.path().to_string_lossy()).await;
+
+        let resolved = resolve_session(&event_id, &ctx).await.unwrap();
+        assert_eq!(resolved.payload.source_cli, "myplugin");
+        assert_eq!(resolved.payload.session_id, "T-native-1");
+        assert_eq!(resolved.payload.messages.len(), 2);
+    }
+
+    /// A `native` plugin whose binary can't be located fails with a clear error
+    /// rather than silently falling through to the native-CLI enumeration.
+    #[tokio::test]
+    async fn resolve_native_plugin_without_binary_errors() {
+        let temp = TempDir::new().unwrap();
+        let mut ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
+        ctx.plugin_transcripts.insert(
+            "myplugin".to_string(),
+            PluginTranscript {
+                format: "native".to_string(),
+                dir: PathBuf::new(),
+                bin: None,
+            },
+        );
+        let event_id = append_run_event(&ctx, "myplugin", &temp.path().to_string_lossy()).await;
+        let err = resolve_session(&event_id, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("couldn't locate its binary"));
     }
 }

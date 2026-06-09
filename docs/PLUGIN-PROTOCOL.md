@@ -265,18 +265,37 @@ selected.
 
 ## Transcripts (sharing)
 
-aivo records *that* a plugin ran (`aivo logs`/`aivo stats`), never the conversation — that lives in
-the agent's own session store. A plugin whose sessions use a format aivo already reads can opt in:
+aivo records *that* a plugin ran (`aivo logs`/`aivo stats`), never the conversation. A plugin opts
+into `aivo share <run-id>` by declaring a `transcripts` source, in one of two modes.
+
+**Built-in format** — the plugin's sessions already use a format aivo reads:
 
 ```jsonc
 "transcripts": { "format": "pi", "dir": "~/.omp/agent/sessions" }
 ```
 
-`format` ∈ `pi` | `codex` | `gemini` | `opencode`. For `pi`/`codex`/`gemini`, `dir` is the sessions
-root (leading `~` expanded); for `opencode`, `dir` is the path to the `opencode.db` SQLite file.
-`aivo share <run-id>` points the matching built-in reader at `dir`, matches the run by cwd + time,
-and emits the transcript. An undeclared or unknown format stays un-shareable — there's no generic
-reader.
+`format` ∈ `pi` | `codex` | `gemini` | `opencode`; `dir` is the sessions root (`~` expanded), or for
+`opencode` the path to `opencode.db`. aivo points the matching reader at `dir`, picks the run by
+cwd + time, and emits the transcript — **labeled with that format** (`source: pi`). A plugin that
+wants its own identity, or whose format aivo can't read, uses native export instead.
+
+**Native export** — `format: "native"` (no `dir`); the plugin emits its own transcript. aivo invokes
+(with `AIVO_CONFIG_DIR` set, stdin `/dev/null`):
+
+```
+aivo-<name> --aivo-export-transcript --cwd <run-cwd> --ts <run-ts-rfc3339>
+```
+
+The plugin picks the run's conversation (match on `--ts`, the run's start time, and/or `--cwd`) and
+prints **one `SharePayload` JSON** to stdout, exit `0` — owning every field, including `source_cli`
+and the full message/tool shape. Best-effort, **10s** timeout; a missing binary, non-zero exit,
+timeout, or unparseable output becomes a clear share error.
+
+`SharePayload` is the schema aivo serves over the tunnel: `source_cli`, `session_id`, `project`,
+`model`, `created_at`/`updated_at`, `meta`, and `messages[]` of `{role, content[], reasoning?}` —
+each content block one of `text` / `code` / `tool_call` / `tool_result` / `attachment`. aivo re-runs
+redaction and overrides `model` from the logged run, so both can be approximate. An undeclared or
+unknown format stays un-shareable.
 
 ## Requirements
 
@@ -358,8 +377,6 @@ Specified so the contract stays stable; not yet implemented:
 - **`hook` role** — observe/transform launches and routing over JSON-RPC (the `hook:<event>` caps and
   the manifest `hooks` array)
 - **`config-read` / `config-write`** — scoped config access
-- **transcript export** — a subcommand so a plugin with a *novel* session format (one aivo can't
-  read) can emit its own transcript for `aivo share`
 - **signing + a discovery index**
 
 OAuth keys stay **deliberately out of scope** for the endpoint (no provider REST endpoint to proxy);

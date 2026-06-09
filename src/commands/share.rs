@@ -29,11 +29,15 @@ fn plugin_transcript_sources() -> HashMap<String, PluginTranscript> {
     crate::plugin::installed_transcript_sources()
         .into_iter()
         .map(|(name, format, dir)| {
+            // `native` format emits its own transcript via the binary — resolve
+            // it here, where discovery is reachable.
+            let bin = crate::plugin::discover(&name);
             (
                 name,
                 PluginTranscript {
                     format,
                     dir: expand_tilde(&dir),
+                    bin,
                 },
             )
         })
