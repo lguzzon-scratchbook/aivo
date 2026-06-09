@@ -20,18 +20,58 @@ use crate::style;
 
 pub(crate) const PLUGIN_PREFIX: &str = "aivo-";
 
+/// AI tools aivo once shipped natively but now distributes only as plugins.
+/// Invoking one without its plugin installed prints a `plugins install` hint
+/// instead of letting clap reject the name as unknown. `(tool, install_source)`.
+const PLUGIN_ONLY_TOOLS: &[(&str, &str)] = &[("amp", "github:yuanchuan/aivo-amp")];
+
 /// Run the matching `aivo-<name>` plugin and return its exit code, or `None` if
 /// none applies. Call before `Cli::parse_from` — clap rejects unknown subcommands.
 /// Granted plugins (and `coding-agent` types) get a key/endpoint handoff and run
-/// accounting via `endpoint::dispatch`; everything else spawns plain.
+/// accounting via `endpoint::dispatch`; everything else spawns plain. A known
+/// plugin-only tool (e.g. `amp`) that isn't installed yields a non-zero code
+/// after pointing the user at `aivo plugins install`.
 pub async fn try_dispatch(
     raw_args: &[String],
     bundles: &HashMap<String, BundleAlias>,
     store: &SessionStore,
 ) -> Option<i32> {
     let (name, plugin_args) = resolve_invocation(raw_args, bundles)?;
-    let bin = discover(name)?;
-    Some(endpoint::dispatch(name, &bin, plugin_args, store).await)
+    match discover(name) {
+        Some(bin) => Some(endpoint::dispatch(name, &bin, plugin_args, store).await),
+        // Not installed: nudge for the former-native tools; otherwise fall
+        // through to clap (typo / unknown name / bare-prompt rewrite).
+        None => {
+            let source = plugin_only_tool_source(name)?;
+            print_missing_plugin_hint(name, source);
+            Some(ExitCode::UserError.code())
+        }
+    }
+}
+
+/// The `aivo plugins install` source for a former-native tool now shipped only
+/// as a plugin, or `None` if `name` isn't one. Pure lookup.
+fn plugin_only_tool_source(name: &str) -> Option<&'static str> {
+    PLUGIN_ONLY_TOOLS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, source)| *source)
+}
+
+/// Tell the user a former-native tool now lives in a plugin and how to add it.
+fn print_missing_plugin_hint(name: &str, source: &str) {
+    eprintln!(
+        "{} `{name}` is now an aivo plugin and isn't installed.",
+        style::red("Error:"),
+    );
+    eprintln!(
+        "  Install it:  {}",
+        style::cyan(format!("aivo plugins install {source}")),
+    );
+    eprintln!(
+        "  Then run:    {}",
+        style::dim(format!("aivo {name} --help")),
+    );
 }
 
 /// Every installed plugin as `(name, path)` from one search-path sweep; first
@@ -392,6 +432,19 @@ mod tests {
             Some("mytool")
         );
         assert_eq!(infer_plugin_name(""), None);
+    }
+
+    #[test]
+    fn plugin_only_tools_have_install_sources() {
+        // `amp` is a former-native tool, so an uninstalled `aivo amp` is nudged
+        // toward its plugin source rather than rejected by clap.
+        assert_eq!(
+            plugin_only_tool_source("amp"),
+            Some("github:yuanchuan/aivo-amp")
+        );
+        // Live native tools and genuinely unknown names are not plugin-only.
+        assert_eq!(plugin_only_tool_source("claude"), None);
+        assert_eq!(plugin_only_tool_source("foobar"), None);
     }
 
     #[test]
