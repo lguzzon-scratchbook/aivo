@@ -305,6 +305,9 @@ impl AILauncher {
             resolved.codex_app_models.as_deref(),
             &runtime.env,
             &resolved.tool_config.env_vars,
+            &self.cache,
+            Some(resolved.key.base_url.as_str()),
+            options.claude_overrides.max_context.as_deref(),
         )
         .await?;
 

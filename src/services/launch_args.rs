@@ -6,6 +6,8 @@ use crate::cli_args::context_tag_to_tokens;
 use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::codex_model_map::map_model_for_codex_cli;
+use crate::services::model_metadata::{self, ResolvedLimits};
+use crate::services::models_cache::ModelsCache;
 
 pub(crate) struct RuntimeArgs {
     pub(crate) args: Vec<String>,
@@ -169,6 +171,7 @@ pub(crate) fn build_preview_notes(
     notes
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_runtime_args(
     tool: AIToolType,
     raw_args: &[String],
@@ -176,6 +179,9 @@ pub(crate) async fn build_runtime_args(
     codex_app_models: Option<&[String]>,
     env: &HashMap<String, String>,
     aivo_env: &HashMap<String, String>,
+    cache: &ModelsCache,
+    upstream_base_url: Option<&str>,
+    max_context: Option<&str>,
 ) -> Result<RuntimeArgs> {
     let args = inject_claude_teammate_mode(tool, raw_args);
     if tool == AIToolType::Pi {
@@ -197,8 +203,15 @@ pub(crate) async fn build_runtime_args(
     }
 
     let use_responses_router = uses_responses_to_chat_router(env);
-    let codex_model_catalog_path =
-        maybe_write_codex_model_catalog(model, codex_app_models, use_responses_router).await?;
+    let codex_model_catalog_path = maybe_write_codex_model_catalog(
+        model,
+        codex_app_models,
+        use_responses_router,
+        cache,
+        upstream_base_url,
+        max_context,
+    )
+    .await?;
     let args = inject_codex_model(model, &args, use_responses_router);
     let args = inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args);
     let args = inject_codex_cursor_tui_reasoning(use_responses_router, &args);
@@ -709,6 +722,9 @@ async fn maybe_write_codex_model_catalog(
     model: Option<&str>,
     codex_app_models: Option<&[String]>,
     uses_non_openai_router: bool,
+    cache: &ModelsCache,
+    upstream_base_url: Option<&str>,
+    max_context: Option<&str>,
 ) -> Result<Option<String>> {
     let slugs = catalog_slugs(model, codex_app_models, uses_non_openai_router);
     if slugs.is_empty() {
@@ -716,7 +732,14 @@ async fn maybe_write_codex_model_catalog(
     }
     cleanup_stale_codex_model_catalogs().await;
 
-    let catalog_json = build_codex_model_catalog_json(&slugs)?;
+    let mut limits = HashMap::new();
+    for slug in &slugs {
+        limits.insert(
+            slug.clone(),
+            model_metadata::resolve_limits(cache, upstream_base_url, slug).await,
+        );
+    }
+    let catalog_json = build_codex_model_catalog_json(&slugs, &limits, max_context)?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -810,17 +833,27 @@ fn is_safe_codex_slug(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_control())
 }
 
-fn build_codex_model_catalog_json(slugs: &[String]) -> Result<String> {
+fn build_codex_model_catalog_json(
+    slugs: &[String],
+    limits: &HashMap<String, ResolvedLimits>,
+    max_context: Option<&str>,
+) -> Result<String> {
+    let tag_tokens = max_context.and_then(context_tag_to_tokens);
     let models: Vec<_> = slugs
         .iter()
         .enumerate()
-        .map(|(i, m)| model_entry(m, i))
+        .map(|(i, m)| model_entry(m, i, limits.get(m.as_str()), tag_tokens))
         .collect();
     let catalog = json!({ "models": models });
     Ok(serde_json::to_string(&catalog)?)
 }
 
-fn model_entry(model: &str, index: usize) -> serde_json::Value {
+fn model_entry(
+    model: &str,
+    index: usize,
+    limits: Option<&ResolvedLimits>,
+    tag_tokens: Option<u64>,
+) -> serde_json::Value {
     // Field set tracks codex 0.133+ `ModelInfo` (protocol/src/openai_models.rs).
     // Missing required fields make codex silently reject the catalog file —
     // codex then falls back to its built-in `models_cache.json` (full of stock
@@ -831,16 +864,52 @@ fn model_entry(model: &str, index: usize) -> serde_json::Value {
     // values render earlier / more prominently in the picker; the GUI hides
     // entries with priority 0 ("internal") so a non-zero value is required.
     let priority = 10 + (index as i64) * 10;
+    // Real context from the limits cascade when known; 128k stays the
+    // unknown-model fallback. `max_context_window` is raised to an explicit
+    // `--1m`/`--2m` tag so codex's internal clamp never undercuts the user.
+    let context_window = limits.and_then(|l| l.context).unwrap_or(128_000);
+    let max_context_window = context_window.max(tag_tokens.unwrap_or(0));
+    let image_input = limits
+        .and_then(|l| l.caps)
+        .is_some_and(|caps| caps.image_input);
+    let input_modalities = if image_input {
+        json!(["text", "image"])
+    } else {
+        json!(["text"])
+    };
+    // Published effort levels when models.dev knows them, filtered to the
+    // values codex accepts; the low/medium/high hardcode stays the fallback
+    // so unknown models behave exactly as before.
+    let published_efforts: Vec<&str> = limits
+        .and_then(|l| l.caps)
+        .map(|caps| {
+            caps.reasoning_efforts
+                .iter()
+                .map(String::as_str)
+                .filter(|e| ["minimal", "low", "medium", "high"].contains(e))
+                .collect()
+        })
+        .unwrap_or_default();
+    let efforts: Vec<&str> = if published_efforts.is_empty() {
+        vec!["low", "medium", "high"]
+    } else {
+        published_efforts
+    };
+    let default_effort = if efforts.contains(&"medium") {
+        "medium"
+    } else {
+        efforts[efforts.len() - 1]
+    };
+    let supported_reasoning_levels: Vec<serde_json::Value> = efforts
+        .iter()
+        .map(|e| json!({"effort": e, "description": format!("{e} reasoning")}))
+        .collect();
     json!({
         "slug": model,
         "display_name": model,
         "description": format!("aivo-routed model {}", model),
-        "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [
-            {"effort": "low", "description": "Lighter reasoning"},
-            {"effort": "medium", "description": "Balanced"},
-            {"effort": "high", "description": "Deeper reasoning"}
-        ],
+        "default_reasoning_level": default_effort,
+        "supported_reasoning_levels": supported_reasoning_levels,
         "shell_type": "default",
         "visibility": "list",
         "supported_in_api": true,
@@ -860,11 +929,11 @@ fn model_entry(model: &str, index: usize) -> serde_json::Value {
         "truncation_policy": {"mode": "tokens", "limit": 100000},
         "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
-        "context_window": 128000,
-        "max_context_window": 128000,
+        "context_window": context_window,
+        "max_context_window": max_context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        "input_modalities": input_modalities,
         "supports_search_tool": false
     })
 }
@@ -884,9 +953,18 @@ mod tests {
         assert!(uses_responses_to_chat_router(&env));
     }
 
+    /// Hermetic cache so catalog tests don't read the developer's real
+    /// ~/.config/aivo/models-cache.json.
+    fn empty_cache() -> (tempfile::TempDir, ModelsCache) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        (dir, cache)
+    }
+
     #[tokio::test]
     async fn cursor_router_codex_keeps_model_and_writes_catalog() {
         let env = HashMap::from([("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string())]);
+        let (_dir, cache) = empty_cache();
         let runtime = build_runtime_args(
             AIToolType::Codex,
             &["prompt".to_string()],
@@ -894,6 +972,9 @@ mod tests {
             None,
             &env,
             &env,
+            &cache,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -929,6 +1010,7 @@ mod tests {
             ),
             ("OPENAI_API_KEY".to_string(), "sk-test".to_string()),
         ]);
+        let (_dir, cache) = empty_cache();
         let mut runtime = build_runtime_args(
             AIToolType::CodexApp,
             &[".".to_string()],
@@ -936,6 +1018,9 @@ mod tests {
             None,
             &env,
             &env,
+            &cache,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1160,9 +1245,20 @@ mod tests {
             "ANTHROPIC_BASE_URL".to_string(),
             "http://127.0.0.1:4123".to_string(),
         )]);
-        let runtime = build_runtime_args(AIToolType::Claude, &[], None, None, &env, &env)
-            .await
-            .unwrap();
+        let (_dir, cache) = empty_cache();
+        let runtime = build_runtime_args(
+            AIToolType::Claude,
+            &[],
+            None,
+            None,
+            &env,
+            &env,
+            &cache,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             pinned_env(&runtime.args)["ANTHROPIC_BASE_URL"],
             "http://127.0.0.1:4123"
@@ -1271,10 +1367,94 @@ mod tests {
     #[test]
     fn test_build_codex_model_catalog_json_includes_model_slug() {
         let model = "minimax/minimax-m2.5".to_string();
-        let json = build_codex_model_catalog_json(std::slice::from_ref(&model)).unwrap();
+        let json =
+            build_codex_model_catalog_json(std::slice::from_ref(&model), &HashMap::new(), None)
+                .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["slug"], model);
         assert_eq!(parsed["models"][0]["display_name"], model);
+        // No resolved limits → 128k fallback.
+        assert_eq!(parsed["models"][0]["context_window"], 128_000);
+        assert_eq!(parsed["models"][0]["max_context_window"], 128_000);
+    }
+
+    #[tokio::test]
+    async fn catalog_entries_carry_real_context_from_cascade() {
+        let (_dir, cache) = empty_cache();
+        let slugs = vec!["claude-sonnet-4-6".to_string(), "deepseek-chat".to_string()];
+        let mut limits = HashMap::new();
+        for slug in &slugs {
+            limits.insert(
+                slug.clone(),
+                model_metadata::resolve_limits(&cache, None, slug).await,
+            );
+        }
+        let json = build_codex_model_catalog_json(&slugs, &limits, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["models"][0]["context_window"], 1_000_000);
+        assert_eq!(parsed["models"][0]["max_context_window"], 1_000_000);
+        // claude takes image input; deepseek-chat doesn't.
+        assert_eq!(
+            parsed["models"][0]["input_modalities"],
+            json!(["text", "image"])
+        );
+        assert_eq!(parsed["models"][1]["input_modalities"], json!(["text"]));
+    }
+
+    #[tokio::test]
+    async fn catalog_reasoning_levels_follow_published_efforts() {
+        let (_dir, cache) = empty_cache();
+        let slugs = vec![
+            "gemini-3-flash-preview".to_string(),
+            "deepseek-v4-flash".to_string(),
+            "glm-4.7".to_string(),
+        ];
+        let mut limits = HashMap::new();
+        for slug in &slugs {
+            limits.insert(
+                slug.clone(),
+                model_metadata::resolve_limits(&cache, None, slug).await,
+            );
+        }
+        let json_str = build_codex_model_catalog_json(&slugs, &limits, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let levels = |i: usize| -> Vec<String> {
+            parsed["models"][i]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["effort"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Publishes minimal,low,medium,high.
+        assert_eq!(levels(0), ["minimal", "low", "medium", "high"]);
+        assert_eq!(parsed["models"][0]["default_reasoning_level"], "medium");
+        // Publishes high,max — `max` filtered to codex-safe values.
+        assert_eq!(levels(1), ["high"]);
+        assert_eq!(parsed["models"][1]["default_reasoning_level"], "high");
+        // Publishes nothing → unchanged hardcoded fallback.
+        assert_eq!(levels(2), ["low", "medium", "high"]);
+        assert_eq!(parsed["models"][2]["default_reasoning_level"], "medium");
+    }
+
+    #[test]
+    fn catalog_tag_raises_max_context_window_above_real_ceiling() {
+        // An explicit --2m must never be clamped down by the catalog ceiling
+        // (the old 128k hardcode bug); the tag wins over the known context.
+        let mut limits = HashMap::new();
+        limits.insert(
+            "glm-4.7".to_string(),
+            ResolvedLimits {
+                context: Some(205_000),
+                output: None,
+                caps: None,
+            },
+        );
+        let slugs = vec!["glm-4.7".to_string()];
+        let json = build_codex_model_catalog_json(&slugs, &limits, Some("2m")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["models"][0]["context_window"], 205_000);
+        assert_eq!(parsed["models"][0]["max_context_window"], 2_000_000);
     }
 
     #[test]
@@ -1286,7 +1466,9 @@ mod tests {
         // codex silently swallows the failure and falls back to its built-in
         // default model — so the user's `-m <picked>` is ignored and the
         // banner shows `gpt-4o` instead of the chosen cursor/openrouter slug.
-        let json = build_codex_model_catalog_json(&["composer-2.5".to_string()]).unwrap();
+        let json =
+            build_codex_model_catalog_json(&["composer-2.5".to_string()], &HashMap::new(), None)
+                .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["shell_type"], "default");
     }
@@ -1295,10 +1477,11 @@ mod tests {
     fn build_codex_model_catalog_json_emits_multiple_entries() {
         // CodexApp without -m: catalog should list every discovered model so
         // the GUI dropdown can show them.
-        let json = build_codex_model_catalog_json(&[
-            "deepseek-chat".to_string(),
-            "deepseek-reasoner".to_string(),
-        ])
+        let json = build_codex_model_catalog_json(
+            &["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+            &HashMap::new(),
+            None,
+        )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["slug"], "deepseek-chat");
@@ -1433,9 +1616,20 @@ mod tests {
     async fn opencode_prompt_passes_through_build_runtime_args() {
         let args = vec!["explain this code".to_string()];
         let env = HashMap::new();
-        let result = build_runtime_args(AIToolType::Opencode, &args, None, None, &env, &env)
-            .await
-            .unwrap();
+        let (_dir, cache) = empty_cache();
+        let result = build_runtime_args(
+            AIToolType::Opencode,
+            &args,
+            None,
+            None,
+            &env,
+            &env,
+            &cache,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.args, vec!["explain this code"]);
     }
 
