@@ -368,7 +368,7 @@ future work.
 |---|---|---|
 | local path | `./aivo-foo` | used as-is — **the only form probed for a manifest at install** |
 | direct URL | `https://host/dl/aivo-foo` | downloads the binary, or unpacks a `.tar.gz`/`.zip` |
-| GitHub | `github:owner/repo[@tag]`, `gh:owner/repo`, `https://github.com/owner/repo` | resolves the release, picks the asset matching your OS+arch |
+| GitHub | `github:owner/repo[@tag]`, `gh:owner/repo`, `https://github.com/owner/repo` | resolves the release, picks the asset matching your OS+arch; with no matching asset, falls back to the source tarball if the repo is an npm-style Node package (`package.json` with a `bin`) |
 | npm | `npm:pkg`, `npm:@scope/pkg@1.2.0` | fetches the tarball + writes a `node` shim — needs Node.js |
 | cargo | `cargo:crate[@version]` | `cargo install` — builds from source, needs a Rust toolchain |
 

@@ -5,6 +5,9 @@
 //!   local path · `http(s)://…/binary` · `github:owner/repo[@tag]` / `gh:` /
 //!   bare `github.com/owner/repo` · `npm:[@scope/]pkg[@version]` · `cargo:crate[@version]`
 //!
+//! A `github:` release with no matching binary asset falls back to the source
+//! tarball when the repo is an npm-style Node package (`package.json` + `bin`).
+//!
 //! Network bases are overridable for tests / private mirrors: `AIVO_GITHUB_API`,
 //! `AIVO_NPM_REGISTRY`.
 
@@ -488,13 +491,26 @@ async fn materialize_github(
         .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
         .collect();
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    let picked = pick_asset(&names, os, arch, host_prefers_musl()).map_err(|e| {
-        anyhow::anyhow!(
-            "no release asset for {os}/{arch} in {owner}/{repo}.\n  Available: {}.\n  \
-             Publish an asset whose name contains the OS and arch (e.g. `aivo-{name}-{arch}-…`).",
-            e.available.join(", "),
-        )
-    })?;
+    let picked = match pick_asset(&names, os, arch, host_prefers_musl()) {
+        Ok(p) => p,
+        Err(e) => {
+            // Node plugin repos ship no per-arch binaries — fall back to the
+            // release's source tarball when it's an npm-style package.
+            if let Some(done) = materialize_github_source(&manifest, name, dir, quiet).await? {
+                return Ok(done);
+            }
+            let available = if e.available.is_empty() {
+                "(none)".to_string()
+            } else {
+                e.available.join(", ")
+            };
+            anyhow::bail!(
+                "no release asset for {os}/{arch} in {owner}/{repo}.\n  Available: {available}.\n  \
+                 Publish an asset whose name contains the OS and arch (e.g. `aivo-{name}-{arch}-…`),\n  \
+                 or ship a Node plugin as an npm-style package (`package.json` with a `bin`).",
+            );
+        }
+    };
     let asset_url = assets
         .iter()
         .find(|a| a.get("name").and_then(|v| v.as_str()) == Some(picked))
@@ -512,6 +528,38 @@ async fn materialize_github(
         checksum: Some(checksum),
         trusted_local: false,
     })
+}
+
+/// Install a GitHub release's *source* tarball as a Node plugin: extract, read
+/// `package.json` `bin`, write a node shim — the npm path minus the registry.
+/// `Ok(None)` = not an npm-style package; the caller keeps its no-asset error.
+async fn materialize_github_source(
+    release: &serde_json::Value,
+    name: &str,
+    dir: &Path,
+    quiet: bool,
+) -> Result<Option<Materialized>> {
+    let Some(tarball_url) = release.get("tarball_url").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    if !quiet {
+        eprintln!(
+            "  {} No binary asset; checking the source tarball for a Node plugin…",
+            style::dim("·")
+        );
+    }
+    let body = download(tarball_url, quiet).await?;
+    let bundle = extract_bundle(&body.bytes, name, dir)?;
+    let Some(bin_value) = bundle_package_bin(&bundle) else {
+        let _ = std::fs::remove_dir_all(&bundle);
+        return Ok(None);
+    };
+    let primary = install_node_shim(&bundle, &bin_value, name, dir)?;
+    Ok(Some(Materialized {
+        primary,
+        checksum: Some(sha(&body.bytes)),
+        trusted_local: false,
+    }))
 }
 
 async fn materialize_npm(
@@ -559,28 +607,52 @@ async fn materialize_npm(
     let body = download(tarball, quiet).await?;
     let checksum = sha(&body.bytes);
 
+    let bundle = extract_bundle(&body.bytes, name, dir)?;
+    let bin_value = match vmeta.get("bin") {
+        Some(b) if !b.is_null() => b.clone(),
+        _ => bundle_package_bin(&bundle)
+            .ok_or_else(|| anyhow::anyhow!("npm package declares no `bin` to run"))?,
+    };
+    let primary = install_node_shim(&bundle, &bin_value, name, dir)?;
+    Ok(Materialized {
+        primary,
+        checksum: Some(checksum),
+        trusted_local: false,
+    })
+}
+
+/// Extract a gzipped tarball into the plugin's bundle dir `aivo-<name>.d`,
+/// hoisting the single wrapper dir (npm `package/`, GitHub `owner-repo-<sha>/`).
+fn extract_bundle(tgz_bytes: &[u8], name: &str, dir: &Path) -> Result<PathBuf> {
     let bundle = dir.join(format!("aivo-{name}.d"));
     let _ = std::fs::remove_dir_all(&bundle);
     std::fs::create_dir_all(&bundle).with_context(|| format!("creating {}", bundle.display()))?;
     let tgz = bundle.join(".pkg.tgz");
-    std::fs::write(&tgz, &body.bytes).context("writing npm tarball")?;
+    std::fs::write(&tgz, tgz_bytes).context("writing the package tarball")?;
     archive::extract_archive(&tgz, &bundle, ArchiveKind::TarGz)?;
     let _ = std::fs::remove_file(&tgz);
-    archive::flatten_single_subdir(&bundle)?; // npm tarballs wrap in `package/`
+    archive::flatten_single_subdir(&bundle)?;
+    Ok(bundle)
+}
 
-    let bin_value = match vmeta.get("bin") {
-        Some(b) if !b.is_null() => b.clone(),
-        _ => {
-            let pj = std::fs::read(bundle.join("package.json"))
-                .context("npm package has no package.json")?;
-            serde_json::from_slice::<serde_json::Value>(&pj)
-                .context("parsing package.json")?
-                .get("bin")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null)
-        }
-    };
-    let bin_rel = resolve_npm_bin(&bin_value, name)?;
+/// The bundle's `package.json` `bin` value, if the tree is an npm-style package.
+fn bundle_package_bin(bundle: &Path) -> Option<serde_json::Value> {
+    let pj = std::fs::read(bundle.join("package.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&pj)
+        .ok()?
+        .get("bin")
+        .cloned()
+        .filter(|b| !b.is_null())
+}
+
+/// Resolve the bundle's bin script and front it with the `aivo-<name>` shim.
+fn install_node_shim(
+    bundle: &Path,
+    bin_value: &serde_json::Value,
+    name: &str,
+    dir: &Path,
+) -> Result<PathBuf> {
+    let bin_rel = resolve_npm_bin(bin_value, name)?;
     let bin_abs = bundle.join(bin_rel.trim_start_matches("./"));
     #[cfg(unix)]
     if let Ok(meta) = std::fs::metadata(&bin_abs) {
@@ -589,7 +661,6 @@ async fn materialize_npm(
         perms.set_mode(0o755);
         let _ = std::fs::set_permissions(&bin_abs, perms);
     }
-
     if find_in_dirs("node", &collect_path_dirs()).is_none() {
         eprintln!(
             "  {} {}",
@@ -599,13 +670,7 @@ async fn materialize_npm(
             ))
         );
     }
-
-    let primary = write_shim(name, &bin_abs, dir)?;
-    Ok(Materialized {
-        primary,
-        checksum: Some(checksum),
-        trusted_local: false,
-    })
+    write_shim(name, &bin_abs, dir)
 }
 
 async fn materialize_cargo(

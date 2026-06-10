@@ -172,6 +172,129 @@ fn github_install_resolves_release_asset() {
 }
 
 #[test]
+fn github_install_falls_back_to_node_source_tarball() {
+    // A GitHub source tarball: single `owner-repo-<sha>/` wrapper holding an
+    // npm-style Node package (package.json `bin` + script).
+    let work = TempDir::new().unwrap();
+    let tree = work.path().join("o-aivo-hello-abc1234");
+    std::fs::create_dir_all(tree.join("bin")).unwrap();
+    std::fs::write(
+        tree.join("package.json"),
+        r#"{"name":"aivo-hello","version":"1.0.0","bin":{"aivo-hello":"bin/aivo-hello"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tree.join("bin/aivo-hello"),
+        "#!/usr/bin/env node\nconsole.log('hello ran');\n",
+    )
+    .unwrap();
+    let tgz = tar_czf(work.path(), "o-aivo-hello-abc1234");
+
+    let (listener, base) = bind();
+    // No binary assets → the installer must fall back to tarball_url.
+    let release = format!(
+        r#"{{"tag_name":"v1","assets":[],"tarball_url":"{base}/tarball/o/aivo-hello/v1"}}"#
+    );
+    serve(
+        listener,
+        vec![
+            route(
+                "/repos/o/aivo-hello/releases/latest",
+                "application/json",
+                release.into_bytes(),
+            ),
+            route("/tarball/o/aivo-hello/v1", "application/x-gzip", tgz),
+        ],
+    );
+
+    let home = TempDir::new().unwrap();
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base)
+        .args(["plugins", "install", "github:o/aivo-hello"])
+        .output()
+        .expect("spawn aivo");
+    assert!(
+        out.status.success(),
+        "install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let shim = home.path().join(".config/aivo/plugins/aivo-hello");
+    let shim_text = std::fs::read_to_string(&shim).expect("shim file");
+    assert!(
+        shim_text.contains("node"),
+        "shim must invoke node: {shim_text}"
+    );
+    assert!(
+        home.path()
+            .join(".config/aivo/plugins/aivo-hello.d/bin/aivo-hello")
+            .exists(),
+        "the source tree should be extracted alongside the shim"
+    );
+    assert_eq!(
+        registry(&home)["plugins"]["hello"]["source"],
+        "github:o/aivo-hello"
+    );
+
+    // It dispatches.
+    let run = aivo(&home).args(["hello"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("hello ran"),
+        "dispatch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+}
+
+#[test]
+fn github_install_without_assets_or_node_package_keeps_asset_error() {
+    // Source tarball that is NOT a Node package (no package.json) → the
+    // fallback must decline and the no-asset error must survive.
+    let work = TempDir::new().unwrap();
+    let tree = work.path().join("o-aivo-rusty-abc1234");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("README.md"), "a rust repo\n").unwrap();
+    let tgz = tar_czf(work.path(), "o-aivo-rusty-abc1234");
+
+    let (listener, base) = bind();
+    let release = format!(
+        r#"{{"tag_name":"v1","assets":[],"tarball_url":"{base}/tarball/o/aivo-rusty/v1"}}"#
+    );
+    serve(
+        listener,
+        vec![
+            route(
+                "/repos/o/aivo-rusty/releases/latest",
+                "application/json",
+                release.into_bytes(),
+            ),
+            route("/tarball/o/aivo-rusty/v1", "application/x-gzip", tgz),
+        ],
+    );
+
+    let home = TempDir::new().unwrap();
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base)
+        .args(["plugins", "install", "github:o/aivo-rusty"])
+        .output()
+        .expect("spawn aivo");
+    assert!(!out.status.success(), "install must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no release asset"),
+        "stderr should keep the no-asset error:\n{stderr}"
+    );
+    assert!(
+        !home
+            .path()
+            .join(".config/aivo/plugins/aivo-rusty.d")
+            .exists(),
+        "the probed bundle must be cleaned up"
+    );
+}
+
+#[test]
 fn npm_install_extracts_and_writes_a_node_shim() {
     // npm tarballs wrap everything in `package/`.
     let work = TempDir::new().unwrap();
