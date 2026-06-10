@@ -1,9 +1,10 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use super::provider_protocol::{
     AttemptClassification, PathVariant, ProviderProtocol, decode_route, encode_route,
     fallback_path_variants, fallback_protocols,
 };
+use super::route_cache::RouteSlot;
 
 /// Outcome of a single protocol attempt in the fallback loop.
 pub enum AttemptOutcome<T> {
@@ -135,6 +136,131 @@ pub fn should_bail_on_mismatch(
         return true;
     }
     false
+}
+
+/// What a cascade loop should do after a failed attempt, as decided by
+/// `mismatch_directive` — the single policy point shared by every router.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MismatchDirective {
+    /// The upstream demanded a request-body quirk (e.g. strict
+    /// `reasoning_content`); rebuild the body and retry the SAME candidate.
+    RetrySameCandidate,
+    /// Stop walking candidates and surface the recorded error.
+    Bail,
+    /// Try the next `(protocol, path_variant)` candidate.
+    NextCandidate,
+}
+
+/// Per-cascade state for the in-flight `requires_reasoning_content` retry:
+/// at most one strict-body rebuild per cascade, and none when the body on the
+/// wire was already strict when the cascade started.
+pub struct QuirkRetryState<'a> {
+    learned_requires_reasoning: &'a AtomicBool,
+    effective_requires_reasoning: bool,
+    retried_with_strict: bool,
+}
+
+impl<'a> QuirkRetryState<'a> {
+    pub fn new(learned_requires_reasoning: &'a AtomicBool, effective: bool) -> Self {
+        Self {
+            learned_requires_reasoning,
+            effective_requires_reasoning: effective,
+            retried_with_strict: false,
+        }
+    }
+}
+
+/// Tracks the most diagnostic upstream error across cascade attempts: keep the
+/// first error seen, but let a terminal error or semantic rejection overwrite
+/// it — a 500/structured 400 from a real handler beats the leading 404 emitted
+/// while probing wrong paths.
+pub struct FirstError<E> {
+    inner: Option<E>,
+}
+
+impl<E> FirstError<E> {
+    pub fn new() -> Self {
+        Self { inner: None }
+    }
+
+    /// Start with an error carried in from before the cascade (e.g. the native
+    /// Anthropic probe's terminal response).
+    pub fn seeded(initial: Option<E>) -> Self {
+        Self { inner: initial }
+    }
+
+    pub fn record_with(
+        &mut self,
+        classification: &AttemptClassification,
+        make: impl FnOnce() -> E,
+    ) {
+        if classification.is_terminal
+            || classification.is_semantic_rejection
+            || self.inner.is_none()
+        {
+            self.inner = Some(make());
+        }
+    }
+
+    pub fn take(self) -> Option<E> {
+        self.inner
+    }
+}
+
+impl<E> Default for FirstError<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The shared post-mismatch cascade policy. Applies, in order:
+///
+/// 1. **Semantic rejection** — the route is proven (`slot.confirm()`); if the
+///    body names the `requires_reasoning_content` quirk and a strict retry is
+///    still available, ask the router to rebuild and retry the same candidate;
+///    otherwise pin the winning route (no-op at attempt 0) and bail.
+/// 2. **Terminal error** — pin and bail, except at attempt 0 where a 401/403
+///    can mean "this host rejected the protocol's auth-header shape" (e.g.
+///    DeepSeek seeing `x-goog-api-key`); probe one fallback first. 429 never
+///    gets the carve-out: rate-limit is a quota statement, and probing more
+///    candidates piles requests into the same overbudget window.
+/// 3. **Pin-trust** — once the slot's route has answered authoritatively, an
+///    attempt-0 mismatch is the request's fault, not the route's; bail instead
+///    of fanning out across unrelated protocol shapes.
+///
+/// Callers record the error via [`FirstError::record_with`] before calling.
+pub fn mismatch_directive(
+    attempt: usize,
+    classification: &AttemptClassification,
+    slot: &RouteSlot,
+    protocol: ProviderProtocol,
+    variant: PathVariant,
+    quirk: Option<&mut QuirkRetryState>,
+) -> MismatchDirective {
+    if classification.is_semantic_rejection {
+        slot.confirm();
+        if classification.quirk_hint == Some("requires_reasoning_content")
+            && let Some(q) = quirk
+        {
+            q.learned_requires_reasoning.store(true, Ordering::Relaxed);
+            if !q.retried_with_strict && !q.effective_requires_reasoning {
+                q.retried_with_strict = true;
+                return MismatchDirective::RetrySameCandidate;
+            }
+        }
+        commit_protocol_switch(slot.route_atom(), protocol, variant, attempt);
+        return MismatchDirective::Bail;
+    }
+    if classification.is_terminal && (attempt > 0 || classification.is_rate_limited) {
+        // Pin in-memory so retry storms hit this path directly instead of
+        // re-probing the wrong paths; persistence still requires a confirm.
+        commit_protocol_switch(slot.route_atom(), protocol, variant, attempt);
+        return MismatchDirective::Bail;
+    }
+    if should_bail_on_mismatch(attempt, classification, slot.is_confirmed()) {
+        return MismatchDirective::Bail;
+    }
+    MismatchDirective::NextCandidate
 }
 
 /// Classify an HTTP response into an attempt outcome.
@@ -423,6 +549,190 @@ mod tests {
         // authoritatively, so the cascade keeps walking.
         let c = cls(false, false);
         assert!(!should_bail_on_mismatch(1, &c, false));
+    }
+
+    fn test_slot(tool_native: ProviderProtocol) -> std::sync::Arc<RouteSlot> {
+        crate::services::route_cache::RouteCache::new(
+            "claude",
+            tool_native,
+            std::collections::BTreeMap::new(),
+        )
+        .resolve("test-model")
+    }
+
+    #[test]
+    fn directive_semantic_rejection_bails_confirms_and_pins() {
+        let slot = test_slot(ProviderProtocol::Anthropic);
+        let c = cls(false, true);
+        let d = mismatch_directive(
+            1,
+            &c,
+            &slot,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            None,
+        );
+        assert_eq!(d, MismatchDirective::Bail);
+        assert!(slot.is_confirmed());
+        // Fallback win (attempt > 0) pins the answering route.
+        assert_eq!(slot.current().0, ProviderProtocol::Openai);
+    }
+
+    #[test]
+    fn directive_semantic_rejection_at_attempt_zero_does_not_pin() {
+        let slot = test_slot(ProviderProtocol::Anthropic);
+        let c = cls(false, true);
+        let d = mismatch_directive(
+            0,
+            &c,
+            &slot,
+            ProviderProtocol::Anthropic,
+            PathVariant::Default,
+            None,
+        );
+        assert_eq!(d, MismatchDirective::Bail);
+        assert!(slot.is_confirmed());
+        assert_eq!(slot.current().0, ProviderProtocol::Anthropic);
+    }
+
+    #[test]
+    fn directive_quirk_retries_same_candidate_once() {
+        let slot = test_slot(ProviderProtocol::Openai);
+        let learned = AtomicBool::new(false);
+        let mut quirk = QuirkRetryState::new(&learned, false);
+        let c = AttemptClassification {
+            is_terminal: false,
+            is_rate_limited: false,
+            is_semantic_rejection: true,
+            quirk_hint: Some("requires_reasoning_content"),
+        };
+        let d = mismatch_directive(
+            0,
+            &c,
+            &slot,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            Some(&mut quirk),
+        );
+        assert_eq!(d, MismatchDirective::RetrySameCandidate);
+        assert!(learned.load(Ordering::Relaxed));
+        // Second rejection on the rebuilt body must not loop.
+        let d = mismatch_directive(
+            0,
+            &c,
+            &slot,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            Some(&mut quirk),
+        );
+        assert_eq!(d, MismatchDirective::Bail);
+    }
+
+    #[test]
+    fn directive_quirk_already_strict_bails_without_retry() {
+        let slot = test_slot(ProviderProtocol::Openai);
+        let learned = AtomicBool::new(false);
+        // Body was already strict when the cascade started — a retry would be
+        // a wasted round-trip.
+        let mut quirk = QuirkRetryState::new(&learned, true);
+        let c = AttemptClassification {
+            is_terminal: false,
+            is_rate_limited: false,
+            is_semantic_rejection: true,
+            quirk_hint: Some("requires_reasoning_content"),
+        };
+        let d = mismatch_directive(
+            0,
+            &c,
+            &slot,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            Some(&mut quirk),
+        );
+        assert_eq!(d, MismatchDirective::Bail);
+        assert!(learned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn directive_terminal_attempt_zero_probes_one_fallback() {
+        let slot = test_slot(ProviderProtocol::Openai);
+        let c = cls(true, false);
+        let d = mismatch_directive(
+            0,
+            &c,
+            &slot,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            None,
+        );
+        assert_eq!(d, MismatchDirective::NextCandidate);
+        let d = mismatch_directive(
+            1,
+            &c,
+            &slot,
+            ProviderProtocol::Anthropic,
+            PathVariant::Default,
+            None,
+        );
+        assert_eq!(d, MismatchDirective::Bail);
+        assert_eq!(slot.current().0, ProviderProtocol::Anthropic);
+    }
+
+    #[test]
+    fn directive_rate_limit_bails_at_attempt_zero() {
+        let slot = test_slot(ProviderProtocol::Openai);
+        let d = mismatch_directive(
+            0,
+            &cls_rate_limited(),
+            &slot,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            None,
+        );
+        assert_eq!(d, MismatchDirective::Bail);
+    }
+
+    #[test]
+    fn directive_pin_trust_bails_on_confirmed_slot() {
+        let slot = test_slot(ProviderProtocol::Openai);
+        let c = cls(false, false);
+        // Unproven route: keep walking.
+        assert_eq!(
+            mismatch_directive(
+                0,
+                &c,
+                &slot,
+                ProviderProtocol::Openai,
+                PathVariant::Default,
+                None
+            ),
+            MismatchDirective::NextCandidate
+        );
+        // Proven route: an attempt-0 error is the request's fault — bail.
+        slot.confirm();
+        assert_eq!(
+            mismatch_directive(
+                0,
+                &c,
+                &slot,
+                ProviderProtocol::Openai,
+                PathVariant::Default,
+                None
+            ),
+            MismatchDirective::Bail
+        );
+    }
+
+    #[test]
+    fn first_error_keeps_first_until_authoritative() {
+        let mut fe: FirstError<u16> = FirstError::new();
+        fe.record_with(&cls(false, false), || 404);
+        // A later non-authoritative error must not overwrite the first.
+        fe.record_with(&cls(false, false), || 405);
+        let mut fe2 = FirstError::seeded(fe.take());
+        // A terminal error overwrites — it's more diagnostic.
+        fe2.record_with(&cls(true, false), || 500);
+        assert_eq!(fe2.take(), Some(500));
     }
 
     #[test]

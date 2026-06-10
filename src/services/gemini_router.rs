@@ -22,8 +22,8 @@ use crate::services::openai_gemini_bridge::{
     openai_chat_model, sanitize_schema_for_gemini,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
-    should_bail_on_mismatch,
+    AttemptOutcome, FirstError, MismatchDirective, QuirkRetryState, classify_attempt,
+    commit_protocol_switch, mismatch_directive, protocol_candidates,
 };
 use crate::services::provider_protocol::{PathVariant, ProviderProtocol, classify_failed_attempt};
 use crate::services::route_cache::{PersistedRoute, RouteCache, RouteSlot};
@@ -226,7 +226,7 @@ async fn forward_to_provider(
 ) -> Result<ForwardResult> {
     let active_protocol = slot.route_atom();
     let candidates = protocol_candidates(active_protocol);
-    let mut first_error: Option<(u16, String)> = None;
+    let mut first_error: FirstError<(u16, String)> = FirstError::new();
     let original_openai_req = openai_req;
     let mut body_for_attempts = original_openai_req.clone();
     // Snapshot once at the top: the caller in `handle_request` already used the
@@ -235,7 +235,7 @@ async fn forward_to_provider(
     // the upstream rejects an already-strict body.
     let effective_requires_reasoning =
         config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
-    let mut retried_with_strict = false;
+    let mut quirk = QuirkRetryState::new(learned_requires_reasoning, effective_requires_reasoning);
     let mut idx = 0;
 
     while idx < candidates.len() {
@@ -407,66 +407,30 @@ async fn forward_to_provider(
                 return Ok(ForwardResult::Success(result));
             }
             AttemptOutcome::Mismatch { status, body } => {
-                // A 4xx whose body is a recognizable LLM-API error envelope is
-                // a semantic rejection — switching protocols cannot fix it.
                 let classification = classify_failed_attempt(status, &body);
-                if classification.is_terminal
-                    || classification.is_semantic_rejection
-                    || first_error.is_none()
-                {
-                    first_error = Some((status, body));
-                }
-                if classification.is_semantic_rejection {
-                    slot.confirm();
-                    if classification.quirk_hint == Some("requires_reasoning_content") {
-                        learned_requires_reasoning.store(true, Ordering::Relaxed);
-                        if !retried_with_strict && !effective_requires_reasoning {
-                            retried_with_strict = true;
-                            body_for_attempts = original_openai_req.clone();
-                            ensure_assistant_reasoning_content_in_chat_request(
-                                &mut body_for_attempts,
-                            );
-                            continue;
-                        }
+                first_error.record_with(&classification, || (status, body));
+                match mismatch_directive(
+                    attempt,
+                    &classification,
+                    slot,
+                    protocol,
+                    variant,
+                    Some(&mut quirk),
+                ) {
+                    MismatchDirective::RetrySameCandidate => {
+                        body_for_attempts = original_openai_req.clone();
+                        ensure_assistant_reasoning_content_in_chat_request(&mut body_for_attempts);
+                        continue;
                     }
-                    if attempt > 0 {
-                        commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                    }
-                    break;
-                }
-                // Terminal errors (401/403/429/5xx) are usually authoritative,
-                // but attempt 0 is just our best initial guess for this key —
-                // a 401 there can also mean "this upstream doesn't speak that
-                // protocol and rejected the auth header shape" (e.g., DeepSeek
-                // returns 401 on /v1beta/models/...:generateContent because it
-                // doesn't recognize Google's `x-goog-api-key`). Probe at least
-                // one fallback before bailing so genuine cross-protocol hosts
-                // can still be discovered.
-                //
-                // 429 is the exception: a rate-limit response is never an
-                // auth-shape mismatch, so the carve-out doesn't apply. Probing
-                // 4 fallback paths against the same upstream just burns more
-                // requests inside the already-overbudget quota window.
-                if classification.is_terminal && (attempt > 0 || classification.is_rate_limited) {
-                    // Pin in-memory: the path answered authoritatively, so
-                    // retry storms hit it directly instead of re-probing.
-                    commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                    break;
-                }
-                // Pin-trust: once the active route has ever answered
-                // authoritatively, an attempt-0 mismatch is the upstream's
-                // real answer — not a wrong-protocol guess. Surface it
-                // rather than fan out across 4 unrelated protocol shapes
-                // and pay 4 wasted gateway hits per failure.
-                if should_bail_on_mismatch(attempt, &classification, slot.is_confirmed()) {
-                    break;
+                    MismatchDirective::Bail => break,
+                    MismatchDirective::NextCandidate => {}
                 }
             }
         }
         idx += 1;
     }
 
-    let (status, body) = first_error.unwrap_or_default();
+    let (status, body) = first_error.take().unwrap_or_default();
     Ok(ForwardResult::Exhausted { status, body })
 }
 

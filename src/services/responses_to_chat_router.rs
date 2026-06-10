@@ -31,8 +31,8 @@ use crate::services::openai_gemini_bridge::{
     openai_chat_model,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
-    record_request_outcome,
+    AttemptOutcome, FirstError, MismatchDirective, QuirkRetryState, classify_attempt,
+    commit_protocol_switch, mismatch_directive, protocol_candidates, record_request_outcome,
 };
 use crate::services::provider_profile::is_openrouter_base;
 use crate::services::provider_protocol::{
@@ -1370,15 +1370,15 @@ async fn forward_openai_chat_request(
             )
         })
         .collect();
-    let mut first_error: Option<(u16, String)> = None;
+    let mut first_error: FirstError<(u16, String)> = FirstError::new();
     let mut body_for_attempts = body.clone();
-    let mut retried_with_strict = false;
     let mut idx = 0;
     // Snapshot once so the retry decision matches what's actually on the wire:
     // when learned was already true at the start of this request, the body is
     // already strict and a retry would be a wasted round-trip.
     let effective_requires_reasoning =
         config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
+    let mut quirk = QuirkRetryState::new(learned_requires_reasoning, effective_requires_reasoning);
 
     while idx < candidates.len() {
         let (protocol, variant) = candidates[idx];
@@ -1403,58 +1403,30 @@ async fn forward_openai_chat_request(
                 status,
                 body: response_body,
             } => {
-                // A 4xx whose body is a recognizable LLM-API error envelope is
-                // a semantic rejection — bail out instead of probing other
-                // protocols that will return the same rejection.
                 let classification = classify_failed_attempt(status, &response_body);
-                if classification.is_terminal
-                    || classification.is_semantic_rejection
-                    || first_error.is_none()
-                {
-                    first_error = Some((status, response_body));
-                }
-                if classification.is_semantic_rejection {
-                    slot.confirm();
-                    if classification.quirk_hint == Some("requires_reasoning_content") {
-                        learned_requires_reasoning.store(true, Ordering::Relaxed);
-                        if !retried_with_strict && !effective_requires_reasoning {
-                            retried_with_strict = true;
-                            body_for_attempts = body.clone();
-                            ensure_assistant_reasoning_content_in_chat_request(
-                                &mut body_for_attempts,
-                            );
-                            continue;
-                        }
+                first_error.record_with(&classification, || (status, response_body));
+                match mismatch_directive(
+                    attempt,
+                    &classification,
+                    slot,
+                    protocol,
+                    variant,
+                    Some(&mut quirk),
+                ) {
+                    MismatchDirective::RetrySameCandidate => {
+                        body_for_attempts = body.clone();
+                        ensure_assistant_reasoning_content_in_chat_request(&mut body_for_attempts);
+                        continue;
                     }
-                    if attempt > 0 {
-                        commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                    }
-                    break;
-                }
-                // Skip the fast-bail at attempt 0: a 401/403 there often means
-                // "this host rejected the protocol's auth header shape" rather
-                // than "your key is bad" (e.g. cross-protocol gateways). Probe
-                // at least one fallback before believing the upstream.
-                //
-                // 429 doesn't get the carve-out: a rate-limit response is a
-                // quota statement, not an auth-shape mismatch, and probing
-                // more candidates against the same upstream piles requests
-                // into the same already-overbudget window.
-                if classification.is_terminal && (attempt > 0 || classification.is_rate_limited) {
-                    // The path answered (with an error, but it answered) —
-                    // pin it in memory so retry storms from codex/claude
-                    // don't re-probe the wrong chat/completions paths every
-                    // time. Don't flip request_succeeded: we still don't
-                    // want to *persist* the pin to disk based on a 5xx.
-                    commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                    break;
+                    MismatchDirective::Bail => break,
+                    MismatchDirective::NextCandidate => {}
                 }
             }
         }
         idx += 1;
     }
 
-    let (status, body) = first_error.unwrap_or_default();
+    let (status, body) = first_error.take().unwrap_or_default();
     Ok(ForwardedChatResponse::HttpError { status, body })
 }
 

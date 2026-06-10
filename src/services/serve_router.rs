@@ -8,7 +8,6 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::commands::models::fetch_models;
 use crate::constants::CONTENT_TYPE_JSON;
@@ -16,14 +15,19 @@ use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::model_list_response;
+use crate::services::protocol_fallback::{
+    FirstError, MismatchDirective, commit_protocol_switch, mismatch_directive, protocol_candidates,
+    record_request_outcome,
+};
 use crate::services::provider_protocol::{
-    ProviderProtocol, fallback_protocols, is_protocol_mismatch, is_terminal_upstream_error,
+    PathVariant, ProviderProtocol, classify_failed_attempt, is_protocol_mismatch,
 };
 use crate::services::request_log::RequestLogger;
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, convert_chat_response_to_responses_sse,
     convert_responses_to_chat_request,
 };
+use crate::services::route_cache::{RouteCache, RouteSlot};
 use crate::services::serve_responses::{
     OpenAIToResponsesStreamConverter, convert_chat_response_to_responses_json,
     convert_chat_sse_to_responses_sse,
@@ -124,7 +128,11 @@ struct ServeState {
     client: reqwest::Client,
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
-    active_protocol: Arc<AtomicU8>,
+    /// Per-model learned protocol routes (in-memory only — `aivo serve` doesn't
+    /// persist routes yet). Replaces the old single per-process pin so a
+    /// multi-model gateway key learns a route per model instead of thrashing
+    /// one scalar.
+    route_cache: Arc<RouteCache>,
     log_store: LogStore,
     logger: Option<RequestLogger>,
     failover_keys: Arc<Vec<FailoverEntry>>,
@@ -138,7 +146,9 @@ struct FailoverEntry {
     config: Arc<ServeRouterConfig>,
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
-    active_protocol: AtomicU8,
+    /// Shared across failover attempts so a route learned during one failover
+    /// carries to the next request instead of being re-probed every time.
+    route_cache: Arc<RouteCache>,
 }
 
 impl ServeRouter {
@@ -267,7 +277,11 @@ impl ServeRouter {
                     }),
                     key: fk,
                     copilot_tokens: ct,
-                    active_protocol: AtomicU8::new(protocol.to_u8()),
+                    route_cache: Arc::new(RouteCache::new(
+                        "serve",
+                        protocol,
+                        std::collections::BTreeMap::new(),
+                    )),
                 }
             })
             .collect();
@@ -279,7 +293,11 @@ impl ServeRouter {
             client: router_http_client_with_timeout(timeout),
             key: self.key,
             copilot_tokens,
-            active_protocol: Arc::new(AtomicU8::new(initial_protocol.to_u8())),
+            route_cache: Arc::new(RouteCache::new(
+                "serve",
+                initial_protocol,
+                std::collections::BTreeMap::new(),
+            )),
             log_store: self.log_store,
             logger: self.logger,
             failover_keys: Arc::new(failover_entries),
@@ -810,7 +828,7 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
     // `actual_model` causes `select_model_for_protocol` to return it verbatim, so the model
     // field in `chat_body` is always the original string and `handle_chat_body` transforms it
     // for the protocol that is actually selected.
-    let mut config = responses_router_config(state);
+    let mut config = responses_router_config(state, resolve_slot(&body, state).current().0);
     config.actual_model = Some(original_model.clone());
     let mut chat_body = convert_responses_to_chat_request(&body, &config);
     chat_body["stream"] = json!(client_wants_stream);
@@ -838,7 +856,7 @@ fn failover_state(
         client: client.clone(),
         key: entry.key.clone(),
         copilot_tokens: entry.copilot_tokens.clone(),
-        active_protocol: Arc::new(AtomicU8::new(entry.active_protocol.load(Ordering::Relaxed))),
+        route_cache: entry.route_cache.clone(),
         log_store: log_store.clone(),
         logger: None,
         failover_keys: Arc::new(Vec::new()),
@@ -899,7 +917,14 @@ impl_with_failover!(handle_responses_with_failover, handle_responses);
 impl_with_failover!(handle_embeddings_with_failover, handle_embeddings);
 
 async fn handle_embeddings(request: &str, state: &ServeState) -> Result<RouterResponse> {
-    let protocol = ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed));
+    let body_str = http_utils::extract_request_body(request)?;
+    let mut body = match parse_json_body(body_str) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+
+    apply_alias(&mut body, &state.config.aliases);
+    let protocol = resolve_slot(&body, state).current().0;
     if !matches!(
         protocol,
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi
@@ -911,14 +936,13 @@ async fn handle_embeddings(request: &str, state: &ServeState) -> Result<RouterRe
         ));
     }
 
-    let body_str = http_utils::extract_request_body(request)?;
-    let mut body = match parse_json_body(body_str) {
-        Ok(v) => v,
-        Err(r) => return Ok(r),
-    };
-
-    apply_alias(&mut body, &state.config.aliases);
     send_openai_embeddings(&body, &upstream_context(state)).await
+}
+
+/// Resolve the per-model route slot for a request body's `model` field.
+fn resolve_slot(body: &Value, state: &ServeState) -> Arc<RouteSlot> {
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    state.route_cache.resolve(model)
 }
 
 async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
@@ -926,11 +950,12 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let slot = resolve_slot(&body, state);
 
     // Skip fallback for copilot/openrouter — these have fixed protocols
     if state.config.is_copilot || state.config.is_openrouter {
         let mut body = body;
-        return match ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed)) {
+        return match slot.current().0 {
             ProviderProtocol::Anthropic => {
                 handle_chat_anthropic(&body, client_wants_stream, state).await
             }
@@ -943,12 +968,25 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         };
     }
 
-    let current = ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed));
-    let candidates: Vec<ProviderProtocol> = std::iter::once(current)
-        .chain(fallback_protocols(current))
+    // Protocol-only candidates: serve's upstream senders own their URLs, so
+    // path variants don't apply, and ResponsesApi shares the OpenAI chat
+    // handler — keep only the first candidate per handler family.
+    let mut seen_openai_family = false;
+    let candidates: Vec<ProviderProtocol> = protocol_candidates(slot.route_atom())
+        .into_iter()
+        .filter(|(_, variant)| *variant == PathVariant::Default)
+        .map(|(protocol, _)| protocol)
+        .filter(|protocol| {
+            let openai_family = matches!(
+                protocol,
+                ProviderProtocol::Openai | ProviderProtocol::ResponsesApi
+            );
+            !openai_family || !std::mem::replace(&mut seen_openai_family, true)
+        })
         .collect();
 
-    let mut first_error: Option<RouterResponse> = None;
+    let mut first_error: FirstError<RouterResponse> = FirstError::new();
+    let mut success: Option<RouterResponse> = None;
     for (attempt, protocol) in candidates.into_iter().enumerate() {
         let mut body_clone = body.clone();
         let response = match protocol {
@@ -970,44 +1008,61 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
             RouterResponse::Streaming { .. } => 200,
         };
 
-        if is_protocol_mismatch(status) {
-            let is_terminal = is_terminal_upstream_error(status);
-            if is_terminal || first_error.is_none() {
-                first_error = Some(response);
+        if !is_protocol_mismatch(status) {
+            commit_protocol_switch(slot.route_atom(), protocol, PathVariant::Default, attempt);
+            slot.confirm();
+            if attempt > 0 {
+                eprintln!("  \u{2022} Protocol auto-switched to {}", protocol.as_str());
             }
-            if is_terminal {
-                // Pin in-memory so concurrent/retry requests skip the
-                // wrong-path probes and hit this protocol directly.
-                state
-                    .active_protocol
-                    .store(protocol.to_u8(), Ordering::Relaxed);
-                break;
-            }
-            continue;
+            success = Some(response);
+            break;
         }
 
-        // Not a mismatch — return this response
-        if attempt > 0 {
-            state
-                .active_protocol
-                .store(protocol.to_u8(), Ordering::Relaxed);
-            eprintln!("  \u{2022} Protocol auto-switched to {}", protocol.as_str());
+        let body_text = match &response {
+            RouterResponse::Buffered { body, .. } => String::from_utf8_lossy(body).into_owned(),
+            RouterResponse::Streaming { .. } => String::new(),
+        };
+        let classification = classify_failed_attempt(status, &body_text);
+        first_error.record_with(&classification, || response);
+        match mismatch_directive(
+            attempt,
+            &classification,
+            &slot,
+            protocol,
+            PathVariant::Default,
+            None,
+        ) {
+            MismatchDirective::Bail => break,
+            MismatchDirective::RetrySameCandidate | MismatchDirective::NextCandidate => {}
         }
-        return Ok(response);
     }
 
-    Ok(first_error.unwrap_or(RouterResponse::buffered(
+    let (seed_protocol, seed_variant) = slot.seed_route();
+    record_request_outcome(
+        slot.route_atom(),
+        slot.failures_atom(),
+        seed_protocol,
+        seed_variant,
+        success.is_some(),
+    );
+    if let Some(response) = success {
+        return Ok(response);
+    }
+    Ok(first_error.take().unwrap_or(RouterResponse::buffered(
         503,
         CONTENT_TYPE_JSON,
         br#"{"error":{"message":"No compatible protocol found"}}"#.to_vec(),
     )))
 }
 
-fn responses_router_config(state: &ServeState) -> ResponsesToChatRouterConfig {
+fn responses_router_config(
+    state: &ServeState,
+    target_protocol: ProviderProtocol,
+) -> ResponsesToChatRouterConfig {
     ResponsesToChatRouterConfig {
         target_base_url: state.config.upstream_base_url.clone(),
         api_key: state.config.upstream_api_key.clone(),
-        target_protocol: ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed)),
+        target_protocol,
         target_path_variant: None,
         copilot_token_manager: state.copilot_tokens.clone(),
         model_prefix: None,
@@ -1314,7 +1369,11 @@ mod tests {
             client: http_utils::router_http_client(),
             key: test_key(),
             copilot_tokens: None,
-            active_protocol: Arc::new(AtomicU8::new(protocol.to_u8())),
+            route_cache: Arc::new(RouteCache::new(
+                "serve",
+                protocol,
+                std::collections::BTreeMap::new(),
+            )),
             log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
@@ -1424,9 +1483,10 @@ mod tests {
     }
 
     #[test]
-    fn responses_router_config_uses_active_protocol() {
+    fn responses_router_config_uses_slot_protocol() {
         let state = test_state(ProviderProtocol::Google);
-        let config = responses_router_config(&state);
+        let slot = state.route_cache.resolve("some-model");
+        let config = responses_router_config(&state, slot.current().0);
 
         assert_eq!(config.target_protocol, ProviderProtocol::Google);
         assert_eq!(config.target_base_url, "https://example.com/v1");
@@ -1451,7 +1511,11 @@ mod tests {
             client: http_utils::router_http_client(),
             key: test_key(),
             copilot_tokens: None,
-            active_protocol: Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8())),
+            route_cache: Arc::new(RouteCache::new(
+                "serve",
+                ProviderProtocol::Openai,
+                std::collections::BTreeMap::new(),
+            )),
             log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
@@ -1526,7 +1590,8 @@ mod tests {
     #[test]
     fn responses_router_config_anthropic_protocol() {
         let state = test_state(ProviderProtocol::Anthropic);
-        let config = responses_router_config(&state);
+        let slot = state.route_cache.resolve("some-model");
+        let config = responses_router_config(&state, slot.current().0);
         assert_eq!(config.target_protocol, ProviderProtocol::Anthropic);
     }
 
@@ -1620,7 +1685,11 @@ mod tests {
             }),
             key: test_key(),
             copilot_tokens: None,
-            active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
+            route_cache: Arc::new(RouteCache::new(
+                "serve",
+                ProviderProtocol::Openai,
+                std::collections::BTreeMap::new(),
+            )),
         };
 
         let client = http_utils::router_http_client();
@@ -1654,7 +1723,11 @@ mod tests {
             config: config.clone(),
             key: test_key(),
             copilot_tokens: None,
-            active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
+            route_cache: Arc::new(RouteCache::new(
+                "serve",
+                ProviderProtocol::Openai,
+                std::collections::BTreeMap::new(),
+            )),
         };
 
         let client = http_utils::router_http_client();
@@ -1681,7 +1754,11 @@ mod tests {
             }),
             key: test_key(),
             copilot_tokens: None,
-            active_protocol: AtomicU8::new(ProviderProtocol::Openai.to_u8()),
+            route_cache: Arc::new(RouteCache::new(
+                "serve",
+                ProviderProtocol::Openai,
+                std::collections::BTreeMap::new(),
+            )),
         };
 
         let client = http_utils::router_http_client();
@@ -1765,7 +1842,8 @@ mod tests {
     #[test]
     fn responses_router_config_openai_protocol() {
         let state = test_state(ProviderProtocol::Openai);
-        let config = responses_router_config(&state);
+        let slot = state.route_cache.resolve("some-model");
+        let config = responses_router_config(&state, slot.current().0);
 
         assert_eq!(config.target_protocol, ProviderProtocol::Openai);
         assert_eq!(config.target_base_url, "https://example.com/v1");

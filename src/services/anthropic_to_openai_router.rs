@@ -45,7 +45,8 @@ use crate::services::openai_models::{
     stringify_message_content as stringify_typed_message_content,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    AttemptOutcome, FirstError, MismatchDirective, QuirkRetryState, classify_attempt,
+    commit_protocol_switch, mismatch_directive, protocol_candidates,
 };
 use crate::services::provider_profile::is_direct_openai_base;
 use crate::services::provider_protocol::{
@@ -692,13 +693,10 @@ async fn handle_anthropic_to_upstream(
     let candidates = router_candidates(active_protocol, &config.target_base_url);
     // Seed first_error with the native-Anthropic Terminal response (if any) so
     // a chat fallback that also exhausts surfaces *some* error to the client.
-    // The chat-loop's "is_terminal" branch will overwrite this with the more
+    // The chat-loop's authoritative errors overwrite this with the more
     // diagnostic chat-shaped response when one is available.
-    let mut first_error: Option<RouterResponse> = native_anthropic_terminal;
-    // Set to `true` after we've already rebuilt `simplified` with strict
-    // reasoning mode in response to a `requires_reasoning_content` rejection.
-    // Prevents a retry storm: at most one rebuild per cascade.
-    let mut retried_with_strict = false;
+    let mut first_error: FirstError<RouterResponse> = FirstError::seeded(native_anthropic_terminal);
+    let mut quirk = QuirkRetryState::new(learned_requires_reasoning, effective_requires_reasoning);
 
     let mut idx = 0;
     while idx < candidates.len() {
@@ -885,83 +883,53 @@ async fn handle_anthropic_to_upstream(
                 status,
                 body: response_body,
             } => {
-                // A 4xx whose body is a recognizable LLM-API error envelope is
-                // a semantic rejection: the upstream parsed our request and
-                // answered in its native shape, which proves the protocol
-                // matches. Switching protocols cannot recover — bail out and
-                // surface the real error instead of paying for 4 more probes.
                 let classification = classify_failed_attempt(status, &response_body);
-                // Terminal errors and semantic rejections are both authoritative
-                // — overwrite earlier non-diagnostic errors (e.g., a leading 404
-                // emitted while probing the wrong path) so the user sees the
-                // real upstream failure.
-                if classification.is_terminal
-                    || classification.is_semantic_rejection
-                    || first_error.is_none()
-                {
-                    first_error = Some(RouterResponse::Buffered {
-                        status,
-                        content_type: CONTENT_TYPE_JSON.to_string(),
-                        body: response_body.into_bytes(),
-                    });
-                }
-                if classification.is_semantic_rejection {
-                    slot.confirm();
-                    if classification.quirk_hint == Some("requires_reasoning_content") {
-                        learned_requires_reasoning.store(true, Ordering::Relaxed);
-                        // Same-launch recovery: if the upstream told us it
-                        // needs `reasoning_content` and we sent the request
-                        // without it, rebuild `simplified` with strict mode
-                        // and retry the same (protocol, variant) so the
+                first_error.record_with(&classification, || RouterResponse::Buffered {
+                    status,
+                    content_type: CONTENT_TYPE_JSON.to_string(),
+                    body: response_body.into_bytes(),
+                });
+                match mismatch_directive(
+                    attempt,
+                    &classification,
+                    &slot,
+                    protocol,
+                    variant,
+                    Some(&mut quirk),
+                ) {
+                    MismatchDirective::RetrySameCandidate => {
+                        // Same-launch recovery: the upstream told us it needs
+                        // `reasoning_content`; rebuild `simplified` with strict
+                        // mode and retry the same (protocol, variant) so the
                         // *current* request succeeds without a relaunch.
-                        if !retried_with_strict && !effective_requires_reasoning {
-                            retried_with_strict = true;
-                            if let Ok(mut strict) = build_simplified_openai_body(
-                                &body,
-                                true,
-                                model_is_claude,
-                                config.strip_cache_control,
-                                config.max_tokens_cap,
-                            ) {
-                                if !is_direct_openai_base(&config.target_base_url) {
-                                    crate::services::responses_chat_conversion::cap_reasoning_effort(
-                                        &mut strict,
-                                    );
-                                }
-                                simplified = strict;
-                                continue; // re-do the SAME idx with strict body
+                        if let Ok(mut strict) = build_simplified_openai_body(
+                            &body,
+                            true,
+                            model_is_claude,
+                            config.strip_cache_control,
+                            config.max_tokens_cap,
+                        ) {
+                            if !is_direct_openai_base(&config.target_base_url) {
+                                crate::services::responses_chat_conversion::cap_reasoning_effort(
+                                    &mut strict,
+                                );
                             }
+                            simplified = strict;
+                            continue; // re-do the SAME idx with strict body
                         }
-                    }
-                    // Pin in-memory only after a fallback win: at attempt 0 the
-                    // route is already the configured default and committing
-                    // would be a no-op write.
-                    if attempt > 0 {
+                        // Rebuild failed — treat as a plain semantic bail.
                         commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                        break;
                     }
-                    break;
-                }
-                // Skip the fast-bail at attempt 0: a 401/403 there often means
-                // "this host rejected the protocol's auth header shape" rather
-                // than "your key is bad" (e.g. cross-protocol gateways). Probe
-                // at least one fallback before believing the upstream.
-                //
-                // 429 doesn't get the carve-out: rate-limit is a quota
-                // statement, not an auth-shape mismatch, and probing more
-                // candidates against the same upstream piles requests into
-                // the same already-overbudget window.
-                if classification.is_terminal && (attempt > 0 || classification.is_rate_limited) {
-                    // Pin in-memory so retry storms hit this path directly
-                    // instead of re-probing the wrong chat/completions paths.
-                    commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                    break;
+                    MismatchDirective::Bail => break,
+                    MismatchDirective::NextCandidate => {}
                 }
             }
         }
         idx += 1;
     }
 
-    Ok(first_error.unwrap_or(RouterResponse::Buffered {
+    Ok(first_error.take().unwrap_or(RouterResponse::Buffered {
         status: 503,
         content_type: CONTENT_TYPE_JSON.to_string(),
         body: b"{\"error\":\"No compatible protocol found\"}".to_vec(),
@@ -1492,7 +1460,6 @@ impl OpenAIStreamConverter {
             self.pending.drain(..=pos);
             self.process_line(line.trim_end_matches('\r'), &mut output)?;
         }
-
         Ok(output)
     }
 
