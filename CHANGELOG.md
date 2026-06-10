@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.28.0
+
+- feat(cli): consistent list/ls and rm/remove verbs across commands (2dcd0c9)
+- feat(cli): bare lowercase words are subcommands, never prompts (66033bf)
+- feat(keys): clear the cached model list on reset-route (ed3f191)
+- feat(plugins): offer install-on-demand when a known plugin isn't installed (90480d5)
+- feat(plugins): install Node plugins from GitHub via source-tarball fallback (8fa19f2)
+- feat(run): plugin-aware tool picker, always shown with replay default (7fa9760)
+- feat(plugins): advisory model-limit env vars in the endpoint handoff (0982e27)
+- feat(serve): emit model limits in loopback /v1/models responses (dc5f114)
+- feat(codex): real context and published reasoning levels in the model catalog (005dcbe)
+- feat(metadata): embedded models.dev limits snapshot with canonical lookup cascade (afea486)
+- feat(plugins): first-run confirmation before executing remote installs (cb8f80b)
+- feat(stats): windowable per-run token stats for plugin endpoints (c6ce13c)
+- fix(pi): real default model and resolved limits in generated models.json (94d0c89)
+- fix(http): parse K/M display strings in token-limit fields (e2b8d4d)
+- fix(bridges): drop sampling params for models that reject them (6cfd47d)
+- fix(bridge): emit parallel tool results as one anthropic user message (5760d1f)
+- fix(hardening): SSE buffer caps, atomic stats cache, 0700 config dir (ea98a1d)
+- fix(errors): honor the documented exit-code contract at command boundaries (ee332e4)
+- fix(gemini): accept nullable/union tool-param types (2d87913)
+- refactor(routers): unify cascade fallback policy across all routers (ed02559)
+- refactor(injector): extract routing decision policy into router_selection (7b6793d)
+- test(routers): add fake-provider e2e harness for cascade behavior (7d3eda5)
+- chore(data): re-sync model limits from models.dev (b63da77)
+- docs(readme): supported coding agents as a table with built-in/plugin type (4eea92d)
+
+
 ## v0.27.1
 
 - feat(plugins): native transcript export for `aivo share` (a46a772)
