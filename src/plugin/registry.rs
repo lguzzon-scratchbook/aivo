@@ -43,6 +43,14 @@ pub(crate) struct PluginRecord {
     /// only these are acted on at launch. Empty until consent is given.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub granted_caps: Vec<String>,
+    /// The user confirmed running this binary (first-dispatch gate for remote
+    /// installs whose manifest probe would otherwise be its first execution).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub run_approved: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +143,7 @@ fn sources_view(dir: &Path) -> Option<Registry> {
                     manifest: None,
                     installed_at: None,
                     granted_caps: Vec::new(),
+                    run_approved: false,
                 },
             )
         })
@@ -197,6 +206,7 @@ mod tests {
             manifest: None,
             installed_at: Some("2026-06-04T00:00:00+00:00".to_string()),
             granted_caps: Vec::new(),
+            run_approved: false,
         }
     }
 

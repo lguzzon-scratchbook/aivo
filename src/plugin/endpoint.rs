@@ -31,7 +31,10 @@ use super::registry::{self, PluginRecord};
 pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &SessionStore) -> i32 {
     let config_dir = store.config_dir().to_path_buf();
 
-    let plan = grant_plan(name, bin).await;
+    let Some(plan) = grant_plan(name, bin).await else {
+        eprintln!("  aborted; `{name}` was not run.");
+        return crate::errors::ExitCode::UserError.code();
+    };
     if plan.caps.is_empty() && !plan.is_coding_agent {
         // Nothing granted and no host behavior — plain dispatch.
         return super::exec_plugin(bin, args, &config_dir, &[]).await;
@@ -324,42 +327,66 @@ impl GrantPlan {
 
 /// Resolve what's granted to `name`: read the cached manifest + grants, or
 /// (for a managed but manifest-less plugin) lazily probe and seek consent once.
-async fn grant_plan(name: &str, bin: &Path) -> GrantPlan {
+/// `None` means the user declined the first-run gate — don't run the plugin.
+async fn grant_plan(name: &str, bin: &Path) -> Option<GrantPlan> {
     let reg = registry::load();
     match reg.plugins.get(name) {
         // Already probed at install — honor the recorded grants.
         Some(rec) if rec.manifest.is_some() => {
             let manifest = rec.manifest.as_ref().unwrap();
             let requested = grantable_capabilities(&manifest.capabilities);
-            GrantPlan {
+            Some(GrantPlan {
                 caps: retained_grants(&requested, &rec.granted_caps),
                 is_coding_agent: manifest.is_coding_agent(),
                 documents_aivo_flags: manifest.documents_aivo_flags,
-            }
+            })
         }
         // Manifest-less managed plugin (e.g. a `npm:`/`github:` install): lazily
         // probe + seek consent once, persisting the grant for next time.
         Some(rec) => lazy_probe_and_consent(name, bin, rec).await,
         // Unmanaged/PATH plugin — nothing to grant; runs plain.
-        None => GrantPlan {
+        None => Some(GrantPlan {
             caps: Vec::new(),
             is_coding_agent: false,
             documents_aivo_flags: false,
-        },
+        }),
     }
 }
 
 /// First-dispatch probe + consent for a managed plugin recorded without a
 /// manifest (e.g. installed via `npm:`/`github:`, where install-time probing is
 /// skipped). On a successful probe the manifest + approved caps are persisted so
-/// neither the probe nor the prompt recurs.
-async fn lazy_probe_and_consent(name: &str, bin: &Path, existing: &PluginRecord) -> GrantPlan {
+/// neither the probe nor the prompt recurs. Returns `None` when the user
+/// declines the first-run gate.
+async fn lazy_probe_and_consent(
+    name: &str,
+    bin: &Path,
+    existing: &PluginRecord,
+) -> Option<GrantPlan> {
+    // First-run gate: the manifest probe below would be this downloaded
+    // binary's very first execution. Capability consent governs what aivo
+    // hands over, not whether the binary runs — that decision is this one.
+    // TTY-only so scripted dispatch keeps working.
+    if !existing.run_approved
+        && existing.granted_caps.is_empty()
+        && std::io::stdin().is_terminal()
+        && !super::prompt_first_run(name, &existing.source)
+    {
+        return None;
+    }
     let Some(manifest) = probe_manifest(bin, name).await else {
-        return GrantPlan {
+        // Persist the run approval so a manifest-less plugin (probe failed or
+        // unsupported) isn't re-gated on every dispatch.
+        if !existing.run_approved {
+            let mut rec = existing.clone();
+            rec.run_approved = true;
+            registry::record(name, rec);
+        }
+        return Some(GrantPlan {
             caps: Vec::new(),
             is_coding_agent: false,
             documents_aivo_flags: false,
-        };
+        });
     };
     let is_ca = manifest.is_coding_agent();
     let documents_aivo_flags = manifest.documents_aivo_flags;
@@ -375,12 +402,13 @@ async fn lazy_probe_and_consent(name: &str, bin: &Path, existing: &PluginRecord)
     let mut rec = existing.clone();
     rec.manifest = Some(manifest);
     rec.granted_caps = granted.clone();
+    rec.run_approved = true;
     registry::record(name, rec);
-    GrantPlan {
+    Some(GrantPlan {
         caps: granted,
         is_coding_agent: is_ca,
         documents_aivo_flags,
-    }
+    })
 }
 
 fn retained_grants(requested: &[String], prior: &[String]) -> Vec<String> {

@@ -242,6 +242,30 @@ async fn exec_plugin(
 
 /// Shared y/N consent prompt for a plugin's grantable capabilities. Callers
 /// gate on a TTY; this just asks and reads. Used at install and on first dispatch.
+/// First-dispatch gate for a remote-installed plugin aivo has never executed:
+/// the manifest probe that follows would be the binary's first run, so confirm
+/// before executing anything. TTY-only; callers skip the gate when scripted.
+pub(crate) fn prompt_first_run(name: &str, source: &str) -> bool {
+    use std::io::Write;
+    eprintln!(
+        "  {} first run of plugin `{}` (installed from {})",
+        style::yellow("?"),
+        name,
+        source,
+    );
+    eprintln!(
+        "    {}",
+        style::dim("it runs unsandboxed with your user's permissions — only run plugins you trust")
+    );
+    eprint!("  {} run it? [y/N] ", style::yellow("?"));
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 pub(crate) fn prompt_capability_grant(name: &str, caps: &[String]) -> bool {
     use std::io::Write;
     eprintln!(

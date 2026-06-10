@@ -192,6 +192,13 @@ silently escalates to a newly-requested grantable cap (it re-asks). `aivo plugin
 grants the requested grantable caps without prompting — local-path installs only (the only form
 whose manifest is known at install time).
 
+**First-run gate.** Capability consent governs what aivo hands over, not whether the binary runs.
+For a remote install (`npm:`/`github:`/URL/`cargo:`) the first dispatch is also the downloaded
+binary's first execution (the lazy manifest probe runs it), so aivo asks a separate
+"run it? [y/N]" confirmation first — TTY only, asked once, persisted as `run_approved` in the
+registry. Declining aborts the dispatch without executing the plugin. Non-interactive dispatch
+(no TTY) skips the gate, matching prior scripted behavior.
+
 ## Endpoint handoff
 
 A granted plugin gets a **per-launch loopback proxy** bound to one resolved key. aivo picks the

@@ -622,6 +622,9 @@ fn record_install(
     manifest: Option<PluginManifest>,
     granted_caps: Vec<String>,
 ) {
+    // An install-time manifest probe already executed the binary with the
+    // user's explicit consent, so the first-dispatch run gate is satisfied.
+    let run_approved = manifest.is_some();
     registry::record(
         name,
         PluginRecord {
@@ -630,6 +633,7 @@ fn record_install(
             manifest,
             installed_at: Some(Utc::now().to_rfc3339()),
             granted_caps,
+            run_approved,
         },
     );
 }
