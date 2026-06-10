@@ -1078,7 +1078,7 @@ fn ensure_loopback_no_proxy(env: &mut HashMap<String, String>) {
 /// work shares one OS thread and concurrent env reads can't race. Must not
 /// run inside or after a `spawn_blocking` on the env vars being modified —
 /// the blocking pool's reads would race the write.
-pub(crate) fn ensure_loopback_no_proxy_in_process_env() {
+pub fn ensure_loopback_no_proxy_in_process_env() {
     // SAFETY: see fn-level comment.
     unsafe {
         for var in NO_PROXY_VAR_NAMES {
