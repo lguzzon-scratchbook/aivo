@@ -210,14 +210,19 @@ registry. Declining aborts the dispatch without executing the plugin. Non-intera
 
 ## Endpoint handoff
 
-A granted plugin gets a **per-launch loopback proxy** bound to one resolved key. aivo picks the
-active key (or one named by `-k`/`--key <id>` in the plugin's argv) and injects:
+A granted plugin gets a **per-launch loopback proxy** bound to one resolved key. For an
+endpoint-granted plugin aivo **owns `-k`/`-m`** (like a `coding-agent`): it resolves the key and
+model — a bare `-k`/`-m` opens the picker, `-k`/`-m <v>` selects, otherwise the key's remembered
+selection — strips just those two from the plugin's argv (the plugin keeps its own
+`--debug`/`--dry-run`), and persists the choice. `-m hf:<ref>` (or a local `.gguf`) is served by a
+local llama-server over the same endpoint instead of the selected key. It injects:
 
 | Var | Value |
 |---|---|
 | `AIVO_ENDPOINT_URL` | `http://127.0.0.1:<port>/v1` (OS-assigned loopback port) |
 | `AIVO_ENDPOINT_TOKEN` | a random per-launch bearer token |
-| `AIVO_KEY_MODEL` | the resolved model for `coding-agent` plugins; for other endpoint-granted plugins, the key's remembered model when one exists — an **advisory hint**, rank it below your own flags/env |
+| `AIVO_KEY_MODEL` | the model aivo resolved (it owns `-k`/`-m` for `coding-agent` **and** endpoint-granted plugins — picker on a bare flag, else the value, else the key's remembered model) |
+| `AIVO_KEY_MODEL_EXPLICIT` | `1` when the model came from **this launch** (`-m` value, picker, or `hf:` takeover) — rank `AIVO_KEY_MODEL` above your own model env/pin. Absent when it's the remembered fallback |
 | `AIVO_MODEL_CONTEXT_WINDOW` | the resolved model's context window in tokens — **advisory, only when known** |
 | `AIVO_MODEL_MAX_OUTPUT_TOKENS` | the resolved model's max output tokens — **advisory, only when known** |
 

@@ -1281,11 +1281,11 @@ pub(crate) async fn resolve_model_outcome(
         Some(_) => {}
     }
 
-    // The picker reads keys via console::Term; on a non-TTY it would spin. Bail
-    // before the network fetch so piped invocations don't pay for a catalog they
-    // can't show. Only explain when the user explicitly asked for a picker.
-    use std::io::IsTerminal;
-    if !std::io::stderr().is_terminal() {
+    // The picker raw-modes stdin and renders to stderr; without both TTYs it
+    // can't run (a piped stdin reads as a cancel). Bail before the network fetch
+    // so piped invocations don't pay for a catalog they can't show. Only explain
+    // when the user explicitly asked for a picker.
+    if !crate::tui::picker_interactive() {
         if explicit_model_flag {
             crate::commands::print_no_model_list_hint();
         }

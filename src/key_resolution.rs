@@ -1,4 +1,3 @@
-use std::io::{self, IsTerminal};
 use std::process;
 
 use crate::commands;
@@ -110,7 +109,7 @@ pub(crate) async fn resolve_by_id_or_name_or_pick(
         }
         1 => Ok(KeyResolution::Selected(matches.into_iter().next().unwrap())),
         _ => {
-            if !io::stderr().is_terminal() {
+            if !crate::tui::picker_interactive() {
                 return Err(session_store
                     .resolve_key_by_id_or_name(key_id_or_name)
                     .await
@@ -141,7 +140,7 @@ async fn prompt_temporary_key_override(
         eprintln!("  Run {} to add one.", style::cyan("aivo keys add"));
         return Ok(KeyResolution::MissingAuth);
     }
-    if !io::stderr().is_terminal() {
+    if !crate::tui::picker_interactive() {
         anyhow::bail!(
             "Cannot open key picker without a terminal. Run in a terminal or pass --key <id|name>."
         );
@@ -217,7 +216,7 @@ async fn resolve_active_key_or_prompt(
     );
     eprintln!();
 
-    if !io::stderr().is_terminal() {
+    if !crate::tui::picker_interactive() {
         eprintln!(
             "{} Cannot open key picker without a terminal. Run in a terminal or activate a key first.",
             style::red("Error:")

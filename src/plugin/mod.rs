@@ -435,6 +435,38 @@ pub(crate) fn extract_aivo_flags(args: &[String]) -> AivoFlags {
     }
 }
 
+/// Remove only `-k`/`--key` and `-m`/`--model` (and their separate values) from argv,
+/// leaving every other arg — including `--debug`/`--dry-run` and the plugin's own flags — in
+/// place. Used for endpoint-granted (non-coding-agent) plugins, where aivo owns key/model
+/// selection but the plugin keeps the rest of its argv. Value-consumption mirrors
+/// `extract_aivo_flags`: a `-k`/`-m` consumes the next arg only when it isn't itself a flag.
+pub(crate) fn strip_key_model_flags(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a.starts_with("--key=")
+            || a.starts_with("-k=")
+            || a.starts_with("--model=")
+            || a.starts_with("-m=")
+        {
+            // inline value form → drop
+        } else if a == "--key" || a == "-k" || a == "--model" || a == "-m" {
+            // drop the flag, and a following separate value when it isn't itself a flag
+            if let Some(n) = args.get(i + 1)
+                && !n.is_empty()
+                && !n.starts_with('-')
+            {
+                i += 1;
+            }
+        } else {
+            out.push(args[i].clone());
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Resolve the debug-log path to hand a plugin, mirroring aivo's `--debug`
 /// handling: `--debug=<path>` uses that path, bare `--debug` uses the shared
 /// default. `None` when `--debug` isn't present.
@@ -640,5 +672,33 @@ mod tests {
         assert!(f.debug_log.is_none());
         assert!(!f.dry_run);
         assert_eq!(f.rest, args(&["-p", "hello", "--thinking"]));
+    }
+
+    #[test]
+    fn strip_key_model_flags_handling() {
+        // Separate-value and inline forms are dropped with their values.
+        assert_eq!(
+            strip_key_model_flags(&args(&["-k", "work", "-m", "gpt-4o", "-p", "hi"])),
+            args(&["-p", "hi"])
+        );
+        assert_eq!(
+            strip_key_model_flags(&args(&["--key=work", "--model=m1", "file.rs"])),
+            args(&["file.rs"])
+        );
+        // A bare flag (next arg is itself a flag) drops only the flag.
+        assert_eq!(
+            strip_key_model_flags(&args(&["-k", "--verbose", "-m"])),
+            args(&["--verbose"])
+        );
+        // `--debug`/`--dry-run` and everything else stay with the plugin.
+        assert_eq!(
+            strip_key_model_flags(&args(&["--dry-run", "-m", "x", "--debug", "HEAD~1"])),
+            args(&["--dry-run", "--debug", "HEAD~1"])
+        );
+        // No key/model flags → argv unchanged.
+        assert_eq!(
+            strip_key_model_flags(&args(&["review", "/abs/path", "--all"])),
+            args(&["review", "/abs/path", "--all"])
+        );
     }
 }

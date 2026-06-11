@@ -19,6 +19,15 @@ pub enum FuzzyOutcome {
     Cancelled,
 }
 
+/// True when an interactive picker can actually run: it renders to stderr but
+/// puts **stdin** into raw mode (`RawModeGuard`), so both must be terminals.
+/// Gating on stderr alone lets piped-stdin invocations reach the picker, where
+/// the raw-mode failure is indistinguishable from a user cancel.
+pub fn picker_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 impl Default for FuzzySelect {
     fn default() -> Self {
         Self::new()

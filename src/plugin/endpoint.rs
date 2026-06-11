@@ -56,17 +56,17 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
         }
     }
 
-    // Coding-agent plugins behave like native tools: aivo owns `-k`/`-m` and
-    // `--debug`, strips them from the argv (so they don't reach the wrapped
-    // tool), opens the picker on a bare `-k`, and resolves the model. Other
-    // granted plugins keep verbatim argv — `-k <id>` still selects a key, but
-    // nothing is stripped and a bare `-k` uses the active key (no surprise picker
-    // before launch); the key's remembered model still travels as `AIVO_KEY_MODEL`
-    // (a read-only hint — see the model match below).
+    // aivo owns `-k`/`-m` for any plugin it serves a key to — a coding-agent OR an
+    // endpoint-granted plugin of any type. For those it resolves the key/model (picker on a
+    // bare `-k`/`-m`, otherwise the value, otherwise the remembered selection) and hands the
+    // model over as `AIVO_KEY_MODEL`. A coding-agent additionally owns `--debug`/`--dry-run`
+    // and strips all four; an endpoint `tool` plugin keeps its own `--debug`/`--dry-run`, so
+    // we strip only `-k`/`-m`. A granted-but-no-endpoint plugin keeps verbatim argv — `-k <id>`
+    // still selects a key, but a bare `-k` uses the active key (no picker).
+    let manages_km = plan.is_coding_agent || plan.has("endpoint");
     let flags = super::extract_aivo_flags(args);
-    // `--dry-run` previews the resolved plan instead of launching — coding-agent
-    // only (it mirrors native `aivo run --dry-run`; other plugins keep verbatim
-    // argv, so their `--dry-run` reaches the wrapped tool).
+    // `--dry-run` previews the resolved plan instead of launching — coding-agent only (it
+    // mirrors native `aivo run --dry-run`; other plugins keep their own `--dry-run`).
     let dry_run = plan.is_coding_agent && flags.dry_run;
     let debug_log = if plan.is_coding_agent {
         flags.debug_log.clone()
@@ -76,17 +76,30 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     let (key_flag, model_flag, mut plugin_args): (Option<String>, Option<String>, Vec<String>) =
         if plan.is_coding_agent {
             (flags.key, flags.model, flags.rest)
+        } else if manages_km {
+            // Endpoint plugin: aivo owns -k/-m; strip just those, keep --debug/--dry-run.
+            (flags.key, flags.model, super::strip_key_model_flags(args))
         } else {
             (flags.key.filter(|s| !s.is_empty()), None, args.to_vec())
         };
 
-    // HF/local-gguf takeover (coding-agent only): an `hf:`/gguf model — passed via
-    // `-m hf:…` or positionally as `aivo <plugin> hf:…` — is served by a local
-    // llama-server, not the active key. Spawn it, synthesize the loopback key, and
-    // strip a positional ref from the wrapped tool's argv (it can't read `hf:`; the
-    // model reaches it through the endpoint). Mirrors `aivo run`'s takeover.
-    let hf = if plan.is_coding_agent {
-        match take_hf_takeover(model_flag.as_deref(), &mut plugin_args, dry_run).await {
+    // HF/local-gguf takeover: an `hf:`/gguf model is served by a local
+    // llama-server, not the active key. Spawn it, synthesize the loopback key,
+    // and serve the model over the endpoint (the wrapped tool can't read `hf:`).
+    // An explicit `-m hf:…` takes over for any key-managed plugin — without this
+    // the ref would be handed to the real key's endpoint and persisted as a
+    // bogus remembered model. The positional form (`aivo <plugin> hf:…`) stays
+    // coding-agent only: generic plugins take real paths/refs positionally,
+    // which must not be lifted. Mirrors `aivo run`'s takeover.
+    let hf = if manages_km {
+        match take_hf_takeover(
+            model_flag.as_deref(),
+            &mut plugin_args,
+            plan.is_coding_agent,
+            dry_run,
+        )
+        .await
+        {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("  {} {e:#}", style::red("Error:"));
@@ -110,33 +123,41 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
         None => resolve_plugin_key(store, key_flag_for_resolve, plan.is_coding_agent).await,
     };
     let serve = key.as_ref().map(plugin_serve);
-    let servable = serve.is_some_and(PluginServe::is_servable);
+    // Whether aivo can serve this key to THIS plugin: Cursor goes through the
+    // coding-agent-only ACP router, so for any other plugin it is effectively
+    // blocked — resolving a model for it would picker-then-refuse.
+    let servable = match serve {
+        Some(PluginServe::Serve) => true,
+        Some(PluginServe::Cursor) => plan.is_coding_agent,
+        _ => false,
+    };
 
     let model_flag_was_explicit = model_flag.is_some();
     let model_request = plugin_model_request(model_flag, key_was_explicit);
 
-    // A coding-agent plugin needs a concrete model (unlike native tools, which
-    // fall back to their own default), so resolve one: `-m <v>` is used +
-    // remembered, a bare launch reuses the remembered model, `-k` without `-m`
-    // forces the model picker after key selection, otherwise the picker opens
-    // once and the choice is remembered. OAuth is Blocked; Cursor is servable
-    // only through the coding-agent Cursor router.
+    // aivo resolves a concrete model for any plugin whose `-k`/`-m` it owns:
+    // `-m <v>` is used + remembered, a bare launch reuses the remembered model,
+    // a bare `-m` (or `-k` without `-m`) opens the picker once and the choice is
+    // remembered — handed over as `AIVO_KEY_MODEL`. Unservable keys (OAuth,
+    // Cursor for a non-coding-agent) skip resolution: the plugin runs on its
+    // own auth, so a picker would resolve-then-refuse.
     let model = match &hf {
         // The takeover already resolved the served model.
         Some(h) => Some(h.model.clone()),
         None => match key.as_ref() {
-            Some(k) if plan.is_coding_agent && servable => {
+            Some(k) if manages_km && servable => {
                 resolve_plugin_model(store, k, model_request, model_flag_was_explicit, dry_run)
                     .await
             }
-            // Endpoint-granted non-coding-agent plugin: hand over the key's
-            // remembered model as a read-only hint (it self-resolves and ranks
-            // `AIVO_KEY_MODEL` below its own flags/env) — no picker, no
-            // flag-stripping, nothing persisted.
-            Some(k) if servable && plan.has("endpoint") => remembered_plugin_model(store, k).await,
             _ => model_request,
         },
     };
+
+    // An explicit `-m` (value or picker) — or an hf takeover, whose endpoint
+    // serves only that model — makes the handoff model binding rather than a
+    // remembered fallback; plugins rank `AIVO_KEY_MODEL` above their own model
+    // pin env when this is set.
+    let model_explicit = model_flag_was_explicit || hf.is_some();
 
     // --dry-run: report the resolved plan and stop before any side effect —
     // no last-selection write, endpoint, accounting, llama-server, or launch.
@@ -149,6 +170,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
             serve,
             plan.has("endpoint"),
             model.as_deref(),
+            model_explicit,
             debug_log.as_deref(),
             &plugin_args,
             hf.is_some(),
@@ -164,12 +186,24 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     // a bare launch — whose key/model were themselves resolved from this record —
     // writes back idempotently. Skipped on an hf takeover (mirrors run.rs): the
     // synthetic loopback key isn't in the store, so persisting it would poison
-    // the record and the next read would prune it.
-    if plan.is_coding_agent
+    // the record and the next read would prune it. A modelless launch
+    // (OAuth/unservable key, or no TTY for the picker) persists only a key
+    // *switch*: rewriting the same key's record with `model: None` would erase
+    // the remembered model every other launch relies on.
+    if manages_km
         && hf.is_none()
         && let Some(k) = key.as_ref()
     {
-        let _ = store.set_last_selection(k, name, model.as_deref()).await;
+        let same_key_modelless = model.is_none()
+            && store
+                .get_last_selection()
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.key_id == k.id);
+        if !same_key_modelless {
+            let _ = store.set_last_selection(k, name, model.as_deref()).await;
+        }
     }
 
     // The endpoint is the only handoff: aivo stands up a loopback proxy bound to
@@ -210,10 +244,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
             PluginServe::Blocked => {}
             PluginServe::Cursor if plan.has("endpoint") => {
                 if plan.is_coding_agent {
-                    if let Some(m) = &model {
-                        extra_env.push(("AIVO_KEY_MODEL".to_string(), m.clone()));
-                        extra_env.extend(model_limit_env(key, m).await);
-                    }
+                    push_model_env(&mut extra_env, key, model.as_deref(), model_explicit).await;
                     maybe_init_http_debug(debug_log.as_deref()).await;
                     apply_endpoint(
                         start_cursor_endpoint(key).await,
@@ -237,10 +268,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
             // serve proxy, which additionally logs each request to the plugin's
             // `--debug` file.
             PluginServe::Serve if plan.has("endpoint") => {
-                if let Some(m) = &model {
-                    extra_env.push(("AIVO_KEY_MODEL".to_string(), m.clone()));
-                    extra_env.extend(model_limit_env(key, m).await);
-                }
+                push_model_env(&mut extra_env, key, model.as_deref(), model_explicit).await;
                 let started = if use_responses_router(key) {
                     maybe_init_http_debug(debug_log.as_deref()).await;
                     start_responses_endpoint(key, store, name, run_tally.clone()).await
@@ -487,7 +515,8 @@ fn print_aivo_help_banner(name: &str, plan: &GrantPlan) {
             style::dim(desc)
         );
     };
-    if plan.is_coding_agent {
+    if plan.is_coding_agent || plan.has("endpoint") {
+        // aivo owns -k/-m for coding-agent and endpoint plugins (picker on a bare flag).
         row(
             "-k, --key [<id|name>]",
             "aivo key to use (bare -k opens the picker)",
@@ -496,13 +525,24 @@ fn print_aivo_help_banner(name: &str, plan: &GrantPlan) {
             "-m, --model [<model>]",
             "model to use (bare -m opens the picker)",
         );
-        row("--debug[=<path>]", "log the proxied endpoint traffic");
-        row(
-            "--dry-run",
-            "preview the resolved key/model/command without launching",
-        );
+        // --debug/--dry-run are aivo-owned only for a coding-agent; an endpoint tool plugin
+        // keeps its own.
+        if plan.is_coding_agent {
+            row("--debug[=<path>]", "log the proxied endpoint traffic");
+            row(
+                "--dry-run",
+                "preview the resolved key/model/command without launching",
+            );
+        }
     } else {
-        row("-k, --key <id|name>", "aivo key to serve over the endpoint");
+        row(
+            "-k, --key [<id|name>]",
+            "aivo key to serve over the endpoint (bare -k opens the picker)",
+        );
+        row(
+            "-m, --model [<model>]",
+            "model to use (bare -m opens the picker)",
+        );
         row("--debug[=<path>]", "log the proxied endpoint traffic");
     }
     println!();
@@ -525,21 +565,23 @@ struct HfTakeover {
     model: String,
 }
 
-/// Detect and stand up an `hf:`/local-gguf takeover for a coding-agent plugin.
-/// The ref is an explicit `-m hf:…`, else the first positional `hf:`/gguf arg —
-/// lifted out of `plugin_args` since the wrapped tool can't interpret it. Spawns
-/// the local llama-server and returns the synthetic loopback key + served model.
-/// `Ok(None)` when the invocation carries no hf ref. Under `dry_run` the
-/// llama-server is not spawned: the synthetic key carries a placeholder port so
-/// the preview reflects the takeover without the (slow, stateful) launch.
+/// Detect and stand up an `hf:`/local-gguf takeover for a key-managed plugin.
+/// The ref is an explicit `-m hf:…`, else (under `allow_positional`, coding-agent
+/// only) the first positional `hf:`/gguf arg — lifted out of `plugin_args` since
+/// the wrapped tool can't interpret it. Spawns the local llama-server and returns
+/// the synthetic loopback key + served model. `Ok(None)` when the invocation
+/// carries no hf ref. Under `dry_run` the llama-server is not spawned: the
+/// synthetic key carries a placeholder port so the preview reflects the takeover
+/// without the (slow, stateful) launch.
 async fn take_hf_takeover(
     model_flag: Option<&str>,
     plugin_args: &mut Vec<String>,
+    allow_positional: bool,
     dry_run: bool,
 ) -> anyhow::Result<Option<HfTakeover>> {
     use crate::services::huggingface as hf;
 
-    let Some(raw) = take_hf_ref(model_flag, plugin_args) else {
+    let Some(raw) = take_hf_ref(model_flag, plugin_args, allow_positional) else {
         return Ok(None);
     };
 
@@ -585,6 +627,7 @@ fn print_plugin_dry_run(
     serve: Option<PluginServe>,
     endpoint_granted: bool,
     model: Option<&str>,
+    model_explicit: bool,
     debug_log: Option<&Path>,
     plugin_args: &[String],
     hf_active: bool,
@@ -632,6 +675,9 @@ fn print_plugin_dry_run(
         (Some(k), Some(serve)) if serve.is_servable() && endpoint_granted => {
             if let Some(m) = model {
                 env.push(("AIVO_KEY_MODEL".to_string(), m.to_string()));
+                if model_explicit {
+                    env.push(("AIVO_KEY_MODEL_EXPLICIT".to_string(), "1".to_string()));
+                }
             }
             env.push((
                 "AIVO_ENDPOINT_URL".to_string(),
@@ -682,19 +728,26 @@ fn print_plugin_dry_run(
     }
 }
 
-/// The hf/gguf ref for a coding-agent invocation, or `None`. An explicit `-m`
-/// wins entirely (an `hf:` value takes over; a normal model suppresses any
-/// positional lift); otherwise the first positional `hf:`/gguf arg is lifted out
-/// of `plugin_args` (parity with `aivo run`'s positional-hf lifting in `cli_args`).
-fn take_hf_ref(model_flag: Option<&str>, plugin_args: &mut Vec<String>) -> Option<String> {
+/// The hf/gguf ref for a key-managed plugin invocation, or `None`. An explicit
+/// `-m` wins entirely (an `hf:` value takes over; a normal model suppresses any
+/// positional lift). The positional lift — the first `hf:`/gguf arg, parity with
+/// `aivo run`'s lifting in `cli_args` — runs only under `allow_positional`
+/// (coding-agent): the predicate matches any `/`-anchored path, and a generic
+/// plugin's positionals are real paths/refs that must reach it untouched.
+fn take_hf_ref(
+    model_flag: Option<&str>,
+    plugin_args: &mut Vec<String>,
+    allow_positional: bool,
+) -> Option<String> {
     use crate::services::huggingface::is_hf_or_local_gguf;
     match model_flag {
         Some(m) if is_hf_or_local_gguf(m) => Some(m.to_string()),
         Some(_) => None,
-        None => {
+        None if allow_positional => {
             let idx = plugin_args.iter().position(|a| is_hf_or_local_gguf(a))?;
             Some(plugin_args.remove(idx))
         }
+        None => None,
     }
 }
 
@@ -719,9 +772,19 @@ async fn resolve_plugin_key(
         Ok(KeyResolution::Selected(k)) => Some(k),
         // The user opened the picker (`-k`) and cancelled → abort the run, like
         // `aivo <tool>` does, rather than silently launching on another key.
-        Ok(KeyResolution::Cancelled) => std::process::exit(0),
-        // No usable key / error → run bare; the plugin falls back to its own auth.
-        _ => None,
+        Ok(KeyResolution::Cancelled) => {
+            eprintln!("{}", style::dim("Cancelled."));
+            std::process::exit(0)
+        }
+        // No usable key → run bare; the plugin falls back to its own auth.
+        Ok(KeyResolution::MissingAuth) => None,
+        // A real resolution failure (unknown key id, picker without a terminal,
+        // unreadable store) aborts like native `aivo <tool>` — running bare would
+        // mislabel it as a missing endpoint grant.
+        Err(e) => {
+            eprintln!("  {} {e:#}", style::red("Error:"));
+            std::process::exit(crate::errors::ExitCode::UserError.code())
+        }
     }
 }
 
@@ -836,7 +899,10 @@ async fn resolve_plugin_model(
             Some(m)
         }
         // Picker cancelled — don't launch (parity with `aivo run`).
-        Ok(ModelOutcome::Cancelled) => std::process::exit(0),
+        Ok(ModelOutcome::Cancelled) => {
+            eprintln!("{}", crate::style::dim("Cancelled."));
+            std::process::exit(0)
+        }
         // No TTY / empty catalog: leave it to the plugin (it asks the user for -m).
         _ => None,
     }
@@ -927,6 +993,25 @@ impl EndpointHandle {
 /// models-cache → embedded snapshot). Emitted only when known; plugins map
 /// them onto their CLI's own config instead of guessing. Contract:
 /// `docs/PLUGIN-PROTOCOL.md`.
+/// Push the resolved-model handoff env: `AIVO_KEY_MODEL`, the binding marker
+/// `AIVO_KEY_MODEL_EXPLICIT` (this launch's `-m`/picker/hf — not the remembered
+/// fallback), and the advisory limit vars. No-op when no model resolved.
+async fn push_model_env(
+    extra_env: &mut Vec<(String, String)>,
+    key: &ApiKey,
+    model: Option<&str>,
+    explicit: bool,
+) {
+    let Some(m) = model else {
+        return;
+    };
+    extra_env.push(("AIVO_KEY_MODEL".to_string(), m.to_string()));
+    if explicit {
+        extra_env.push(("AIVO_KEY_MODEL_EXPLICIT".to_string(), "1".to_string()));
+    }
+    extra_env.extend(model_limit_env(key, m).await);
+}
+
 async fn model_limit_env(key: &ApiKey, model: &str) -> Vec<(String, String)> {
     let cache = crate::services::models_cache::ModelsCache::new();
     model_limit_env_with_cache(&cache, key, model).await
@@ -1361,13 +1446,13 @@ mod tests {
         // `-m hf:…` is the ref; positional args are left untouched.
         let mut rest = args(&["-p", "hi"]);
         assert_eq!(
-            take_hf_ref(Some("hf:owner/repo"), &mut rest).as_deref(),
+            take_hf_ref(Some("hf:owner/repo"), &mut rest, true).as_deref(),
             Some("hf:owner/repo")
         );
         assert_eq!(rest, args(&["-p", "hi"]));
         // A normal `-m` suppresses any positional lift entirely.
         let mut rest = args(&["hf:owner/repo"]);
-        assert!(take_hf_ref(Some("gpt-4o"), &mut rest).is_none());
+        assert!(take_hf_ref(Some("gpt-4o"), &mut rest, true).is_none());
         assert_eq!(rest, args(&["hf:owner/repo"]));
     }
 
@@ -1377,21 +1462,38 @@ mod tests {
         // the wrapped tool never sees the (uninterpretable) `hf:` token.
         let mut rest = args(&["hf:owner/repo", "explain this"]);
         assert_eq!(
-            take_hf_ref(None, &mut rest).as_deref(),
+            take_hf_ref(None, &mut rest, true).as_deref(),
             Some("hf:owner/repo")
         );
         assert_eq!(rest, args(&["explain this"]));
         // A `.gguf` path is lifted the same way.
         let mut rest = args(&["./model.gguf"]);
         assert_eq!(
-            take_hf_ref(None, &mut rest).as_deref(),
+            take_hf_ref(None, &mut rest, true).as_deref(),
             Some("./model.gguf")
         );
         assert!(rest.is_empty());
         // No hf ref anywhere → no takeover, argv unchanged.
         let mut rest = args(&["just", "a", "prompt"]);
-        assert!(take_hf_ref(None, &mut rest).is_none());
+        assert!(take_hf_ref(None, &mut rest, true).is_none());
         assert_eq!(rest, args(&["just", "a", "prompt"]));
+    }
+
+    #[test]
+    fn take_hf_ref_never_lifts_positionals_for_generic_plugins() {
+        // A generic plugin's positionals are real paths/refs (`/abs/path`,
+        // `./dir`) that match the hf-path predicate — they must reach the
+        // plugin untouched.
+        let mut rest = args(&["/etc/hosts", "review this"]);
+        assert!(take_hf_ref(None, &mut rest, false).is_none());
+        assert_eq!(rest, args(&["/etc/hosts", "review this"]));
+        // An explicit `-m hf:…` still takes over regardless.
+        let mut rest = args(&["./src"]);
+        assert_eq!(
+            take_hf_ref(Some("hf:owner/repo"), &mut rest, false).as_deref(),
+            Some("hf:owner/repo")
+        );
+        assert_eq!(rest, args(&["./src"]));
     }
 
     #[test]
