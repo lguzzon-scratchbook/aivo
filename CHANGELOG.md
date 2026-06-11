@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.28.1
+
+- feat(plugins): aivo owns -k/-m for all endpoint-granted plugins (fec42af)
+- feat(plugins): closed plugin type vocabulary (coding-agent | tool | media) (1b3f96b)
+- feat(plugins): advisory AIVO_KEY_MODEL hint for endpoint plugins (c66a31f)
+
 ## v0.28.0
 
 - feat(cli): consistent list/ls and rm/remove verbs across commands (2dcd0c9)
