@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
 
-use crate::cli_args::context_tag_to_tokens;
 use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::codex_model_map::map_model_for_codex_cli;
@@ -181,7 +180,6 @@ pub(crate) async fn build_runtime_args(
     aivo_env: &HashMap<String, String>,
     cache: &ModelsCache,
     upstream_base_url: Option<&str>,
-    max_context: Option<&str>,
 ) -> Result<RuntimeArgs> {
     let args = inject_claude_teammate_mode(tool, raw_args);
     if tool == AIToolType::Pi {
@@ -209,7 +207,6 @@ pub(crate) async fn build_runtime_args(
         use_responses_router,
         cache,
         upstream_base_url,
-        max_context,
     )
     .await?;
     let args = inject_codex_model(model, &args, use_responses_router);
@@ -323,43 +320,6 @@ pub(crate) fn inject_codex_provider_config(
     }
     config_args.append(args);
     *args = config_args;
-}
-
-/// Append `--config model_context_window=<tokens>` for codex when the user
-/// asked for `--max-context=<N>m`. Codex clamps the value against the
-/// model's advertised ceiling internally, so passing a high value on a
-/// small model is silently a no-op rather than an error. We append (not
-/// prepend) so the user's own `--config` flags, if any, parse first and
-/// can win on conflict per codex's last-write-wins semantics.
-pub(crate) fn inject_codex_max_context(args: &mut Vec<String>, max_context: Option<&str>) {
-    let Some(tag) = max_context else {
-        return;
-    };
-    let Some(tokens) = context_tag_to_tokens(tag) else {
-        return;
-    };
-    args.push("--config".to_string());
-    args.push(format!("model_context_window={tokens}"));
-}
-
-pub(crate) fn inject_codex_max_context_before_args(
-    args: &mut Vec<String>,
-    max_context: Option<&str>,
-) {
-    let Some(tag) = max_context else {
-        return;
-    };
-    let Some(tokens) = context_tag_to_tokens(tag) else {
-        return;
-    };
-    let insert_at = codex_global_prefix_len(args);
-    args.splice(
-        insert_at..insert_at,
-        [
-            "--config".to_string(),
-            format!("model_context_window={tokens}"),
-        ],
-    );
 }
 
 /// Converts Codex CLI args into Codex Desktop App args by inserting the
@@ -724,7 +684,6 @@ async fn maybe_write_codex_model_catalog(
     uses_non_openai_router: bool,
     cache: &ModelsCache,
     upstream_base_url: Option<&str>,
-    max_context: Option<&str>,
 ) -> Result<Option<String>> {
     let slugs = catalog_slugs(model, codex_app_models, uses_non_openai_router);
     if slugs.is_empty() {
@@ -739,7 +698,7 @@ async fn maybe_write_codex_model_catalog(
             model_metadata::resolve_limits(cache, upstream_base_url, slug).await,
         );
     }
-    let catalog_json = build_codex_model_catalog_json(&slugs, &limits, max_context)?;
+    let catalog_json = build_codex_model_catalog_json(&slugs, &limits)?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -836,24 +795,17 @@ fn is_safe_codex_slug(s: &str) -> bool {
 fn build_codex_model_catalog_json(
     slugs: &[String],
     limits: &HashMap<String, ResolvedLimits>,
-    max_context: Option<&str>,
 ) -> Result<String> {
-    let tag_tokens = max_context.and_then(context_tag_to_tokens);
     let models: Vec<_> = slugs
         .iter()
         .enumerate()
-        .map(|(i, m)| model_entry(m, i, limits.get(m.as_str()), tag_tokens))
+        .map(|(i, m)| model_entry(m, i, limits.get(m.as_str())))
         .collect();
     let catalog = json!({ "models": models });
     Ok(serde_json::to_string(&catalog)?)
 }
 
-fn model_entry(
-    model: &str,
-    index: usize,
-    limits: Option<&ResolvedLimits>,
-    tag_tokens: Option<u64>,
-) -> serde_json::Value {
+fn model_entry(model: &str, index: usize, limits: Option<&ResolvedLimits>) -> serde_json::Value {
     // Field set tracks codex 0.133+ `ModelInfo` (protocol/src/openai_models.rs).
     // Missing required fields make codex silently reject the catalog file —
     // codex then falls back to its built-in `models_cache.json` (full of stock
@@ -865,10 +817,8 @@ fn model_entry(
     // entries with priority 0 ("internal") so a non-zero value is required.
     let priority = 10 + (index as i64) * 10;
     // Real context from the limits cascade when known; 128k stays the
-    // unknown-model fallback. `max_context_window` is raised to an explicit
-    // `--1m`/`--2m` tag so codex's internal clamp never undercuts the user.
+    // unknown-model fallback.
     let context_window = limits.and_then(|l| l.context).unwrap_or(128_000);
-    let max_context_window = context_window.max(tag_tokens.unwrap_or(0));
     let image_input = limits
         .and_then(|l| l.caps)
         .is_some_and(|caps| caps.image_input);
@@ -930,7 +880,7 @@ fn model_entry(
         "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
         "context_window": context_window,
-        "max_context_window": max_context_window,
+        "max_context_window": context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
         "input_modalities": input_modalities,
@@ -973,7 +923,6 @@ mod tests {
             &env,
             &env,
             &cache,
-            None,
             None,
         )
         .await
@@ -1020,14 +969,12 @@ mod tests {
             &env,
             &cache,
             None,
-            None,
         )
         .await
         .unwrap();
 
         let mut env_for_provider = env.clone();
         inject_codex_provider_config(&mut env_for_provider, &mut runtime.args);
-        inject_codex_max_context_before_args(&mut runtime.args, Some("1m"));
         inject_codex_app_subcommand(&mut runtime.args);
 
         let app_idx = runtime
@@ -1037,12 +984,6 @@ mod tests {
             .expect("app subcommand present");
         let path_idx = runtime.args.iter().position(|arg| arg == ".").unwrap();
         assert!(app_idx < path_idx, "app must come before PATH");
-        assert!(
-            runtime.args[..app_idx]
-                .windows(2)
-                .any(|w| w[0] == "--config" && w[1] == "model_context_window=1000000"),
-            "max-context config must remain a top-level codex option"
-        );
         assert!(
             runtime.args[..app_idx]
                 .windows(2)
@@ -1255,7 +1196,6 @@ mod tests {
             &env,
             &cache,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -1368,8 +1308,7 @@ mod tests {
     fn test_build_codex_model_catalog_json_includes_model_slug() {
         let model = "minimax/minimax-m2.5".to_string();
         let json =
-            build_codex_model_catalog_json(std::slice::from_ref(&model), &HashMap::new(), None)
-                .unwrap();
+            build_codex_model_catalog_json(std::slice::from_ref(&model), &HashMap::new()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["slug"], model);
         assert_eq!(parsed["models"][0]["display_name"], model);
@@ -1389,7 +1328,7 @@ mod tests {
                 model_metadata::resolve_limits(&cache, None, slug).await,
             );
         }
-        let json = build_codex_model_catalog_json(&slugs, &limits, None).unwrap();
+        let json = build_codex_model_catalog_json(&slugs, &limits).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["context_window"], 1_000_000);
         assert_eq!(parsed["models"][0]["max_context_window"], 1_000_000);
@@ -1417,7 +1356,7 @@ mod tests {
                 model_metadata::resolve_limits(&cache, None, slug).await,
             );
         }
-        let json_str = build_codex_model_catalog_json(&slugs, &limits, None).unwrap();
+        let json_str = build_codex_model_catalog_json(&slugs, &limits).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         let levels = |i: usize| -> Vec<String> {
             parsed["models"][i]["supported_reasoning_levels"]
@@ -1443,26 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_tag_raises_max_context_window_above_real_ceiling() {
-        // An explicit --2m must never be clamped down by the catalog ceiling
-        // (the old 128k hardcode bug); the tag wins over the known context.
-        let mut limits = HashMap::new();
-        limits.insert(
-            "glm-4.7".to_string(),
-            ResolvedLimits {
-                context: Some(205_000),
-                output: None,
-                caps: None,
-            },
-        );
-        let slugs = vec!["glm-4.7".to_string()];
-        let json = build_codex_model_catalog_json(&slugs, &limits, Some("2m")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["models"][0]["context_window"], 205_000);
-        assert_eq!(parsed["models"][0]["max_context_window"], 2_000_000);
-    }
-
-    #[test]
     fn build_codex_model_catalog_json_uses_shell_type_default() {
         // Pin: codex 0.132+ only accepts `"default"` for `shell_type` in
         // model_catalog_json entries. Anything else (we previously emitted
@@ -1472,8 +1391,7 @@ mod tests {
         // default model — so the user's `-m <picked>` is ignored and the
         // banner shows `gpt-4o` instead of the chosen cursor/openrouter slug.
         let json =
-            build_codex_model_catalog_json(&["composer-2.5".to_string()], &HashMap::new(), None)
-                .unwrap();
+            build_codex_model_catalog_json(&["composer-2.5".to_string()], &HashMap::new()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["shell_type"], "default");
     }
@@ -1485,7 +1403,6 @@ mod tests {
         let json = build_codex_model_catalog_json(
             &["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
             &HashMap::new(),
-            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1631,45 +1548,10 @@ mod tests {
             &env,
             &cache,
             None,
-            None,
         )
         .await
         .unwrap();
         assert_eq!(result.args, vec!["explain this code"]);
-    }
-
-    #[test]
-    fn inject_codex_max_context_appends_config_arg() {
-        let mut args = vec!["-m".to_string(), "gpt-5".to_string()];
-        inject_codex_max_context(&mut args, Some("1m"));
-        assert_eq!(
-            args,
-            vec!["-m", "gpt-5", "--config", "model_context_window=1000000"]
-        );
-    }
-
-    #[test]
-    fn inject_codex_max_context_handles_multi_digit_tags() {
-        let mut args: Vec<String> = vec![];
-        inject_codex_max_context(&mut args, Some("12m"));
-        assert_eq!(args, vec!["--config", "model_context_window=12000000"]);
-    }
-
-    #[test]
-    fn inject_codex_max_context_noop_when_unset() {
-        let mut args = vec!["existing".to_string()];
-        inject_codex_max_context(&mut args, None);
-        assert_eq!(args, vec!["existing"]);
-    }
-
-    #[test]
-    fn inject_codex_max_context_noop_on_malformed_tag() {
-        // Defensive: callers should pass canonical `<N>m`, but if junk slips
-        // through (e.g. a future code path forgets to validate), we silently
-        // skip rather than appending a garbage `--config` value.
-        let mut args = vec!["existing".to_string()];
-        inject_codex_max_context(&mut args, Some("foo"));
-        assert_eq!(args, vec!["existing"]);
     }
 
     #[test]

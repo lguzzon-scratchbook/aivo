@@ -320,12 +320,11 @@ pub async fn run() -> ! {
                     process::exit(ExitCode::UserError.code());
                 };
                 let parsed_tool = run_args.tool.as_deref().and_then(AIToolType::parse);
-                let supported = parsed_tool
-                    .is_some_and(|t| matches!(t, AIToolType::Claude) || t.is_codex_family());
+                let supported = parsed_tool.is_some_and(|t| matches!(t, AIToolType::Claude));
                 if !supported {
                     let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
                     eprintln!(
-                        "{} --max-context only applies to `aivo run claude`, `aivo run codex`, and `aivo run codex-app` (got {}).",
+                        "{} --max-context only applies to `aivo run claude` (got {}).",
                         style::red("Error:"),
                         tool_name
                     );

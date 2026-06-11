@@ -13,8 +13,7 @@ use tokio::signal;
 use crate::errors::{CLIError, ErrorCategory};
 use crate::services::environment_injector::{ClaudeModelOverrides, EnvironmentInjector};
 use crate::services::launch_args::{
-    build_preview_notes, build_runtime_args, inject_codex_max_context,
-    inject_codex_max_context_before_args, inject_codex_provider_config, inject_codex_root_model,
+    build_preview_notes, build_runtime_args, inject_codex_provider_config, inject_codex_root_model,
     merge_preview_env, preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
@@ -186,11 +185,10 @@ pub struct LaunchOptions {
     pub args: Vec<String>,
     pub model: Option<String>,
     /// Per-slot Claude model overrides (six addressable slots) plus the
-    /// shared `max_context` tag. The slot fields are Claude-only — set on
-    /// other tools they trigger one stderr warning per slot and are then
-    /// dropped. `max_context` is honored by Claude and Codex (each
-    /// interprets it differently — see `for_claude_with_overrides` and
-    /// `inject_codex_max_context`).
+    /// shared `max_context` tag. All fields are Claude-only — the slot flags
+    /// trigger one stderr warning per slot on other tools and are then
+    /// dropped; `max_context` is rejected up-front for non-Claude tools (see
+    /// `for_claude_with_overrides` for how Claude consumes it).
     pub claude_overrides: ClaudeModelOverrides,
     pub env: Option<HashMap<String, String>>,
     /// Temporary key override for this launch (does not persist to config)
@@ -307,7 +305,6 @@ impl AILauncher {
             &resolved.tool_config.env_vars,
             &self.cache,
             Some(resolved.key.base_url.as_str()),
-            options.claude_overrides.max_context.as_deref(),
         )
         .await?;
 
@@ -315,10 +312,6 @@ impl AILauncher {
         if options.tool.is_codex_family() {
             inject_codex_provider_config(&mut runtime.env, &mut runtime_args.args);
             if options.tool == AIToolType::CodexApp {
-                inject_codex_max_context_before_args(
-                    &mut runtime_args.args,
-                    options.claude_overrides.max_context.as_deref(),
-                );
                 inject_codex_root_model(&mut runtime_args.args, resolved.model.as_deref());
                 crate::services::launch_args::inject_codex_app_subcommand(&mut runtime_args.args);
                 codex_app_wrapper_path = install_codex_app_wrapper(
@@ -333,11 +326,6 @@ impl AILauncher {
                     runtime_args.codex_model_catalog_path.as_deref(),
                 )
                 .await;
-            } else {
-                inject_codex_max_context(
-                    &mut runtime_args.args,
-                    options.claude_overrides.max_context.as_deref(),
-                );
             }
         }
 
@@ -645,10 +633,6 @@ impl AILauncher {
         if options.tool.is_codex_family() {
             rewrite_codex_preview_env(&mut env_vars);
             if options.tool == AIToolType::CodexApp {
-                inject_codex_max_context_before_args(
-                    &mut args,
-                    options.claude_overrides.max_context.as_deref(),
-                );
                 // Match the real launch ordering exactly so --dry-run isn't
                 // misleading: root model first, then the `app` subcommand
                 // insert. The actual launch then drains the global prefix
@@ -676,11 +660,6 @@ impl AILauncher {
                 notes.push(
                     "writes a per-key models_cache.json into the shadow CODEX_HOME so the GUI's model picker reflects aivo's discovered models"
                         .to_string(),
-                );
-            } else {
-                inject_codex_max_context(
-                    &mut args,
-                    options.claude_overrides.max_context.as_deref(),
                 );
             }
         }
@@ -1024,10 +1003,9 @@ impl AILauncher {
         pi_model_limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
         claude_overrides: &ClaudeModelOverrides,
     ) -> ToolConfig {
-        // claude_overrides.{slot fields} are non-empty only on the Claude
-        // path; for other tools the run command warns up-front and never
-        // populates them. `max_context` may be set for Claude or Codex —
-        // each branch below picks it up explicitly.
+        // claude_overrides are non-empty only on the Claude path; for other
+        // tools the run command warns or errors up-front and never populates
+        // them.
         let env_vars = match tool {
             AIToolType::Claude => {
                 self.env_injector

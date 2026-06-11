@@ -325,12 +325,10 @@ impl RunCommand {
             }
         };
 
-        // Auto-defaults (1m/2m based on the model's advertised context window)
-        // only make sense for Claude — they target Anthropic's beta-tier
-        // context-bar opt-in. For Codex the same flag is a raw token-count
-        // override of `model_context_window`, so silently picking "1m" because
-        // a model happens to advertise ≥1M tokens would unexpectedly shadow
-        // Codex's own discovery. Only respect the user's explicit value there.
+        // `--max-context` is Claude-only — it targets Anthropic's beta-tier
+        // context-bar opt-in 1m/2m. Other tools (codex included) get their
+        // context windows from the limits cascade; the run entry point
+        // rejects the flag for them before dispatch reaches here.
         claude_overrides.max_context = match ai_tool {
             AIToolType::Claude => {
                 resolve_max_context(
@@ -341,7 +339,7 @@ impl RunCommand {
                 )
                 .await
             }
-            _ => max_context,
+            _ => None,
         };
 
         let launch_model = resolve_model_placeholder(resolved_model);
@@ -436,7 +434,7 @@ impl RunCommand {
     /// tools the run pipeline actually honors:
     ///   - Claude slot flags (`--reasoning-model`, `--{haiku,sonnet,opus}-model`,
     ///     `--subagent-model`) → claude
-    ///   - `--max-context`/`--1m`/`--2m` → claude, codex, codex-app
+    ///   - `--max-context`/`--1m`/`--2m` → claude
     ///   - `--relogin` → claude, codex/codex-app, gemini (the OAuth-backed keys)
     ///   - `-c, --context` → every tool (no flat prompt-flag path)
     pub fn print_help(tool: Option<&str>) {
@@ -528,7 +526,7 @@ impl RunCommand {
         }
 
         section("Context:");
-        if is("claude") || is("codex") || is("codex-app") {
+        if is("claude") {
             print_opt(
                 "--max-context <size>",
                 "Opt every model slot into a larger context window (e.g. 1m, 2m)",
