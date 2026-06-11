@@ -51,6 +51,9 @@ ed25519-dalek = "2"
 rand = "0.8"
 base64 = "0.22"
 zeroize = { version = "1.8", features = ["derive"] }
+# Verify-only minisign: authenticates self-update downloads against an
+# embedded public key (src/commands/update.rs). No signing on the client.
+minisign-verify = "0.2.5"
 
 # Utils
 bytes = "1"

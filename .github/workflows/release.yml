@@ -93,6 +93,28 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Sign artifacts (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          # Fail closed: never publish a release the strict client can't verify.
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set — refusing to publish unsigned artifacts" >&2
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          # Detached signature per binary (skip the .sha256 sidecars). `update.rs`
+          # fetches <binary>.minisig and verifies it against the embedded pubkey.
+          for f in artifacts/aivo-*; do
+            case "$f" in
+              *.sha256|*.minisig) continue ;;
+            esac
+            printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "$f"
+          done
+          rm -f minisign.key
+
       - name: Install wrangler
         run: npm install -g wrangler@4
 

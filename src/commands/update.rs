@@ -14,6 +14,13 @@ use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::style;
 
 const DOWNLOAD_BASE: &str = "https://getaivo.dev/dl";
+
+/// Ed25519 public key (the base64 line of `aivo.pub`) that every self-update
+/// download is verified against. The matching secret key lives only in CI
+/// secrets and signs each release artifact into a detached `.minisig`. This is
+/// the trust anchor: a compromised download host can't forge an update without
+/// it. Authenticity check; the SHA-256 stays as a corruption check.
+const MINISIGN_PUBKEY: &str = "RWTXF3LNcIUx6667XJo3zslNJQPdcNqMagE/Qp7AQUZTQ2BoghNzgwd7";
 const NPM_UPDATE_COMMAND: &str = "npm install -g @yuanchuan/aivo@latest";
 #[cfg(not(windows))]
 const NPM_UPDATE_ARGS: [&str; 3] = ["install", "-g", "@yuanchuan/aivo@latest"];
@@ -152,11 +159,16 @@ impl UpdateCommand {
         let base_url = format!("{}/v{}", DOWNLOAD_BASE, latest_version);
         let binary_url = format!("{}/{}", base_url, binary_name);
         let sha256_url = format!("{}/{}.sha256", base_url, binary_name);
+        let minisig_url = format!("{}/{}.minisig", base_url, binary_name);
 
         let expected_sha256 = self.fetch_sha256(&sha256_url, &binary_name).await?;
+        let signature = self.fetch_text(&minisig_url).await.context(
+            "Failed to fetch the update's signature (.minisig) — refusing to install unverified",
+        )?;
 
         println!("{} Downloading update...", style::arrow_symbol());
-        self.install_update(&binary_url, &expected_sha256).await?;
+        self.install_update(&binary_url, &expected_sha256, &signature)
+            .await?;
 
         println!(
             "{} Updated to version {}",
@@ -225,8 +237,32 @@ impl UpdateCommand {
             .ok_or_else(|| anyhow::anyhow!("Could not parse checksum for {}", binary_name))
     }
 
+    /// Fetches a small text resource (e.g. the `.minisig` signature).
+    async fn fetch_text(&self, url: &str) -> Result<String> {
+        let response = self
+            .client
+            .get(url)
+            .header("User-Agent", "aivo-cli")
+            .send()
+            .await
+            .context("Request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("HTTP {}", status));
+        }
+        response
+            .text()
+            .await
+            .context("Failed to read response body")
+    }
+
     /// Downloads and installs the update
-    async fn install_update(&self, download_url: &str, expected_sha256: &str) -> Result<()> {
+    async fn install_update(
+        &self,
+        download_url: &str,
+        expected_sha256: &str,
+        signature: &str,
+    ) -> Result<()> {
         let exec_path = get_install_path()?;
         let tmp_path = exec_path.with_extension("tmp");
 
@@ -237,6 +273,26 @@ impl UpdateCommand {
                 return Err(err).context("Failed to download update");
             }
         };
+
+        // Authenticity first: a valid signature over the downloaded bytes proves
+        // the release came from the holder of the CI secret key, not just that
+        // the bytes match a hash the same host served.
+        let bytes = match tokio::fs::read(&tmp_path).await {
+            Ok(b) => b,
+            Err(err) => {
+                tokio::fs::remove_file(&tmp_path).await.ok();
+                return Err(err).context("Failed to re-read downloaded update for verification");
+            }
+        };
+        if let Err(err) = verify_minisign(MINISIGN_PUBKEY, &bytes, signature) {
+            tokio::fs::remove_file(&tmp_path).await.ok();
+            return Err(err).context("Signature verification failed — refusing to install");
+        }
+        println!(
+            "  {} {}",
+            style::dim("Signature (Ed25519):"),
+            style::green("verified")
+        );
 
         if actual_sha256 != expected_sha256 {
             tokio::fs::remove_file(&tmp_path).await.ok();
@@ -512,6 +568,25 @@ impl UpdateCommand {
     }
 }
 
+/// Verifies `data` against a detached minisign `signature` using `pubkey_b64`
+/// (the base64 line of an `aivo.pub`). Any parse or verification failure is an
+/// error — the caller treats that as "do not install".
+fn verify_minisign(pubkey_b64: &str, data: &[u8], signature: &str) -> Result<()> {
+    use minisign_verify::{PublicKey, Signature};
+
+    let public_key = PublicKey::from_base64(pubkey_b64.trim()).map_err(|e| {
+        anyhow::anyhow!(
+            "this aivo build has no valid update-signing public key ({e}); \
+             reinstall from https://getaivo.dev or your package manager"
+        )
+    })?;
+    let signature = Signature::decode(signature.trim())
+        .map_err(|e| anyhow::anyhow!("malformed signature: {e}"))?;
+    public_key
+        .verify(data, &signature, false)
+        .map_err(|e| anyhow::anyhow!("signature does not match the downloaded binary: {e}"))
+}
+
 fn normalize_sha256(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -732,6 +807,50 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A self-contained minisign test vector (generated offline; not the
+    // production key). Signature is over the exact bytes of TEST_PAYLOAD.
+    const TEST_PUBKEY: &str = "RWQGB+jqLf9L8qddcLvjpHkTbNnCoF959l7GeTTqTUCCiGiFIuxEOQ+F";
+    const TEST_PAYLOAD: &[u8] = b"aivo-update-test-payload";
+    const TEST_SIG: &str = "untrusted comment: signature from minisign secret key\n\
+RUQGB+jqLf9L8gqLIGqP9w+H8OnkiCS9gNcFNLx4zujoZKUsLJGVVSfgVLqC4HoozPwBh0JN4uRbI2S+b7PfgopEw8LigYxcdw0=\n\
+trusted comment: timestamp:1781191999\tfile:msg.bin\thashed\n\
+Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmuWTyQCA==\n";
+
+    #[test]
+    fn verify_minisign_accepts_valid_signature() {
+        assert!(verify_minisign(TEST_PUBKEY, TEST_PAYLOAD, TEST_SIG).is_ok());
+    }
+
+    #[test]
+    fn verify_minisign_rejects_tampered_payload() {
+        let mut tampered = TEST_PAYLOAD.to_vec();
+        tampered[0] ^= 0x01;
+        assert!(verify_minisign(TEST_PUBKEY, &tampered, TEST_SIG).is_err());
+    }
+
+    #[test]
+    fn verify_minisign_rejects_wrong_key() {
+        // A real, different minisign key must not verify this signature.
+        let other = "RWS3ZL6im4hk6qKNxqj4pM0CUc/N/kpnr8Q6stytqeRMJKgaeUeIEhu2";
+        assert!(verify_minisign(other, TEST_PAYLOAD, TEST_SIG).is_err());
+    }
+
+    #[test]
+    fn production_pubkey_parses_and_rejects_foreign_signature() {
+        // The embedded production key must be a well-formed minisign key (so it
+        // can verify real releases) yet reject a signature made by any other key.
+        assert!(
+            minisign_verify::PublicKey::from_base64(MINISIGN_PUBKEY).is_ok(),
+            "embedded MINISIGN_PUBKEY must be a valid minisign public key"
+        );
+        assert!(verify_minisign(MINISIGN_PUBKEY, TEST_PAYLOAD, TEST_SIG).is_err());
+    }
+
+    #[test]
+    fn verify_minisign_rejects_garbage_signature() {
+        assert!(verify_minisign(TEST_PUBKEY, TEST_PAYLOAD, "not a signature").is_err());
+    }
 
     #[test]
     fn test_is_newer_version() {
