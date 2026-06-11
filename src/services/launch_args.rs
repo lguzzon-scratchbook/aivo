@@ -854,7 +854,7 @@ fn model_entry(model: &str, index: usize, limits: Option<&ResolvedLimits>) -> se
         .iter()
         .map(|e| json!({"effort": e, "description": format!("{e} reasoning")}))
         .collect();
-    json!({
+    let mut entry = json!({
         "slug": model,
         "display_name": model,
         "description": format!("aivo-routed model {}", model),
@@ -885,7 +885,12 @@ fn model_entry(model: &str, index: usize, limits: Option<&ResolvedLimits>) -> se
         "experimental_supported_tools": [],
         "input_modalities": input_modalities,
         "supports_search_tool": false
-    })
+    });
+    // Omitted (not null) when unknown so codex's own default applies.
+    if let Some(output) = limits.and_then(|l| l.output) {
+        entry["max_output_tokens"] = json!(output);
+    }
+    entry
 }
 
 #[cfg(test)]
@@ -1312,9 +1317,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["slug"], model);
         assert_eq!(parsed["models"][0]["display_name"], model);
-        // No resolved limits → 128k fallback.
+        // No resolved limits → 128k fallback, and no output field at all.
         assert_eq!(parsed["models"][0]["context_window"], 128_000);
         assert_eq!(parsed["models"][0]["max_context_window"], 128_000);
+        assert!(parsed["models"][0].get("max_output_tokens").is_none());
     }
 
     #[tokio::test]
@@ -1332,6 +1338,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["context_window"], 1_000_000);
         assert_eq!(parsed["models"][0]["max_context_window"], 1_000_000);
+        assert_eq!(parsed["models"][0]["max_output_tokens"], 64_000);
         // claude takes image input; deepseek-chat doesn't.
         assert_eq!(
             parsed["models"][0]["input_modalities"],

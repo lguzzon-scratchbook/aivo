@@ -787,6 +787,7 @@ impl EnvironmentInjector {
         key: &ApiKey,
         model: Option<&str>,
         discovered_models: Option<&[String]>,
+        limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
     ) -> HashMap<String, String> {
         if key.is_cursor_acp() {
             return Self::for_opencode_cursor(key, model, discovered_models);
@@ -911,7 +912,18 @@ impl EnvironmentInjector {
         if !model_ids.is_empty() {
             let mut models = Map::new();
             for model_id in model_ids {
-                models.insert(model_id.clone(), json!({ "name": model_id }));
+                let mut entry = json!({ "name": model_id });
+                // opencode's schema requires context AND output together;
+                // limits are keyed by the raw (possibly `aivo/`-prefixed) id.
+                let resolved = limits
+                    .get(&model_id)
+                    .or_else(|| limits.get(&format!("aivo/{model_id}")));
+                if let Some(l) = resolved
+                    && let (Some(context), Some(output)) = (l.context, l.output)
+                {
+                    entry["limit"] = json!({ "context": context, "output": output });
+                }
+                models.insert(model_id.clone(), entry);
             }
             provider.insert("models".to_string(), Value::Object(models));
         }
@@ -1329,7 +1341,7 @@ mod tests {
             "{}testaccount1",
             crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
         ));
-        let env = injector.for_opencode(&key, Some("composer-2.5"), None);
+        let env = injector.for_opencode(&key, Some("composer-2.5"), None, &HashMap::new());
 
         assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
@@ -2829,7 +2841,7 @@ mod tests {
     fn test_for_opencode() {
         let injector = EnvironmentInjector::new();
         let key = test_key();
-        let env = injector.for_opencode(&key, None, None);
+        let env = injector.for_opencode(&key, None, None, &HashMap::new());
 
         let config: Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
@@ -2851,10 +2863,58 @@ mod tests {
     }
 
     #[test]
+    fn for_opencode_emits_model_limits_when_cascade_knows_both() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let mut limits = HashMap::new();
+        limits.insert(
+            "deepseek-chat".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(128_000),
+                output: Some(8_000),
+                caps: None,
+            },
+        );
+        // Raw catalog id carries the `aivo/` prefix the config id strips.
+        limits.insert(
+            "aivo/starter".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(1_000_000),
+                output: Some(384_000),
+                caps: None,
+            },
+        );
+        // Context-only must not emit a half-filled limit.
+        limits.insert(
+            "mystery".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(64_000),
+                output: None,
+                caps: None,
+            },
+        );
+        let discovered = vec![
+            "deepseek-chat".to_string(),
+            "aivo/starter".to_string(),
+            "mystery".to_string(),
+        ];
+        let env = injector.for_opencode(&key, None, Some(&discovered), &limits);
+
+        let config: Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        let models = &config["provider"]["aivo"]["models"];
+        assert_eq!(models["deepseek-chat"]["limit"]["context"], 128_000);
+        assert_eq!(models["deepseek-chat"]["limit"]["output"], 8_000);
+        assert_eq!(models["starter"]["limit"]["context"], 1_000_000);
+        assert_eq!(models["starter"]["limit"]["output"], 384_000);
+        assert!(models["mystery"].get("limit").is_none());
+    }
+
+    #[test]
     fn test_for_opencode_with_model() {
         let injector = EnvironmentInjector::new();
         let key = test_key();
-        let env = injector.for_opencode(&key, Some("gpt-5"), None);
+        let env = injector.for_opencode(&key, Some("gpt-5"), None, &HashMap::new());
 
         let config: Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
@@ -2869,7 +2929,7 @@ mod tests {
     fn test_for_opencode_with_prefixed_model() {
         let injector = EnvironmentInjector::new();
         let key = test_key();
-        let env = injector.for_opencode(&key, Some("aivo/gpt-5"), None);
+        let env = injector.for_opencode(&key, Some("aivo/gpt-5"), None, &HashMap::new());
 
         let config: Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
@@ -2885,7 +2945,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let key = test_key();
         let discovered = vec!["gpt-4o".to_string(), "claude-sonnet-4".to_string()];
-        let env = injector.for_opencode(&key, None, Some(&discovered));
+        let env = injector.for_opencode(&key, None, Some(&discovered), &HashMap::new());
 
         let config: Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
@@ -2905,7 +2965,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let key = test_key();
         let discovered = vec!["gpt-4o".to_string(), "claude-sonnet-4".to_string()];
-        let env = injector.for_opencode(&key, Some("gpt-5"), Some(&discovered));
+        let env = injector.for_opencode(&key, Some("gpt-5"), Some(&discovered), &HashMap::new());
 
         let config: Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
@@ -2934,7 +2994,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        let env = injector.for_opencode(&key, Some("minimax/minimax-m2.7"), None);
+        let env = injector.for_opencode(&key, Some("minimax/minimax-m2.7"), None, &HashMap::new());
 
         assert_eq!(env.get("AIVO_IS_STARTER"), Some(&"1".to_string()));
         assert!(
@@ -2958,7 +3018,7 @@ mod tests {
             "minimax/minimax-m2.7".to_string(),
         ];
 
-        let env = injector.for_opencode(&key, Some("starter"), Some(&catalog));
+        let env = injector.for_opencode(&key, Some("starter"), Some(&catalog), &HashMap::new());
         assert_eq!(
             env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS"),
             Some(&"starter".to_string()),
@@ -2974,7 +3034,12 @@ mod tests {
         key.base_url = AIVO_STARTER_SENTINEL.to_string();
         let catalog = vec!["minimax/minimax-m2.7".to_string()];
 
-        let env = injector.for_opencode(&key, Some("minimax/minimax-m2.7"), Some(&catalog));
+        let env = injector.for_opencode(
+            &key,
+            Some("minimax/minimax-m2.7"),
+            Some(&catalog),
+            &HashMap::new(),
+        );
         assert!(!env.contains_key("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS"));
     }
 
@@ -2983,7 +3048,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "copilot".to_string();
-        let env = injector.for_opencode(&key, None, None);
+        let env = injector.for_opencode(&key, None, None, &HashMap::new());
 
         // Must set the router trigger env vars
         assert_eq!(
@@ -3010,7 +3075,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.opencode_mode = Some(OpenAICompatibilityMode::Router);
-        let env = injector.for_opencode(&key, Some("gpt-4o"), None);
+        let env = injector.for_opencode(&key, Some("gpt-4o"), None, &HashMap::new());
 
         assert_eq!(env.get("AIVO_USE_OPENCODE_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
@@ -3201,7 +3266,7 @@ mod tests {
     fn test_for_opencode_ollama_uses_direct_connection() {
         let injector = EnvironmentInjector::new();
         let key = ollama_key();
-        let env = injector.for_opencode(&key, Some("llama3.2"), None);
+        let env = injector.for_opencode(&key, Some("llama3.2"), None, &HashMap::new());
 
         let config: Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();

@@ -756,12 +756,24 @@ impl AILauncher {
         } else {
             Vec::new()
         };
-        // Resolved limits for pi's models.json — pi assumes 128k context for
-        // entries without an explicit contextWindow.
-        let pi_model_limits = if options.tool == AIToolType::Pi {
+        // Per-model limits for the tools that can consume them: pi models.json,
+        // opencode `limit`, claude CLAUDE_CODE_MAX_OUTPUT_TOKENS.
+        let catalog_ids: Vec<&str> = match options.tool {
+            AIToolType::Pi => pi_models.iter().map(String::as_str).collect(),
+            AIToolType::Opencode => opencode_models
+                .iter()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let model_limits = if matches!(
+            options.tool,
+            AIToolType::Pi | AIToolType::Opencode | AIToolType::Claude
+        ) {
             let cache_base = crate::commands::models::model_cache_key_for_key(&key);
             let mut limits = HashMap::new();
-            for id in pi_models.iter().map(String::as_str).chain(model.as_deref()) {
+            for id in catalog_ids.into_iter().chain(model.as_deref()) {
                 if !limits.contains_key(id) {
                     let resolved = crate::services::model_metadata::resolve_limits(
                         &self.cache,
@@ -782,7 +794,7 @@ impl AILauncher {
             model.as_deref(),
             opencode_models.as_deref(),
             &pi_models,
-            &pi_model_limits,
+            &model_limits,
             &options.claude_overrides,
         );
         Ok(ResolvedLaunchContext {
@@ -1000,7 +1012,7 @@ impl AILauncher {
         model: Option<&str>,
         opencode_models: Option<&[String]>,
         pi_models: &[String],
-        pi_model_limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
+        model_limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
         claude_overrides: &ClaudeModelOverrides,
     ) -> ToolConfig {
         // claude_overrides are non-empty only on the Claude path; for other
@@ -1008,15 +1020,29 @@ impl AILauncher {
         // them.
         let env_vars = match tool {
             AIToolType::Claude => {
-                self.env_injector
-                    .for_claude_with_overrides(key, model, claude_overrides)
+                let mut env =
+                    self.env_injector
+                        .for_claude_with_overrides(key, model, claude_overrides);
+                // Claude Code's per-request output cap; user `--env` still
+                // wins at the runtime merge.
+                if let Some(output) = model
+                    .and_then(|m| model_limits.get(m))
+                    .and_then(|l| l.output)
+                {
+                    env.entry("CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string())
+                        .or_insert_with(|| output.to_string());
+                }
+                env
             }
             AIToolType::Codex | AIToolType::CodexApp => self.env_injector.for_codex(key, model),
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
-            AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
+            AIToolType::Opencode => {
+                self.env_injector
+                    .for_opencode(key, model, opencode_models, model_limits)
+            }
             AIToolType::Pi => self
                 .env_injector
-                .for_pi(key, model, pi_models, pi_model_limits),
+                .for_pi(key, model, pi_models, model_limits),
         };
 
         ToolConfig {
@@ -2004,6 +2030,50 @@ mod tests {
             .await
             .unwrap();
         store.get_key_by_id(&id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_tool_config_sets_claude_max_output_tokens_from_limits() {
+        let (store, launcher, _tmp) = test_launcher_with_store().await;
+        let key = test_insert_key(&store, "https://api.example.com/v1").await;
+        let mut limits = HashMap::new();
+        limits.insert(
+            "deepseek-chat".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(128_000),
+                output: Some(8_000),
+                caps: None,
+            },
+        );
+        let config = launcher.get_tool_config(
+            AIToolType::Claude,
+            &key,
+            Some("deepseek-chat"),
+            None,
+            &[],
+            &limits,
+            &ClaudeModelOverrides::default(),
+        );
+        assert_eq!(
+            config.env_vars.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+            Some(&"8000".to_string())
+        );
+
+        // Output unknown → the var stays unset so Claude's default applies.
+        let config = launcher.get_tool_config(
+            AIToolType::Claude,
+            &key,
+            Some("mystery-model"),
+            None,
+            &[],
+            &limits,
+            &ClaudeModelOverrides::default(),
+        );
+        assert!(
+            !config
+                .env_vars
+                .contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        );
     }
 
     #[tokio::test]
