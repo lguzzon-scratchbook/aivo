@@ -44,7 +44,8 @@ jobs:
             run: '-p'
           - tool: codex
             package: '@openai/codex'
-            run: 'exec'
+            # codex exec refuses to run outside a git repo without this.
+            run: 'exec --skip-git-repo-check'
           - tool: gemini
             package: '@google/gemini-cli'
             run: '-p'
