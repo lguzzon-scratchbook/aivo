@@ -148,7 +148,7 @@ fn github_install_resolves_release_asset() {
     let home = TempDir::new().unwrap();
     let out = aivo(&home)
         .env("AIVO_GITHUB_API", &base)
-        .args(["plugins", "install", "github:o/aivo-widget"])
+        .args(["plugins", "install", "github:o/aivo-widget", "--trust"])
         .output()
         .expect("spawn aivo");
     assert!(
@@ -166,7 +166,7 @@ fn github_install_resolves_release_asset() {
         "github:o/aivo-widget"
     );
 
-    // It dispatches.
+    // It dispatches (`--trust` approved the first run; this session has no TTY).
     let run = aivo(&home).args(["widget"]).output().unwrap();
     assert!(String::from_utf8_lossy(&run.stdout).contains("widget ran"));
 }
@@ -210,7 +210,7 @@ fn github_install_falls_back_to_node_source_tarball() {
     let home = TempDir::new().unwrap();
     let out = aivo(&home)
         .env("AIVO_GITHUB_API", &base)
-        .args(["plugins", "install", "github:o/aivo-hello"])
+        .args(["plugins", "install", "github:o/aivo-hello", "--trust"])
         .output()
         .expect("spawn aivo");
     assert!(
@@ -438,7 +438,7 @@ fn update_resets_consent_when_remote_binary_changes() {
     );
     let out = aivo(&home)
         .env("AIVO_GITHUB_API", &base1)
-        .args(["plugins", "install", "github:o/aivo-widget"])
+        .args(["plugins", "install", "github:o/aivo-widget", "--trust"])
         .output()
         .expect("spawn aivo");
     assert!(
@@ -509,5 +509,166 @@ fn update_resets_consent_when_remote_binary_changes() {
         rec["checksum"].as_str(),
         Some(checksum_v1.as_str()),
         "checksum pin must advance to the new binary: {rec}"
+    );
+    assert!(
+        rec["approved_checksum"].is_null(),
+        "approval pin must be cleared on change: {rec}"
+    );
+}
+
+/// Off-TTY, an unapproved remote plugin must be refused with guidance — not
+/// silently executed and permanently approved (the old fail-open).
+#[test]
+fn non_tty_dispatch_refuses_unapproved_plugin() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let (l, base) = bind();
+    serve(l, widget_routes(&base, widget_release_tgz(&work, "1.0.0")));
+
+    // Plain install (no --trust): nothing has approved execution yet.
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base)
+        .args(["plugins", "install", "github:o/aivo-widget"])
+        .output()
+        .expect("spawn aivo");
+    assert!(
+        out.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = aivo(&home).args(["widget"]).output().expect("spawn aivo");
+    assert!(!run.status.success(), "dispatch must refuse to run");
+    assert!(
+        !String::from_utf8_lossy(&run.stdout).contains("widget 1.0.0"),
+        "the binary must not have executed"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("not approved") && stderr.contains("--trust"),
+        "refusal should explain how to approve:\n{stderr}"
+    );
+    // Crucially, the refusal must not have persisted an approval.
+    let rec = &registry(&home)["plugins"]["widget"];
+    assert!(
+        !rec["run_approved"].as_bool().unwrap_or(false),
+        "refusal must not approve: {rec}"
+    );
+}
+
+/// `install --force` over an already-consented plugin must not carry the old
+/// binary's consent onto different remote bytes (the same trojan-update hole
+/// `plugins update` closes).
+#[test]
+fn force_reinstall_does_not_inherit_consent_for_changed_binary() {
+    let home = TempDir::new().unwrap();
+
+    // v1: trusted install + one run to capture manifest and bind approval.
+    let work1 = TempDir::new().unwrap();
+    let (l1, base1) = bind();
+    serve(
+        l1,
+        widget_routes(&base1, widget_release_tgz(&work1, "1.0.0")),
+    );
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base1)
+        .args(["plugins", "install", "github:o/aivo-widget", "--trust"])
+        .output()
+        .expect("spawn aivo");
+    assert!(out.status.success());
+    let run = aivo(&home).args(["widget"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&run.stdout).contains("widget 1.0.0"));
+
+    // Simulate granted caps (a TTY would have prompted at first dispatch).
+    let reg_path = home.path().join(".config/aivo/plugins/.registry.json");
+    let mut reg: Value =
+        serde_json::from_str(&std::fs::read_to_string(&reg_path).unwrap()).unwrap();
+    reg["plugins"]["widget"]["granted_caps"] = serde_json::json!(["endpoint"]);
+    std::fs::write(&reg_path, serde_json::to_string(&reg).unwrap()).unwrap();
+
+    // Different bytes now sit at the source; the user force-reinstalls.
+    let work2 = TempDir::new().unwrap();
+    let (l2, base2) = bind();
+    serve(
+        l2,
+        widget_routes(&base2, widget_release_tgz(&work2, "2.0.0")),
+    );
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base2)
+        .args(["plugins", "install", "github:o/aivo-widget", "--force"])
+        .output()
+        .expect("spawn aivo");
+    assert!(
+        out.status.success(),
+        "force reinstall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Consent must not have carried onto the new bytes...
+    let rec = &registry(&home)["plugins"]["widget"];
+    assert!(
+        rec["granted_caps"].as_array().is_none_or(|a| a.is_empty()),
+        "caps must not survive a byte change: {rec}"
+    );
+    assert!(
+        !rec["run_approved"].as_bool().unwrap_or(false),
+        "run approval must not survive a byte change: {rec}"
+    );
+    // ...so a non-TTY dispatch of the new binary is refused.
+    let run = aivo(&home).args(["widget"]).output().unwrap();
+    assert!(!run.status.success(), "changed binary must be re-gated");
+    assert!(
+        !String::from_utf8_lossy(&run.stdout).contains("widget 2.0.0"),
+        "the changed binary must not have executed"
+    );
+}
+
+/// A no-op `plugins update` (identical bytes) must keep the dispatch-time run
+/// approval — amp-style manifest-less plugins were re-gated on every update.
+#[test]
+fn noop_update_preserves_dispatch_approval() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+
+    // A binary that does NOT answer --aivo-manifest (amp-style): the probe
+    // fails, so approval lives only on the record, not via a manifest.
+    let exe = work.path().join("aivo-widget");
+    std::fs::write(&exe, "#!/bin/sh\necho \"widget ran\"\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tgz = tar_czf(work.path(), "aivo-widget");
+
+    let (l, base) = bind();
+    serve(l, widget_routes(&base, tgz));
+
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base)
+        .args(["plugins", "install", "github:o/aivo-widget", "--trust"])
+        .output()
+        .expect("spawn aivo");
+    assert!(out.status.success());
+    let run = aivo(&home).args(["widget"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&run.stdout).contains("widget ran"));
+    assert_eq!(registry(&home)["plugins"]["widget"]["run_approved"], true);
+
+    // Same bytes re-fetched: approval must survive.
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base)
+        .args(["plugins", "update", "widget"])
+        .output()
+        .expect("spawn aivo");
+    assert!(
+        out.status.success(),
+        "update failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rec = &registry(&home)["plugins"]["widget"];
+    assert_eq!(
+        rec["run_approved"], true,
+        "a no-op update must not revoke the run approval: {rec}"
+    );
+    let run = aivo(&home).args(["widget"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("widget ran"),
+        "plugin must still dispatch after a no-op update"
     );
 }

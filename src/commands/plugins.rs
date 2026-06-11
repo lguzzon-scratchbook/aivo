@@ -264,6 +264,7 @@ pub(crate) async fn install_for_dispatch(name: &str, source: &str) -> Result<()>
         outcome.checksum.clone(),
         outcome.manifest.clone(),
         granted,
+        false,
     );
     eprintln!("  {} Installed plugin `{name}`", style::success_symbol());
     Ok(())
@@ -334,6 +335,7 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
         outcome.checksum.clone(),
         outcome.manifest.clone(),
         granted.clone(),
+        args.trust,
     );
     print_disclosure(&outcome, &granted);
     ensure_requirements(outcome.manifest.as_ref()).await;
@@ -431,7 +433,14 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
                     // and clear consent so the next dispatch re-probes the new
                     // binary behind a fresh first-run + capability prompt, rather
                     // than inheriting the old binary's approval.
-                    record_install(name, &source, outcome.checksum.clone(), None, Vec::new());
+                    record_install(
+                        name,
+                        &source,
+                        outcome.checksum.clone(),
+                        None,
+                        Vec::new(),
+                        false,
+                    );
                     updated += 1;
                     eprintln!(
                         "  {} {col}  {}  {}",
@@ -444,7 +453,14 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
                     let manifest = outcome.manifest.clone().or_else(|| rec.manifest.clone());
                     let granted = resolve_grants(name, manifest.as_ref(), &prior_granted, false);
                     let new_version = manifest.as_ref().map(|m| m.version.clone());
-                    record_install(name, &source, outcome.checksum.clone(), manifest, granted);
+                    record_install(
+                        name,
+                        &source,
+                        outcome.checksum.clone(),
+                        manifest,
+                        granted,
+                        false,
+                    );
                     updated += 1;
                     eprintln!(
                         "  {} {col}  {}  {}",
@@ -458,7 +474,14 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
                     let manifest = outcome.manifest.clone().or_else(|| rec.manifest.clone());
                     let granted = resolve_grants(name, manifest.as_ref(), &prior_granted, false);
                     let new_version = manifest.as_ref().map(|m| m.version.clone());
-                    record_install(name, &source, outcome.checksum.clone(), manifest, granted);
+                    record_install(
+                        name,
+                        &source,
+                        outcome.checksum.clone(),
+                        manifest,
+                        granted,
+                        false,
+                    );
                     unchanged += 1;
                     let v = new_version.map(|v| format!(" · v{v}")).unwrap_or_default();
                     eprintln!(
@@ -682,17 +705,26 @@ fn canonical_source(source: &str) -> String {
 
 /// Persist provenance (source + checksum + manifest + timestamp + granted caps)
 /// so `update` can re-fetch and dispatch knows what to hand over. See
-/// `crate::plugin::registry`.
+/// `crate::plugin::registry`. `trusted` is the explicit `--trust` consent:
+/// it approves execution even when no manifest probe ran.
 fn record_install(
     name: &str,
     source: &str,
     checksum: Option<String>,
     manifest: Option<PluginManifest>,
     granted_caps: Vec<String>,
+    trusted: bool,
 ) {
-    // An install-time manifest probe already executed the binary with the
-    // user's explicit consent, so the first-dispatch run gate is satisfied.
-    let run_approved = manifest.is_some();
+    let prior = registry::load().plugins.get(name).cloned();
+    let local = matches!(source::classify(source), Ok(SourceKind::LocalPath));
+    let (granted_caps, run_approved, approved_checksum) = consent_carry(
+        prior.as_ref(),
+        local,
+        &checksum,
+        manifest.is_some(),
+        granted_caps,
+        trusted,
+    );
     registry::record(
         name,
         PluginRecord {
@@ -702,8 +734,51 @@ fn record_install(
             installed_at: Some(Utc::now().to_rfc3339()),
             granted_caps,
             run_approved,
+            approved_checksum,
         },
     );
+}
+
+/// Consent (granted caps + run approval) carries onto a new record only when
+/// nothing changed underneath it: the user's own local file, or bytes
+/// identical to the consented install. Otherwise consent is dropped so the
+/// dispatch gate re-asks for the new binary. Consent given right now, for
+/// exactly the bytes being recorded: an install-time manifest probe
+/// (`manifest_present`), `--trust`, or a local-path install (the user pointed
+/// aivo at their own file, and the trusted-local probe already executed it).
+fn consent_carry(
+    prior: Option<&PluginRecord>,
+    local: bool,
+    checksum: &Option<String>,
+    manifest_present: bool,
+    granted_caps: Vec<String>,
+    trusted: bool,
+) -> (Vec<String>, bool, Option<String>) {
+    let same_bytes = checksum.is_some() && prior.is_some_and(|p| p.checksum == *checksum);
+    let carry = local || same_bytes;
+    let consented_now = manifest_present || trusted || local;
+    let prior_run = prior.is_some_and(|p| p.run_approved);
+    let run_approved = consented_now || (carry && prior_run);
+    let granted_caps = if carry || consented_now {
+        granted_caps
+    } else {
+        Vec::new()
+    };
+    let approved_checksum = if trusted {
+        // Explicit trust covers exactly the bytes being recorded.
+        checksum.clone()
+    } else if !run_approved && granted_caps.is_empty() {
+        None
+    } else if carry {
+        // Same bytes: keep the existing pin (including a pending re-verify —
+        // an unchanged update must not silently bless an unverified binary).
+        prior
+            .and_then(|p| p.approved_checksum.clone())
+            .or_else(|| checksum.clone())
+    } else {
+        checksum.clone()
+    };
+    (granted_caps, run_approved, approved_checksum)
 }
 
 /// Decide which grantable caps to grant. With `auto_grant` (`--trust`),
@@ -891,5 +966,113 @@ mod tests {
             resolve_grants("amp", Some(&manifest), &prior, false),
             ["endpoint"]
         );
+    }
+
+    fn prior_rec(checksum: &str, approved: Option<&str>) -> PluginRecord {
+        PluginRecord {
+            source: "github:o/aivo-amp".to_string(),
+            checksum: Some(checksum.to_string()),
+            manifest: None,
+            installed_at: None,
+            granted_caps: vec!["endpoint".to_string()],
+            run_approved: true,
+            approved_checksum: approved.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn consent_carries_across_identical_bytes() {
+        let prior = prior_rec("sha256:v1", Some("sha256:v1"));
+        let (caps, approved, pin) = consent_carry(
+            Some(&prior),
+            false,
+            &Some("sha256:v1".to_string()),
+            false,
+            vec!["endpoint".to_string()],
+            false,
+        );
+        assert_eq!(caps, ["endpoint"]);
+        assert!(approved, "same bytes keep the dispatch-time run approval");
+        assert_eq!(pin.as_deref(), Some("sha256:v1"));
+    }
+
+    #[test]
+    fn consent_dropped_for_changed_remote_bytes() {
+        // The --force / install_for_dispatch bypass: prior caps must NOT ride
+        // onto different bytes fetched with prior_checksum unknown.
+        let prior = prior_rec("sha256:v1", Some("sha256:v1"));
+        let (caps, approved, pin) = consent_carry(
+            Some(&prior),
+            false,
+            &Some("sha256:v2".to_string()),
+            false,
+            vec!["endpoint".to_string()],
+            false,
+        );
+        assert!(caps.is_empty(), "caps must not survive a byte change");
+        assert!(!approved);
+        assert!(pin.is_none());
+    }
+
+    #[test]
+    fn trust_approves_execution_and_binds_to_current_bytes() {
+        let (caps, approved, pin) = consent_carry(
+            None,
+            false,
+            &Some("sha256:v1".to_string()),
+            false,
+            Vec::new(),
+            true,
+        );
+        assert!(caps.is_empty());
+        assert!(approved, "--trust is explicit run consent");
+        assert_eq!(pin.as_deref(), Some("sha256:v1"));
+    }
+
+    #[test]
+    fn local_source_carries_consent_across_rebuilds() {
+        let mut prior = prior_rec("sha256:v1", Some("sha256:v1"));
+        prior.source = "/abs/aivo-amp".to_string();
+        let (caps, approved, _) = consent_carry(
+            Some(&prior),
+            true,
+            &Some("sha256:v2".to_string()),
+            false,
+            vec!["endpoint".to_string()],
+            false,
+        );
+        assert_eq!(caps, ["endpoint"]);
+        assert!(approved, "the user's own file is never re-gated");
+    }
+
+    #[test]
+    fn fresh_local_install_is_run_approved_even_without_manifest() {
+        // Installing a local path is itself execution consent (the
+        // trusted-local probe already ran the binary at install).
+        let (_, approved, _) = consent_carry(
+            None,
+            true,
+            &Some("sha256:v1".to_string()),
+            false,
+            Vec::new(),
+            false,
+        );
+        assert!(approved, "local install must not hit the first-run gate");
+    }
+
+    #[test]
+    fn unchanged_bytes_keep_a_pending_reverify_pin() {
+        // approved != checksum (re-verify pending): an unchanged update must
+        // not silently bless the unverified binary.
+        let prior = prior_rec("sha256:v2", Some("sha256:v1"));
+        let (_, _, pin) = consent_carry(
+            Some(&prior),
+            false,
+            &Some("sha256:v2".to_string()),
+            false,
+            vec!["endpoint".to_string()],
+            false,
+        );
+        assert_eq!(pin.as_deref(), Some("sha256:v1"), "stale pin must survive");
     }
 }

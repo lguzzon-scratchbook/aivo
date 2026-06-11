@@ -47,6 +47,11 @@ pub(crate) struct PluginRecord {
     /// installs whose manifest probe would otherwise be its first execution).
     #[serde(default, skip_serializing_if = "is_false")]
     pub run_approved: bool,
+    /// The `checksum` the user's consent (run approval + caps) was given for.
+    /// Consent is bound to these bytes: a record whose `checksum` drifts from
+    /// this pin is re-gated at dispatch instead of inheriting approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_checksum: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -102,6 +107,8 @@ pub(crate) fn approve_run(name: &str) {
 fn approve_run_in(reg: &mut Registry, name: &str) {
     if let Some(rec) = reg.plugins.get_mut(name) {
         rec.run_approved = true;
+        // The consent just given covers exactly the bytes on record.
+        rec.approved_checksum = rec.checksum.clone();
     }
 }
 
@@ -157,6 +164,7 @@ fn sources_view(dir: &Path) -> Option<Registry> {
                     installed_at: None,
                     granted_caps: Vec::new(),
                     run_approved: false,
+                    approved_checksum: None,
                 },
             )
         })
@@ -220,6 +228,7 @@ mod tests {
             installed_at: Some("2026-06-04T00:00:00+00:00".to_string()),
             granted_caps: Vec::new(),
             run_approved: false,
+            approved_checksum: None,
         }
     }
 
@@ -307,6 +316,11 @@ mod tests {
         let back = read_view(dir.path());
         assert!(back.plugins["amp"].run_approved);
         assert_eq!(back.plugins["amp"].source, "/abs/aivo-amp");
+        // Approval is pinned to the bytes on record.
+        assert_eq!(
+            back.plugins["amp"].approved_checksum.as_deref(),
+            Some("sha256:abc")
+        );
 
         // An unknown name is a no-op, not an insert.
         apply(dir.path(), |reg| approve_run_in(reg, "ghost")).unwrap();

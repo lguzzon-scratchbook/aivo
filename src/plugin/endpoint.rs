@@ -369,41 +369,83 @@ impl GrantPlan {
 /// `None` means the user declined the first-run gate — don't run the plugin.
 async fn grant_plan(name: &str, bin: &Path) -> Option<GrantPlan> {
     let reg = registry::load();
-    match reg.plugins.get(name) {
+    let Some(rec) = reg.plugins.get(name) else {
+        // Unmanaged/PATH plugin — nothing to grant; runs plain.
+        return Some(GrantPlan {
+            caps: Vec::new(),
+            is_coding_agent: false,
+            documents_aivo_flags: false,
+        });
+    };
+    // Consent is bound to the bytes it was given for; strip it (and the
+    // stale manifest) when the recorded binary drifted from the approved pin.
+    let rec = reverify_on_drift(name, rec);
+    if let Some(manifest) = &rec.manifest {
         // Already probed — honor the recorded grants, but re-ask (TTY) for
         // requested caps not yet granted: a past decline means "not that
         // time", not forever, else the plugin is stuck cap-less until a
         // reinstall. Accepted grants persist so the prompt doesn't recur.
-        Some(rec) if rec.manifest.is_some() => {
-            let manifest = rec.manifest.as_ref().unwrap();
-            let requested = grantable_capabilities(&manifest.capabilities);
-            let mut granted = retained_grants(&requested, &rec.granted_caps);
-            let missing = missing_grants(&requested, &rec.granted_caps);
-            if !missing.is_empty()
-                && std::io::stdin().is_terminal()
-                && super::prompt_capability_grant(name, &missing)
-            {
-                granted.extend(missing);
-                let mut updated = rec.clone();
-                updated.granted_caps = granted.clone();
-                registry::record(name, updated);
-            }
-            Some(GrantPlan {
-                caps: granted,
-                is_coding_agent: manifest.is_coding_agent(),
-                documents_aivo_flags: manifest.documents_aivo_flags,
-            })
+        let requested = grantable_capabilities(&manifest.capabilities);
+        let mut granted = retained_grants(&requested, &rec.granted_caps);
+        let missing = missing_grants(&requested, &rec.granted_caps);
+        if !missing.is_empty()
+            && std::io::stdin().is_terminal()
+            && super::prompt_capability_grant(name, &missing)
+        {
+            granted.extend(missing);
+            let mut updated = rec.clone();
+            updated.granted_caps = granted.clone();
+            updated.approved_checksum = updated.checksum.clone();
+            registry::record(name, updated);
         }
-        // Manifest-less managed plugin (e.g. a `npm:`/`github:` install): lazily
-        // probe + seek consent once, persisting the grant for next time.
-        Some(rec) => lazy_probe_and_consent(name, bin, rec).await,
-        // Unmanaged/PATH plugin — nothing to grant; runs plain.
-        None => Some(GrantPlan {
-            caps: Vec::new(),
-            is_coding_agent: false,
-            documents_aivo_flags: false,
-        }),
+        return Some(GrantPlan {
+            caps: granted,
+            is_coding_agent: manifest.is_coding_agent(),
+            documents_aivo_flags: manifest.documents_aivo_flags,
+        });
     }
+    // Manifest-less managed plugin (e.g. a `npm:`/`github:` install): lazily
+    // probe + seek consent once, persisting the grant for next time.
+    lazy_probe_and_consent(name, bin, &rec).await
+}
+
+/// True when the record's consent was given for different bytes than the ones
+/// on record. A missing pin on either side proves nothing and passes (legacy
+/// records); local paths are the user's own file and are never re-gated.
+fn consent_drifted(rec: &PluginRecord) -> bool {
+    if rec.run_approved || !rec.granted_caps.is_empty() {
+        let local = matches!(
+            super::source::classify(&rec.source),
+            Ok(super::source::SourceKind::LocalPath)
+        );
+        return !local
+            && matches!(
+                (&rec.approved_checksum, &rec.checksum),
+                (Some(approved), Some(current)) if approved != current
+            );
+    }
+    false
+}
+
+/// Strip consent (persisted) when the recorded binary no longer matches the
+/// bytes it was approved for, so the first-run + capability gates re-ask for
+/// the new binary instead of inheriting the old one's approval.
+fn reverify_on_drift(name: &str, rec: &PluginRecord) -> PluginRecord {
+    if !consent_drifted(rec) {
+        return rec.clone();
+    }
+    eprintln!(
+        "  {} `{name}` changed since it was approved — re-verifying",
+        style::yellow("!")
+    );
+    let mut fresh = rec.clone();
+    fresh.run_approved = false;
+    fresh.granted_caps.clear();
+    fresh.approved_checksum = None;
+    // The cached manifest describes the approved bytes, not these.
+    fresh.manifest = None;
+    registry::record(name, fresh.clone());
+    fresh
 }
 
 /// First-dispatch probe + consent for a managed plugin recorded without a
@@ -419,13 +461,25 @@ async fn lazy_probe_and_consent(
     // First-run gate: the manifest probe below would be this downloaded
     // binary's very first execution. Capability consent governs what aivo
     // hands over, not whether the binary runs — that decision is this one.
-    // TTY-only so scripted dispatch keeps working.
-    if !existing.run_approved
-        && existing.granted_caps.is_empty()
-        && std::io::stdin().is_terminal()
-        && !super::prompt_first_run(name, &existing.source)
-    {
-        return None;
+    // Fail closed off-TTY: silently executing an unapproved (or changed)
+    // binary would turn the re-verify promise into a no-op in CI/cron.
+    if !existing.run_approved && existing.granted_caps.is_empty() {
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "  {} plugin `{name}` (from {}) is not approved to run, and this session cannot prompt (no TTY).",
+                style::red("✗"),
+                existing.source
+            );
+            eprintln!(
+                "    Run {} once from a terminal to approve it, or reinstall with {}.",
+                style::cyan(format!("aivo {name}")),
+                style::cyan(format!("aivo plugins install {} --trust", existing.source)),
+            );
+            return None;
+        }
+        if !super::prompt_first_run(name, &existing.source) {
+            return None;
+        }
     }
     let Some(manifest) = probe_manifest(bin, name).await else {
         // Persist the run approval so a manifest-less plugin (probe failed or
@@ -433,6 +487,7 @@ async fn lazy_probe_and_consent(
         if !existing.run_approved {
             let mut rec = existing.clone();
             rec.run_approved = true;
+            rec.approved_checksum = rec.checksum.clone();
             registry::record(name, rec);
         }
         return Some(GrantPlan {
@@ -456,6 +511,7 @@ async fn lazy_probe_and_consent(
     rec.manifest = Some(manifest);
     rec.granted_caps = granted.clone();
     rec.run_approved = true;
+    rec.approved_checksum = rec.checksum.clone();
     registry::record(name, rec);
     Some(GrantPlan {
         caps: granted,
@@ -1309,10 +1365,12 @@ async fn finish_accounting(store: &SessionStore, acct: Accounting, code: i32, du
 #[cfg(test)]
 mod tests {
     use super::{
-        HelpKind, PluginServe, help_kind, missing_grants, model_limit_env_with_cache,
-        plugin_model_request, plugin_serve, retained_grants, take_hf_ref, use_responses_router,
+        HelpKind, PluginServe, consent_drifted, help_kind, missing_grants,
+        model_limit_env_with_cache, plugin_model_request, plugin_serve, retained_grants,
+        take_hf_ref, use_responses_router,
     };
     use crate::plugin::manifest::grantable_capabilities;
+    use crate::plugin::registry::PluginRecord;
     use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
     use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
     use crate::services::cursor_acp::CURSOR_ACP_SENTINEL;
@@ -1326,6 +1384,41 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn consented_rec(source: &str, checksum: Option<&str>, approved: Option<&str>) -> PluginRecord {
+        PluginRecord {
+            source: source.to_string(),
+            checksum: checksum.map(|s| s.to_string()),
+            manifest: None,
+            installed_at: None,
+            granted_caps: vec!["endpoint".to_string()],
+            run_approved: true,
+            approved_checksum: approved.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn consent_drift_detection() {
+        // Pin matches → no drift.
+        let rec = consented_rec("github:o/aivo-x", Some("sha256:v1"), Some("sha256:v1"));
+        assert!(!consent_drifted(&rec));
+        // Bytes changed since approval → drift.
+        let rec = consented_rec("github:o/aivo-x", Some("sha256:v2"), Some("sha256:v1"));
+        assert!(consent_drifted(&rec));
+        // Local path is the user's own file — never re-gated.
+        let rec = consented_rec("/abs/aivo-x", Some("sha256:v2"), Some("sha256:v1"));
+        assert!(!consent_drifted(&rec));
+        // Missing pins prove nothing (legacy records) → pass.
+        let rec = consented_rec("github:o/aivo-x", Some("sha256:v2"), None);
+        assert!(!consent_drifted(&rec));
+        let rec = consented_rec("github:o/aivo-x", None, Some("sha256:v1"));
+        assert!(!consent_drifted(&rec));
+        // No consent to protect → nothing to drift.
+        let mut rec = consented_rec("github:o/aivo-x", Some("sha256:v2"), Some("sha256:v1"));
+        rec.run_approved = false;
+        rec.granted_caps.clear();
+        assert!(!consent_drifted(&rec));
     }
 
     #[tokio::test]

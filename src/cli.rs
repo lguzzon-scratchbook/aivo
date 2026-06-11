@@ -238,8 +238,8 @@ pub struct PluginInstallArgs {
     #[arg(short = 'f', long)]
     pub force: bool,
 
-    /// Grant the manifest's grantable capabilities without prompting for
-    /// non-interactive installs.
+    /// Skip the consent prompts: grant the manifest's grantable capabilities
+    /// and approve the binary's first run (for non-interactive installs).
     #[arg(long)]
     pub trust: bool,
 }

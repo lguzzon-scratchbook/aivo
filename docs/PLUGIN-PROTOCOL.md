@@ -198,15 +198,23 @@ without it.
 Decline → the plugin still runs, just without the handoff. The approved set is stored as
 `granted_caps` in the [registry](#registry) and is the **only** thing aivo injects; an update never
 silently escalates to a newly-requested grantable cap (it re-asks). `aivo plugins install --trust`
-grants the requested grantable caps without prompting — local-path installs only (the only form
-whose manifest is known at install time).
+skips the prompts: it grants the requested grantable caps (when the manifest is known at install,
+i.e. local paths) and approves the binary's first run (any source) — the headless alternative to
+the interactive gates below.
 
 **First-run gate.** Capability consent governs what aivo hands over, not whether the binary runs.
 For a remote install (`npm:`/`github:`/URL/`cargo:`) the first dispatch is also the downloaded
 binary's first execution (the lazy manifest probe runs it), so aivo asks a separate
-"run it? [y/N]" confirmation first — TTY only, asked once, persisted as `run_approved` in the
+"run it? [y/N]" confirmation first — asked once, persisted as `run_approved` in the
 registry. Declining aborts the dispatch without executing the plugin. Non-interactive dispatch
-(no TTY) skips the gate, matching prior scripted behavior.
+(no TTY) cannot ask, so it refuses to execute an unapproved binary — approve it once from a
+terminal, or install with `--trust`.
+
+**Consent is bound to bytes.** Approval and grants are pinned to the `checksum` they were given
+for (`approved_checksum` in the registry). Any path that changes the installed bytes — `update`,
+`install --force`, a re-fetch of a missing binary — re-gates the next dispatch instead of letting
+the new binary inherit the old one's consent. Local-path installs are the user's own file and are
+never re-gated.
 
 ## Endpoint handoff
 
@@ -363,7 +371,9 @@ skipped by discovery):
       "checksum":     "sha256:9f86d0…",         // of the installed bytes at install time
       "manifest":     { /* … */ },              // cached probe; absent if not self-described
       "installed_at": "2026-06-04T05:48:30Z",   // RFC3339
-      "granted_caps": ["endpoint"]              // consented caps; omitted when none
+      "granted_caps": ["endpoint"],             // consented caps; omitted when none
+      "run_approved": true,                     // first-run consent; omitted when false
+      "approved_checksum": "sha256:9f86d0…"     // the bytes that consent was given for
     }
   }
 }
