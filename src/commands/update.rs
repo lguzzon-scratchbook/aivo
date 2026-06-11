@@ -167,7 +167,7 @@ impl UpdateCommand {
         )?;
 
         println!("{} Downloading update...", style::arrow_symbol());
-        self.install_update(&binary_url, &expected_sha256, &signature)
+        self.install_update(&binary_url, &expected_sha256, &signature, &latest_version)
             .await?;
 
         println!(
@@ -262,6 +262,7 @@ impl UpdateCommand {
         download_url: &str,
         expected_sha256: &str,
         signature: &str,
+        expected_version: &str,
     ) -> Result<()> {
         let exec_path = get_install_path()?;
         let tmp_path = exec_path.with_extension("tmp");
@@ -338,13 +339,23 @@ impl UpdateCommand {
             return Err(e).with_context(|| format!("Failed to replace binary at {:?}", exec_path));
         }
 
-        // Smoke test: verify the new binary can run
-        if let Err(reason) = run_version_check(&exec_path) {
+        // Smoke test: the new binary must run AND report the advertised version.
+        // The signature only proves "signed by us at some point" — without this
+        // check a compromised host could replay an old, genuinely-signed release.
+        let smoke_failure = match run_version_check(&exec_path) {
+            Err(reason) => Some(format!("{}", reason)),
+            Ok(reported) if !version_output_matches(&reported, expected_version) => Some(format!(
+                "binary reports \"{}\", expected version {}",
+                reported, expected_version
+            )),
+            Ok(_) => None,
+        };
+        if let Some(reason) = smoke_failure {
             eprintln!(
                 "  {} New binary failed smoke test, rolling back...",
                 style::red("Error:")
             );
-            eprintln!("  {}", style::dim(format!("{}", reason)));
+            eprintln!("  {}", style::dim(reason));
             if has_backup {
                 match tokio::fs::rename(&backup_path, &exec_path).await {
                     Ok(()) => {
@@ -725,6 +736,14 @@ fn run_version_check(exec_path: &Path) -> Result<String> {
     Ok(version)
 }
 
+/// True when `--version` output (e.g. "aivo v0.28.2") names `expected`.
+fn version_output_matches(output: &str, expected: &str) -> bool {
+    let expected = expected.trim_start_matches('v');
+    output
+        .split_whitespace()
+        .any(|tok| tok.trim_start_matches('v') == expected)
+}
+
 fn backup_path_for(exec_path: &Path) -> PathBuf {
     exec_path.with_extension("previous")
 }
@@ -850,6 +869,17 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
     #[test]
     fn verify_minisign_rejects_garbage_signature() {
         assert!(verify_minisign(TEST_PUBKEY, TEST_PAYLOAD, "not a signature").is_err());
+    }
+
+    #[test]
+    fn test_version_output_matches() {
+        assert!(version_output_matches("aivo v0.28.2", "0.28.2"));
+        assert!(version_output_matches("aivo 0.28.2", "0.28.2"));
+        assert!(version_output_matches("0.28.2", "0.28.2"));
+        assert!(version_output_matches("aivo v0.28.2", "v0.28.2"));
+        assert!(!version_output_matches("aivo v0.20.0", "0.28.2"));
+        assert!(!version_output_matches("aivo v0.28.21", "0.28.2"));
+        assert!(!version_output_matches("", "0.28.2"));
     }
 
     #[test]

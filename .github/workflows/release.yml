@@ -88,6 +88,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v5
         with:
           path: artifacts
@@ -114,6 +116,23 @@ jobs:
             printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "$f"
           done
           rm -f minisign.key
+          # Cross-check against the pubkey embedded in this tag's source: a
+          # mismatched CI secret would otherwise publish a release that every
+          # client's `aivo update` rejects — discovered only post-publish.
+          PUBKEY=$(sed -n 's/^const MINISIGN_PUBKEY: &str = "\([^"]*\)".*/\1/p' src/commands/update.rs)
+          if [ -z "$PUBKEY" ]; then
+            echo "::error::could not extract MINISIGN_PUBKEY from src/commands/update.rs" >&2
+            exit 1
+          fi
+          for f in artifacts/aivo-*; do
+            case "$f" in
+              *.sha256|*.minisig) continue ;;
+            esac
+            if ! minisign -V -P "$PUBKEY" -m "$f" -q; then
+              echo "::error::$f signature does not verify against the embedded MINISIGN_PUBKEY — signing secret and src/commands/update.rs pubkey are out of sync" >&2
+              exit 1
+            fi
+          done
 
       - name: Install wrangler
         run: npm install -g wrangler@4

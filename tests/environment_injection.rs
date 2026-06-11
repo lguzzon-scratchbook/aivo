@@ -94,7 +94,7 @@ fn claude_copilot_uses_copilot_router() {
         env.get("ANTHROPIC_AUTH_TOKEN"),
         env.get("AIVO_ROUTER_AUTH_TOKEN")
     );
-    assert!(env.get("AIVO_ROUTER_AUTH_TOKEN").is_some());
+    assert!(env.contains_key("AIVO_ROUTER_AUTH_TOKEN"));
 }
 
 #[test]

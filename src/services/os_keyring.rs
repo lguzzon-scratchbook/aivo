@@ -5,9 +5,9 @@
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
 const SERVICE: &str = "aivo";
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
 const ACCOUNT: &str = "master-secret";
 pub const SECRET_LEN: usize = 32;
 
@@ -315,11 +315,15 @@ mod platform {
             };
         }
         let result = unsafe {
-            let blob = std::slice::from_raw_parts(
-                (*credential).CredentialBlob,
-                (*credential).CredentialBlobSize as usize,
-            );
-            decode_secret_hex(&String::from_utf8_lossy(blob))
+            let ptr = (*credential).CredentialBlob;
+            let len = (*credential).CredentialBlobSize as usize;
+            // Empty blobs come back as NULL, which from_raw_parts forbids.
+            if ptr.is_null() || len == 0 {
+                None
+            } else {
+                let blob = std::slice::from_raw_parts(ptr, len);
+                decode_secret_hex(&String::from_utf8_lossy(blob))
+            }
         };
         unsafe { CredFree(credential as *mut core::ffi::c_void) };
         match result {
