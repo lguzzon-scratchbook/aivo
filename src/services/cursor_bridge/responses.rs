@@ -799,7 +799,9 @@ pub(super) async fn stream_bridged_responses_turn(
                                 ).await;
                                 current_message = Some((id, String::new(), idx));
                             }
-                            let entry = current_message.as_mut().unwrap();
+                            let Some(entry) = current_message.as_mut() else {
+                                continue 'outer;
+                            };
                             let msg_id_str = entry.0.clone();
                             let msg_idx = entry.2;
                             entry.1.push_str(text);

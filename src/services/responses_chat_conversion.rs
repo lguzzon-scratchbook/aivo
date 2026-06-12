@@ -1236,7 +1236,9 @@ impl ResponsesStreamConverter {
                 text: String::new(),
             });
         }
-        let reasoning = self.reasoning.as_mut().unwrap();
+        let Some(reasoning) = self.reasoning.as_mut() else {
+            return;
+        };
         reasoning.text.push_str(delta);
         out.push_str(&sse_event(
             "response.reasoning_summary_text.delta",
@@ -1285,7 +1287,9 @@ impl ResponsesStreamConverter {
 
     fn push_content_delta(&mut self, delta: &str, out: &mut String) {
         self.start_message(out);
-        let message = self.message.as_mut().unwrap();
+        let Some(message) = self.message.as_mut() else {
+            return;
+        };
         message.text.push_str(delta);
         out.push_str(&sse_event(
             "response.output_text.delta",
@@ -1685,11 +1689,10 @@ impl ResponsesToChatStreamConverter {
                 }
             }
             "response.output_item.added" => {
-                let item = ev.get("item");
-                if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
-                    == Some("function_call")
+                if let Some(item) = ev.get("item")
+                    && item.get("type").and_then(|t| t.as_str()) == Some("function_call")
                 {
-                    self.start_tool_call(item.unwrap(), out);
+                    self.start_tool_call(item, out);
                 }
             }
             "response.function_call_arguments.delta" => {
