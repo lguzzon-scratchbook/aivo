@@ -196,6 +196,64 @@ pub fn coding_agent_plugin_names() -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Curated one-line details for well-known coding-agent plugins, in the same
+/// terse style as the native tools'. Manifest descriptions are free-form and
+/// often too long for a picker row.
+fn known_coding_agent_description(name: &str) -> Option<&'static str> {
+    match name {
+        "amp" => Some("Sourcegraph's coding agent."),
+        "copilot" => Some("GitHub's official terminal coding agent."),
+        "grok" => Some("An open-source coding agent for the Grok API."),
+        "omp" => Some("Oh My Pi, a terminal coding agent built on pi-mono."),
+        _ => None,
+    }
+}
+
+/// Normalize a free-form manifest description to the picker's house style:
+/// first line only, sentence-cased, capped at a word boundary, trailing
+/// period.
+fn normalize_plugin_description(desc: &str) -> Option<String> {
+    const MAX_CHARS: usize = 60;
+    let first = desc.lines().next()?.trim();
+    let mut chars = first.chars();
+    let mut out: String = chars.next()?.to_uppercase().chain(chars).collect();
+    if out.chars().count() > MAX_CHARS {
+        let head: String = out.chars().take(MAX_CHARS).collect();
+        let cut = match head.rfind(' ') {
+            Some(i) => &head[..i],
+            None => head.as_str(),
+        };
+        out = format!("{}…", cut.trim_end_matches([' ', ',', ';', ':', '.']));
+    } else if !out.ends_with(['.', '!', '?', '…']) {
+        out.push('.');
+    }
+    Some(out)
+}
+
+/// Detail text for installed coding-agent plugins, keyed by name — curated
+/// for well-known plugins, normalized first manifest line otherwise.
+pub fn coding_agent_descriptions() -> HashMap<String, String> {
+    registry::load()
+        .plugins
+        .into_iter()
+        .filter_map(|(name, rec)| {
+            let manifest = rec.manifest?;
+            if !manifest.is_coding_agent() {
+                return None;
+            }
+            let detail = match known_coding_agent_description(&name) {
+                Some(curated) => curated.to_string(),
+                None => manifest
+                    .description
+                    .as_deref()
+                    .and_then(normalize_plugin_description)
+                    .unwrap_or_else(|| "A coding agent plugin.".to_string()),
+            };
+            Some((name, detail))
+        })
+        .collect()
+}
+
 /// Sorted `type: coding-agent` plugins whose binary is still discoverable —
 /// offered alongside native tools in the start flow's tool picker.
 pub fn launchable_coding_agents() -> Vec<String> {
@@ -493,6 +551,39 @@ fn debug_path_from_value(value: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_description_sentence_cased_with_period() {
+        assert_eq!(
+            normalize_plugin_description("a coding agent for acme"),
+            Some("A coding agent for acme.".to_string())
+        );
+        // Existing terminal punctuation is kept as-is.
+        assert_eq!(
+            normalize_plugin_description("Reviews diffs. "),
+            Some("Reviews diffs.".to_string())
+        );
+    }
+
+    #[test]
+    fn plugin_description_takes_first_line_and_truncates_on_word_boundary() {
+        assert_eq!(
+            normalize_plugin_description("Fast agent\nsecond line"),
+            Some("Fast agent.".to_string())
+        );
+        assert_eq!(
+            normalize_plugin_description(
+                "Run GitHub Copilot CLI on aivo-managed keys, models and endpoints"
+            ),
+            Some("Run GitHub Copilot CLI on aivo-managed keys, models and…".to_string())
+        );
+    }
+
+    #[test]
+    fn plugin_description_empty_is_none() {
+        assert_eq!(normalize_plugin_description(""), None);
+        assert_eq!(normalize_plugin_description("  \n x"), None);
+    }
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()

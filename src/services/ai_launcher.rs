@@ -91,6 +91,41 @@ impl AIToolType {
         }
     }
 
+    /// One-line detail shown next to the tool name in the picker and the
+    /// generic `aivo run` help.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Claude => "Anthropic's official terminal coding agent.",
+            Self::Codex => "OpenAI's official Codex CLI.",
+            Self::CodexApp => "OpenAI's official Codex desktop app (experimental).",
+            Self::Gemini => "Google's official Gemini CLI.",
+            Self::Opencode => "An open-source coding agent.",
+            Self::Pi => "A terminal coding agent from the pi-mono toolkit.",
+        }
+    }
+
+    /// False when the tool cannot run on this OS (`codex-app` wraps the
+    /// macOS-only Codex desktop app). Pickers and the generic help hide
+    /// unsupported tools; an explicit `aivo run codex-app` still gets the
+    /// launch-time platform error.
+    pub fn supported_on_current_platform(&self) -> bool {
+        match self {
+            Self::CodexApp => cfg!(target_os = "macos"),
+            _ => true,
+        }
+    }
+
+    /// Best-effort "binary already on this machine" probe for picker hints.
+    /// The launch path re-resolves PATH and offers an install, so a false
+    /// negative only mislabels a row.
+    pub fn looks_installed(&self) -> bool {
+        if matches!(self, Self::CodexApp) {
+            return crate::services::codex_app_wrapper::locate_codex_app().is_some();
+        }
+        find_in_dirs(self.command_name(), &collect_path_dirs()).is_some()
+            || find_in_dirs(self.command_name(), &self.well_known_install_dirs()).is_some()
+    }
+
     pub fn is_codex_family(&self) -> bool {
         matches!(self, Self::Codex | Self::CodexApp)
     }

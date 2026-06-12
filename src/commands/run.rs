@@ -581,12 +581,12 @@ impl RunCommand {
                     style::dim(desc)
                 );
             };
-            print_tool("claude", "Claude Code");
-            print_tool("codex", "Codex");
-            print_tool("codex-app", "Codex Desktop App (experimental)");
-            print_tool("gemini", "Gemini");
-            print_tool("opencode", "OpenCode");
-            print_tool("pi", "Pi");
+            for t in AIToolType::all()
+                .iter()
+                .filter(|t| t.supported_on_current_platform())
+            {
+                print_tool(t.as_str(), t.description());
+            }
         }
 
         println!();

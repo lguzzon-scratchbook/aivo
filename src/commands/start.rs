@@ -359,13 +359,25 @@ impl StartCommand {
             });
         }
 
-        let mut items = AIToolType::all()
+        let plugin_details = crate::plugin::coding_agent_descriptions();
+        let mut entries: Vec<(String, String)> = AIToolType::all()
             .iter()
-            .map(|t| t.as_str().to_string())
-            .collect::<Vec<_>>();
-        items.extend(plugins.iter().cloned());
+            .filter(|t| t.supported_on_current_platform())
+            .map(|t| {
+                let mut detail = t.description().to_string();
+                if !t.looks_installed() {
+                    detail.push_str(" (not installed)");
+                }
+                (t.as_str().to_string(), detail)
+            })
+            .collect();
+        entries.extend(plugins.iter().map(|name| {
+            let detail = plugin_details.get(name).cloned().unwrap_or_default();
+            (name.clone(), detail)
+        }));
+        let items = render_tool_rows(&entries);
         let default_idx = remembered_name
-            .and_then(|name| items.iter().position(|item| *item == name))
+            .and_then(|name| entries.iter().position(|(item, _)| *item == name))
             .unwrap_or(0);
         let selected = FuzzySelect::new()
             .with_prompt("Select tool")
@@ -376,7 +388,7 @@ impl StartCommand {
             .flatten()
             .ok_or_else(|| anyhow::anyhow!("Cancelled"))?;
         Ok(Resolved {
-            value: parse(&items[selected]).expect("picker items are parseable"),
+            value: parse(&entries[selected].0).expect("picker items are parseable"),
             interactive: true,
         })
     }
@@ -531,6 +543,26 @@ impl StartCommand {
     }
 }
 
+/// Aligned `<name>  <detail>` picker rows; detail is painted dim so the name
+/// stays the visual anchor (same convention as `format_key_choice`).
+fn render_tool_rows(entries: &[(String, String)]) -> Vec<String> {
+    let name_w = entries
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    entries
+        .iter()
+        .map(|(name, detail)| {
+            if detail.is_empty() {
+                name.clone()
+            } else {
+                format!("{name:<name_w$}  {}", style::dim(detail))
+            }
+        })
+        .collect()
+}
+
 fn confirm(prompt: &str) -> std::io::Result<bool> {
     let term = Term::stdout();
     term.write_str(&format!("{prompt} [Y/n] "))?;
@@ -549,5 +581,48 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_tool_rows;
+    use crate::services::ai_launcher::AIToolType;
+
+    fn plain(rows: Vec<String>) -> Vec<String> {
+        rows.iter()
+            .map(|r| console::strip_ansi_codes(r).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn rows_align_names_to_longest() {
+        let entries = vec![
+            ("claude".to_string(), "Claude Code · Anthropic".to_string()),
+            ("codex-app".to_string(), "Codex Desktop App".to_string()),
+        ];
+        let rows = plain(render_tool_rows(&entries));
+        assert_eq!(rows[0], "claude     Claude Code · Anthropic");
+        assert_eq!(rows[1], "codex-app  Codex Desktop App");
+    }
+
+    #[test]
+    fn empty_detail_renders_bare_name() {
+        let entries = vec![
+            ("someplugin".to_string(), String::new()),
+            ("pi".to_string(), "Pi · Earendil".to_string()),
+        ];
+        let rows = plain(render_tool_rows(&entries));
+        assert_eq!(rows[0], "someplugin");
+        assert_eq!(rows[1], "pi          Pi · Earendil");
+    }
+
+    #[test]
+    fn codex_app_offered_only_on_macos() {
+        let offered = AIToolType::all()
+            .iter()
+            .filter(|t| t.supported_on_current_platform())
+            .any(|t| *t == AIToolType::CodexApp);
+        assert_eq!(offered, cfg!(target_os = "macos"));
     }
 }
