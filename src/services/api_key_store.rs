@@ -65,6 +65,24 @@ fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
         .retain(|_, session| session.key_id != key_id);
 }
 
+/// Re-encrypts keys on older encryption versions in place; returns whether
+/// anything changed. Caller must hold the config lock: re-encrypt may CREATE
+/// the keyring master secret.
+fn migrate_keys_in_place(keys: &mut [ApiKey]) -> bool {
+    let mut changed = false;
+    for key in keys.iter_mut() {
+        if is_encrypted(&key.key)
+            && !is_current_encryption(&key.key)
+            && let Ok(plaintext) = decrypt(&key.key)
+            && let Ok(re_encrypted) = encrypt(&plaintext)
+        {
+            key.key = Zeroizing::new(re_encrypted);
+            changed = true;
+        }
+    }
+    changed
+}
+
 pub(crate) fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
     let mut rng = rand::thread_rng();
 
@@ -96,6 +114,9 @@ impl ApiKeyStore {
     ) -> Result<String> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
+
+        // Migrate existing keys too so a version bump doesn't leave a mixed store.
+        migrate_keys_in_place(&mut config.api_keys);
 
         let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
         let id = generate_key_id(&existing_ids)?;
@@ -192,6 +213,8 @@ impl ApiKeyStore {
     ) -> Result<ImportReport> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
+        // Same as add: migrate existing keys while we hold the lock anyway.
+        migrate_keys_in_place(&mut config.api_keys);
         let mut report = ImportReport::default();
 
         for mut incoming in records {
@@ -266,19 +289,7 @@ impl ApiKeyStore {
             return;
         };
 
-        let mut changed = false;
-        for key in &mut config.api_keys {
-            if is_encrypted(&key.key)
-                && !is_current_encryption(&key.key)
-                && let Ok(plaintext) = decrypt(&key.key)
-                && let Ok(re_encrypted) = encrypt(&plaintext)
-            {
-                key.key = Zeroizing::new(re_encrypted);
-                changed = true;
-            }
-        }
-
-        if changed {
+        if migrate_keys_in_place(&mut config.api_keys) {
             let _ = self.ctx.save_raw(&config).await;
         }
     }
