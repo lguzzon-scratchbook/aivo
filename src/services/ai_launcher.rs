@@ -109,10 +109,7 @@ impl AIToolType {
     /// unsupported tools; an explicit `aivo run codex-app` still gets the
     /// launch-time platform error.
     pub fn supported_on_current_platform(&self) -> bool {
-        match self {
-            Self::CodexApp => cfg!(target_os = "macos"),
-            _ => true,
-        }
+        !matches!(self, Self::CodexApp) || cfg!(target_os = "macos")
     }
 
     /// Best-effort "binary already on this machine" probe for picker hints.
