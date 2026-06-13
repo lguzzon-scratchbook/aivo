@@ -160,6 +160,16 @@ aivo pi -m hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF                   # any tool that 
 
 The `hf:` form is accepted anywhere a model is — `-m`, chat's positional `REF`, and as a bare top-level arg (which rewrites to `aivo chat hf:...`). Full HuggingFace URLs (`https://huggingface.co/...`) work the same way.
 
+The local `llama-server` is configured from the model, no setup required: it runs at the model's real context window (capped at 65536), and if the repo ships an `mmproj-*.gguf` projector or a `*-MTP.gguf` draft model, those are pulled and wired up automatically — enabling image input and speculative decoding respectively. Tune or opt out with environment variables:
+
+```bash
+AIVO_LLAMA_CTX=16384      # override the context size (e.g. on a low-RAM machine)
+AIVO_LLAMA_ARGS='--temp 0.1'  # pass extra llama-server flags (appended last, override aivo's)
+AIVO_LLAMA_MMPROJ=off     # skip the auto-detected vision projector
+AIVO_LLAMA_DRAFT=off      # skip the auto-detected speculative-decoding draft model
+AIVO_LLAMA_NGL=20         # GPU layers to offload (AIVO_GPU=cpu disables GPU)
+```
+
 Manage the cached GGUF files (under `~/.config/aivo/cache/huggingface`):
 
 ```bash

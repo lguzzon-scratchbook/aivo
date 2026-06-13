@@ -8,8 +8,8 @@ use crate::cli::{HfArgs, HfCleanArgs, HfListArgs, HfPullArgs, HfRmArgs, HfSubcom
 use crate::errors::ExitCode;
 use crate::services::huggingface::{
     self, CachedModel, CachedRepo, ensure_cached_refresh, format_modified_ago, format_size,
-    is_hf_or_local_gguf, list_cached_models, list_cached_repos, parse_hf_ref, remove_all_cached,
-    remove_cached_repo,
+    is_hf_or_local_gguf, is_sidecar_filename, list_cached_models, list_cached_repos, parse_hf_ref,
+    remove_all_cached, remove_cached_repo, sidecar_label,
 };
 use crate::style;
 
@@ -83,6 +83,28 @@ impl HfCommand {
         ] {
             println!("  {}", style::dim(ex));
         }
+        println!();
+        println!("{}", style::bold("Environment (llama-server runs):"));
+        row(
+            "AIVO_LLAMA_CTX=<n>",
+            "Context size override (default: min(model's training ctx, 65536))",
+        );
+        row(
+            "AIVO_LLAMA_ARGS=<args>",
+            "Extra llama-server flags, appended last (override anything aivo set)",
+        );
+        row(
+            "AIVO_LLAMA_MMPROJ=off",
+            "Skip the auto-detected mmproj projector (vision input)",
+        );
+        row(
+            "AIVO_LLAMA_DRAFT=off",
+            "Skip the auto-detected MTP draft model (speculative decoding)",
+        );
+        row(
+            "AIVO_LLAMA_NGL=<n>",
+            "GPU layer count (AIVO_GPU=cpu disables)",
+        );
         println!();
         println!(
             "{}",
@@ -161,7 +183,10 @@ fn list_verbose() -> Result<ExitCode> {
     }
 
     for m in &models {
-        let quant = m.quant().unwrap_or_else(|| "?".into());
+        let quant = sidecar_label(&m.filename)
+            .map(str::to_string)
+            .or_else(|| m.quant())
+            .unwrap_or_else(|| "?".into());
         let age = format_modified_ago(m.modified);
         if any_non_main {
             println!(
@@ -216,9 +241,15 @@ fn print_empty_hint() {
     );
 }
 
-/// `Q4_K_M` for a single quant, `Q4_K_M+2` for multiple.
+/// `Q4_K_M` for a single quant, `Q4_K_M+2` for multiple. Sidecars (mmproj,
+/// MTP drafts) aren't quants of the model and stay out of the summary.
 fn quant_summary(r: &CachedRepo) -> String {
-    let mut quants: Vec<String> = r.files.iter().filter_map(|f| f.quant()).collect();
+    let mut quants: Vec<String> = r
+        .files
+        .iter()
+        .filter(|f| !is_sidecar_filename(&f.filename))
+        .filter_map(|f| f.quant())
+        .collect();
     quants.sort();
     quants.dedup();
     match quants.len() {
@@ -322,9 +353,12 @@ fn rm_action(args: HfRmArgs) -> Result<ExitCode> {
 
 fn rm_one_quant(target: &CachedRepo, quant: &str, yes: bool) -> Result<ExitCode> {
     let upper = quant.to_ascii_uppercase();
+    // Sidecars never match a quant — `--quant BF16` must not delete
+    // `mmproj-BF16.gguf`; they go with `--all`.
     let matches: Vec<&CachedModel> = target
         .files
         .iter()
+        .filter(|f| !is_sidecar_filename(&f.filename))
         .filter(|f| f.quant().as_deref() == Some(upper.as_str()))
         .collect();
     let file = match matches.as_slice() {

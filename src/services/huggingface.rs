@@ -32,6 +32,26 @@ const HF_SHORT_PREFIX: &str = "hf:";
 /// same loopback key.
 pub const HF_LOCAL_KEY_ID: &str = "aivo-hf-local";
 
+static SPAWN_INFO: OnceLock<SpawnInfo> = OnceLock::new();
+
+/// Spawn-time facts about this process's llama-server, recorded so the
+/// limits cascade advertises what the server actually runs instead of a
+/// snapshot guess (`model_metadata::resolve_limits` consults this).
+#[derive(Debug, Clone)]
+pub struct SpawnInfo {
+    pub port: u16,
+    /// The `-c` the server runs with (or the user's explicit override).
+    pub context: u64,
+    /// True when an mmproj sidecar was loaded — the server takes images.
+    pub image_input: bool,
+    /// Display model name tools address the server by.
+    pub model_name: String,
+}
+
+pub fn spawn_info() -> Option<&'static SpawnInfo> {
+    SPAWN_INFO.get()
+}
+
 fn child_slot() -> &'static Mutex<Option<Child>> {
     SERVER_CHILD.get_or_init(|| Mutex::new(None))
 }
@@ -734,6 +754,17 @@ pub async fn ensure_cached_refresh(model: &HfModelRef, refresh: bool) -> Result<
     // repo) must never pin re-runs to the same unreachable file.
     save_cached_metadata(model, &resolved);
 
+    // Fail-open: a missing projector or draft never blocks the main model.
+    for sc in &resolved.sidecars {
+        if let Err(e) = ensure_sidecar_cached(&resolved, sc).await {
+            eprintln!(
+                "  {} Skipping companion file {}: {e:#}",
+                crate::style::yellow("!"),
+                sc.filename
+            );
+        }
+    }
+
     Ok(CachedFile {
         repo: resolved.repo,
         revision: resolved.revision,
@@ -742,6 +773,49 @@ pub async fn ensure_cached_refresh(model: &HfModelRef, refresh: bool) -> Result<
         path: cache_path,
         was_cached,
     })
+}
+
+/// Downloads one companion file next to the main model, skipping when the
+/// on-disk size already matches (the same idempotence rule as the main
+/// model's download).
+async fn ensure_sidecar_cached(resolved: &ResolvedGgufFile, sc: &SidecarMeta) -> Result<()> {
+    let path = local_cache_path(&resolved.repo, &resolved.revision, &sc.filename)?;
+    // Tree API occasionally returns size 0 for LFS pointers.
+    let size = if sc.size_bytes > 0 {
+        sc.size_bytes
+    } else {
+        head_content_length(&sc.download_url).await?
+    };
+    if matches!(tokio::fs::metadata(&path).await, Ok(m) if m.len() == size) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create cache dir {}", parent.display()))?;
+    }
+    eprintln!(
+        "  {} Found companion {} ({})",
+        crate::style::dim("·"),
+        sc.filename,
+        human_size(size)
+    );
+    let as_resolved = ResolvedGgufFile {
+        repo: resolved.repo.clone(),
+        revision: resolved.revision.clone(),
+        filename: sc.filename.clone(),
+        download_url: sc.download_url.clone(),
+        size_bytes: size,
+        sidecars: Vec::new(),
+    };
+    download_with_progress(&as_resolved, &path).await?;
+    eprintln!(
+        "  {} Downloaded {} ({})",
+        crate::style::success_symbol(),
+        sc.filename,
+        human_size(size)
+    );
+    Ok(())
 }
 
 /// The local-source arm of [`ensure_cached`]. Hardlinks the source
@@ -831,7 +905,7 @@ pub fn lookup_cached(model: &HfModelRef) -> Option<CachedFile> {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            !name.starts_with('@') && is_gguf_name(&name)
+            !name.starts_with('@') && is_gguf_name(&name) && !is_sidecar_filename(&name)
         })
         .collect();
     if entries.is_empty() {
@@ -893,17 +967,36 @@ impl CachedFile {
     }
 }
 
-/// Reads `general.architecture` from a GGUF v2/v3 header. Returns `None`
-/// on any parse failure or if the key is missing — the probe is best-effort
-/// and must never block a legitimate model.
-fn read_gguf_architecture(path: &Path) -> Option<String> {
-    let f = std::fs::File::open(path).ok()?;
-    let mut r = std::io::BufReader::new(f);
-    let mut budget: usize = 2 * 1024 * 1024;
-    read_gguf_architecture_from(&mut r, &mut budget)
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct GgufMeta {
+    architecture: Option<String>,
+    /// `{arch}.context_length` — the model's training context.
+    context_length: Option<u64>,
 }
 
-fn read_gguf_architecture_from<R: std::io::Read>(r: &mut R, budget: &mut usize) -> Option<String> {
+/// Reads `general.architecture` and `{arch}.context_length` from a GGUF
+/// v2/v3 header. Best-effort: any parse failure returns whatever was
+/// captured so far — the probe must never block a legitimate model.
+fn read_gguf_meta(path: &Path) -> GgufMeta {
+    let Ok(f) = std::fs::File::open(path) else {
+        return GgufMeta::default();
+    };
+    let mut r = std::io::BufReader::new(f);
+    let mut budget: usize = 2 * 1024 * 1024;
+    read_gguf_meta_from(&mut r, &mut budget)
+}
+
+fn read_gguf_meta_from<R: std::io::Read>(r: &mut R, budget: &mut usize) -> GgufMeta {
+    let mut meta = GgufMeta::default();
+    let _ = scan_gguf_header(r, budget, &mut meta);
+    meta
+}
+
+fn scan_gguf_header<R: std::io::Read>(
+    r: &mut R,
+    budget: &mut usize,
+    meta: &mut GgufMeta,
+) -> Option<()> {
     fn take<R: std::io::Read>(r: &mut R, buf: &mut [u8], budget: &mut usize) -> Option<()> {
         if buf.len() > *budget {
             return None;
@@ -976,15 +1069,54 @@ fn read_gguf_architecture_from<R: std::io::Read>(r: &mut R, budget: &mut usize) 
     for _ in 0..kv_count.min(4096) {
         let key = gguf_string(r, budget)?;
         let ty = u32_le(r, budget)?;
-        if key == "general.architecture" {
-            if ty != 8 {
-                return None;
+        if key == "general.architecture" && ty == 8 {
+            meta.architecture = Some(gguf_string(r, budget)?);
+        } else if is_context_length_key(&key, meta.architecture.as_deref()) {
+            // Read aligned, then validate — a bogus value must not
+            // desynchronize the stream.
+            let value = match ty {
+                4 => Some(u64::from(u32_le(r, budget)?)),
+                5 => {
+                    let v = u32_le(r, budget)? as i32;
+                    (v >= 0).then_some(v as u64)
+                }
+                10 => Some(u64_le(r, budget)?),
+                11 => {
+                    let v = u64_le(r, budget)? as i64;
+                    (v >= 0).then_some(v as u64)
+                }
+                _ => {
+                    skip_value(r, ty, budget)?;
+                    None
+                }
+            };
+            if let Some(v) = value
+                && v > 0
+            {
+                meta.context_length = Some(v);
             }
-            return gguf_string(r, budget);
+        } else {
+            skip_value(r, ty, budget)?;
         }
-        skip_value(r, ty, budget)?;
+        if meta.architecture.is_some() && meta.context_length.is_some() {
+            return Some(());
+        }
     }
-    None
+    Some(())
+}
+
+/// `general.architecture` is the first kv llama.cpp writes, so the exact
+/// `{arch}.context_length` match almost always applies; the suffix match
+/// covers headers where the arch key hasn't been seen yet.
+fn is_context_length_key(key: &str, arch: Option<&str>) -> bool {
+    match arch {
+        Some(a) => {
+            key.len() == a.len() + ".context_length".len()
+                && key.starts_with(a)
+                && key.ends_with(".context_length")
+        }
+        None => key.ends_with(".context_length"),
+    }
 }
 
 /// Returns a short user-facing label when `arch` is a llama.cpp architecture
@@ -1001,11 +1133,11 @@ fn non_chat_arch_label(arch: &str) -> Option<&'static str> {
     }
 }
 
-fn ensure_arch_is_chat_capable(cache_path: &Path) -> Result<()> {
-    let Some(arch) = read_gguf_architecture(cache_path) else {
+fn ensure_arch_is_chat_capable(meta: &GgufMeta) -> Result<()> {
+    let Some(arch) = meta.architecture.as_deref() else {
         return Ok(());
     };
-    let Some(label) = non_chat_arch_label(&arch) else {
+    let Some(label) = non_chat_arch_label(arch) else {
         return Ok(());
     };
     anyhow::bail!(
@@ -1030,48 +1162,131 @@ pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
     let cache_hit = lookup_cached(model).is_some();
     let cached = ensure_cached(model).await?;
     let cache_path = cached.path;
-    ensure_arch_is_chat_capable(&cache_path)?;
+    let meta = read_gguf_meta(&cache_path);
+    ensure_arch_is_chat_capable(&meta)?;
 
-    // `--jinja` keeps `tools:` routing alive — llama-server returns 500
-    // ("tools param requires --jinja") for any tool request without it.
-    let port = match try_spawn_and_warmup(&bin, &cache_path, cache_hit, &["--jinja"]).await? {
-        WarmupOutcome::Ready(p) => p,
-        WarmupOutcome::JinjaFailed { .. } => {
-            // Some GGUFs ship templates that use filters (e.g. `tojson`)
-            // that llama.cpp's embedded minijinja can't parse. Override
-            // with chatml — first-class in llama.cpp and tool-capable —
-            // instead of `--no-jinja` (which kills tool routing).
-            eprintln!(
-                "  {} Model's embedded jinja chat template failed to parse; \
-                 retrying with --chat-template chatml",
-                crate::style::yellow("!"),
-            );
-            stop_if_we_started();
-            match try_spawn_and_warmup(
-                &bin,
-                &cache_path,
-                cache_hit,
-                &["--jinja", "--chat-template", "chatml"],
-            )
-            .await?
-            {
-                WarmupOutcome::Ready(p) => p,
-                WarmupOutcome::JinjaFailed { stderr_tail } => {
+    let user_args = user_llama_args()?;
+    let (user_owns_ctx, user_ctx) = user_ctx_directive(&user_args);
+    let (ctx_flag, advertised_ctx) =
+        resolve_ctx(user_owns_ctx, user_ctx, env_ctx(), meta.context_length);
+
+    // Sidecars only pair with main-revision files — a pinned revision's
+    // projector/draft may not match what's on disk for `main`.
+    let sidecars = if cached.revision == "main" {
+        discover_sidecars(&cache_path)
+    } else {
+        Sidecars::default()
+    };
+    let mmproj = (!env_disabled("AIVO_LLAMA_MMPROJ"))
+        .then_some(sidecars.mmproj)
+        .flatten();
+    let mut draft = (!env_disabled("AIVO_LLAMA_DRAFT"))
+        .then_some(sidecars.mtp_draft)
+        .flatten();
+
+    // Some GGUFs ship templates that use filters (e.g. `tojson`) that
+    // llama.cpp's embedded minijinja can't parse; the retry overrides with
+    // chatml — first-class in llama.cpp and tool-capable — instead of
+    // `--no-jinja` (which kills tool routing). Draft flags fail open the
+    // same way so a llama.cpp predating `--spec-type` keeps working.
+    let mut chatml = false;
+    let port = loop {
+        let args = build_spawn_args(
+            ctx_flag,
+            mmproj.as_deref(),
+            draft.as_deref(),
+            chatml,
+            &user_args,
+        );
+        match try_spawn_and_warmup(&bin, &cache_path, cache_hit, &args, ctx_flag).await? {
+            WarmupOutcome::Ready(p) => break p,
+            WarmupOutcome::JinjaFailed { stderr_tail } => {
+                if chatml {
                     stop_if_we_started();
                     anyhow::bail!(
                         "llama-server failed even with --chat-template chatml:\n--- last stderr ---\n{stderr_tail}"
                     )
                 }
+                eprintln!(
+                    "  {} Model's embedded jinja chat template failed to parse; \
+                     retrying with --chat-template chatml",
+                    crate::style::yellow("!"),
+                );
+                stop_if_we_started();
+                chatml = true;
+            }
+            WarmupOutcome::DraftRejected { stderr_tail } => {
+                if draft.is_none() {
+                    stop_if_we_started();
+                    anyhow::bail!(
+                        "llama-server exited during warmup:\n--- last stderr ---\n{stderr_tail}"
+                    )
+                }
+                eprintln!(
+                    "  {} This llama-server doesn't support MTP draft flags; \
+                     retrying without speculative decoding (update llama.cpp to enable it)",
+                    crate::style::yellow("!"),
+                );
+                stop_if_we_started();
+                draft = None;
             }
         }
     };
+    let _ = SPAWN_INFO.set(SpawnInfo {
+        port,
+        context: advertised_ctx,
+        image_input: mmproj.is_some(),
+        model_name: model.display_model_name(),
+    });
     let _ = SERVER_PORT.set(port);
     Ok(port)
+}
+
+/// Assembly order: aivo's flags first, user passthrough last — llama-server
+/// parses last-one-wins, so `AIVO_LLAMA_ARGS` can override anything aivo
+/// chose. The chatml rescue template stays after user args: it only runs
+/// once the previous template (the user's included) failed to parse.
+fn build_spawn_args(
+    ctx_flag: Option<u64>,
+    mmproj: Option<&Path>,
+    draft: Option<&Path>,
+    chatml: bool,
+    user_args: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(n) = ctx_flag {
+        args.push("-c".into());
+        args.push(n.to_string());
+    }
+    if let Some(p) = mmproj {
+        args.push("--mmproj".into());
+        args.push(p.to_string_lossy().into_owned());
+    }
+    if let Some(p) = draft {
+        args.push("--model-draft".into());
+        args.push(p.to_string_lossy().into_owned());
+        args.push("--spec-type".into());
+        args.push("draft-mtp".into());
+        args.push("--spec-draft-n-max".into());
+        // The MTP sweet spot measured on Apple Silicon; llama.cpp adapts
+        // downward when drafts miss.
+        args.push("3".into());
+    }
+    // `--jinja` keeps `tools:` routing alive — llama-server returns 500
+    // ("tools param requires --jinja") for any tool request without it.
+    args.push("--jinja".into());
+    args.extend(user_args.iter().cloned());
+    if chatml {
+        args.push("--chat-template".into());
+        args.push("chatml".into());
+    }
+    args
 }
 
 enum WarmupOutcome {
     Ready(u16),
     JinjaFailed { stderr_tail: String },
+    DraftRejected { stderr_tail: String },
 }
 
 fn ngl_for_spawn() -> Option<u32> {
@@ -1096,24 +1311,259 @@ fn resolved_ngl(gpu_env: Option<&str>, ngl_env: Option<&str>, default_on: bool) 
     default_on.then_some(99)
 }
 
+/// Hard cap on the default `-c` — bounds KV-cache memory; the blog-class
+/// coding-agent workload is comfortable here and `AIVO_LLAMA_CTX` lifts it.
+const CTX_CAP: u64 = 65_536;
+/// Default when the GGUF header doesn't reveal the training context.
+const CTX_UNKNOWN_DEFAULT: u64 = 32_768;
+
+/// Decides the server context. Returns `(flag aivo passes, context
+/// advertised to tools)` — the two must agree or tools overrun the server.
+/// Precedence: user's own `-c`/`--ctx-size` (aivo passes nothing) →
+/// `AIVO_LLAMA_CTX` → `min(training ctx, 65536)` → 32768.
+fn resolve_ctx(
+    user_owns: bool,
+    user_value: Option<u64>,
+    env_value: Option<u64>,
+    training: Option<u64>,
+) -> (Option<u64>, u64) {
+    if user_owns {
+        // `-c 0` tells llama-server to use the model's training context.
+        let advertised = match user_value {
+            Some(n) if n > 0 => n,
+            _ => training.unwrap_or(CTX_UNKNOWN_DEFAULT),
+        };
+        return (None, advertised);
+    }
+    if let Some(n) = env_value {
+        return (Some(n), n);
+    }
+    let n = training
+        .map(|t| t.min(CTX_CAP))
+        .unwrap_or(CTX_UNKNOWN_DEFAULT);
+    (Some(n), n)
+}
+
+fn env_ctx() -> Option<u64> {
+    let raw = std::env::var("AIVO_LLAMA_CTX").ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            eprintln!(
+                "  {} Ignoring AIVO_LLAMA_CTX=`{raw}` (expected a positive integer)",
+                crate::style::yellow("!"),
+            );
+            None
+        }
+    }
+}
+
+/// `AIVO_LLAMA_MMPROJ=off` / `AIVO_LLAMA_DRAFT=off` style opt-outs.
+fn env_disabled(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+/// Flags aivo owns outright; user values for these are dropped with a
+/// warning since overriding them would detach aivo from its own server.
+const OWNED_LLAMA_FLAGS: &[&str] = &["-m", "--model", "--port", "--host"];
+
+fn user_llama_args() -> Result<Vec<String>> {
+    let raw = std::env::var("AIVO_LLAMA_ARGS").unwrap_or_default();
+    let (args, stripped) = parse_user_llama_args(&raw)?;
+    for flag in stripped {
+        eprintln!(
+            "  {} Ignoring `{flag}` from AIVO_LLAMA_ARGS — aivo owns the model path and server binding",
+            crate::style::yellow("!"),
+        );
+    }
+    Ok(args)
+}
+
+/// Shell-style split of `AIVO_LLAMA_ARGS` → (kept tokens, stripped owned
+/// flags). `~/` paths are expanded; quoting follows POSIX rules (on Windows,
+/// quote backslash paths or use forward slashes).
+fn parse_user_llama_args(raw: &str) -> Result<(Vec<String>, Vec<String>)> {
+    if raw.trim().is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let tokens = shlex::split(raw).ok_or_else(|| {
+        anyhow::anyhow!("AIVO_LLAMA_ARGS could not be parsed (unbalanced quote?): {raw}")
+    })?;
+    let mut kept = Vec::with_capacity(tokens.len());
+    let mut stripped = Vec::new();
+    let mut skip_next = false;
+    for tok in tokens {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let flag = tok.split('=').next().unwrap_or(&tok);
+        if OWNED_LLAMA_FLAGS.contains(&flag) {
+            skip_next = !tok.contains('=');
+            stripped.push(flag.to_string());
+            continue;
+        }
+        if tok == "~" || tok.starts_with("~/") {
+            kept.push(
+                system_env::expand_tilde(&tok)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else {
+            kept.push(tok);
+        }
+    }
+    Ok((kept, stripped))
+}
+
+/// Whether user args contain `-c`/`--ctx-size`, and its value when it
+/// parses. Doesn't consume the value token — it stays in the passthrough.
+fn user_ctx_directive(args: &[String]) -> (bool, Option<u64>) {
+    let owns = args.iter().any(|a| {
+        a == "-c" || a == "--ctx-size" || a.starts_with("--ctx-size=") || a.starts_with("-c=")
+    });
+    let value = flag_value(args, &["-c", "--ctx-size"]).and_then(|v| v.parse::<u64>().ok());
+    (owns, value)
+}
+
+#[derive(Debug, Default, Clone)]
+struct Sidecars {
+    mmproj: Option<PathBuf>,
+    mtp_draft: Option<PathBuf>,
+}
+
+/// Last path segment with the cache's `__` flattening and `@rev__` prefix
+/// stripped, so tree paths and on-disk names classify identically.
+fn sidecar_base(name: &str) -> &str {
+    let s = name.rsplit('/').next().unwrap_or(name);
+    s.rsplit("__").next().unwrap_or(s)
+}
+
+fn is_mmproj_name(name: &str) -> bool {
+    let b = sidecar_base(name);
+    is_gguf_name(b) && b.len() >= 6 && b.as_bytes()[..6].eq_ignore_ascii_case(b"mmproj")
+}
+
+/// Unsloth's MTP draft convention: `<model>-<quant>-MTP.gguf`.
+fn is_mtp_draft_name(name: &str) -> bool {
+    let b = sidecar_base(name);
+    if !is_gguf_name(b) {
+        return false;
+    }
+    let stem = &b[..b.len() - 5];
+    stem.len() >= 4 && stem.as_bytes()[stem.len() - 4..].eq_ignore_ascii_case(b"-mtp")
+}
+
+/// True for files that ride along with a main model rather than being one
+/// (multimodal projectors, MTP draft models).
+pub fn is_sidecar_filename(name: &str) -> bool {
+    is_mmproj_name(name) || is_mtp_draft_name(name)
+}
+
+/// Short display label for `aivo hf list`.
+pub fn sidecar_label(name: &str) -> Option<&'static str> {
+    if is_mmproj_name(name) {
+        Some("mmproj")
+    } else if is_mtp_draft_name(name) {
+        Some("draft")
+    } else {
+        None
+    }
+}
+
+/// Projector precision preference; quality first, llama.cpp loads all three.
+const MMPROJ_PRECISION_ORDER: &[&str] = &["BF16", "F16", "F32"];
+
+fn pick_mmproj_idx(candidates: &[&str]) -> Option<usize> {
+    for tag in MMPROJ_PRECISION_ORDER {
+        if let Some(i) = candidates
+            .iter()
+            .position(|c| c.to_ascii_uppercase().contains(tag))
+        {
+            return Some(i);
+        }
+    }
+    (!candidates.is_empty()).then_some(0)
+}
+
+/// MTP drafts must pair with their exact base model; with several
+/// candidates there's no safe pick, so only a lone file qualifies.
+fn pick_mtp_idx(candidates: &[&str]) -> Option<usize> {
+    (candidates.len() == 1).then_some(0)
+}
+
+/// Sidecars living next to the cached main model. Disk is the source of
+/// truth at spawn time: files appear here when a tree resolve (or
+/// `aivo hf pull`) downloaded them, and pre-feature caches simply have none.
+fn discover_sidecars(main_path: &Path) -> Sidecars {
+    let Some(dir) = main_path.parent() else {
+        return Sidecars::default();
+    };
+    let main_name = main_path.file_name().map(|n| n.to_os_string());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Sidecars::default();
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .filter(|e| Some(e.file_name()) != main_name)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        // Only main-revision files — `@rev__` entries belong to a pin.
+        .filter(|n| !n.starts_with('@') && is_gguf_name(n))
+        .collect();
+    let mmproj: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| is_mmproj_name(n))
+        .collect();
+    let drafts: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| is_mtp_draft_name(n))
+        .collect();
+    Sidecars {
+        mmproj: pick_mmproj_idx(&mmproj).map(|i| dir.join(mmproj[i])),
+        mtp_draft: pick_mtp_idx(&drafts).map(|i| dir.join(drafts[i])),
+    }
+}
+
 async fn try_spawn_and_warmup(
     bin: &Path,
     cache_path: &Path,
     cache_hit: bool,
-    extra_args: &[&str],
+    extra_args: &[String],
+    ctx_for_hint: Option<u64>,
 ) -> Result<WarmupOutcome> {
     let port = alloc_free_port()?;
     let ngl = ngl_for_spawn();
     if !cache_hit {
-        let gpu_suffix = match ngl {
-            Some(n) => format!(" (GPU offload: {n} layers)"),
-            None => String::new(),
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(n) = ngl {
+            notes.push(format!("GPU offload: {n} layers"));
+        }
+        if let Some(c) = flag_value(extra_args, &["-c", "--ctx-size"]) {
+            notes.push(format!("ctx {c}"));
+        }
+        if extra_args.iter().any(|a| a == "--mmproj") {
+            notes.push("vision".to_string());
+        }
+        if extra_args.iter().any(|a| a == "--model-draft") {
+            notes.push("MTP draft".to_string());
+        }
+        let suffix = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
         };
         eprintln!(
             "  {} Starting llama-server on port {}{}",
             crate::style::dim("⟳"),
             port,
-            gpu_suffix,
+            suffix,
         );
     }
 
@@ -1176,10 +1626,14 @@ async fn try_spawn_and_warmup(
             let tail = drain.snapshot();
             if is_jinja_template_error(&tail) {
                 Ok(WarmupOutcome::JinjaFailed { stderr_tail: tail })
+            } else if extra_args.iter().any(|a| a == "--model-draft") && is_draft_flag_error(&tail)
+            {
+                Ok(WarmupOutcome::DraftRejected { stderr_tail: tail })
             } else {
                 stop_if_we_started();
                 anyhow::bail!(
-                    "llama-server exited during warmup on port {port}.\n--- last stderr ---\n{tail}"
+                    "llama-server exited during warmup on port {port}.\n--- last stderr ---\n{tail}{}",
+                    ctx_hint(ctx_for_hint)
                 )
             }
         }
@@ -1188,10 +1642,53 @@ async fn try_spawn_and_warmup(
             stop_if_we_started();
             anyhow::bail!(
                 "llama-server did not become ready within 10 minutes on port {port}.\n\
-                 --- last stderr ---\n{tail}"
+                 --- last stderr ---\n{tail}{}",
+                ctx_hint(ctx_for_hint)
             )
         }
     }
+}
+
+/// First value following any of `flags` (`-c 65536` or `--ctx-size=65536`).
+fn flag_value<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
+    let mut hit = None;
+    let mut iter = args.iter().peekable();
+    while let Some(tok) = iter.next() {
+        match tok.split_once('=') {
+            Some((f, v)) if flags.contains(&f) => hit = Some(v),
+            _ if flags.contains(&tok.as_str()) => {
+                if let Some(v) = iter.peek() {
+                    hit = Some(v.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    hit
+}
+
+fn ctx_hint(ctx_flag: Option<u64>) -> String {
+    match ctx_flag {
+        Some(n) => format!(
+            "\nThe server was started with -c {n}; if the failure is memory-related, \
+             retry with a smaller context, e.g. AIVO_LLAMA_CTX=16384."
+        ),
+        None => String::new(),
+    }
+}
+
+/// True when the stderr tail is an argument-parsing rejection of the MTP
+/// draft flags (llama.cpp predating `--spec-type`), as opposed to a real
+/// load failure with the draft model itself.
+fn is_draft_flag_error(stderr_tail: &str) -> bool {
+    let mentions_flag = stderr_tail.contains("--spec-type")
+        || stderr_tail.contains("--spec-draft-n-max")
+        || stderr_tail.contains("--model-draft");
+    let arg_error = stderr_tail.contains("invalid argument")
+        || stderr_tail.contains("unknown argument")
+        || stderr_tail.contains("unrecognized argument")
+        || stderr_tail.contains("error while handling argument");
+    mentions_flag && arg_error
 }
 
 enum WaitOutcome {
@@ -1284,6 +1781,16 @@ struct ResolvedGgufFile {
     filename: String,
     download_url: String,
     size_bytes: u64,
+    /// Companion files (mmproj projector, MTP draft) found in the same
+    /// tree; downloaded fail-open after the main model.
+    sidecars: Vec<SidecarMeta>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SidecarMeta {
+    filename: String,
+    download_url: String,
+    size_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -1314,12 +1821,15 @@ async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFi
                 current.repo, revision, file
             );
             let size = head_content_length(&url).await?;
+            // Direct-file refs skip the tree API, so no sidecar discovery;
+            // previously pulled sidecars still pair up via the disk scan.
             return Ok(ResolvedGgufFile {
                 repo: current.repo.clone(),
                 revision: revision.to_string(),
                 filename: file.clone(),
                 download_url: url,
                 size_bytes: size,
+                sidecars: Vec::new(),
             });
         }
 
@@ -1397,10 +1907,16 @@ async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFi
                 current.repo
             );
         }
+        // Sidecars never compete for the main slot — `mmproj-BF16.gguf`
+        // would otherwise win an explicit `:BF16` quant request.
+        let (sidecar_entries, mains): (Vec<&TreeEntry>, Vec<&TreeEntry>) = singles
+            .iter()
+            .copied()
+            .partition(|e| is_sidecar_filename(&e.path));
         let explicit_quant = current.quant.is_some();
         let matched =
-            find_matching_gguf(&singles, &quant_upper, explicit_quant).ok_or_else(|| {
-                let available: Vec<String> = singles.iter().map(|e| e.path.clone()).collect();
+            find_matching_gguf(&mains, &quant_upper, explicit_quant).ok_or_else(|| {
+                let available: Vec<String> = mains.iter().map(|e| e.path.clone()).collect();
                 anyhow::anyhow!(
                     "No GGUF file matching quant `{quant}` in `{}`. Available files: {}",
                     current.repo,
@@ -1433,8 +1949,44 @@ async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFi
             filename: matched.path.clone(),
             download_url: url,
             size_bytes: size,
+            sidecars: pick_tree_sidecars(&sidecar_entries, &current.repo, revision),
         });
     }
+}
+
+/// The mmproj (best precision) and MTP draft (only when unambiguous) a
+/// fresh tree resolve should bring along with the main model.
+fn pick_tree_sidecars(entries: &[&TreeEntry], repo: &str, revision: &str) -> Vec<SidecarMeta> {
+    let as_meta = |e: &TreeEntry| SidecarMeta {
+        filename: e.path.clone(),
+        download_url: format!(
+            "https://huggingface.co/{repo}/resolve/{revision}/{}",
+            e.path
+        ),
+        size_bytes: e.size,
+    };
+    let mmproj: Vec<&str> = entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .filter(|p| is_mmproj_name(p))
+        .collect();
+    let drafts: Vec<&str> = entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .filter(|p| is_mtp_draft_name(p))
+        .collect();
+    let mut picked = Vec::new();
+    if let Some(i) = pick_mmproj_idx(&mmproj)
+        && let Some(e) = entries.iter().find(|e| e.path == mmproj[i])
+    {
+        picked.push(as_meta(e));
+    }
+    if let Some(i) = pick_mtp_idx(&drafts)
+        && let Some(e) = entries.iter().find(|e| e.path == drafts[i])
+    {
+        picked.push(as_meta(e));
+    }
+    picked
 }
 
 /// Returns `None` on empty suggestions, non-TTY, or user dismissal.
@@ -1631,6 +2183,8 @@ struct CachedMetadata {
     filename: String,
     download_url: String,
     size_bytes: u64,
+    #[serde(default)]
+    sidecars: Vec<SidecarMeta>,
 }
 
 fn metadata_cache_path(model: &HfModelRef) -> Option<PathBuf> {
@@ -1671,6 +2225,7 @@ fn load_cached_metadata(model: &HfModelRef) -> Option<ResolvedGgufFile> {
         filename: entry.filename,
         download_url: entry.download_url,
         size_bytes: entry.size_bytes,
+        sidecars: entry.sidecars,
     })
 }
 
@@ -1689,6 +2244,7 @@ fn save_cached_metadata(model: &HfModelRef, resolved: &ResolvedGgufFile) {
         filename: resolved.filename.clone(),
         download_url: resolved.download_url.clone(),
         size_bytes: resolved.size_bytes,
+        sidecars: resolved.sidecars.clone(),
     };
     let Ok(json) = serde_json::to_string(&entry) else {
         return;
@@ -2067,23 +2623,33 @@ pub fn list_cached_models() -> Vec<CachedModel> {
 /// Sums file sizes across all quants in a repo. Sorted most-recently-used.
 pub fn list_cached_repos() -> Vec<CachedRepo> {
     use std::collections::HashMap;
-    let mut by_repo: HashMap<String, CachedRepo> = HashMap::new();
+    let mut by_repo: HashMap<String, Vec<CachedModel>> = HashMap::new();
     for m in list_cached_models() {
-        let entry = by_repo.entry(m.repo.clone()).or_insert_with(|| CachedRepo {
-            repo: m.repo.clone(),
-            total_bytes: 0,
-            modified: None,
-            primary: m.clone(),
-            files: Vec::new(),
-        });
-        entry.total_bytes += m.size_bytes;
-        if entry.modified < m.modified {
-            entry.modified = m.modified;
-            entry.primary = m.clone();
-        }
-        entry.files.push(m);
+        by_repo.entry(m.repo.clone()).or_default().push(m);
     }
-    let mut repos: Vec<CachedRepo> = by_repo.into_values().collect();
+    let mut repos: Vec<CachedRepo> = by_repo
+        .into_iter()
+        .map(|(repo, files)| {
+            let total_bytes = files.iter().map(|f| f.size_bytes).sum();
+            let modified = files.iter().filter_map(|f| f.modified).max();
+            // A sidecar must never become the repo's launchable face —
+            // its launch_ref would point llama-server at the projector.
+            let primary = files
+                .iter()
+                .filter(|f| !is_sidecar_filename(&f.filename))
+                .max_by_key(|f| f.modified)
+                .or_else(|| files.iter().max_by_key(|f| f.modified))
+                .expect("repo entry implies at least one file")
+                .clone();
+            CachedRepo {
+                repo,
+                total_bytes,
+                modified,
+                primary,
+                files,
+            }
+        })
+        .collect();
     repos.sort_by_key(|r| std::cmp::Reverse(r.modified));
     repos
 }
@@ -2917,7 +3483,7 @@ mod tests {
     }
 
     #[test]
-    fn read_gguf_architecture_pulls_arch_after_skipping_other_kvs() {
+    fn read_gguf_meta_pulls_arch_after_skipping_other_kvs() {
         // u32 value (type 4), then a string array (type 9 of type 8, len 2),
         // then the architecture string — exercises scalar + array skips.
         let mut array_val = Vec::new();
@@ -2937,18 +3503,280 @@ mod tests {
         ]);
         let mut cursor = std::io::Cursor::new(bytes);
         let mut budget = 2 * 1024 * 1024;
+        let meta = read_gguf_meta_from(&mut cursor, &mut budget);
+        assert_eq!(meta.architecture.as_deref(), Some("bert"));
+        assert_eq!(meta.context_length, None);
+    }
+
+    #[test]
+    fn read_gguf_meta_returns_empty_on_bad_magic() {
+        let bytes = b"NOPE\x03\x00\x00\x00".to_vec();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut budget = 2 * 1024 * 1024;
         assert_eq!(
-            read_gguf_architecture_from(&mut cursor, &mut budget).as_deref(),
-            Some("bert")
+            read_gguf_meta_from(&mut cursor, &mut budget),
+            GgufMeta::default()
         );
     }
 
     #[test]
-    fn read_gguf_architecture_returns_none_on_bad_magic() {
-        let bytes = b"NOPE\x03\x00\x00\x00".to_vec();
+    fn read_gguf_meta_captures_u32_context_length() {
+        let bytes = build_gguf_header(&[
+            ("general.architecture", 8, gguf_string_val("llama")),
+            ("llama.vocab_size", 4, 32_000u32.to_le_bytes().to_vec()),
+            ("llama.context_length", 4, 131_072u32.to_le_bytes().to_vec()),
+        ]);
         let mut cursor = std::io::Cursor::new(bytes);
         let mut budget = 2 * 1024 * 1024;
-        assert_eq!(read_gguf_architecture_from(&mut cursor, &mut budget), None);
+        let meta = read_gguf_meta_from(&mut cursor, &mut budget);
+        assert_eq!(meta.architecture.as_deref(), Some("llama"));
+        assert_eq!(meta.context_length, Some(131_072));
+    }
+
+    #[test]
+    fn read_gguf_meta_captures_u64_context_length() {
+        let bytes = build_gguf_header(&[
+            ("general.architecture", 8, gguf_string_val("qwen2")),
+            ("qwen2.context_length", 10, 32_768u64.to_le_bytes().to_vec()),
+        ]);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut budget = 2 * 1024 * 1024;
+        assert_eq!(
+            read_gguf_meta_from(&mut cursor, &mut budget).context_length,
+            Some(32_768)
+        );
+    }
+
+    #[test]
+    fn read_gguf_meta_ignores_foreign_context_length_once_arch_known() {
+        // `clip.context_length` must not satisfy a `llama` model's lookup.
+        let bytes = build_gguf_header(&[
+            ("general.architecture", 8, gguf_string_val("llama")),
+            ("clip.context_length", 4, 77u32.to_le_bytes().to_vec()),
+            ("llama.context_length", 4, 8_192u32.to_le_bytes().to_vec()),
+        ]);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut budget = 2 * 1024 * 1024;
+        assert_eq!(
+            read_gguf_meta_from(&mut cursor, &mut budget).context_length,
+            Some(8_192)
+        );
+    }
+
+    #[test]
+    fn read_gguf_meta_accepts_context_length_before_arch() {
+        let bytes = build_gguf_header(&[
+            ("llama.context_length", 4, 4_096u32.to_le_bytes().to_vec()),
+            ("general.architecture", 8, gguf_string_val("llama")),
+        ]);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut budget = 2 * 1024 * 1024;
+        let meta = read_gguf_meta_from(&mut cursor, &mut budget);
+        assert_eq!(meta.context_length, Some(4_096));
+        assert_eq!(meta.architecture.as_deref(), Some("llama"));
+    }
+
+    #[test]
+    fn resolve_ctx_user_flag_wins_and_suppresses_aivos() {
+        // Explicit user value: aivo passes nothing, advertises the value.
+        assert_eq!(
+            resolve_ctx(true, Some(8_192), Some(99_999), Some(131_072)),
+            (None, 8_192)
+        );
+        // `-c 0` = model training context.
+        assert_eq!(
+            resolve_ctx(true, Some(0), None, Some(131_072)),
+            (None, 131_072)
+        );
+        // `-c 0` with unreadable header falls to the unknown default.
+        assert_eq!(resolve_ctx(true, Some(0), None, None), (None, 32_768));
+    }
+
+    #[test]
+    fn resolve_ctx_env_beats_default() {
+        assert_eq!(
+            resolve_ctx(false, None, Some(131_072), Some(8_192)),
+            (Some(131_072), 131_072)
+        );
+    }
+
+    #[test]
+    fn resolve_ctx_defaults_to_capped_training_ctx() {
+        // Big training context clamps to the cap.
+        assert_eq!(
+            resolve_ctx(false, None, None, Some(1_048_576)),
+            (Some(65_536), 65_536)
+        );
+        // Small training context is used as-is (never stretched).
+        assert_eq!(
+            resolve_ctx(false, None, None, Some(8_192)),
+            (Some(8_192), 8_192)
+        );
+        // Unknown header → bounded default.
+        assert_eq!(resolve_ctx(false, None, None, None), (Some(32_768), 32_768));
+    }
+
+    #[test]
+    fn parse_user_llama_args_splits_and_strips_owned_flags() {
+        let (kept, stripped) =
+            parse_user_llama_args("--temp 0.6 --port 9999 -m /x.gguf --host=0.0.0.0 -fa on")
+                .unwrap();
+        assert_eq!(kept, ["--temp", "0.6", "-fa", "on"]);
+        assert_eq!(stripped, ["--port", "-m", "--host"]);
+    }
+
+    #[test]
+    fn parse_user_llama_args_handles_quotes_and_empty() {
+        let (kept, _) = parse_user_llama_args(r#"--chat-template "a b c""#).unwrap();
+        assert_eq!(kept, ["--chat-template", "a b c"]);
+        assert_eq!(parse_user_llama_args("").unwrap().0, Vec::<String>::new());
+        assert_eq!(
+            parse_user_llama_args("   ").unwrap().0,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parse_user_llama_args_rejects_unbalanced_quote() {
+        let err = parse_user_llama_args(r#"--temp "0.6"#).unwrap_err();
+        assert!(err.to_string().contains("AIVO_LLAMA_ARGS"), "got {err}");
+    }
+
+    #[test]
+    fn user_ctx_directive_detects_both_spellings() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            user_ctx_directive(&args(&["-c", "4096"])),
+            (true, Some(4_096))
+        );
+        assert_eq!(
+            user_ctx_directive(&args(&["--ctx-size=16384"])),
+            (true, Some(16_384))
+        );
+        assert_eq!(user_ctx_directive(&args(&["--temp", "1"])), (false, None));
+        // Owns it even when the value doesn't parse — aivo must not add
+        // a second `-c`.
+        assert_eq!(user_ctx_directive(&args(&["-c", "lots"])), (true, None));
+    }
+
+    #[test]
+    fn flag_value_takes_last_occurrence() {
+        let args: Vec<String> = ["-c", "1024", "--ctx-size=2048"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(flag_value(&args, &["-c", "--ctx-size"]), Some("2048"));
+    }
+
+    #[test]
+    fn sidecar_classification() {
+        assert!(is_mmproj_name("mmproj-BF16.gguf"));
+        assert!(is_mmproj_name("mmproj-model-f16.gguf"));
+        // Cache-flattened and revision-prefixed forms classify the same.
+        assert!(is_mmproj_name("@abc123__mmproj-BF16.gguf"));
+        assert!(is_mmproj_name("subdir/mmproj-F32.gguf"));
+        assert!(is_mtp_draft_name("gemma-4-26B-A4B-it-Q8_0-MTP.gguf"));
+        assert!(is_mtp_draft_name("model-q4-mtp.GGUF"));
+        assert!(!is_mmproj_name("gemma-4-26B-A4B-it-Q4_K_XL.gguf"));
+        assert!(!is_mtp_draft_name("gemma-4-26B-A4B-it-Q4_K_XL.gguf"));
+        // `-MTP` must be a suffix of the stem, not a substring.
+        assert!(!is_mtp_draft_name("MTP-bench-Q4_K_M.gguf"));
+        assert!(!is_sidecar_filename("Llama-3.2-3B-Instruct-Q5_K_M.gguf"));
+    }
+
+    #[test]
+    fn mmproj_pick_prefers_precision_order() {
+        assert_eq!(
+            pick_mmproj_idx(&["mmproj-F32.gguf", "mmproj-F16.gguf", "mmproj-BF16.gguf"]),
+            Some(2)
+        );
+        assert_eq!(pick_mmproj_idx(&["mmproj-weird.gguf"]), Some(0));
+        assert_eq!(pick_mmproj_idx(&[]), None);
+    }
+
+    #[test]
+    fn mtp_pick_requires_single_candidate() {
+        assert_eq!(pick_mtp_idx(&["a-MTP.gguf"]), Some(0));
+        assert_eq!(pick_mtp_idx(&["a-MTP.gguf", "b-MTP.gguf"]), None);
+        assert_eq!(pick_mtp_idx(&[]), None);
+    }
+
+    #[test]
+    fn draft_flag_error_requires_flag_mention_and_arg_error() {
+        assert!(is_draft_flag_error(
+            "error: invalid argument: --spec-type\nusage: llama-server ..."
+        ));
+        assert!(is_draft_flag_error("unknown argument: --model-draft"));
+        // A real draft-model load failure is NOT an argument error.
+        assert!(!is_draft_flag_error(
+            "failed to load model '--model-draft path': tensor mismatch"
+        ));
+        assert!(!is_draft_flag_error("invalid argument: --frobnicate"));
+    }
+
+    #[test]
+    fn build_spawn_args_orders_aivo_then_user_then_rescue_template() {
+        let user: Vec<String> = ["--temp", "0.6"].iter().map(|s| s.to_string()).collect();
+        let args = build_spawn_args(
+            Some(65_536),
+            Some(Path::new("/cache/mmproj-BF16.gguf")),
+            Some(Path::new("/cache/m-Q8_0-MTP.gguf")),
+            true,
+            &user,
+        );
+        let joined = args.join(" ");
+        assert!(joined.starts_with("-c 65536 --mmproj"), "got {joined}");
+        assert!(
+            joined.contains(
+                "--model-draft /cache/m-Q8_0-MTP.gguf --spec-type draft-mtp --spec-draft-n-max 3"
+            ),
+            "got {joined}"
+        );
+        // User args after aivo's flags; chatml rescue last so it wins.
+        assert!(
+            joined.ends_with("--jinja --temp 0.6 --chat-template chatml"),
+            "got {joined}"
+        );
+    }
+
+    #[test]
+    fn build_spawn_args_minimal_is_jinja_only() {
+        assert_eq!(build_spawn_args(None, None, None, false, &[]), ["--jinja"]);
+    }
+
+    #[test]
+    fn discover_sidecars_pairs_main_revision_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let touch = |name: &str| std::fs::write(dir.path().join(name), b"x").unwrap();
+        touch("model-Q4_K_M.gguf");
+        touch("mmproj-F16.gguf");
+        touch("mmproj-BF16.gguf");
+        touch("model-Q8_0-MTP.gguf");
+        touch("@deadbeef__mmproj-F32.gguf"); // pinned revision: ignored
+        touch("notes.txt");
+
+        let found = discover_sidecars(&dir.path().join("model-Q4_K_M.gguf"));
+        assert_eq!(
+            found.mmproj.as_deref(),
+            Some(dir.path().join("mmproj-BF16.gguf").as_path())
+        );
+        assert_eq!(
+            found.mtp_draft.as_deref(),
+            Some(dir.path().join("model-Q8_0-MTP.gguf").as_path())
+        );
+    }
+
+    #[test]
+    fn discover_sidecars_skips_ambiguous_drafts_and_main_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let touch = |name: &str| std::fs::write(dir.path().join(name), b"x").unwrap();
+        touch("model-Q4_K_M.gguf");
+        touch("model-Q8_0-MTP.gguf");
+        touch("model-BF16-MTP.gguf");
+
+        let found = discover_sidecars(&dir.path().join("model-Q4_K_M.gguf"));
+        assert_eq!(found.mmproj, None);
+        assert_eq!(found.mtp_draft, None, "two MTP candidates → no safe pick");
     }
 
     #[test]
@@ -2973,7 +3801,7 @@ mod tests {
         let bytes = build_gguf_header(&[("general.architecture", 8, gguf_string_val("bert"))]);
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &bytes).unwrap();
-        let err = ensure_arch_is_chat_capable(tmp.path()).unwrap_err();
+        let err = ensure_arch_is_chat_capable(&read_gguf_meta(tmp.path())).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("`bert`"), "got: {msg}");
         assert!(msg.contains("logits computation"), "got: {msg}");
@@ -2984,7 +3812,7 @@ mod tests {
         let bytes = build_gguf_header(&[("general.architecture", 8, gguf_string_val("llama"))]);
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &bytes).unwrap();
-        ensure_arch_is_chat_capable(tmp.path()).unwrap();
+        ensure_arch_is_chat_capable(&read_gguf_meta(tmp.path())).unwrap();
     }
 
     #[test]

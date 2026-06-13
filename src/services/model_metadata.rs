@@ -139,6 +139,57 @@ pub fn rejects_temperature(model: &str) -> bool {
     snapshot_limits(model).is_some_and(|limits| !limits.temperature)
 }
 
+/// Capability sets for this process's local llama-server. Static because
+/// `ResolvedLimits.caps` borrows `'static`; context comes from `SpawnInfo`.
+static HF_LOCAL_CAPS_TEXT: LazyLock<ModelLimits> = LazyLock::new(|| hf_local_caps(false));
+static HF_LOCAL_CAPS_VISION: LazyLock<ModelLimits> = LazyLock::new(|| hf_local_caps(true));
+
+fn hf_local_caps(image_input: bool) -> ModelLimits {
+    ModelLimits {
+        context: None,
+        output: None,
+        tool_call: true,
+        reasoning: false,
+        attachment: false,
+        image_input,
+        temperature: true,
+        deprecated: false,
+        reasoning_efforts: Vec::new(),
+    }
+}
+
+/// When `model` targets this process's local llama-server, advertise the
+/// server's actual spawn parameters (context it was started with, whether
+/// an mmproj is loaded) instead of snapshot guesses. One aivo process runs
+/// at most one local server, so any hf-style ref maps to it.
+fn hf_local_limits(base_url: Option<&str>, model: &str) -> Option<ResolvedLimits> {
+    crate::services::huggingface::spawn_info()
+        .and_then(|info| hf_local_limits_for(info, base_url, model))
+}
+
+fn hf_local_limits_for(
+    info: &crate::services::huggingface::SpawnInfo,
+    base_url: Option<&str>,
+    model: &str,
+) -> Option<ResolvedLimits> {
+    let url_hit = base_url.is_some_and(|u| u.contains(&format!("127.0.0.1:{}", info.port)));
+    let model_hit =
+        model == info.model_name || crate::services::huggingface::is_hf_or_local_gguf(model);
+    if !url_hit && !model_hit {
+        return None;
+    }
+    let caps: &'static ModelLimits = if info.image_input {
+        &HF_LOCAL_CAPS_VISION
+    } else {
+        &HF_LOCAL_CAPS_TEXT
+    };
+    Some(ResolvedLimits {
+        context: Some(info.context),
+        output: None,
+        caps: Some(caps),
+    })
+}
+
 /// THE canonical limits cascade. Every consumer (claude `[1m]` auto-tag,
 /// codex catalog, loopback `/v1/models`) goes through here.
 pub async fn resolve_limits(
@@ -147,6 +198,9 @@ pub async fn resolve_limits(
     model: &str,
 ) -> ResolvedLimits {
     let stripped = strip_context_suffix(model);
+    if let Some(local) = hf_local_limits(base_url, stripped) {
+        return local;
+    }
     let live = match base_url {
         Some(url) => match cache.get_metadata(&full_catalog_key(url), stripped).await {
             Some(meta) => Some(meta),
@@ -375,6 +429,44 @@ mod tests {
             resolve_limits(&cache, Some("https://api.example.com"), "claude-sonnet-4-6").await;
         assert_eq!(resolved.context, Some(1_000_000));
         assert_eq!(resolved.output, Some(64_000));
+    }
+
+    #[test]
+    fn hf_local_override_matches_loopback_url_name_and_refs() {
+        let info = crate::services::huggingface::SpawnInfo {
+            port: 18080,
+            context: 40_960,
+            image_input: true,
+            model_name: "Qwen2.5-0.5B-Instruct-GGUF".to_string(),
+        };
+        // Loopback base URL.
+        let by_url = hf_local_limits_for(&info, Some("http://127.0.0.1:18080/v1"), "anything")
+            .expect("url match");
+        assert_eq!(by_url.context, Some(40_960));
+        assert!(by_url.caps.unwrap().image_input);
+        assert!(by_url.caps.unwrap().tool_call);
+        // Display model name.
+        assert!(hf_local_limits_for(&info, None, "Qwen2.5-0.5B-Instruct-GGUF").is_some());
+        // hf-style refs map to the (only) local server.
+        assert!(hf_local_limits_for(&info, None, "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF").is_some());
+        // Unrelated remote model on an unrelated URL: untouched.
+        assert!(
+            hf_local_limits_for(&info, Some("https://api.example.com"), "claude-sonnet-4-6")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hf_local_override_text_only_without_mmproj() {
+        let info = crate::services::huggingface::SpawnInfo {
+            port: 18081,
+            context: 32_768,
+            image_input: false,
+            model_name: "m".to_string(),
+        };
+        let limits = hf_local_limits_for(&info, Some("http://127.0.0.1:18081/v1"), "m").unwrap();
+        assert!(!limits.caps.unwrap().image_input);
+        assert_eq!(limits.output, None);
     }
 
     #[tokio::test]
