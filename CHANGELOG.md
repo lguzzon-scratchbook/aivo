@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.30.1
+
+Local llama-server runs (`hf:` refs and local `.gguf` files) now configure
+themselves from the model: the real context length is read from the GGUF
+header, an `mmproj-*.gguf` sidecar is auto-detected, and `AIVO_LLAMA_ARGS`
+is appended last for overrides. The bare `aivo run` picker also gained an
+aligned description per tool and hides the macOS-only `codex-app` on other
+platforms.
+
+- feat(hf): auto-configure llama-server from the model (6e9f3ed)
+- feat(run): describe tools in the picker and hide codex-app off macOS (82f8c9b)
+- fix(update): fail before download when the install dir is unwritable (3d65c7c)
+- fix(clippy): keep codex-app platform check matches!-free (510659d)
+
 ## v0.30.0
 
 OS-keyring custody is now the default: API keys are encrypted under a master
