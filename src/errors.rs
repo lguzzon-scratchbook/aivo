@@ -37,11 +37,10 @@ impl fmt::Display for ExitCode {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
     User,
-    #[allow(dead_code)]
-    Network,
     Auth,
 }
 
@@ -49,8 +48,6 @@ pub enum ErrorCategory {
 #[derive(Debug)]
 pub struct CLIError {
     message: String,
-    #[allow(dead_code)] // used in binary crate's error handling
-    category: ErrorCategory,
     details: Option<String>,
     suggestion: Option<String>,
 }
@@ -58,13 +55,11 @@ pub struct CLIError {
 impl CLIError {
     pub fn new(
         message: impl Into<String>,
-        category: ErrorCategory,
         details: Option<impl Into<String>>,
         suggestion: Option<impl Into<String>>,
     ) -> Self {
         Self {
             message: message.into(),
-            category,
             details: details.map(|d| d.into()),
             suggestion: suggestion.map(|s| s.into()),
         }
@@ -101,12 +96,7 @@ mod tests {
 
     #[test]
     fn test_cli_error_creation() {
-        let err = CLIError::new(
-            "test error",
-            ErrorCategory::User,
-            None::<String>,
-            None::<String>,
-        );
+        let err = CLIError::new("test error", None::<String>, None::<String>);
         assert_eq!(err.to_string(), "test error");
     }
 
@@ -114,7 +104,6 @@ mod tests {
     fn test_cli_error_with_details_and_suggestion() {
         let err = CLIError::new(
             "Key not found",
-            ErrorCategory::User,
             Some("No key matching 'foo' was found"),
             Some("Run 'aivo keys' to see available keys"),
         );
@@ -128,7 +117,6 @@ mod tests {
     fn test_cli_error_with_actionable_suggestion() {
         let err = CLIError::new(
             "Failed to connect to OpenRouter",
-            ErrorCategory::Network,
             Some("HTTP 403: Invalid API key"),
             Some("Check your key with `aivo keys cat <id>` or add a new key with `aivo keys add`"),
         );
@@ -147,12 +135,7 @@ mod tests {
 
     #[test]
     fn test_cli_error_no_details_or_suggestion() {
-        let err = CLIError::new(
-            "Simple error",
-            ErrorCategory::User,
-            None::<String>,
-            None::<String>,
-        );
+        let err = CLIError::new("Simple error", None::<String>, None::<String>);
         let display = err.to_string();
         assert_eq!(display, "Simple error");
     }

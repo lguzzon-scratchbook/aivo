@@ -9,4 +9,4 @@ pub mod services;
 pub mod style;
 pub mod tui;
 
-pub use errors::{CLIError, ErrorCategory, ExitCode};
+pub use errors::{CLIError, ExitCode};

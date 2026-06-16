@@ -10,7 +10,7 @@ use tokio::process::Command;
 #[cfg(unix)]
 use tokio::signal;
 
-use crate::errors::{CLIError, ErrorCategory};
+use crate::errors::CLIError;
 use crate::services::environment_injector::EnvironmentInjector;
 use crate::services::launch_args::{
     build_preview_notes, build_runtime_args, inject_codex_provider_config, merge_preview_env,
@@ -461,7 +461,6 @@ impl AILauncher {
                 None => {
                     return Err(CLIError::new(
                         "No API key configured. Please add a key with 'aivo keys add'.",
-                        ErrorCategory::Auth,
                         None::<String>,
                         Some("Run 'aivo keys add' to add an API key"),
                     )

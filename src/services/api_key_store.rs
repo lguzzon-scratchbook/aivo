@@ -3,7 +3,7 @@ use rand::Rng;
 use std::collections::HashSet;
 use zeroize::Zeroizing;
 
-use crate::errors::{CLIError, ErrorCategory};
+use crate::errors::CLIError;
 use crate::services::session_crypto::{decrypt, encrypt, is_current_encryption, is_encrypted};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, ConfigContext, GeminiProviderProtocol, OpenAICompatibilityMode,
@@ -264,7 +264,6 @@ impl ApiKeyStore {
         if !config.api_keys.iter().any(|k| k.id == id) {
             return Err(CLIError::new(
                 format!("Key {} not found", id),
-                ErrorCategory::User,
                 None::<String>,
                 Some("Run 'aivo keys' to see available keys"),
             )
@@ -280,7 +279,6 @@ impl ApiKeyStore {
         match matches.len() {
             0 => Err(CLIError::new(
                 format!("API key \"{}\" not found", id_or_name),
-                ErrorCategory::User,
                 None::<String>,
                 Some("Run 'aivo keys' to see available keys"),
             )
@@ -291,7 +289,6 @@ impl ApiKeyStore {
                     "Multiple keys found with name \"{}\". Use the key ID instead.",
                     id_or_name
                 ),
-                ErrorCategory::User,
                 None::<String>,
                 Some("Run 'aivo keys' to see key IDs"),
             )
