@@ -1113,7 +1113,6 @@ impl SessionStore {
             .await
     }
 
-    #[allow(dead_code)]
     pub async fn clear_last_selection(&self) -> Result<()> {
         self.last_sel
             .clear(crate::services::last_selection::SelectionScope::Default)
@@ -1140,22 +1139,10 @@ impl SessionStore {
             .await
     }
 
-    #[allow(dead_code)]
-    pub async fn clear_last_image_selection(&self) -> Result<()> {
-        self.last_sel
-            .clear(crate::services::last_selection::SelectionScope::Image)
-            .await
-    }
-
     // ── Usage stats (delegated to UsageStatsStore) ────────────────────────
 
     pub async fn load_stats(&self) -> Result<UsageStats> {
         self.stats.load().await
-    }
-
-    #[allow(dead_code)]
-    pub async fn clear_stats(&self) -> Result<()> {
-        self.stats.clear().await
     }
 
     pub async fn remove_key_stats(&self, key_id: &str) -> Result<()> {
@@ -1239,12 +1226,6 @@ impl SessionStore {
 
     pub async fn count_chat_sessions(&self) -> u64 {
         self.sessions.count_chat_sessions().await
-    }
-
-    /// Removes session files for all sessions belonging to a key.
-    #[allow(dead_code)]
-    pub async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {
-        self.sessions.remove_sessions_for_key(key_id).await
     }
 
     // ── Model aliases ─────────────────────────────────────────────────────

@@ -46,7 +46,9 @@ fn phase1(registry: &Registry, errors: &mut Vec<ValidationError>) {
 fn phase2(registry: &Registry, errors: &mut Vec<ValidationError>) {
     for fallback in registry.values() {
         for entry in &fallback.sequence {
-            if let Entry::FallbackReference(fr) = entry && !registry.contains_key(&fr.fallback_id) {
+            if let Entry::FallbackReference(fr) = entry
+                && !registry.contains_key(&fr.fallback_id)
+            {
                 errors.push(ValidationError::new(format!(
                     "Fallback '{}' references unknown id '{}'",
                     fallback.id, fr.fallback_id,

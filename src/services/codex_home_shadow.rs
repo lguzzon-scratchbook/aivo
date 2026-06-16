@@ -149,6 +149,7 @@ fn real_codex_home() -> Option<std::path::PathBuf> {
 
 /// Returns true if the on-disk tokens differ from `original` in any field
 /// codex may have rotated.
+#[cfg(test)]
 pub fn tokens_changed(original: &CodexOAuthCredential, disk: &AuthDotJson) -> bool {
     original.refresh_token != disk.tokens.refresh_token
         || original.access_token != disk.tokens.access_token
