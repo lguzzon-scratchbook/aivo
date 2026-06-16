@@ -58,6 +58,8 @@ pub struct ServeRouter {
     log_store: LogStore,
     logger: Option<RequestLogger>,
     failover_keys: Vec<ApiKey>,
+    /// Optional session store for fallback alias resolution.
+    session_store: Option<crate::services::SessionStore>,
 }
 
 struct ServeState {
@@ -70,6 +72,8 @@ struct ServeState {
     logger: Option<RequestLogger>,
     failover_keys: Arc<Vec<FailoverEntry>>,
     shutdown: Arc<tokio::sync::Notify>,
+    /// Optional session store for fallback alias resolution.
+    session_store: Option<crate::services::SessionStore>,
 }
 
 struct FailoverEntry {
@@ -87,6 +91,7 @@ impl ServeRouter {
             log_store,
             logger: None,
             failover_keys: Vec::new(),
+            session_store: None,
         }
     }
 
@@ -97,6 +102,11 @@ impl ServeRouter {
 
     pub fn with_failover_keys(mut self, keys: Vec<ApiKey>) -> Self {
         self.failover_keys = keys;
+        self
+    }
+
+    pub fn with_session_store(mut self, store: Option<crate::services::SessionStore>) -> Self {
+        self.session_store = store;
         self
     }
 
@@ -171,6 +181,7 @@ impl ServeRouter {
             log_store: self.log_store,
             logger: self.logger,
             failover_keys: Arc::new(failover_entries),
+            session_store: self.session_store,
             shutdown: shutdown.clone(),
         });
 
@@ -497,6 +508,7 @@ fn failover_state(
         log_store: log_store.clone(),
         logger: None,
         failover_keys: Arc::new(Vec::new()),
+        session_store: None,
         shutdown: Arc::new(tokio::sync::Notify::new()),
     }
 }
@@ -573,6 +585,16 @@ async fn handle_embeddings(request: &str, state: &ServeState) -> Result<RouterRe
 }
 
 async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
+    // Check if the model is a fallback alias — resolve through fallback chain
+    if let Some(ref store) = state.session_store {
+        let model_name = body.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        if let Some(ref name) = model_name {
+            if store.is_fallback(name).await.unwrap_or(false) {
+                return handle_fallback_chat(body, name, state, store).await;
+            }
+        }
+    }
+
     let client_wants_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -668,6 +690,94 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
         is_starter: state.config.is_starter,
         copilot_tokens: state.copilot_tokens.clone(),
     }
+}
+
+/// Try each target in a fallback alias chain through the protocol fallback loop.
+///
+/// For each (provider, model) target, sets `body["model"]` to the concrete
+/// model and runs the standard protocol fallback loop. Returns the first
+/// successful response, or an exhaustion error if all targets fail.
+async fn handle_fallback_chat(
+    mut body: Value,
+    fallback_id: &str,
+    state: &ServeState,
+    store: &crate::services::SessionStore,
+) -> Result<RouterResponse> {
+    let targets = match store.get_fallback_targets(fallback_id).await {
+        Some(t) => t,
+        None => {
+            return Ok(RouterResponse::buffered(
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":{{"message":"Unknown fallback '{}'"}}}}"#,
+                    fallback_id
+                )
+                .into_bytes(),
+            ));
+        }
+    };
+
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    for target in targets.iter() {
+        // Clone the base body and set the concrete model for this attempt
+        let mut body = body.clone();
+        body["model"] = serde_json::Value::String(target.model.clone());
+
+        // Run the standard protocol fallback loop
+        let current = ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed));
+        let candidates: Vec<ProviderProtocol> = std::iter::once(current)
+            .chain(fallback_protocols(current))
+            .collect();
+
+        for (attempt, protocol) in candidates.iter().enumerate() {
+            let response = match protocol {
+                ProviderProtocol::Anthropic => {
+                    handle_chat_anthropic(&body, client_wants_stream, state).await?
+                }
+                ProviderProtocol::Google => {
+                    handle_chat_gemini(&mut body.clone(), client_wants_stream, state).await?
+                }
+                ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
+                    handle_chat_openai(&mut body.clone(), client_wants_stream, state).await?
+                }
+            };
+
+            let status = match &response {
+                RouterResponse::Buffered { status, .. } => *status,
+                RouterResponse::Streaming { .. } => 200,
+            };
+
+            if is_protocol_mismatch(status) {
+                continue;
+            }
+
+            // Success — switch protocol if needed
+            if attempt > 0 {
+                state
+                    .active_protocol
+                    .store(protocol.to_u8(), Ordering::Relaxed);
+            }
+            return Ok(response);
+        }
+
+        // This target failed the protocol fallback — try next target
+    }
+
+    // All targets exhausted
+    Ok(RouterResponse::buffered(
+        503,
+        "application/json",
+        format!(
+            r#"{{"error":{{"message":"Fallback '{}' exhausted: all targets failed"}}}}"#,
+            fallback_id
+        )
+        .into_bytes(),
+    ))
 }
 
 async fn handle_chat_anthropic(
@@ -947,6 +1057,7 @@ mod tests {
             log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
+            session_store: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -1080,6 +1191,7 @@ mod tests {
             log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
+            session_store: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
         };
 

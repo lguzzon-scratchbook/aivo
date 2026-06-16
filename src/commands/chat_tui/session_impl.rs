@@ -25,9 +25,10 @@ impl ChatTuiApp {
             None => return,
         };
         let cache = self.cache.clone();
+        let store = self.session_store.clone();
 
         tokio::spawn(async move {
-            let choices = load_model_choices(&client, &key, &cache).await;
+            let choices = load_model_choices(&client, &key, &cache, &store).await;
             if choices.is_empty() {
                 tx.send(RuntimeEvent::ModelsLoaded(Err(
                     "No models available for this provider".to_string(),
@@ -424,26 +425,67 @@ async fn load_model_choices(
     client: &reqwest::Client,
     key: &ApiKey,
     cache: &crate::services::ModelsCache,
+    store: &crate::services::SessionStore,
 ) -> Vec<ModelChoice> {
-    match crate::commands::models::fetch_models_detailed(client, key).await {
-        Ok(infos) => {
-            let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-            cache.set(&key.base_url, ids).await;
-            infos
+    let mut choices: Vec<ModelChoice> =
+        match crate::commands::models::fetch_models_detailed(client, key).await {
+            Ok(infos) => {
+                let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
+                cache.set(&key.base_url, ids).await;
+                infos
+                    .into_iter()
+                    .map(|m| ModelChoice {
+                        label: crate::commands::models::picker_label(&m),
+                        id: m.id,
+                    })
+                    .collect()
+            }
+            Err(_) => fetch_models_for_select(client, key, cache)
+                .await
                 .into_iter()
-                .map(|m| ModelChoice {
-                    label: crate::commands::models::picker_label(&m),
-                    id: m.id,
+                .map(|id| ModelChoice {
+                    label: id.clone(),
+                    id,
                 })
-                .collect()
+                .collect(),
+        };
+
+    // Append plain aliases with distinguishable label
+    if let Ok(aliases) = store.get_aliases().await {
+        for (name, target) in &aliases {
+            choices.push(ModelChoice {
+                label: format!("{}  {}  {}", name, crate::style::dim("→"), target),
+                id: name.clone(),
+            });
         }
-        Err(_) => fetch_models_for_select(client, key, cache)
-            .await
-            .into_iter()
-            .map(|id| ModelChoice {
-                label: id.clone(),
-                id,
-            })
-            .collect(),
     }
+
+    // Append fallback aliases with distinguishable label
+    if let Ok(fallbacks) = store.get_fallbacks().await {
+        for (id, def) in &fallbacks {
+            let target_desc = def
+                .sequence
+                .iter()
+                .map(|e| match e {
+                    crate::services::fallback::Entry::ProviderModelPair(pmp) => {
+                        format!("{}:{}", pmp.provider, pmp.model)
+                    }
+                    crate::services::fallback::Entry::FallbackReference(fr) => {
+                        format!("@{}", fr.fallback_id)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            choices.push(ModelChoice {
+                label: format!(
+                    "{}  {}",
+                    id,
+                    crate::style::dim(format!("[fallback: {}]", target_desc)),
+                ),
+                id: id.clone(),
+            });
+        }
+    }
+
+    choices
 }

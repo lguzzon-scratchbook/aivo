@@ -58,6 +58,10 @@ pub enum Commands {
     /// Create, list, or remove model aliases
     Alias(AliasArgs),
 
+    /// Manage fallback definitions (ordered lists of provider/model targets)
+    #[command(alias = "fb")]
+    Fallback(FallbackArgs),
+
     /// Show system info, keys, tools, and directory state
     #[command(alias = "ls")]
     Info(InfoArgs),
@@ -95,6 +99,26 @@ pub struct AliasArgs {
     pub rm: bool,
 
     /// Output alias list as JSON (only affects listing)
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for the fallback command
+#[derive(Args, Debug, Clone)]
+pub struct FallbackArgs {
+    /// Set a fallback: `aivo fallback set <name> -- <provider:model>...`
+    #[arg(long)]
+    pub set: Option<String>,
+
+    /// Remove a fallback definition
+    #[arg(long)]
+    pub rm: Option<String>,
+
+    /// Targets for --set (format: provider:model, e.g. anthropic:claude-sonnet-4-6)
+    #[arg(allow_hyphen_values = true)]
+    pub targets: Vec<String>,
+
+    /// Output fallback list as JSON (only affects listing)
     #[arg(long)]
     pub json: bool,
 }

@@ -18,9 +18,9 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    AliasCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand, KeysCommand, LogsCommand,
-    McpServeCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand,
-    StartFlowArgs, StatsCommand, UpdateCommand,
+    AliasCommand, ChatCommand, ContextCommand, FallbackCommand, ImageCommand, InfoCommand,
+    KeysCommand, LogsCommand, McpServeCommand, ModelsCommand, RunCommand, ServeCommand,
+    ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
 };
 use errors::ExitCode;
 use key_resolution::{
@@ -94,6 +94,7 @@ async fn main() {
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
             Commands::Alias(_) => AliasCommand::print_help(),
+            Commands::Fallback(_) => {} // FallbackCommand has no separate help page
             Commands::Info(_) => InfoCommand::print_help(),
             Commands::Logs(_) => LogsCommand::print_help(),
             Commands::Stats(_) => StatsCommand::print_help(),
@@ -140,6 +141,11 @@ async fn main() {
         Commands::Alias(alias_args) => {
             let command = AliasCommand::new(session_store);
             command.execute(alias_args).await
+        }
+
+        Commands::Fallback(fallback_args) => {
+            let command = FallbackCommand::new(session_store);
+            command.execute(fallback_args).await
         }
 
         Commands::Keys(keys_args) => {
@@ -417,7 +423,8 @@ async fn main() {
             } else {
                 Vec::new()
             };
-            let command = ServeCommand::new(session_store.logs());
+            let command = ServeCommand::new(session_store.logs())
+                .with_session_store(Some(session_store));
             command
                 .execute(ServeParams {
                     port: serve_args.port,
@@ -690,14 +697,16 @@ async fn ensure_image_compatible_key(
     }
 }
 
-/// Resolves a model alias if the model is a non-empty Some value.
+/// Resolves a model alias using plain aliases first, then checks fallback
+/// definitions. Fallback alias names pass through unchanged so the caller
+/// can use them for resolution.
 /// Returns the original value unchanged if resolution fails or if it's None/empty (picker).
 async fn resolve_model_alias(
     session_store: &SessionStore,
     model: Option<String>,
 ) -> Option<String> {
     match model {
-        Some(ref m) if !m.is_empty() => match session_store.resolve_alias(m).await {
+        Some(ref m) if !m.is_empty() => match session_store.resolve_alias_or_fallback(m).await {
             Ok(resolved) => Some(resolved),
             Err(_) => model,
         },

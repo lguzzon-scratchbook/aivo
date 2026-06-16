@@ -24,6 +24,7 @@ pub struct ServeParams {
 
 pub struct ServeCommand {
     log_store: LogStore,
+    session_store: Option<crate::services::SessionStore>,
 }
 
 impl Default for ServeCommand {
@@ -34,7 +35,15 @@ impl Default for ServeCommand {
 
 impl ServeCommand {
     pub fn new(log_store: LogStore) -> Self {
-        Self { log_store }
+        Self {
+            log_store,
+            session_store: None,
+        }
+    }
+
+    pub fn with_session_store(mut self, store: Option<crate::services::SessionStore>) -> Self {
+        self.session_store = store;
+        self
     }
 
     pub async fn execute(&self, params: ServeParams) -> ExitCode {
@@ -167,7 +176,8 @@ impl ServeCommand {
         let auth_display = config.auth_token.clone();
         let router = ServeRouter::new(config, key, self.log_store.clone())
             .with_logger(logger)
-            .with_failover_keys(failover_keys);
+            .with_failover_keys(failover_keys)
+            .with_session_store(self.session_store.clone());
 
         // Bind eagerly — errors here (e.g. "address already in use") before printing startup
         let (mut handle, shutdown) = router.start_background(&host, port).await?;

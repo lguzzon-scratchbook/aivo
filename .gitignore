@@ -29,3 +29,9 @@ Thumbs.db
 npm/native/
 npm/*.tgz
 graphify-out/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
