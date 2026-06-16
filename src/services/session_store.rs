@@ -16,7 +16,6 @@ use crate::services::chat_session_store::ChatSessionStore;
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::usage_stats_store::UsageStatsStore;
-use crate::style;
 
 /// Serde module for serializing/deserializing Zeroizing<String> as regular String
 mod zeroizing_string {
@@ -843,7 +842,8 @@ pub struct SessionStore {
     logs: LogStore,
     /// Cached fallback manager, created on first access from config.
     /// Uses OnceLock for thread-safe one-time init.
-    fallback_manager: std::sync::OnceLock<std::sync::Arc<crate::services::fallback::FallbackManager>>,
+    fallback_manager:
+        std::sync::OnceLock<std::sync::Arc<crate::services::fallback::FallbackManager>>,
 }
 
 impl SessionStore {
@@ -1295,12 +1295,8 @@ impl SessionStore {
     /// Returns fallback definitions from config.
     pub async fn get_fallbacks(
         &self,
-    ) -> Result<
-        std::collections::HashMap<
-            String,
-            crate::services::fallback::FallbackDefinition,
-        >,
-    > {
+    ) -> Result<std::collections::HashMap<String, crate::services::fallback::FallbackDefinition>>
+    {
         let config = self.ctx.load().await?;
         Ok(config.fallbacks)
     }
@@ -1384,9 +1380,7 @@ impl SessionStore {
     pub async fn get_fallback_targets(
         &self,
         fallback_id: &str,
-    ) -> Option<
-        std::sync::Arc<[crate::services::fallback::ProviderModelPair]>,
-    > {
+    ) -> Option<std::sync::Arc<[crate::services::fallback::ProviderModelPair]>> {
         let mgr = self.fallback_manager().await.ok()?;
         mgr.resolve_targets(fallback_id).map(std::sync::Arc::from)
     }

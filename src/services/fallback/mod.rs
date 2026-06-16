@@ -1,3 +1,5 @@
+pub mod flatten;
+pub mod manager;
 /// Provider/model fallback mechanism.
 ///
 /// Implements the fallback specification:
@@ -8,14 +10,7 @@
 /// selecting a concrete model from the caller's perspective.
 pub mod types;
 pub mod validate;
-pub mod flatten;
-pub mod resolve;
-pub mod reload;
-pub mod metrics;
-pub mod manager;
-pub mod adapters;
 
-pub use resolve::{InvokeProvider, resolve, classify_error};
-pub use types::*;
-pub use validate::ValidateRegistry;
 pub use manager::FallbackManager;
+pub use types::*;
+pub use validate::validate_fallback_registry;

@@ -4,12 +4,9 @@
 /// expanding all `FallbackReference` entries into concrete `ProviderModelPair`
 /// entries. The resulting flat index is immutable for the lifetime of the
 /// configuration instance.
-
 use std::collections::HashMap;
 
-use super::types::{
-    Entry, FlatTargetList, FlattenedIndex, Registry, MAX_FLATTEN_DEPTH,
-};
+use super::types::{Entry, FlatTargetList, FlattenedIndex, MAX_FLATTEN_DEPTH, Registry};
 
 /// Build the flattened index from a validated registry.
 ///
@@ -59,7 +56,9 @@ fn flatten(fallback_id: &str, registry: &Registry, depth: usize) -> FlatTargetLi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::fallback::types::{Entry, FallbackDefinition, FallbackReference, ProviderModelPair};
+    use crate::services::fallback::types::{
+        Entry, FallbackDefinition, FallbackReference, ProviderModelPair,
+    };
 
     fn pmp(provider: &str, model: &str) -> Entry {
         Entry::ProviderModelPair(ProviderModelPair {
@@ -115,10 +114,7 @@ mod tests {
             FallbackDefinition {
                 id: "auto".into(),
                 description: None,
-                sequence: vec![
-                    pmp("anthropic", "claude-sonnet-4-6"),
-                    rf("backup"),
-                ],
+                sequence: vec![pmp("anthropic", "claude-sonnet-4-6"), rf("backup")],
                 timeout_ms: None,
             },
         );
@@ -207,7 +203,11 @@ mod tests {
         );
         let index = build_flattened_index(&registry);
         // Modifying the registry after building must not affect the index
-        registry.get_mut("x").unwrap().sequence.push(pmp("other", "model"));
+        registry
+            .get_mut("x")
+            .unwrap()
+            .sequence
+            .push(pmp("other", "model"));
         let flat = index.get("x").unwrap();
         assert_eq!(flat.len(), 1);
     }

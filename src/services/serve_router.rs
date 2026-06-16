@@ -35,7 +35,7 @@ use crate::services::session_store::ApiKey;
 use std::sync::LazyLock;
 
 static HEALTH_RESPONSE: LazyLock<Vec<u8>> = LazyLock::new(|| {
-    json!({"status": "ok", "version": crate::version::VERSION})
+    json!({"status": "ok", "version": crate::constants::VERSION})
         .to_string()
         .into_bytes()
 });
@@ -698,7 +698,7 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
 /// model and runs the standard protocol fallback loop. Returns the first
 /// successful response, or an exhaustion error if all targets fail.
 async fn handle_fallback_chat(
-    mut body: Value,
+    body: Value,
     fallback_id: &str,
     state: &ServeState,
     store: &crate::services::SessionStore,

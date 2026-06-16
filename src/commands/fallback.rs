@@ -10,7 +10,7 @@ use anyhow::Result;
 use crate::cli::FallbackArgs;
 use crate::errors::ExitCode;
 use crate::services::fallback::{
-    Entry, FallbackDefinition, FallbackReference, FallbackManager, ProviderModelPair, ValidateRegistry,
+    Entry, FallbackDefinition, FallbackReference, ProviderModelPair, validate_fallback_registry,
 };
 use crate::services::session_store::SessionStore;
 use crate::style;
@@ -74,7 +74,7 @@ impl FallbackCommand {
                             }
                         })
                         .collect();
-                    let mut obj = serde_json::json!({
+                    let obj = serde_json::json!({
                         "description": def.description,
                         "timeoutMs": def.timeout_ms,
                         "sequence": entries,
@@ -89,7 +89,12 @@ impl FallbackCommand {
         if fallbacks.is_empty() {
             println!("{}", style::dim("No fallback definitions."));
             println!();
-            println!("{}", style::dim("Create one with: aivo fallback --set auto -- anthropic:claude-sonnet-4-6 openai:gpt-4o"));
+            println!(
+                "{}",
+                style::dim(
+                    "Create one with: aivo fallback --set auto -- anthropic:claude-sonnet-4-6 openai:gpt-4o"
+                )
+            );
             return Ok(ExitCode::Success);
         }
 
@@ -189,7 +194,7 @@ impl FallbackCommand {
         let mut all = self.session_store.get_fallbacks().await?;
         all.insert(name.to_string(), def);
 
-        ValidateRegistry::validate(&all).map_err(|errors| {
+        validate_fallback_registry(&all).map_err(|errors| {
             anyhow::anyhow!(
                 "Validation failed:\n{}",
                 errors
@@ -218,7 +223,11 @@ impl FallbackCommand {
             anyhow::bail!("Fallback '{}' not found", name);
         }
         self.session_store.set_fallback(name, &all).await?;
-        println!("{} Removed fallback '{}'", style::green("✓"), style::cyan(name));
+        println!(
+            "{} Removed fallback '{}'",
+            style::green("✓"),
+            style::cyan(name)
+        );
         Ok(ExitCode::Success)
     }
 }
