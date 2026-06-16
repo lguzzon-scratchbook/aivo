@@ -53,6 +53,7 @@ pub mod provider_protocol;
 pub mod request_log;
 pub mod responses_chat_conversion;
 pub mod responses_to_chat_router;
+pub mod router_trait;
 pub mod serve_responses;
 pub mod serve_router;
 pub mod serve_stream_converters;
@@ -72,4 +73,5 @@ pub use environment_injector::EnvironmentInjector;
 pub use gemini_router::{GeminiRouter, GeminiRouterConfig};
 pub use models_cache::ModelsCache;
 pub use responses_to_chat_router::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
+
 pub use session_store::SessionStore;

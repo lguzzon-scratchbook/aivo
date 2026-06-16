@@ -20,9 +20,10 @@ use crate::services::openai_gemini_bridge::{
     openai_chat_model, sanitize_schema_for_gemini,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    AttemptOutcome, RouterPattern, TryProtocolsResult, classify_attempt,
 };
-use crate::services::provider_protocol::ProviderProtocol;
+use crate::services::provider_protocol::{PathVariant, ProviderProtocol};
+use crate::services::router_trait::{Router, RouterStart};
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
@@ -62,6 +63,175 @@ struct GeminiRouterState {
     request_succeeded: Arc<AtomicBool>,
 }
 
+impl RouterPattern for GeminiRouterState {
+    type Request = Value;
+    type Response = Value;
+
+    async fn route(
+        &self,
+        request: Self::Request,
+        protocol: ProviderProtocol,
+        variant: PathVariant,
+    ) -> Result<AttemptOutcome<Self::Response>> {
+        let mut req_body = request;
+        let selected_model = select_model_for_provider_attempt(
+            &self.config.target_base_url,
+            req_body.get("model").and_then(|v| v.as_str()),
+            None,
+            protocol,
+        );
+        req_body["model"] = serde_json::json!(selected_model);
+
+        let initiator = self
+            .config
+            .copilot_token_manager
+            .as_ref()
+            .map(|_| http_utils::copilot_initiator_from_openai(&req_body));
+
+        let (status, body_text, parsed) = match protocol {
+            ProviderProtocol::Anthropic => {
+                if req_body
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
+                {
+                    inject_chat_completions_cache_control(&mut req_body);
+                }
+                let mut anthropic_req = convert_openai_chat_to_anthropic_request(
+                    &req_body,
+                    &OpenAIToAnthropicChatConfig {
+                        default_model: "claude-sonnet-4-5",
+                    },
+                );
+                anthropic_req["stream"] = serde_json::json!(false);
+                let target_url = http_utils::build_target_url(
+                    &self.config.target_base_url,
+                    variant.apply("/v1/messages"),
+                );
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    self.client
+                        .post(&target_url)
+                        .header("Authorization", format!("Bearer {}", self.config.api_key))
+                        .header("x-api-key", self.config.api_key.as_str())
+                        .header("anthropic-version", "2023-06-01")
+                        .header("Content-Type", CONTENT_TYPE_JSON)
+                        .json(&anthropic_req),
+                    self.config.is_starter,
+                )
+                .send()
+                .await?;
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    let anthropic_response: Value = serde_json::from_str(&body_text)?;
+                    Some(convert_anthropic_to_openai_chat_response(
+                        &anthropic_response,
+                        req_body
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("gemini-2.5-pro"),
+                    ))
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
+            }
+            ProviderProtocol::Google => {
+                let google_body = convert_openai_chat_to_gemini_request(
+                    &req_body,
+                    &OpenAIToGeminiConfig {
+                        default_model: "gemini-2.5-pro",
+                    },
+                );
+                let model = openai_chat_model(&req_body, "gemini-2.5-pro");
+                let target_url =
+                    build_google_generate_content_url(&self.config.target_base_url, &model);
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    self.client
+                        .post(&target_url)
+                        .header("x-goog-api-key", self.config.api_key.as_str())
+                        .header("Content-Type", CONTENT_TYPE_JSON)
+                        .json(&google_body),
+                    self.config.is_starter,
+                )
+                .send()
+                .await?;
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    let google_response: Value = serde_json::from_str(&body_text)?;
+                    Some(convert_gemini_to_openai_chat_response(
+                        &google_response,
+                        &model,
+                    ))
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
+            }
+            ProviderProtocol::Openai => {
+                let target_url = http_utils::build_target_url(
+                    &self.config.target_base_url,
+                    variant.apply("/v1/chat/completions"),
+                );
+                let req = http_utils::authorized_openai_post(
+                    self.client.as_ref(),
+                    &target_url,
+                    &self.config.api_key,
+                    self.config.copilot_token_manager.as_deref(),
+                    initiator,
+                )
+                .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    req.json(&req_body),
+                    self.config.is_starter,
+                )
+                .send()
+                .await?;
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    Some(serde_json::from_str(&body_text)?)
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
+            }
+            ProviderProtocol::ResponsesApi => {
+                let responses_body = chat_to_responses_request(&req_body)?;
+                let target_url = http_utils::build_target_url(
+                    &self.config.target_base_url,
+                    variant.apply("/v1/responses"),
+                );
+                let req = http_utils::authorized_openai_post(
+                    self.client.as_ref(),
+                    &target_url,
+                    &self.config.api_key,
+                    self.config.copilot_token_manager.as_deref(),
+                    initiator,
+                )
+                .await?;
+                let response = device_fingerprint::maybe_with_starter_headers(
+                    req.json(&responses_body),
+                    self.config.is_starter,
+                )
+                .send()
+                .await?;
+                let status = response.status().as_u16();
+                let body_text = response.text().await?;
+                let parsed = if status == 200 {
+                    Some(responses_to_chat_response(&body_text)?)
+                } else {
+                    None
+                };
+                (status, body_text, parsed)
+            }
+        };
+
+        Ok(classify_attempt(status, body_text, parsed))
+    }
+}
+
 impl GeminiRouter {
     pub fn new(config: GeminiRouterConfig) -> Self {
         Self { config }
@@ -91,16 +261,24 @@ impl GeminiRouter {
     }
 }
 
+impl Router for GeminiRouter {
+    type Config = GeminiRouterConfig;
+
+    async fn start(config: Self::Config, _env: &HashMap<String, String>) -> Result<RouterStart> {
+        let router = GeminiRouter::new(config);
+        let (port, active_protocol, request_succeeded, handle) = router.start_background().await?;
+        Ok(RouterStart {
+            port,
+            active_protocol: Some(active_protocol),
+            request_succeeded: Some(request_succeeded),
+            responses_api_support: None,
+            handle,
+        })
+    }
+}
+
 async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -> String {
-    match handle_request(
-        &request,
-        &state.config,
-        &state.client,
-        &state.active_protocol,
-        &state.request_succeeded,
-    )
-    .await
-    {
+    match handle_request(&request, &state).await {
         Ok(r) => r,
         Err(e) => http_utils::http_error_response(500, &e.to_string()),
     }
@@ -108,30 +286,31 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
 
 async fn handle_request(
     request: &str,
-    config: &std::sync::Arc<GeminiRouterConfig>,
-    client: &Arc<reqwest::Client>,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    state: &GeminiRouterState,
 ) -> Result<String> {
     let path = http_utils::extract_request_path(request);
 
     match parse_gemini_path(&path) {
         Some((extracted_model, is_streaming)) => {
-            let model = config.forced_model.clone().unwrap_or(extracted_model);
-            let body: Value = serde_json::from_str(http_utils::extract_request_body(request)?)?;
+            let model = state
+                .config
+                .forced_model
+                .clone()
+                .unwrap_or(extracted_model);
+            let body: Value =
+                serde_json::from_str(http_utils::extract_request_body(request)?)?;
             let tool_schemas = extract_tool_schemas(&body);
             let openai_req = convert_gemini_to_openai(
                 &body,
                 &model,
-                config.requires_reasoning_content,
-                config.max_tokens_cap,
+                state.config.requires_reasoning_content,
+                state.config.max_tokens_cap,
             );
-            // openai_req already has the model from the Gemini request body — don't pre-select here;
-            // select_model_for_protocol is applied per-attempt inside forward_to_provider.
-            match forward_to_provider(openai_req, config, client, active_protocol).await? {
+            match forward_to_provider(openai_req, state).await? {
                 ForwardResult::Success(openai_response) => {
-                    request_succeeded.store(true, Ordering::Relaxed);
-                    let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
+                    state.request_succeeded.store(true, Ordering::Relaxed);
+                    let openai_response =
+                        repair_tool_call_args(openai_response, &tool_schemas);
                     if is_streaming {
                         let sse = convert_openai_to_gemini_sse(&openai_response);
                         Ok(http_utils::http_response(200, "text/event-stream", &sse))
@@ -173,184 +352,17 @@ fn wrap_upstream_error_as_json(status: u16, body: &str) -> String {
 
 async fn forward_to_provider(
     openai_req: Value,
-    config: &std::sync::Arc<GeminiRouterConfig>,
-    client: &Arc<reqwest::Client>,
-    active_protocol: &Arc<AtomicU8>,
+    state: &GeminiRouterState,
 ) -> Result<ForwardResult> {
-    let candidates = protocol_candidates(active_protocol);
-    let mut first_error: Option<(u16, String)> = None;
-
-    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
-        // Select the right model name for this protocol attempt.
-        let mut req_body = openai_req.clone();
-        let selected_model = select_model_for_provider_attempt(
-            &config.target_base_url,
-            req_body.get("model").and_then(|v| v.as_str()),
-            None,
-            protocol,
-        );
-        req_body["model"] = serde_json::json!(selected_model);
-
-        let initiator = config
-            .copilot_token_manager
-            .as_ref()
-            .map(|_| http_utils::copilot_initiator_from_openai(&req_body));
-
-        let (status, body_text, parsed) = match protocol {
-            ProviderProtocol::Anthropic => {
-                // Only inject cache_control for Claude models — other providers
-                // don't honor it (e.g. Gemini has a different caching model) and
-                // strict ones reject the unknown field outright.
-                if req_body
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
-                {
-                    inject_chat_completions_cache_control(&mut req_body);
-                }
-                let mut anthropic_req = convert_openai_chat_to_anthropic_request(
-                    &req_body,
-                    &OpenAIToAnthropicChatConfig {
-                        default_model: "claude-sonnet-4-5",
-                    },
-                );
-                anthropic_req["stream"] = serde_json::json!(false);
-                let target_url = http_utils::build_target_url(
-                    &config.target_base_url,
-                    variant.apply("/v1/messages"),
-                );
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&target_url)
-                        .header("Authorization", format!("Bearer {}", config.api_key))
-                        .header("x-api-key", config.api_key.as_str())
-                        .header("anthropic-version", "2023-06-01")
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&anthropic_req),
-                    config.is_starter,
-                )
-                .send()
-                .await?;
-                let status = response.status().as_u16();
-                let body_text = response.text().await?;
-                let parsed = if status == 200 {
-                    let anthropic_response: Value = serde_json::from_str(&body_text)?;
-                    Some(convert_anthropic_to_openai_chat_response(
-                        &anthropic_response,
-                        req_body
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("gemini-2.5-pro"),
-                    ))
-                } else {
-                    None
-                };
-                (status, body_text, parsed)
-            }
-            ProviderProtocol::Google => {
-                let google_body = convert_openai_chat_to_gemini_request(
-                    &req_body,
-                    &OpenAIToGeminiConfig {
-                        default_model: "gemini-2.5-pro",
-                    },
-                );
-                let model = openai_chat_model(&req_body, "gemini-2.5-pro");
-                let target_url = build_google_generate_content_url(&config.target_base_url, &model);
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&target_url)
-                        .header("x-goog-api-key", config.api_key.as_str())
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&google_body),
-                    config.is_starter,
-                )
-                .send()
-                .await?;
-                let status = response.status().as_u16();
-                let body_text = response.text().await?;
-                let parsed = if status == 200 {
-                    let google_response: Value = serde_json::from_str(&body_text)?;
-                    Some(convert_gemini_to_openai_chat_response(
-                        &google_response,
-                        &model,
-                    ))
-                } else {
-                    None
-                };
-                (status, body_text, parsed)
-            }
-            ProviderProtocol::Openai => {
-                let target_url = http_utils::build_target_url(
-                    &config.target_base_url,
-                    variant.apply("/v1/chat/completions"),
-                );
-                let req = http_utils::authorized_openai_post(
-                    client.as_ref(),
-                    &target_url,
-                    &config.api_key,
-                    config.copilot_token_manager.as_deref(),
-                    initiator,
-                )
-                .await?;
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    req.json(&req_body),
-                    config.is_starter,
-                )
-                .send()
-                .await?;
-                let status = response.status().as_u16();
-                let body_text = response.text().await?;
-                let parsed = if status == 200 {
-                    Some(serde_json::from_str(&body_text)?)
-                } else {
-                    None
-                };
-                (status, body_text, parsed)
-            }
-            ProviderProtocol::ResponsesApi => {
-                let responses_body = chat_to_responses_request(&req_body)?;
-                let target_url = http_utils::build_target_url(
-                    &config.target_base_url,
-                    variant.apply("/v1/responses"),
-                );
-                let req = http_utils::authorized_openai_post(
-                    client.as_ref(),
-                    &target_url,
-                    &config.api_key,
-                    config.copilot_token_manager.as_deref(),
-                    initiator,
-                )
-                .await?;
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    req.json(&responses_body),
-                    config.is_starter,
-                )
-                .send()
-                .await?;
-                let status = response.status().as_u16();
-                let body_text = response.text().await?;
-                let parsed = if status == 200 {
-                    Some(responses_to_chat_response(&body_text)?)
-                } else {
-                    None
-                };
-                (status, body_text, parsed)
-            }
-        };
-
-        match classify_attempt(status, body_text, parsed) {
-            AttemptOutcome::Success(result) => {
-                commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                return Ok(ForwardResult::Success(result));
-            }
-            AttemptOutcome::Mismatch { status, body } => {
-                first_error.get_or_insert((status, body));
-            }
+    match state
+        .try_protocols(openai_req, &state.active_protocol)
+        .await?
+    {
+        TryProtocolsResult::Success(response, _attempt) => Ok(ForwardResult::Success(response)),
+        TryProtocolsResult::Exhausted { status, body } => {
+            Ok(ForwardResult::Exhausted { status, body })
         }
     }
-
-    let (status, body) = first_error.unwrap_or_default();
-    Ok(ForwardResult::Exhausted { status, body })
 }
 
 /// Parses a Gemini API request path and extracts (model_name, is_streaming).

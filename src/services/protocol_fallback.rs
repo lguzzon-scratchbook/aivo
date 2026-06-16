@@ -4,6 +4,7 @@ use super::provider_protocol::{
     PathVariant, ProviderProtocol, decode_route, encode_route, fallback_path_variants,
     fallback_protocols,
 };
+use anyhow::Result;
 
 /// Outcome of a single protocol attempt in the fallback loop.
 pub enum AttemptOutcome<T> {
@@ -14,6 +15,70 @@ pub enum AttemptOutcome<T> {
         status: u16,
         body: String,
     },
+}
+
+/// Result of trying all protocol candidates in the fallback iteration.
+#[derive(Debug)]
+pub enum TryProtocolsResult<T> {
+    /// A candidate succeeded.
+    Success(T, usize),
+    /// All candidates exhausted. Status and body from the FIRST mismatch
+    /// (most informative upstream error, not a trailing 404 from a wrong endpoint).
+    Exhausted { status: u16, body: String },
+}
+
+/// Shared protocol fallback iteration trait.
+///
+/// Implementors define how to dispatch a single request for a given protocol
+/// and path variant. The default [`try_protocols`] implementation handles
+/// iterating candidates, committing protocol switches, and collecting errors.
+#[allow(async_fn_in_trait)]
+pub trait RouterPattern: Sync {
+    /// Per-call request data. Must be cloneable so `try_protocols` can retry
+    /// each candidate from the same starting state.
+    type Request: Clone;
+
+    /// Per-call response on success.
+    type Response;
+
+    /// Dispatch a single request attempt using the given protocol and path
+    /// variant. Returns `Success(response)` when the attempt succeeds, or
+    /// `Mismatch { status, body }` when the status code indicates the upstream
+    /// does not speak this protocol.
+    async fn route(
+        &self,
+        request: Self::Request,
+        protocol: ProviderProtocol,
+        variant: PathVariant,
+    ) -> Result<AttemptOutcome<Self::Response>>;
+
+    /// Iterate protocol/path-variant candidates until one succeeds or all are
+    /// exhausted.
+    async fn try_protocols(
+        &self,
+        request: Self::Request,
+        active_route: &AtomicU8,
+    ) -> Result<TryProtocolsResult<Self::Response>> {
+        let candidates = protocol_candidates(active_route);
+        let mut first_error: Option<(u16, String)> = None;
+
+        for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
+            let outcome = self.route(request.clone(), protocol, variant).await?;
+            match outcome {
+                AttemptOutcome::Success(response) => {
+                    commit_protocol_switch(active_route, protocol, variant, attempt);
+                    return Ok(TryProtocolsResult::Success(response, attempt));
+                }
+                AttemptOutcome::Mismatch { status, body } => {
+                    first_error.get_or_insert((status, body));
+                }
+            }
+        }
+
+        let (status, body) =
+            first_error.unwrap_or((503, "No compatible protocol found".to_string()));
+        Ok(TryProtocolsResult::Exhausted { status, body })
+    }
 }
 
 /// Returns the ordered list of `(protocol, path_variant)` candidates: the

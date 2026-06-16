@@ -7,6 +7,7 @@
 use anyhow::Result;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,6 +15,7 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
 use crate::services::device_fingerprint;
 use crate::services::http_utils::{self, router_http_client};
+use crate::services::router_trait::{Router, RouterStart};
 
 #[derive(Clone)]
 pub struct AnthropicRouterConfig {
@@ -70,6 +72,22 @@ impl AnthropicRouter {
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, handle))
+    }
+}
+
+impl Router for AnthropicRouter {
+    type Config = AnthropicRouterConfig;
+
+    async fn start(config: Self::Config, _env: &HashMap<String, String>) -> Result<RouterStart> {
+        let router = AnthropicRouter::new(config);
+        let (port, handle) = router.start_background().await?;
+        Ok(RouterStart {
+            port,
+            active_protocol: None,
+            request_succeeded: None,
+            responses_api_support: None,
+            handle,
+        })
     }
 }
 

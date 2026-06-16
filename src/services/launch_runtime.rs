@@ -7,14 +7,21 @@ use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::codex_home_shadow::CodexHomeShadow;
 use crate::services::codex_oauth::{CodexOAuthCredential, REFRESH_SKEW_SECS, ensure_fresh};
+use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::gemini_home_shadow::GeminiHomeShadow;
 use crate::services::gemini_oauth::{
     GeminiOAuthCredential, REFRESH_SKEW_SECS as GEMINI_REFRESH_SKEW_SECS,
     ensure_fresh as gemini_ensure_fresh,
 };
-use crate::services::provider_protocol::ProviderProtocol;
+use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
+use crate::services::router_trait::{Router, RouterStart};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, SessionStore,
+};
+use crate::services::{
+    AnthropicRouter, AnthropicRouterConfig, AnthropicToOpenAIRouter,
+    AnthropicToOpenAIRouterConfig, CopilotRouter, CopilotRouterConfig, GeminiRouter,
+    GeminiRouterConfig, ResponsesToChatRouter, ResponsesToChatRouterConfig,
 };
 
 /// Holds the shadow `CODEX_HOME` dir + metadata needed to sync refreshed
@@ -52,6 +59,52 @@ pub(crate) struct LaunchRuntimeState {
     pub(crate) gemini_system_settings: Option<tempfile::TempDir>,
 }
 
+/// Identifies a specific router startup action in the dispatch table.
+///
+/// Each variant maps to a single [`ROUTER_TABLE`] entry. Adding a new router
+/// requires one entry here, one entry in the table, and one match arm in the
+/// dispatch loop inside `prepare_runtime_env`.
+#[derive(Clone, Copy)]
+enum RouterKind {
+    Anthropic,
+    AnthropicToOpenai,
+    Copilot,
+    ResponsesToChat,
+    ResponsesToChatCopilot,
+    Gemini,
+    GeminiCopilot,
+    OpencodeCopilot,
+    Opencode,
+    PiCopilot,
+    PiStarter,
+}
+
+/// Entry in the router dispatch table.
+struct RouterEntry {
+    tool: AIToolType,
+    flag: &'static str,
+    kind: RouterKind,
+}
+
+/// Dispatch table for all registered routers.
+///
+/// Replaces the previous sequential if-else chain. To add a new router,
+/// add a [`RouterKind`] variant, an entry here, and a match arm in the
+/// dispatch loop inside `prepare_runtime_env`.
+const ROUTER_TABLE: &[RouterEntry] = &[
+    RouterEntry { tool: AIToolType::Claude, flag: "AIVO_USE_ROUTER", kind: RouterKind::Anthropic },
+    RouterEntry { tool: AIToolType::Claude, flag: "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER", kind: RouterKind::AnthropicToOpenai },
+    RouterEntry { tool: AIToolType::Claude, flag: "AIVO_USE_COPILOT_ROUTER", kind: RouterKind::Copilot },
+    RouterEntry { tool: AIToolType::Codex, flag: "AIVO_USE_RESPONSES_TO_CHAT_ROUTER", kind: RouterKind::ResponsesToChat },
+    RouterEntry { tool: AIToolType::Codex, flag: "AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER", kind: RouterKind::ResponsesToChatCopilot },
+    RouterEntry { tool: AIToolType::Gemini, flag: "AIVO_USE_GEMINI_ROUTER", kind: RouterKind::Gemini },
+    RouterEntry { tool: AIToolType::Gemini, flag: "AIVO_USE_GEMINI_COPILOT_ROUTER", kind: RouterKind::GeminiCopilot },
+    RouterEntry { tool: AIToolType::Opencode, flag: "AIVO_USE_OPENCODE_COPILOT_ROUTER", kind: RouterKind::OpencodeCopilot },
+    RouterEntry { tool: AIToolType::Opencode, flag: "AIVO_USE_OPENCODE_ROUTER", kind: RouterKind::Opencode },
+    RouterEntry { tool: AIToolType::Pi, flag: "AIVO_USE_PI_COPILOT_ROUTER", kind: RouterKind::PiCopilot },
+    RouterEntry { tool: AIToolType::Pi, flag: "AIVO_USE_PI_STARTER_ROUTER", kind: RouterKind::PiStarter },
+];
+
 pub(crate) async fn prepare_runtime_env(
     tool: AIToolType,
     mut env: HashMap<String, String>,
@@ -60,74 +113,290 @@ pub(crate) async fn prepare_runtime_env(
     let mut responses_api_support = None;
     let mut request_succeeded: Option<Arc<AtomicBool>> = None;
 
-    if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
-        let port = start_anthropic_router(&env).await?;
-        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
-    }
-
-    if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER") {
-        let (port, active, success) = start_anthropic_to_openai_router(&env).await?;
-        router_protocol = Some(active);
-        request_succeeded = Some(success);
-        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
-    }
-
-    if tool == AIToolType::Claude && env.contains_key("AIVO_USE_COPILOT_ROUTER") {
-        let port = start_copilot_router(&env).await?;
-        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
-    }
-
-    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
-        let (port, _active, responses_api, success) = start_responses_to_chat_router(&env).await?;
-        responses_api_support = Some(responses_api);
-        request_succeeded = Some(success);
-        set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
-    }
-
-    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER") {
-        let port = start_responses_to_chat_copilot_router(&env).await?;
-        set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
-    }
-
-    if tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_ROUTER") {
-        let (port, active, success) = start_gemini_router(&env).await?;
-        router_protocol = Some(active);
-        request_succeeded = Some(success);
-        set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
-        clear_node_proxy_env(&mut env);
-    }
-
-    if tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER") {
-        let port = start_gemini_copilot_router(&env).await?;
-        set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
-        clear_node_proxy_env(&mut env);
-    }
-
-    if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER") {
-        let port = start_responses_to_chat_copilot_router(&env).await?;
-        patch_opencode_config_content(&mut env, port);
-    }
-
-    if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
-        let (port, _active, _responses_api, _success) =
-            start_responses_to_chat_router(&env).await?;
-        patch_opencode_config_content(&mut env, port);
-    }
-
+    // Pi direct connection — no router needed, just write the temp agent dir.
     if tool == AIToolType::Pi && env.contains_key("AIVO_SETUP_PI_AGENT_DIR") {
-        // Direct connection — no router needed, just write the temp agent dir.
         write_pi_agent_dir(&mut env, None).await?;
     }
 
-    if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_COPILOT_ROUTER") {
-        let port = start_responses_to_chat_copilot_router(&env).await?;
-        write_pi_agent_dir(&mut env, Some(port)).await?;
-    }
+    // Router dispatch loop.  Each entry is checked by (tool, flag);
+    // the first match wins and its after-action is applied.
+    for entry in ROUTER_TABLE {
+        if tool == entry.tool && env.contains_key(entry.flag) {
+            let rs: RouterStart = match entry.kind {
+                RouterKind::Anthropic => {
+                    let config = AnthropicRouterConfig {
+                        upstream_base_url: env
+                            .get("AIVO_ROUTER_BASE_URL")
+                            .ok_or_else(|| anyhow::anyhow!("Missing AIVO_ROUTER_BASE_URL"))?
+                            .clone(),
+                        upstream_api_key: env
+                            .get("AIVO_ROUTER_API_KEY")
+                            .ok_or_else(|| anyhow::anyhow!("Missing AIVO_ROUTER_API_KEY"))?
+                            .clone(),
+                        is_starter: env
+                            .get("AIVO_IS_STARTER")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                    };
+                    AnthropicRouter::start(config, &env).await?
+                }
 
-    if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_STARTER_ROUTER") {
-        let (port, _active, _responses_api, _success) =
-            start_responses_to_chat_router(&env).await?;
-        write_pi_agent_dir(&mut env, Some(port)).await?;
+                RouterKind::AnthropicToOpenai => {
+                    let api_key = env
+                        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing anthropic-to-openai router API key")
+                        })?
+                        .clone();
+                    let base_url = env
+                        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing anthropic-to-openai router base URL")
+                        })?
+                        .clone();
+                    let target_protocol = env
+                        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL")
+                        .and_then(|value| ProviderProtocol::parse(value))
+                        .unwrap_or_else(|| detect_provider_protocol(&base_url));
+                    let config = AnthropicToOpenAIRouterConfig {
+                        target_base_url: base_url,
+                        target_api_key: api_key,
+                        target_protocol,
+                        model_prefix: env
+                            .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MODEL_PREFIX")
+                            .cloned(),
+                        requires_reasoning_content: env
+                            .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                        max_tokens_cap: env
+                            .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAX_TOKENS_CAP")
+                            .and_then(|v| v.parse::<u64>().ok()),
+                        anthropic_path_prefix: env
+                            .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_ANTHROPIC_PATH_PREFIX")
+                            .cloned(),
+                        is_starter: env
+                            .get("AIVO_IS_STARTER")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                    };
+                    AnthropicToOpenAIRouter::start(config, &env).await?
+                }
+
+                RouterKind::Copilot => {
+                    let config = CopilotRouterConfig {
+                        github_token: env
+                            .get("AIVO_COPILOT_GITHUB_TOKEN")
+                            .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
+                            .clone(),
+                    };
+                    CopilotRouter::start(config, &env).await?
+                }
+
+                RouterKind::ResponsesToChat => {
+                    let api_key = env
+                        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing responses-to-chat router API key")
+                        })?
+                        .clone();
+                    let base_url = env
+                        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing responses-to-chat router base URL")
+                        })?
+                        .clone();
+                    let config = ResponsesToChatRouterConfig {
+                        target_base_url: base_url.clone(),
+                        api_key,
+                        target_protocol: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL")
+                            .and_then(|value| ProviderProtocol::parse(value))
+                            .unwrap_or_else(|| detect_provider_protocol(&base_url)),
+                        copilot_token_manager: None,
+                        model_prefix: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MODEL_PREFIX")
+                            .cloned(),
+                        requires_reasoning_content: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_REQUIRE_REASONING")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                        actual_model: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL")
+                            .cloned(),
+                        max_tokens_cap: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MAX_TOKENS_CAP")
+                            .and_then(|v| v.parse::<u64>().ok()),
+                        responses_api_supported: match env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API")
+                            .map(|v| v.as_str())
+                        {
+                            Some("1") => Some(true),
+                            Some("0") => Some(false),
+                            _ => None,
+                        },
+                        is_starter: env
+                            .get("AIVO_IS_STARTER")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                    };
+                    ResponsesToChatRouter::start(config, &env).await?
+                }
+
+                RouterKind::ResponsesToChatCopilot
+                | RouterKind::OpencodeCopilot
+                | RouterKind::PiCopilot => {
+                    let github_token = env
+                        .get("AIVO_COPILOT_GITHUB_TOKEN")
+                        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
+                        .clone();
+                    let config = ResponsesToChatRouterConfig {
+                        target_base_url: String::new(),
+                        api_key: String::new(),
+                        target_protocol: ProviderProtocol::Openai,
+                        copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(
+                            github_token,
+                        ))),
+                        model_prefix: None,
+                        requires_reasoning_content: false,
+                        actual_model: None,
+                        max_tokens_cap: None,
+                        responses_api_supported: None,
+                        is_starter: false,
+                    };
+                    ResponsesToChatRouter::start(config, &env).await?
+                }
+
+                RouterKind::Opencode | RouterKind::PiStarter => {
+                    let api_key = env
+                        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing responses-to-chat router API key")
+                        })?
+                        .clone();
+                    let base_url = env
+                        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing responses-to-chat router base URL")
+                        })?
+                        .clone();
+                    let config = ResponsesToChatRouterConfig {
+                        target_base_url: base_url.clone(),
+                        api_key,
+                        target_protocol: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL")
+                            .and_then(|value| ProviderProtocol::parse(value))
+                            .unwrap_or_else(|| detect_provider_protocol(&base_url)),
+                        copilot_token_manager: None,
+                        model_prefix: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MODEL_PREFIX")
+                            .cloned(),
+                        requires_reasoning_content: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_REQUIRE_REASONING")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                        actual_model: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL")
+                            .cloned(),
+                        max_tokens_cap: env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MAX_TOKENS_CAP")
+                            .and_then(|v| v.parse::<u64>().ok()),
+                        responses_api_supported: match env
+                            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API")
+                            .map(|v| v.as_str())
+                        {
+                            Some("1") => Some(true),
+                            Some("0") => Some(false),
+                            _ => None,
+                        },
+                        is_starter: env
+                            .get("AIVO_IS_STARTER")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                    };
+                    ResponsesToChatRouter::start(config, &env).await?
+                }
+
+                RouterKind::Gemini => {
+                    let api_key = env
+                        .get("AIVO_GEMINI_ROUTER_API_KEY")
+                        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_GEMINI_ROUTER_API_KEY"))?
+                        .clone();
+                    let base_url = env
+                        .get("AIVO_GEMINI_ROUTER_BASE_URL")
+                        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_GEMINI_ROUTER_BASE_URL"))?
+                        .clone();
+                    let upstream_protocol = env
+                        .get("AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL")
+                        .and_then(|value| ProviderProtocol::parse(value))
+                        .unwrap_or_else(|| detect_provider_protocol(&base_url));
+                    let config = GeminiRouterConfig {
+                        target_base_url: base_url,
+                        api_key,
+                        upstream_protocol,
+                        forced_model: None,
+                        copilot_token_manager: None,
+                        requires_reasoning_content: env
+                            .get("AIVO_GEMINI_ROUTER_REQUIRE_REASONING")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                        max_tokens_cap: env
+                            .get("AIVO_GEMINI_ROUTER_MAX_TOKENS_CAP")
+                            .and_then(|v| v.parse::<u64>().ok()),
+                        is_starter: env
+                            .get("AIVO_IS_STARTER")
+                            .map(|v| v == "1")
+                            .unwrap_or(false),
+                    };
+                    GeminiRouter::start(config, &env).await?
+                }
+
+                RouterKind::GeminiCopilot => {
+                    let github_token = env
+                        .get("AIVO_COPILOT_GITHUB_TOKEN")
+                        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
+                        .clone();
+                    let forced_model = env
+                        .get("AIVO_GEMINI_COPILOT_FORCED_MODEL")
+                        .cloned();
+                    if forced_model.is_none() {
+                        eprintln!(
+                            "  {} Gemini + Copilot: no model specified. Gemini models are not available on \
+                             Copilot. Pass --model <model> (e.g., --model gpt-4o).",
+                            crate::style::yellow("Warning:")
+                        );
+                    }
+                    let config = GeminiRouterConfig {
+                        target_base_url: String::new(),
+                        api_key: String::new(),
+                        upstream_protocol: ProviderProtocol::ResponsesApi,
+                        forced_model,
+                        copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(
+                            github_token,
+                        ))),
+                        requires_reasoning_content: false,
+                        max_tokens_cap: None,
+                        is_starter: false,
+                    };
+                    GeminiRouter::start(config, &env).await?
+                }
+            };
+
+            router_protocol = rs.active_protocol.or(router_protocol);
+            request_succeeded = rs.request_succeeded.or(request_succeeded);
+            responses_api_support = rs.responses_api_support.or(responses_api_support);
+
+            let flag = entry.flag;
+            tokio::spawn(async move {
+                if let Ok(Err(e)) = rs.handle.await {
+                    eprintln!("aivo: router ({flag}) exited unexpectedly: {e}");
+                }
+            });
+
+            dispatch_after(entry.kind, &mut env, rs.port).await?;
+
+            break;
+        }
     }
 
     let pi_agent_dir = env.get("PI_CODING_AGENT_DIR").cloned();
@@ -711,297 +980,35 @@ fn ensure_loopback_no_proxy(env: &mut HashMap<String, String>) {
     }
 }
 
-/// Starts the built-in AnthropicRouter and returns the port it bound to
-async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
-    use crate::services::{AnthropicRouter, AnthropicRouterConfig};
-
-    let api_key = env
-        .get("AIVO_ROUTER_API_KEY")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_ROUTER_API_KEY"))?
-        .clone();
-
-    let base_url = env
-        .get("AIVO_ROUTER_BASE_URL")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_ROUTER_BASE_URL"))?
-        .clone();
-
-    let config = AnthropicRouterConfig {
-        upstream_base_url: base_url,
-        upstream_api_key: api_key,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
-    };
-
-    let router = AnthropicRouter::new(config);
-    let (port, handle) = router.start_background().await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: anthropic router exited unexpectedly: {e}");
+/// Apply the after-action for a specific router kind.
+///
+/// Each kind maps to one or more environment variable changes
+/// (setting `ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`,
+/// patching `OPENCODE_CONFIG_CONTENT`, or writing the Pi agent dir).
+async fn dispatch_after(
+    kind: RouterKind,
+    env: &mut HashMap<String, String>,
+    port: u16,
+) -> Result<()> {
+    match kind {
+        RouterKind::Anthropic | RouterKind::AnthropicToOpenai | RouterKind::Copilot => {
+            set_local_base_url(env, "ANTHROPIC_BASE_URL", port);
         }
-    });
-    Ok(port)
-}
-
-async fn start_anthropic_to_openai_router(
-    env: &HashMap<String, String>,
-) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicBool>)> {
-    use crate::services::provider_protocol::detect_provider_protocol;
-    use crate::services::{AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig};
-
-    let api_key = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY")
-        .ok_or_else(|| anyhow::anyhow!("Missing anthropic-to-openai router API key"))?
-        .clone();
-
-    let base_url = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL")
-        .ok_or_else(|| anyhow::anyhow!("Missing anthropic-to-openai router base URL"))?
-        .clone();
-
-    let model_prefix = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MODEL_PREFIX")
-        .cloned();
-    let requires_reasoning_content = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let max_tokens_cap = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAX_TOKENS_CAP")
-        .and_then(|v| v.parse::<u64>().ok());
-    let anthropic_path_prefix = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_ANTHROPIC_PATH_PREFIX")
-        .cloned();
-    let target_protocol = env
-        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL")
-        .and_then(|value| ProviderProtocol::parse(value))
-        .unwrap_or_else(|| detect_provider_protocol(&base_url));
-    let config = AnthropicToOpenAIRouterConfig {
-        target_base_url: base_url,
-        target_api_key: api_key,
-        target_protocol,
-        model_prefix,
-        requires_reasoning_content,
-        max_tokens_cap,
-        anthropic_path_prefix,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
-    };
-
-    let router = AnthropicToOpenAIRouter::new(config);
-    let (port, active_protocol, request_succeeded, handle) = router.start_background().await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: anthropic-to-openai router exited unexpectedly: {e}");
+        RouterKind::ResponsesToChat | RouterKind::ResponsesToChatCopilot => {
+            set_local_base_url(env, "OPENAI_BASE_URL", port);
         }
-    });
-    Ok((port, active_protocol, request_succeeded))
-}
-
-async fn start_responses_to_chat_router(
-    env: &HashMap<String, String>,
-) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>, Arc<AtomicBool>)> {
-    use crate::services::provider_protocol::detect_provider_protocol;
-    use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
-
-    let api_key = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
-        .ok_or_else(|| anyhow::anyhow!("Missing responses-to-chat router API key"))?
-        .clone();
-
-    let base_url = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
-        .ok_or_else(|| anyhow::anyhow!("Missing responses-to-chat router base URL"))?
-        .clone();
-
-    let model_prefix = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MODEL_PREFIX")
-        .cloned();
-    let requires_reasoning_content = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_REQUIRE_REASONING")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let actual_model = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL")
-        .cloned();
-    let max_tokens_cap = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_MAX_TOKENS_CAP")
-        .and_then(|v| v.parse::<u64>().ok());
-    let target_protocol = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL")
-        .and_then(|value| ProviderProtocol::parse(value))
-        .unwrap_or_else(|| detect_provider_protocol(&base_url));
-    let responses_api_supported = match env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API")
-        .map(|v| v.as_str())
-    {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ => None,
-    };
-
-    let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
-        target_base_url: base_url,
-        api_key,
-        target_protocol,
-        copilot_token_manager: None,
-        model_prefix,
-        requires_reasoning_content,
-        actual_model,
-        max_tokens_cap,
-        responses_api_supported,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
-    });
-    let (port, active_protocol, responses_api, request_succeeded, handle) =
-        router.start_background().await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: responses-to-chat router exited unexpectedly: {e}");
+        RouterKind::Gemini | RouterKind::GeminiCopilot => {
+            set_local_base_url(env, "GOOGLE_GEMINI_BASE_URL", port);
+            clear_node_proxy_env(env);
         }
-    });
-    Ok((port, active_protocol, responses_api, request_succeeded))
-}
-
-async fn start_gemini_router(
-    env: &HashMap<String, String>,
-) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicBool>)> {
-    use crate::services::provider_protocol::detect_provider_protocol;
-    use crate::services::{GeminiRouter, GeminiRouterConfig};
-
-    let api_key = env
-        .get("AIVO_GEMINI_ROUTER_API_KEY")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_GEMINI_ROUTER_API_KEY"))?
-        .clone();
-
-    let base_url = env
-        .get("AIVO_GEMINI_ROUTER_BASE_URL")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_GEMINI_ROUTER_BASE_URL"))?
-        .clone();
-
-    let requires_reasoning_content = env
-        .get("AIVO_GEMINI_ROUTER_REQUIRE_REASONING")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let max_tokens_cap = env
-        .get("AIVO_GEMINI_ROUTER_MAX_TOKENS_CAP")
-        .and_then(|v| v.parse::<u64>().ok());
-    let upstream_protocol = env
-        .get("AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL")
-        .and_then(|value| ProviderProtocol::parse(value))
-        .unwrap_or_else(|| detect_provider_protocol(&base_url));
-    let router = GeminiRouter::new(GeminiRouterConfig {
-        target_base_url: base_url,
-        api_key,
-        upstream_protocol,
-        forced_model: None,
-        copilot_token_manager: None,
-        requires_reasoning_content,
-        max_tokens_cap,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
-    });
-    let (port, active_protocol, request_succeeded, handle) = router.start_background().await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: gemini router exited unexpectedly: {e}");
+        RouterKind::Opencode | RouterKind::OpencodeCopilot => {
+            patch_opencode_config_content(env, port);
         }
-    });
-    Ok((port, active_protocol, request_succeeded))
-}
-
-async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
-    use crate::services::copilot_auth::CopilotTokenManager;
-    use crate::services::{GeminiRouter, GeminiRouterConfig};
-
-    let github_token = env
-        .get("AIVO_COPILOT_GITHUB_TOKEN")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
-        .clone();
-
-    let forced_model = env.get("AIVO_GEMINI_COPILOT_FORCED_MODEL").cloned();
-
-    if forced_model.is_none() {
-        eprintln!(
-            "  {} Gemini + Copilot: no model specified. Gemini models are not available on \
-             Copilot. Pass --model <model> (e.g., --model gpt-4o).",
-            crate::style::yellow("Warning:")
-        );
+        RouterKind::PiCopilot | RouterKind::PiStarter => {
+            write_pi_agent_dir(env, Some(port)).await?;
+        }
     }
-
-    let router = GeminiRouter::new(GeminiRouterConfig {
-        target_base_url: String::new(),
-        api_key: String::new(),
-        upstream_protocol: ProviderProtocol::ResponsesApi,
-        forced_model,
-        copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
-        requires_reasoning_content: false,
-        max_tokens_cap: None,
-        is_starter: false,
-    });
-    let (port, _active_protocol, _request_succeeded, handle) = router.start_background().await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: gemini copilot router exited unexpectedly: {e}");
-        }
-    });
-    Ok(port)
-}
-
-async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
-    use crate::services::{CopilotRouter, CopilotRouterConfig};
-
-    let github_token = env
-        .get("AIVO_COPILOT_GITHUB_TOKEN")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
-        .clone();
-
-    let router = CopilotRouter::new(CopilotRouterConfig { github_token });
-    let (port, handle) = router.start_background().await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: copilot router exited unexpectedly: {e}");
-        }
-    });
-    Ok(port)
-}
-
-async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
-    use crate::services::copilot_auth::CopilotTokenManager;
-    use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
-
-    let github_token = env
-        .get("AIVO_COPILOT_GITHUB_TOKEN")
-        .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
-        .clone();
-
-    let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
-        target_base_url: String::new(),
-        api_key: String::new(),
-        target_protocol: ProviderProtocol::Openai,
-        copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
-        model_prefix: None,
-        requires_reasoning_content: false,
-        actual_model: None,
-        max_tokens_cap: None,
-        responses_api_supported: None,
-        is_starter: false,
-    });
-    let (port, _active_protocol, _responses_api, _request_succeeded, handle) =
-        router.start_background().await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: responses-to-chat copilot router exited unexpectedly: {e}");
-        }
-    });
-    Ok(port)
+    Ok(())
 }
 
 #[cfg(test)]

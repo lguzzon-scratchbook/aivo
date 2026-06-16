@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::constants::CONTENT_TYPE_JSON;
@@ -20,6 +21,7 @@ use crate::services::copilot_auth::{
     COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 use crate::services::http_utils;
+use crate::services::router_trait::{Router, RouterStart};
 
 #[derive(Clone)]
 pub struct CopilotRouterConfig {
@@ -50,6 +52,22 @@ impl CopilotRouter {
             http_utils::run_text_router(listener, Arc::new(state), handle_copilot_request).await
         });
         Ok((port, handle))
+    }
+}
+
+impl Router for CopilotRouter {
+    type Config = CopilotRouterConfig;
+
+    async fn start(config: Self::Config, _env: &HashMap<String, String>) -> Result<RouterStart> {
+        let router = CopilotRouter::new(config);
+        let (port, handle) = router.start_background().await?;
+        Ok(RouterStart {
+            port,
+            active_protocol: None,
+            request_succeeded: None,
+            responses_api_support: None,
+            handle,
+        })
     }
 }
 

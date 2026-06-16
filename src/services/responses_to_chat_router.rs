@@ -30,14 +30,16 @@ use crate::services::openai_gemini_bridge::{
     openai_chat_model,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    AttemptOutcome, RouterPattern, TryProtocolsResult, classify_attempt,
 };
 use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, decode_route, is_protocol_mismatch,
 };
 use crate::services::responses_chat_conversion;
+use crate::services::router_trait::{Router, RouterStart};
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -97,6 +99,25 @@ struct ResponsesToChatRouterState {
     request_succeeded: Arc<AtomicBool>,
 }
 
+impl RouterPattern for ResponsesToChatRouterState {
+    type Request = Value;
+    type Response = Value;
+
+    async fn route(
+        &self,
+        request: Self::Request,
+        protocol: ProviderProtocol,
+        variant: PathVariant,
+    ) -> Result<AttemptOutcome<Self::Response>> {
+        let force_non_streaming = request
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let body = &request;
+        forward_chat_for_protocol(protocol, variant, body, &self.config, &self.client, force_non_streaming).await
+    }
+}
+
 impl ResponsesToChatRouter {
     pub fn new(config: ResponsesToChatRouterConfig) -> Self {
         Self { config }
@@ -147,6 +168,23 @@ impl ResponsesToChatRouter {
     }
 }
 
+impl Router for ResponsesToChatRouter {
+    type Config = ResponsesToChatRouterConfig;
+
+    async fn start(config: Self::Config, _env: &HashMap<String, String>) -> Result<RouterStart> {
+        let router = ResponsesToChatRouter::new(config);
+        let (port, active_protocol, responses_api_support, request_succeeded, handle) =
+            router.start_background().await?;
+        Ok(RouterStart {
+            port,
+            active_protocol: Some(active_protocol),
+            request_succeeded: Some(request_succeeded),
+            responses_api_support: Some(responses_api_support),
+            handle,
+        })
+    }
+}
+
 async fn handle_router_request_streaming(
     request: String,
     state: Arc<ResponsesToChatRouterState>,
@@ -177,11 +215,7 @@ async fn handle_router_request(
         match handle_api_request(
             &path,
             &request,
-            &state.config,
-            state.client.as_ref(),
-            &state.active_protocol,
-            &state.responses_api_supported,
-            &state.request_succeeded,
+            state,
             socket,
         )
         .await
@@ -209,11 +243,7 @@ async fn handle_router_request(
 async fn handle_api_request(
     path: &str,
     request: &str,
-    config: &Arc<ResponsesToChatRouterConfig>,
-    client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    responses_api_supported: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    state: &ResponsesToChatRouterState,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<Option<String>> {
     let body_str = http_utils::extract_request_body(request)?;
@@ -222,30 +252,22 @@ async fn handle_api_request(
     if is_responses_api_format(&body) {
         // When the upstream supports the Responses API natively, forward directly
         // to preserve IDs and avoid lossy Chat Completions round-trip conversion.
-        let (current, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
+        let (current, variant) = decode_route(state.active_protocol.load(Ordering::Relaxed));
         if current == ProviderProtocol::Openai
             && let Some(result) = try_responses_api_passthrough(
                 variant,
                 &body,
-                config,
-                client,
-                responses_api_supported,
-                request_succeeded,
+                &state.config,
+                &state.client,
+                &state.responses_api_supported,
+                &state.request_succeeded,
             )
             .await
         {
             return Ok(Some(result?));
         }
         Ok(Some(
-            handle_responses_api_via_chat(
-                path,
-                &body,
-                config,
-                client,
-                active_protocol,
-                request_succeeded,
-            )
-            .await?,
+            handle_responses_api_via_chat(path, &body, state).await?,
         ))
     } else {
         // For streaming Chat Completions, stream directly from upstream to client
@@ -255,10 +277,10 @@ async fn handle_api_request(
             .unwrap_or(false)
             && stream_chat_completions(
                 &body,
-                config,
-                client,
-                active_protocol,
-                request_succeeded,
+                &state.config,
+                &state.client,
+                &state.active_protocol,
+                &state.request_succeeded,
                 socket,
             )
             .await
@@ -267,15 +289,7 @@ async fn handle_api_request(
             return Ok(None); // already streamed to socket
         }
         Ok(Some(
-            handle_chat_completions_with_filter(
-                path,
-                &body,
-                config,
-                client,
-                active_protocol,
-                request_succeeded,
-            )
-            .await?,
+            handle_chat_completions_with_filter(path, &body, state).await?,
         ))
     }
 }
@@ -387,10 +401,7 @@ async fn try_responses_api_passthrough(
 async fn handle_responses_api_via_chat(
     _path: &str,
     body: &Value,
-    config: &Arc<ResponsesToChatRouterConfig>,
-    client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    state: &ResponsesToChatRouterState,
 ) -> Result<String> {
     // Extract original model before conversion
     let original_model = body
@@ -401,18 +412,10 @@ async fn handle_responses_api_via_chat(
 
     // Create a config copy with the model pinned to avoid protocol-based transformation
     // before we know which protocol the fallback loop will select.
-    let mut chat_config = (**config).clone();
+    let mut chat_config = (*state.config).clone();
     chat_config.actual_model = Some(original_model.clone());
     let chat_body = convert_responses_to_chat_request(body, &chat_config);
-    let chat_response = match forward_openai_chat_request(
-        &chat_body,
-        config,
-        client,
-        false,
-        active_protocol,
-        request_succeeded,
-    )
-    .await?
+    let chat_response = match forward_openai_chat_request(chat_body, state).await?
     {
         ForwardedChatResponse::Success(value) => value,
         ForwardedChatResponse::HttpError { status, body } => {
@@ -421,7 +424,7 @@ async fn handle_responses_api_via_chat(
     };
     let sse = convert_chat_response_to_responses_sse(
         &chat_response,
-        config.requires_reasoning_content,
+        state.config.requires_reasoning_content,
         &original_model,
     );
 
@@ -512,30 +515,19 @@ async fn stream_chat_completions(
 async fn handle_chat_completions_with_filter(
     _path: &str,
     body: &Value,
-    config: &Arc<ResponsesToChatRouterConfig>,
-    client: &reqwest::Client,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    state: &ResponsesToChatRouterState,
 ) -> Result<String> {
     let body = prepare_chat_completions_body(
         body,
-        config,
-        ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed)),
+        &state.config,
+        ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed)),
     );
     let requested_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let chat_response = match forward_openai_chat_request(
-        &body,
-        config,
-        client,
-        requested_stream,
-        active_protocol,
-        request_succeeded,
-    )
-    .await?
+    let chat_response = match forward_openai_chat_request(body, state).await?
     {
         ForwardedChatResponse::Success(value) => value,
         ForwardedChatResponse::HttpError { status, body } => {
@@ -588,40 +580,18 @@ async fn forward_request(
 }
 
 async fn forward_openai_chat_request(
-    body: &Value,
-    config: &Arc<ResponsesToChatRouterConfig>,
-    client: &reqwest::Client,
-    force_non_streaming: bool,
-    active_protocol: &Arc<AtomicU8>,
-    request_succeeded: &Arc<AtomicBool>,
+    body: Value,
+    state: &ResponsesToChatRouterState,
 ) -> Result<ForwardedChatResponse> {
-    let candidates = protocol_candidates(active_protocol);
-    let mut first_error: Option<(u16, String)> = None;
-
-    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
-        match forward_chat_for_protocol(
-            protocol,
-            variant,
-            body,
-            config.as_ref(),
-            client,
-            force_non_streaming,
-        )
-        .await?
-        {
-            AttemptOutcome::Success(value) => {
-                commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                request_succeeded.store(true, Ordering::Relaxed);
-                return Ok(ForwardedChatResponse::Success(value));
-            }
-            AttemptOutcome::Mismatch { status, body } => {
-                first_error.get_or_insert((status, body));
-            }
+    match state.try_protocols(body, &state.active_protocol).await? {
+        TryProtocolsResult::Success(value, _attempt) => {
+            state.request_succeeded.store(true, Ordering::Relaxed);
+            Ok(ForwardedChatResponse::Success(value))
+        }
+        TryProtocolsResult::Exhausted { status, body } => {
+            Ok(ForwardedChatResponse::HttpError { status, body })
         }
     }
-
-    let (status, body) = first_error.unwrap_or_default();
-    Ok(ForwardedChatResponse::HttpError { status, body })
 }
 
 async fn forward_chat_for_protocol(

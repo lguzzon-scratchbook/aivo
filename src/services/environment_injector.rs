@@ -20,13 +20,16 @@ use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, OpenAICompatibilityMode,
 };
 
-/// Describes which env vars a tool uses for base URL, auth, and router configuration.
-struct ToolEnvConfig {
+/// Describes which env vars a tool uses for base URL, auth, and router configuration,
+/// plus the tool's native API protocol.
+struct ToolEnvSpec {
     base_url_env: &'static str,
     auth_env: &'static str,
     router_flag: &'static str,
     router_prefix: &'static str,
     copilot_flag: &'static str,
+    #[allow(dead_code)]
+    protocol: ProviderProtocol,
 }
 
 /// How the tool should connect to the upstream provider.
@@ -147,7 +150,7 @@ impl EnvironmentInjector {
 
     /// Injects connection env vars following the common Ollama/Copilot/OpenRouter/Direct/Routed pattern.
     fn inject_connection(
-        cfg: &ToolEnvConfig,
+        cfg: &ToolEnvSpec,
         key: &ApiKey,
         mode: &ConnectionMode,
         profile: &ProviderProfile,
@@ -238,6 +241,39 @@ impl EnvironmentInjector {
         env
     }
 
+    /// Unified mode-detection cascade for AI tools.
+    ///
+    /// Determines the connection mode (Ollama / Copilot / Direct / Routed)
+    /// by consulting the provider profile and the caller-provided strategy functions,
+    /// then delegates to `inject_connection` to populate environment variables.
+    ///
+    /// Note: OpenRouter is Claude-specific and is handled by `for_claude` directly.
+    fn inject_for_tool(
+        &self,
+        key: &ApiKey,
+        spec: &ToolEnvSpec,
+        profile: &ProviderProfile,
+        is_direct_native: fn(&ApiKey) -> bool,
+        resolve_routed_protocol: fn(&ApiKey) -> ProviderProtocol,
+        transform_direct_base_url: fn(&str) -> String,
+    ) -> (HashMap<String, String>, ConnectionMode) {
+        let mode = if profile.kind == ProviderKind::Ollama {
+            ConnectionMode::Ollama
+        } else if profile.serve_flags.is_copilot {
+            ConnectionMode::Copilot
+        } else if is_direct_native(key) && !profile.serve_flags.is_starter {
+            ConnectionMode::Direct {
+                base_url: transform_direct_base_url(&key.base_url),
+            }
+        } else {
+            ConnectionMode::Routed {
+                protocol: resolve_routed_protocol(key),
+            }
+        };
+        let env = Self::inject_connection(spec, key, &mode, profile);
+        (env, mode)
+    }
+
     /// Prepares environment variables for Claude CLI
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         if key.is_claude_oauth() {
@@ -269,37 +305,34 @@ impl EnvironmentInjector {
             return env;
         }
 
-        let profile = provider_profile_for_key(key);
-        let mode = if profile.kind == ProviderKind::Ollama {
-            ConnectionMode::Ollama
-        } else if profile.serve_flags.is_copilot {
-            ConnectionMode::Copilot
-        } else if profile.serve_flags.is_openrouter {
-            ConnectionMode::OpenRouter
-        } else if Self::use_direct_anthropic_for_claude(key) && !profile.serve_flags.is_starter {
-            // Starter must route through the local router — it's the only
-            // place device_fingerprint::maybe_with_starter_headers runs.
-            // Direct mode would skip the X-Aivo-* headers and 403 at the gateway.
-            let base_url = key.base_url.trim_end_matches('/');
-            let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
-            ConnectionMode::Direct {
-                base_url: base_url.to_string(),
-            }
-        } else {
-            ConnectionMode::Routed {
-                protocol: Self::routed_protocol_for_claude(key),
-            }
-        };
-
-        let cfg = ToolEnvConfig {
+        let spec = ToolEnvSpec {
             base_url_env: "ANTHROPIC_BASE_URL",
             auth_env: "ANTHROPIC_AUTH_TOKEN",
             router_flag: "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER",
             router_prefix: "AIVO_ANTHROPIC_TO_OPENAI_ROUTER",
             copilot_flag: "AIVO_USE_COPILOT_ROUTER",
+            protocol: ProviderProtocol::Anthropic,
         };
+        let profile = provider_profile_for_key(key);
 
-        let mut env = Self::inject_connection(&cfg, key, &mode, &profile);
+        // OpenRouter is Claude-specific: use the built-in OpenRouter router.
+        let (mut env, mode) = if profile.serve_flags.is_openrouter {
+            let mode = ConnectionMode::OpenRouter;
+            let env = Self::inject_connection(&spec, key, &mode, &profile);
+            (env, mode)
+        } else {
+            self.inject_for_tool(
+                key,
+                &spec,
+                &profile,
+                Self::use_direct_anthropic_for_claude,
+                Self::routed_protocol_for_claude,
+                |base_url| {
+                    let base = base_url.trim_end_matches('/');
+                    base.strip_suffix("/v1").unwrap_or(base).to_string()
+                },
+            )
+        };
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
         env.insert(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
@@ -372,32 +405,26 @@ impl EnvironmentInjector {
             return env;
         }
 
-        let profile = provider_profile_for_key(key);
-        let mode = if profile.kind == ProviderKind::Ollama {
-            ConnectionMode::Ollama
-        } else if profile.serve_flags.is_copilot {
-            ConnectionMode::Copilot
-        } else if !Self::use_direct_openai_for_codex(key) || profile.serve_flags.is_starter {
-            // See for_claude: starter must route through the local router so
-            // device_fingerprint headers attach.
-            ConnectionMode::Routed {
-                protocol: profile.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi),
-            }
-        } else {
-            ConnectionMode::Direct {
-                base_url: key.base_url.clone(),
-            }
-        };
-
-        let cfg = ToolEnvConfig {
+        let spec = ToolEnvSpec {
             base_url_env: "OPENAI_BASE_URL",
             auth_env: "OPENAI_API_KEY",
             router_flag: "AIVO_USE_RESPONSES_TO_CHAT_ROUTER",
             router_prefix: "AIVO_RESPONSES_TO_CHAT_ROUTER",
             copilot_flag: "AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER",
+            protocol: ProviderProtocol::ResponsesApi,
         };
-
-        let mut env = Self::inject_connection(&cfg, key, &mode, &profile);
+        let profile = provider_profile_for_key(key);
+        let (mut env, mode) = self.inject_for_tool(
+            key,
+            &spec,
+            &profile,
+            Self::use_direct_openai_for_codex,
+            |key| {
+                let p = provider_profile_for_key(key);
+                p.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi)
+            },
+            |base_url| base_url.to_string(),
+        );
 
         // Codex-specific: responses_api_supported flag (routed mode only)
         if matches!(mode, ConnectionMode::Routed { .. })
@@ -410,12 +437,10 @@ impl EnvironmentInjector {
         }
 
         if let Some(model) = model {
-            let using_router = env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER")
-                || env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER");
-            let codex_model = if using_router {
-                model.to_string()
-            } else {
+            let codex_model = if matches!(mode, ConnectionMode::Direct { .. }) {
                 map_model_for_codex_cli(model)
+            } else {
+                model.to_string()
             };
             env.insert("CODEX_MODEL".to_string(), codex_model.clone());
             env.insert("OPENAI_DEFAULT_MODEL".to_string(), codex_model.clone());
@@ -473,32 +498,23 @@ impl EnvironmentInjector {
             return env;
         }
 
-        let profile = provider_profile_for_key(key);
-        let mode = if profile.kind == ProviderKind::Ollama {
-            ConnectionMode::Ollama
-        } else if profile.serve_flags.is_copilot {
-            ConnectionMode::Copilot
-        } else if Self::use_google_native_for_gemini(key) && !profile.serve_flags.is_starter {
-            // See for_claude: starter must route through the local router so
-            // device_fingerprint headers attach.
-            ConnectionMode::Direct {
-                base_url: strip_google_version_suffix(&key.base_url).to_string(),
-            }
-        } else {
-            ConnectionMode::Routed {
-                protocol: Self::routed_protocol_for_gemini(key),
-            }
-        };
-
-        let cfg = ToolEnvConfig {
+        let spec = ToolEnvSpec {
             base_url_env: "GOOGLE_GEMINI_BASE_URL",
             auth_env: "GEMINI_API_KEY",
             router_flag: "AIVO_USE_GEMINI_ROUTER",
             router_prefix: "AIVO_GEMINI_ROUTER",
             copilot_flag: "AIVO_USE_GEMINI_COPILOT_ROUTER",
+            protocol: ProviderProtocol::Google,
         };
-
-        let mut env = Self::inject_connection(&cfg, key, &mode, &profile);
+        let profile = provider_profile_for_key(key);
+        let (mut env, mode) = self.inject_for_tool(
+            key,
+            &spec,
+            &profile,
+            Self::use_google_native_for_gemini,
+            Self::routed_protocol_for_gemini,
+            |base_url| strip_google_version_suffix(base_url).to_string(),
+        );
 
         // Gemini-specific: copilot forced model
         if matches!(mode, ConnectionMode::Copilot)

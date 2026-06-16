@@ -49,6 +49,7 @@ use crate::services::protocol_fallback::{
 use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, is_endpoint_missing, is_protocol_mismatch,
 };
+use crate::services::router_trait::{Router, RouterStart};
 
 #[derive(Clone)]
 pub struct AnthropicToOpenAIRouterConfig {
@@ -207,6 +208,22 @@ impl AnthropicToOpenAIRouter {
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
         Ok((port, active_protocol, request_succeeded, handle))
+    }
+}
+
+impl Router for AnthropicToOpenAIRouter {
+    type Config = AnthropicToOpenAIRouterConfig;
+
+    async fn start(config: Self::Config, _env: &HashMap<String, String>) -> Result<RouterStart> {
+        let router = AnthropicToOpenAIRouter::new(config);
+        let (port, active_protocol, request_succeeded, handle) = router.start_background().await?;
+        Ok(RouterStart {
+            port,
+            active_protocol: Some(active_protocol),
+            request_succeeded: Some(request_succeeded),
+            responses_api_support: None,
+            handle,
+        })
     }
 }
 
