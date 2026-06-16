@@ -28,3 +28,4 @@ Thumbs.db
 # npm package
 npm/native/
 npm/*.tgz
+graphify-out/
