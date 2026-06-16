@@ -23,3 +23,6 @@ pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
 /// Not a secret — raises the bar from "copy a URL" to "implement the protocol."
 pub const AIVO_STARTER_SIGNING_KEY: &str =
     "39de0d498e4c6fe7f28f7ccc9956e8e34978188a7d2e122fe3c512fe22863f35";
+
+/// The version of the aivo CLI, embedded at build time from Cargo.toml.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

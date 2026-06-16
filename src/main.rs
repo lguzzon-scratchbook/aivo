@@ -14,7 +14,6 @@ mod key_resolution;
 mod services;
 mod style;
 mod tui;
-mod version;
 
 use cli::{Cli, Commands};
 use commands::{
@@ -423,8 +422,8 @@ async fn main() {
             } else {
                 Vec::new()
             };
-            let command = ServeCommand::new(session_store.logs())
-                .with_session_store(Some(session_store));
+            let command =
+                ServeCommand::new(session_store.logs()).with_session_store(Some(session_store));
             command
                 .execute(ServeParams {
                     port: serve_args.port,
@@ -524,7 +523,7 @@ fn print_help() {
     println!(
         "{} {} {}",
         style::cyan("aivo"),
-        style::dim(format!("v{}", version::VERSION)),
+        style::dim(format!("v{}", crate::constants::VERSION)),
         style::dim("— CLI for AI coding assistants")
     );
     println!();
@@ -619,7 +618,7 @@ fn print_version() {
     println!(
         "{} {}",
         style::cyan("aivo"),
-        style::dim(format!("v{}", version::VERSION))
+        style::dim(format!("v{}", crate::constants::VERSION))
     );
 }
 

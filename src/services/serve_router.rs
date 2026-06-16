@@ -587,7 +587,10 @@ async fn handle_embeddings(request: &str, state: &ServeState) -> Result<RouterRe
 async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
     // Check if the model is a fallback alias — resolve through fallback chain
     if let Some(ref store) = state.session_store {
-        let model_name = body.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let model_name = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         if let Some(ref name) = model_name {
             if store.is_fallback(name).await.unwrap_or(false) {
                 return handle_fallback_chat(body, name, state, store).await;

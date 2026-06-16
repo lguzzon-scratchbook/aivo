@@ -165,7 +165,7 @@ impl UpdateCommand {
 
         println!("{} Checking for updates...", style::arrow_symbol());
 
-        let current_version = crate::version::VERSION;
+        let current_version = crate::constants::VERSION;
         let release = self.get_latest_release().await?;
         let latest_version = release.version();
 

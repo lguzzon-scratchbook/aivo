@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 use crate::constants::AIVO_STARTER_SIGNING_KEY;
+use crate::constants::VERSION;
 use crate::services::http_utils::current_unix_ts;
 use crate::services::system_env;
-use crate::version::VERSION;
 
 type HmacSha256 = Hmac<Sha256>;
 

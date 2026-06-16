@@ -16,7 +16,7 @@ fn non_empty() -> NonEmptyStringValueParser {
 #[command(
     name = "aivo",
     about = "CLI tool for unified access to AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi)",
-    version = crate::version::VERSION,
+    version = crate::constants::VERSION,
     author = "yuanchuan",
     disable_help_flag = true,
     disable_version_flag = true

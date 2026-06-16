@@ -19,7 +19,6 @@ use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::services::session_store::SessionStore;
 use crate::services::system_env;
 use crate::style;
-use crate::version;
 
 const TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
@@ -51,7 +50,7 @@ impl InfoCommand {
         println!(
             "{} {}",
             style::cyan("aivo info"),
-            style::dim(format!("v{}", version::VERSION)),
+            style::dim(format!("v{}", crate::constants::VERSION)),
         );
         println!();
 
@@ -243,7 +242,7 @@ impl InfoCommand {
         });
 
         let mut payload = json!({
-            "version": version::VERSION,
+            "version": crate::constants::VERSION,
             "cwd": cwd,
             "config": {
                 "path": config_path.display().to_string(),

@@ -170,7 +170,7 @@ fn initialize_result() -> Value {
         "capabilities": { "tools": {} },
         "serverInfo": {
             "name": "aivo",
-            "version": crate::version::VERSION,
+            "version": crate::constants::VERSION,
         }
     })
 }
