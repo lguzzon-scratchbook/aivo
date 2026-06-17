@@ -19,9 +19,9 @@ use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, SessionStore,
 };
 use crate::services::{
-    AnthropicRouter, AnthropicRouterConfig, AnthropicToOpenAIRouter,
-    AnthropicToOpenAIRouterConfig, CopilotRouter, CopilotRouterConfig, GeminiRouter,
-    GeminiRouterConfig, ResponsesToChatRouter, ResponsesToChatRouterConfig,
+    AnthropicRouter, AnthropicRouterConfig, AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig,
+    CopilotRouter, CopilotRouterConfig, GeminiRouter, GeminiRouterConfig, ResponsesToChatRouter,
+    ResponsesToChatRouterConfig,
 };
 
 /// Holds the shadow `CODEX_HOME` dir + metadata needed to sync refreshed
@@ -92,17 +92,61 @@ struct RouterEntry {
 /// add a [`RouterKind`] variant, an entry here, and a match arm in the
 /// dispatch loop inside `prepare_runtime_env`.
 const ROUTER_TABLE: &[RouterEntry] = &[
-    RouterEntry { tool: AIToolType::Claude, flag: "AIVO_USE_ROUTER", kind: RouterKind::Anthropic },
-    RouterEntry { tool: AIToolType::Claude, flag: "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER", kind: RouterKind::AnthropicToOpenai },
-    RouterEntry { tool: AIToolType::Claude, flag: "AIVO_USE_COPILOT_ROUTER", kind: RouterKind::Copilot },
-    RouterEntry { tool: AIToolType::Codex, flag: "AIVO_USE_RESPONSES_TO_CHAT_ROUTER", kind: RouterKind::ResponsesToChat },
-    RouterEntry { tool: AIToolType::Codex, flag: "AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER", kind: RouterKind::ResponsesToChatCopilot },
-    RouterEntry { tool: AIToolType::Gemini, flag: "AIVO_USE_GEMINI_ROUTER", kind: RouterKind::Gemini },
-    RouterEntry { tool: AIToolType::Gemini, flag: "AIVO_USE_GEMINI_COPILOT_ROUTER", kind: RouterKind::GeminiCopilot },
-    RouterEntry { tool: AIToolType::Opencode, flag: "AIVO_USE_OPENCODE_COPILOT_ROUTER", kind: RouterKind::OpencodeCopilot },
-    RouterEntry { tool: AIToolType::Opencode, flag: "AIVO_USE_OPENCODE_ROUTER", kind: RouterKind::Opencode },
-    RouterEntry { tool: AIToolType::Pi, flag: "AIVO_USE_PI_COPILOT_ROUTER", kind: RouterKind::PiCopilot },
-    RouterEntry { tool: AIToolType::Pi, flag: "AIVO_USE_PI_STARTER_ROUTER", kind: RouterKind::PiStarter },
+    RouterEntry {
+        tool: AIToolType::Claude,
+        flag: "AIVO_USE_ROUTER",
+        kind: RouterKind::Anthropic,
+    },
+    RouterEntry {
+        tool: AIToolType::Claude,
+        flag: "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER",
+        kind: RouterKind::AnthropicToOpenai,
+    },
+    RouterEntry {
+        tool: AIToolType::Claude,
+        flag: "AIVO_USE_COPILOT_ROUTER",
+        kind: RouterKind::Copilot,
+    },
+    RouterEntry {
+        tool: AIToolType::Codex,
+        flag: "AIVO_USE_RESPONSES_TO_CHAT_ROUTER",
+        kind: RouterKind::ResponsesToChat,
+    },
+    RouterEntry {
+        tool: AIToolType::Codex,
+        flag: "AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER",
+        kind: RouterKind::ResponsesToChatCopilot,
+    },
+    RouterEntry {
+        tool: AIToolType::Gemini,
+        flag: "AIVO_USE_GEMINI_ROUTER",
+        kind: RouterKind::Gemini,
+    },
+    RouterEntry {
+        tool: AIToolType::Gemini,
+        flag: "AIVO_USE_GEMINI_COPILOT_ROUTER",
+        kind: RouterKind::GeminiCopilot,
+    },
+    RouterEntry {
+        tool: AIToolType::Opencode,
+        flag: "AIVO_USE_OPENCODE_COPILOT_ROUTER",
+        kind: RouterKind::OpencodeCopilot,
+    },
+    RouterEntry {
+        tool: AIToolType::Opencode,
+        flag: "AIVO_USE_OPENCODE_ROUTER",
+        kind: RouterKind::Opencode,
+    },
+    RouterEntry {
+        tool: AIToolType::Pi,
+        flag: "AIVO_USE_PI_COPILOT_ROUTER",
+        kind: RouterKind::PiCopilot,
+    },
+    RouterEntry {
+        tool: AIToolType::Pi,
+        flag: "AIVO_USE_PI_STARTER_ROUTER",
+        kind: RouterKind::PiStarter,
+    },
 ];
 
 pub(crate) async fn prepare_runtime_env(
@@ -196,9 +240,7 @@ pub(crate) async fn prepare_runtime_env(
                 RouterKind::ResponsesToChat => {
                     let api_key = env
                         .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Missing responses-to-chat router API key")
-                        })?
+                        .ok_or_else(|| anyhow::anyhow!("Missing responses-to-chat router API key"))?
                         .clone();
                     let base_url = env
                         .get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
@@ -270,9 +312,7 @@ pub(crate) async fn prepare_runtime_env(
                 RouterKind::Opencode | RouterKind::PiStarter => {
                     let api_key = env
                         .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Missing responses-to-chat router API key")
-                        })?
+                        .ok_or_else(|| anyhow::anyhow!("Missing responses-to-chat router API key"))?
                         .clone();
                     let base_url = env
                         .get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
@@ -356,9 +396,7 @@ pub(crate) async fn prepare_runtime_env(
                         .get("AIVO_COPILOT_GITHUB_TOKEN")
                         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
                         .clone();
-                    let forced_model = env
-                        .get("AIVO_GEMINI_COPILOT_FORCED_MODEL")
-                        .cloned();
+                    let forced_model = env.get("AIVO_GEMINI_COPILOT_FORCED_MODEL").cloned();
                     if forced_model.is_none() {
                         eprintln!(
                             "  {} Gemini + Copilot: no model specified. Gemini models are not available on \

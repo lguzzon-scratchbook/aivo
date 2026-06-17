@@ -54,6 +54,7 @@ pub(crate) mod chat_response_parser;
 pub(crate) mod chat_tui_format;
 pub mod context;
 pub mod fallback;
+pub mod fallback_resolve;
 pub mod image;
 pub mod info;
 pub mod keys;

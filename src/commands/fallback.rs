@@ -232,9 +232,15 @@ impl FallbackCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo fallback [--set <name> -- <targets> | --rm <name>]", style::bold("Usage:"));
+        println!(
+            "{} aivo fallback [--set <name> -- <targets> | --rm <name>]",
+            style::bold("Usage:")
+        );
         println!();
-        println!("{}", style::dim("Create, list, or remove fallback definitions."));
+        println!(
+            "{}",
+            style::dim("Create, list, or remove fallback definitions.")
+        );
         println!();
         println!("{}", style::bold("Actions:"));
         let print_row = |label: &str, desc: &str| {
@@ -259,7 +265,10 @@ impl FallbackCommand {
         print_opt("--json", "Output fallback list as JSON (listing only)");
         println!();
         println!("{}", style::bold("Examples:"));
-        println!("  {}", style::dim("aivo fallback --set auto -- anthropic:claude-sonnet-4-6 openai:gpt-4o"));
+        println!(
+            "  {}",
+            style::dim("aivo fallback --set auto -- anthropic:claude-sonnet-4-6 openai:gpt-4o")
+        );
         println!("  {}", style::dim("aivo fallback --rm auto"));
         println!("  {}", style::dim("aivo fallback"));
         println!("  {}", style::dim("aivo fallback --json"));

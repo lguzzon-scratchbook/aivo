@@ -1,7 +1,7 @@
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8};
-use anyhow::Result;
 
 /// Standard result from starting any background router.
 ///
@@ -37,8 +37,5 @@ pub trait Router: Send + Sync {
 
     /// Start the router with the given config, optionally consulting `env`
     /// for runtime overrides (e.g. starter flags).
-    async fn start(
-        config: Self::Config,
-        env: &HashMap<String, String>,
-    ) -> Result<RouterStart>;
+    async fn start(config: Self::Config, env: &HashMap<String, String>) -> Result<RouterStart>;
 }

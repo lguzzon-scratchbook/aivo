@@ -17,6 +17,7 @@ use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
+use crate::commands::fallback_resolve::resolve_fallback_targets;
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
 use crate::services::copilot_auth::{
@@ -250,6 +251,34 @@ impl ChatCommand {
                     None => return Ok(ExitCode::Success),
                 }
             }
+        };
+
+        // Resolve fallback alias — pick the first matching target's model
+        let raw_model = if self
+            .session_store
+            .is_fallback(&raw_model)
+            .await
+            .unwrap_or(false)
+        {
+            let pairs =
+                resolve_fallback_targets(&self.session_store, &raw_model, Some(&key)).await?;
+            let (fb_key, target) = pairs.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("No fallback targets available for '{}'", raw_model)
+            })?;
+            // If the resolved key differs from the current key, use it
+            if fb_key.id != key.id {
+                return Err(anyhow::anyhow!(
+                    "Fallback target '{}' uses key '{}', but chat is locked to '{}'. \
+                     Use 'aivo run --model {}' for cross-key fallback.",
+                    target.model,
+                    fb_key.display_name(),
+                    key.display_name(),
+                    raw_model
+                ));
+            }
+            target.model
+        } else {
+            raw_model
         };
 
         // Preserve the existing tool in last_selection so `aivo run` (no tool)

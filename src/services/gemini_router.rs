@@ -284,21 +284,13 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
     }
 }
 
-async fn handle_request(
-    request: &str,
-    state: &GeminiRouterState,
-) -> Result<String> {
+async fn handle_request(request: &str, state: &GeminiRouterState) -> Result<String> {
     let path = http_utils::extract_request_path(request);
 
     match parse_gemini_path(&path) {
         Some((extracted_model, is_streaming)) => {
-            let model = state
-                .config
-                .forced_model
-                .clone()
-                .unwrap_or(extracted_model);
-            let body: Value =
-                serde_json::from_str(http_utils::extract_request_body(request)?)?;
+            let model = state.config.forced_model.clone().unwrap_or(extracted_model);
+            let body: Value = serde_json::from_str(http_utils::extract_request_body(request)?)?;
             let tool_schemas = extract_tool_schemas(&body);
             let openai_req = convert_gemini_to_openai(
                 &body,
@@ -309,8 +301,7 @@ async fn handle_request(
             match forward_to_provider(openai_req, state).await? {
                 ForwardResult::Success(openai_response) => {
                     state.request_succeeded.store(true, Ordering::Relaxed);
-                    let openai_response =
-                        repair_tool_call_args(openai_response, &tool_schemas);
+                    let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
                     if is_streaming {
                         let sse = convert_openai_to_gemini_sse(&openai_response);
                         Ok(http_utils::http_response(200, "text/event-stream", &sse))

@@ -5,6 +5,10 @@
 ### Features
 
 - `aivo image`: experimental image generation command
+- Fallback mechanism: define fallback aliases targeting multiple provider/model
+  pairs via `aivo fallback --set <name> -- <provider:model>...`. Use
+  `--model <name>` with `aivo run`, `aivo chat`, or `aivo start` to try each
+  target in sequence until one succeeds.
 
 ### Fixes
 

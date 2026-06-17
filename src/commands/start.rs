@@ -104,6 +104,21 @@ impl StartCommand {
 
         let launch_model = resolve_model_placeholder(model.value.clone());
 
+        // Resolve fallback alias — use first matching target's model
+        let launch_model = if let Some(ref m) = launch_model
+            && self.session_store.is_fallback(m).await.unwrap_or(false)
+        {
+            let pairs = crate::commands::fallback_resolve::resolve_fallback_targets(
+                &self.session_store,
+                m,
+                Some(&key.value),
+            )
+            .await?;
+            Some(pairs.into_iter().next().unwrap().1.model)
+        } else {
+            launch_model
+        };
+
         let env = parse_env_vars(&args.envs);
         let skip_confirm =
             last_sel.is_some() || (key.interactive && tool.interactive && model.interactive);

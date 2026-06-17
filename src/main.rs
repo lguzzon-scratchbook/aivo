@@ -541,10 +541,7 @@ fn print_help() {
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
     print_cmd("models", "List available models from the active provider");
     print_cmd("alias", "Create, list, or remove model aliases");
-    print_cmd(
-        "fallback",
-        "Create, list, or remove fallback definitions",
-    );
+    print_cmd("fallback", "Create, list, or remove fallback definitions");
     print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");

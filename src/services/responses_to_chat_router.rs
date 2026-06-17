@@ -114,7 +114,15 @@ impl RouterPattern for ResponsesToChatRouterState {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let body = &request;
-        forward_chat_for_protocol(protocol, variant, body, &self.config, &self.client, force_non_streaming).await
+        forward_chat_for_protocol(
+            protocol,
+            variant,
+            body,
+            &self.config,
+            &self.client,
+            force_non_streaming,
+        )
+        .await
     }
 }
 
@@ -212,14 +220,7 @@ async fn handle_router_request(
     );
 
     if is_api_path {
-        match handle_api_request(
-            &path,
-            &request,
-            state,
-            socket,
-        )
-        .await
-        {
+        match handle_api_request(&path, &request, state, socket).await {
             Ok(r) => r,
             Err(_) => Some(http_utils::http_error_response(
                 500,
@@ -415,8 +416,7 @@ async fn handle_responses_api_via_chat(
     let mut chat_config = (*state.config).clone();
     chat_config.actual_model = Some(original_model.clone());
     let chat_body = convert_responses_to_chat_request(body, &chat_config);
-    let chat_response = match forward_openai_chat_request(chat_body, state).await?
-    {
+    let chat_response = match forward_openai_chat_request(chat_body, state).await? {
         ForwardedChatResponse::Success(value) => value,
         ForwardedChatResponse::HttpError { status, body } => {
             return Ok(http_utils::http_json_response(status, &body));
@@ -527,8 +527,7 @@ async fn handle_chat_completions_with_filter(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let chat_response = match forward_openai_chat_request(body, state).await?
-    {
+    let chat_response = match forward_openai_chat_request(body, state).await? {
         ForwardedChatResponse::Success(value) => value,
         ForwardedChatResponse::HttpError { status, body } => {
             return Ok(http_utils::http_json_response(status, &body));
