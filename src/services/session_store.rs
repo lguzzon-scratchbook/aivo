@@ -542,7 +542,12 @@ pub struct StoredConfig {
     )]
     pub stats: UsageStats,
     /// Model aliases (e.g. "fast" -> "claude-haiku-4-5")
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// Filters out non-string values (legacy complex alias objects).
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_aliases"
+    )]
     pub aliases: HashMap<String, String>,
     /// Fallback definitions — ordered lists of provider/model targets.
     /// Keyed by fallback ID, each entry has a sequence of targets.
@@ -676,6 +681,30 @@ impl StoredConfig {
             starter_key_dismissed: false,
         }
     }
+}
+
+/// Deserializes aliases from config, silently dropping non-string values
+/// (legacy complex alias objects from older aivo versions).
+fn deserialize_aliases<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(Value::Object(map)) = value else {
+        return Ok(HashMap::new());
+    };
+
+    let aliases = map
+        .into_iter()
+        .filter_map(|(key, val)| match val {
+            Value::String(s) => Some((key, s)),
+            _ => None, // skip non-string values (legacy complex alias objects)
+        })
+        .collect();
+    Ok(aliases)
 }
 
 // ── Shared infrastructure ─────────────────────────────────────────────────────
