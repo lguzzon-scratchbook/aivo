@@ -106,6 +106,7 @@ pub fn infer_provider_name_from_model(model: &str) -> Option<String> {
 }
 
 /// Normalizes a Claude model name for providers that expect dots instead of hyphens.
+#[allow(dead_code)]
 pub fn normalize_claude_for_provider(base_url: &str, model: &str) -> String {
     if base_url.to_ascii_lowercase().contains("openrouter") {
         if !model.starts_with("claude-") || model.starts_with("anthropic/") {

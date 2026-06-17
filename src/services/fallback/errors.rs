@@ -38,6 +38,7 @@ pub struct FallbackExhaustedError {
 }
 
 impl FallbackExhaustedError {
+    #[allow(dead_code)]
     pub fn new(
         fallback_id: impl Into<String>,
         attempt_count: usize,

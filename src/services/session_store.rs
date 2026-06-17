@@ -1297,12 +1297,14 @@ impl SessionStore {
     }
 
     /// Access the inner ApiKeyStore directly.
-    pub fn api_key_store(&self) -> ApiKeyStore {
+    #[allow(dead_code)]
+    pub(crate) fn api_key_store(&self) -> ApiKeyStore {
         self.api_keys.clone()
     }
 
     /// Access the inner LastSelectionStore directly.
-    pub fn last_selection_store(&self) -> LastSelectionStore {
+    #[allow(dead_code)]
+    pub(crate) fn last_selection_store(&self) -> LastSelectionStore {
         self.last_sel.clone()
     }
 
