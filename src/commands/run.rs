@@ -318,27 +318,158 @@ impl RunCommand {
             }
         };
 
-        // Launch the AI tool
-        let options = LaunchOptions {
-            tool: ai_tool,
-            args,
-            debug,
-            model: launch_model,
-            env,
-            key_override,
+        // Launch the AI tool (with fallback support)
+        let exit_code = if let Some(ref model_str) = launch_model {
+            if self.session_store.is_fallback(model_str).await.unwrap_or(false) {
+                if dry_run {
+                    self.fallback_preview(ai_tool, model_str).await?
+                } else {
+                    self.fallback_launch(ai_tool, args, debug, env, model_str, key_override).await?
+                }
+            } else {
+                let options = LaunchOptions {
+                    tool: ai_tool,
+                    args,
+                    debug,
+                    model: launch_model,
+                    env,
+                    key_override,
+                };
+                if dry_run {
+                    let plan = self.ai_launcher.prepare_launch(&options).await?;
+                    print_launch_preview(&plan);
+                    return Ok(ExitCode::Success);
+                }
+                self.ai_launcher.launch(&options).await?
+            }
+        } else {
+            let options = LaunchOptions {
+                tool: ai_tool,
+                args,
+                debug,
+                model: launch_model,
+                env,
+                key_override,
+            };
+            if dry_run {
+                let plan = self.ai_launcher.prepare_launch(&options).await?;
+                print_launch_preview(&plan);
+                return Ok(ExitCode::Success);
+            }
+            self.ai_launcher.launch(&options).await?
         };
-
-        if dry_run {
-            let plan = self.ai_launcher.prepare_launch(&options).await?;
-            print_launch_preview(&plan);
-            return Ok(ExitCode::Success);
-        }
-
-        let exit_code = self.ai_launcher.launch(&options).await?;
         Ok(match exit_code {
             0 => ExitCode::Success,
             n => ExitCode::ToolExit(n),
         })
+    }
+
+    /// Preview fallback targets (dry-run).
+    async fn fallback_preview(
+        &self,
+        _tool: AIToolType,
+        fallback_id: &str,
+    ) -> Result<i32> {
+        let targets = self
+            .session_store
+            .get_fallback_targets(fallback_id)
+            .await;
+
+        let Some(targets) = targets else {
+            anyhow::bail!("Unknown fallback alias '{}'", fallback_id);
+        };
+
+        let all_keys = self.session_store.get_keys().await?;
+        println!("Fallback: {} ({} targets)", fallback_id, targets.len());
+        for (i, target) in targets.iter().enumerate() {
+            let key_name = all_keys
+                .iter()
+                .find(|k| {
+                    k.name == target.provider
+                        || k.short_id() == target.provider
+                        || k.id == target.provider
+                })
+                .map(|k| k.display_name().to_string())
+                .unwrap_or_else(|| target.provider.clone());
+            println!(
+                "  {}. {} using key '{}'",
+                i + 1,
+                style::cyan(format!("{}:{}", target.provider, target.model)),
+                style::dim(&key_name),
+            );
+        }
+        Ok(0)
+    }
+
+    /// Try each fallback target in sequence until one succeeds.
+    async fn fallback_launch(
+        &self,
+        tool: AIToolType,
+        args: Vec<String>,
+        debug: bool,
+        env: Option<HashMap<String, String>>,
+        fallback_id: &str,
+        original_key: Option<ApiKey>,
+    ) -> Result<i32> {
+        let targets = self
+            .session_store
+            .get_fallback_targets(fallback_id)
+            .await;
+
+        let Some(targets) = targets else {
+            anyhow::bail!("Unknown fallback alias '{}'", fallback_id);
+        };
+
+        // Try the original key first if no target explicitly matches it
+        let all_keys = self.session_store.get_keys().await?;
+
+        for target in targets.iter() {
+            // Find a key matching the provider name (by name, short_id, or id)
+            let fb_key = all_keys
+                .iter()
+                .find(|k| {
+                    k.name == target.provider
+                        || k.short_id() == target.provider
+                        || k.id == target.provider
+                })
+                .cloned()
+                .or_else(|| original_key.clone());
+
+            if let Some(key) = fb_key {
+                let options = LaunchOptions {
+                    tool,
+                    args: args.clone(),
+                    debug,
+                    model: Some(target.model.clone()),
+                    env: env.clone(),
+                    key_override: Some(key),
+                };
+
+                let exit_code = self.ai_launcher.launch(&options).await?;
+                if exit_code == 0 {
+                    return Ok(0);
+                }
+                eprintln!(
+                    "  {} fallback target {}/{} failed (exit {})",
+                    style::yellow("!"),
+                    target.provider,
+                    target.model,
+                    exit_code
+                );
+            } else {
+                eprintln!(
+                    "  {} fallback target {}/{} skipped: no matching key",
+                    style::yellow("!"),
+                    target.provider,
+                    target.model
+                );
+            }
+        }
+
+        anyhow::bail!(
+            "All fallback targets for '{}' exhausted",
+            fallback_id
+        )
     }
 
     /// Shows usage information
