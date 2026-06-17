@@ -137,7 +137,12 @@ fn test_check_timeout_exceeds() {
     let start = Instant::now() - Duration::from_millis(150);
     let result = check_timeout(start, Some(100));
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Fallback timeout exceeded"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Fallback timeout exceeded")
+    );
 }
 
 #[tokio::test]
@@ -155,7 +160,8 @@ async fn test_fallback_exhaustion_returns_structured_error() {
     );
     store.set_fallback("fail", &defs).await.unwrap();
 
-    let result = aivo::commands::fallback_resolve::resolve_fallback_targets(&store, "fail", None).await;
+    let result =
+        aivo::commands::fallback_resolve::resolve_fallback_targets(&store, "fail", None).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("exhausted"));
 }

@@ -7,7 +7,8 @@
 /// 4. Atomic rejection or acceptance
 use std::collections::HashMap;
 
-use super::types::{Entry, Registry, ValidationError};
+use super::errors::ValidationError;
+use super::types::{Entry, Registry};
 
 /// Validate a complete fallback registry.
 ///

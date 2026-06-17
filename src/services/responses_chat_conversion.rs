@@ -7,7 +7,7 @@
  */
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::http_utils::{self, current_unix_ts};
-use crate::services::model_names::select_model_for_provider_attempt;
+use crate::services::model_resolution::select_model_for_provider_attempt;
 use crate::services::openai_models::{
     OpenAIChatRequest, ResponsesResponse,
     convert_chat_to_responses_request as convert_typed_chat_to_responses,
@@ -318,81 +318,7 @@ pub fn parse_provider_response(text: &str) -> anyhow::Result<Value> {
 
 /// Reads an SSE chat completions stream and returns a synthesized non-streaming response.
 pub fn accumulate_chat_sse(text: &str) -> Value {
-    let mut content = String::new();
-    let mut reasoning_content = String::new();
-    // (id, name, accumulated_args)
-    let mut tool_calls_acc: Vec<(String, String, String)> = Vec::new();
-    let mut finish_reason = String::from("stop");
-
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim() == "[DONE]" {
-                break;
-            }
-            if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                let choice = &chunk["choices"][0];
-                let delta = &choice["delta"];
-
-                if let Some(c) = delta["content"].as_str() {
-                    content.push_str(c);
-                }
-                if let Some(rc) = delta["reasoning_content"].as_str() {
-                    reasoning_content.push_str(rc);
-                }
-                if let Some(tcs) = delta["tool_calls"].as_array() {
-                    for tc in tcs {
-                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-                        while tool_calls_acc.len() <= idx {
-                            tool_calls_acc.push((String::new(), String::new(), String::new()));
-                        }
-                        if let Some(id) = tc["id"].as_str()
-                            && !id.is_empty()
-                        {
-                            tool_calls_acc[idx].0 = id.to_string();
-                        }
-                        if let Some(name) = tc["function"]["name"].as_str()
-                            && !name.is_empty()
-                        {
-                            tool_calls_acc[idx].1.push_str(name);
-                        }
-                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                            tool_calls_acc[idx].2.push_str(args);
-                        }
-                    }
-                }
-                if let Some(fr) = choice["finish_reason"].as_str()
-                    && !fr.is_empty()
-                {
-                    finish_reason = fr.to_string();
-                }
-            }
-        }
-    }
-
-    if !tool_calls_acc.is_empty() {
-        let tcs: Vec<Value> = tool_calls_acc
-            .iter()
-            .enumerate()
-            .map(|(i, (id, name, args))| {
-                json!({
-                    "id": if id.is_empty() { format!("call_{}", i) } else { id.clone() },
-                    "type": "function",
-                    "function": {"name": name, "arguments": args}
-                })
-            })
-            .collect();
-        let mut msg = json!({"role": "assistant", "content": null, "tool_calls": tcs});
-        if !reasoning_content.is_empty() {
-            msg["reasoning_content"] = json!(reasoning_content);
-        }
-        json!({"choices": [{"message": msg, "finish_reason": "tool_calls"}]})
-    } else {
-        let mut msg = json!({"role": "assistant", "content": content});
-        if !reasoning_content.is_empty() {
-            msg["reasoning_content"] = json!(reasoning_content);
-        }
-        json!({"choices": [{"message": msg, "finish_reason": finish_reason}]})
-    }
+    crate::services::sse_accumulator::accumulate_sse_to_response(text).to_chat_json()
 }
 
 /// Converts a Chat Completions non-streaming response to Responses API SSE events.

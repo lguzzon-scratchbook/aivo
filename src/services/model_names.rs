@@ -97,47 +97,6 @@ pub fn anthropic_native_model_name(model: &str) -> String {
     stripped.to_string()
 }
 
-pub fn is_gateway_style_endpoint(base_url: &str) -> bool {
-    let lower = base_url.trim().to_ascii_lowercase();
-    lower.contains("/endpoint") || lower.contains("gateway")
-}
-
-pub fn infer_provider_name_from_model(model: &str) -> Option<String> {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if let Some((provider, _)) = trimmed.split_once('/')
-        && !provider.trim().is_empty()
-    {
-        return Some(provider.trim().to_ascii_lowercase());
-    }
-
-    match infer_model_protocol(trimmed) {
-        Some(ProviderProtocol::Anthropic) => Some("anthropic".to_string()),
-        Some(ProviderProtocol::Google) => Some("google".to_string()),
-        Some(ProviderProtocol::Openai) | Some(ProviderProtocol::ResponsesApi) => {
-            Some("openai".to_string())
-        }
-        None => None,
-    }
-}
-
-pub fn should_preserve_cross_protocol_model(
-    base_url: &str,
-    model: &str,
-    target_protocol: ProviderProtocol,
-) -> bool {
-    match infer_model_protocol(model) {
-        Some(protocol) if model_family(protocol) != model_family(target_protocol) => {
-            model_family(target_protocol) == ProviderProtocol::Openai
-                && is_gateway_style_endpoint(base_url)
-        }
-        _ => false,
-    }
-}
-
 /// Converts Claude model names from Anthropic/Claude Code format to Copilot format.
 ///
 /// Claude Code sends names like `claude-sonnet-4-6-20250603` or `claude-sonnet-4-6`.
@@ -185,61 +144,6 @@ pub fn copilot_model_name(model: &str) -> String {
     base.to_string()
 }
 
-pub fn default_model_for_protocol(protocol: ProviderProtocol) -> &'static str {
-    match protocol {
-        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => "gpt-4o",
-        ProviderProtocol::Anthropic => "claude-sonnet-4-5",
-        ProviderProtocol::Google => "gemini-2.5-pro",
-    }
-}
-
-pub fn select_model_for_protocol(
-    requested_model: Option<&str>,
-    explicit_model: Option<&str>,
-    target_protocol: ProviderProtocol,
-) -> String {
-    if let Some(model) = explicit_model.filter(|model| !model.trim().is_empty()) {
-        return model.to_string();
-    }
-
-    match requested_model.filter(|model| !model.trim().is_empty()) {
-        Some(model) => match infer_model_protocol(model) {
-            Some(protocol) if model_family(protocol) != model_family(target_protocol) => {
-                default_model_for_protocol(target_protocol).to_string()
-            }
-            _ => model.to_string(),
-        },
-        None => default_model_for_protocol(target_protocol).to_string(),
-    }
-}
-
-pub fn select_model_for_provider_attempt(
-    base_url: &str,
-    requested_model: Option<&str>,
-    explicit_model: Option<&str>,
-    target_protocol: ProviderProtocol,
-) -> String {
-    if let Some(model) = explicit_model.filter(|model| !model.trim().is_empty()) {
-        return model.to_string();
-    }
-
-    if let Some(model) = requested_model.filter(|model| !model.trim().is_empty())
-        && should_preserve_cross_protocol_model(base_url, model, target_protocol)
-    {
-        return model.to_string();
-    }
-
-    select_model_for_protocol(requested_model, explicit_model, target_protocol)
-}
-
-/// Normalize protocol for model comparison — ResponsesApi uses the same models as Openai.
-fn model_family(p: ProviderProtocol) -> ProviderProtocol {
-    match p {
-        ProviderProtocol::ResponsesApi => ProviderProtocol::Openai,
-        other => other,
-    }
-}
-
 /// True for OpenAI chat models (`gpt-*`), excluding the `o*` reasoning series.
 pub(crate) fn is_gpt_chat_model_name(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
@@ -258,7 +162,7 @@ pub(crate) fn is_openai_style_model_name(model: &str) -> bool {
     name_only.starts_with("o1") || name_only.starts_with("o3") || name_only.starts_with("o4")
 }
 
-fn infer_model_protocol(model: &str) -> Option<ProviderProtocol> {
+pub fn infer_model_protocol(model: &str) -> Option<ProviderProtocol> {
     let lower = model.to_ascii_lowercase();
     let name_only = lower.split('/').next_back().unwrap_or(&lower);
 
@@ -384,113 +288,6 @@ mod tests {
         assert_eq!(copilot_model_name("claude-sonnet-4"), "claude-sonnet-4");
         assert_eq!(copilot_model_name("claude-sonnet-4-6"), "claude-sonnet-4.6");
         assert_eq!(copilot_model_name("gpt-4o"), "gpt-4o");
-    }
-
-    #[test]
-    fn test_select_model_for_protocol_keeps_provider_native_models() {
-        assert_eq!(
-            select_model_for_protocol(Some("MiniMax-M1"), None, ProviderProtocol::Anthropic),
-            "MiniMax-M1"
-        );
-        assert_eq!(
-            select_model_for_protocol(
-                Some("google/gemini-2.5-pro"),
-                None,
-                ProviderProtocol::Google
-            ),
-            "google/gemini-2.5-pro"
-        );
-    }
-
-    #[test]
-    fn test_select_model_for_protocol_remaps_cross_protocol_defaults() {
-        assert_eq!(
-            select_model_for_protocol(Some("gpt-5-codex"), None, ProviderProtocol::Anthropic),
-            "claude-sonnet-4-5"
-        );
-        assert_eq!(
-            select_model_for_protocol(Some("claude-sonnet-4-5"), None, ProviderProtocol::Google),
-            "gemini-2.5-pro"
-        );
-        assert_eq!(
-            select_model_for_protocol(Some("gemini-2.0-flash"), None, ProviderProtocol::Openai),
-            "gpt-4o"
-        );
-    }
-
-    #[test]
-    fn test_should_preserve_cross_protocol_model_for_gateway_endpoint() {
-        assert!(should_preserve_cross_protocol_model(
-            "https://api.ai.example-gateway.net/endpoint",
-            "claude-sonnet-4-6",
-            ProviderProtocol::Openai
-        ));
-        assert!(should_preserve_cross_protocol_model(
-            "http://localhost:3005/endpoint",
-            "claude-sonnet-4-6",
-            ProviderProtocol::Openai
-        ));
-        assert!(is_gateway_style_endpoint("https://ai-gateway.vercel.sh/v1"));
-    }
-
-    #[test]
-    fn test_should_not_preserve_cross_protocol_model_for_plain_openai_endpoint() {
-        assert!(!should_preserve_cross_protocol_model(
-            "https://api.openai.com/v1",
-            "claude-sonnet-4-6",
-            ProviderProtocol::Openai
-        ));
-    }
-
-    #[test]
-    fn test_infer_provider_name_from_model() {
-        assert_eq!(
-            infer_provider_name_from_model("claude-sonnet-4-6").as_deref(),
-            Some("anthropic")
-        );
-        assert_eq!(
-            infer_provider_name_from_model("moonshot/kimi-k2.5").as_deref(),
-            Some("moonshot")
-        );
-        assert_eq!(infer_provider_name_from_model("").as_deref(), None);
-    }
-
-    #[test]
-    fn test_select_model_for_protocol_prefers_explicit_model() {
-        assert_eq!(
-            select_model_for_protocol(
-                Some("gpt-5-codex"),
-                Some("claude-3-opus"),
-                ProviderProtocol::Anthropic
-            ),
-            "claude-3-opus"
-        );
-    }
-
-    #[test]
-    fn test_select_model_for_provider_attempt_preserves_cross_protocol_gateway_models() {
-        assert_eq!(
-            select_model_for_provider_attempt(
-                "https://api.ai.example-gateway.net/endpoint",
-                Some("claude-sonnet-4.6"),
-                None,
-                ProviderProtocol::Openai
-            ),
-            "claude-sonnet-4.6"
-        );
-    }
-
-    #[test]
-    fn test_select_model_for_provider_attempt_still_remaps_plain_openai_endpoints() {
-        assert_eq!(
-            select_model_for_provider_attempt(
-                "https://api.openai.com/v1",
-                Some("claude-sonnet-4.6"),
-                None,
-                ProviderProtocol::Openai
-            ),
-            "gpt-4o"
-        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_con
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
 use crate::services::http_utils;
-use crate::services::model_names::select_model_for_provider_attempt;
+use crate::services::model_resolution::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
     convert_openai_chat_to_anthropic_request,

@@ -1,8 +1,8 @@
 use aivo::services::model_names::{
     anthropic_native_model_name, copilot_model_name, google_native_model_name,
-    infer_provider_name_from_model, normalize_claude_version, transform_model_for_openrouter,
-    transform_model_for_provider,
+    normalize_claude_version, transform_model_for_openrouter, transform_model_for_provider,
 };
+use aivo::services::model_resolution::infer_provider_name_from_model;
 
 // ── normalize_claude_version ──────────────────────────────────────────
 

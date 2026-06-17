@@ -5,8 +5,9 @@
 /// the application.
 use std::sync::Arc;
 
+use super::errors::ValidationError;
 use super::flatten;
-use super::types::{FlattenedIndex, ProviderModelPair, Registry, ValidationError};
+use super::types::{FlattenedIndex, ProviderModelPair, Registry};
 use super::validate::validate_fallback_registry;
 
 /// Manages fallback configuration and resolution lifecycle.

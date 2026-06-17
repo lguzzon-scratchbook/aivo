@@ -28,7 +28,7 @@ use crate::services::anthropic_route_pipeline::{
     CacheControlPatch, RequestContext, RequestPatch, inject_chat_completions_cache_control,
 };
 use crate::services::http_utils::{self, router_http_client};
-use crate::services::model_names::{
+use crate::services::model_resolution::{
     infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_provider_attempt,
 };
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
@@ -1473,14 +1473,15 @@ impl OpenAIStreamConverter {
 
 /// Convert OpenAI SSE streaming response to Anthropic SSE format.
 fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Result<String> {
+    if response_body.trim().is_empty() {
+        return Ok(response_body.to_string());
+    }
     if status_code >= 400 {
         return Ok(format!("data: {}\n\ndata: [DONE]\n\n", response_body));
     }
 
-    let mut converter = OpenAIStreamConverter::new();
-    let mut sse_output = converter.push_bytes(response_body.as_bytes())?;
-    sse_output.push_str(&converter.finish()?);
-    Ok(sse_output)
+    let acc = crate::services::sse_accumulator::accumulate_sse_to_response(response_body);
+    Ok(acc.to_anthropic_sse())
 }
 
 /// Generate a collision-resistant unique ID using a monotonic counter + timestamp.
@@ -1834,8 +1835,7 @@ data: [DONE]\n";
         let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
         assert!(result.contains("event: message_start"));
         assert!(result.contains("\"type\":\"text_delta\""));
-        assert!(result.contains("\"text\":\"hello \""));
-        assert!(result.contains("\"text\":\"world\""));
+        assert!(result.contains("\"text\":\"hello world\"")); // Accumulated by sse_accumulator
         assert!(result.contains("\"stop_reason\":\"end_turn\""));
         assert!(result.contains("\"cache_read_input_tokens\":90"));
         assert!(result.contains("\"cache_creation_input_tokens\":15"));

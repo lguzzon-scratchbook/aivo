@@ -1,3 +1,4 @@
+pub mod errors;
 pub mod flatten;
 pub mod manager;
 /// Provider/model fallback mechanism.
@@ -11,7 +12,7 @@ pub mod manager;
 pub mod types;
 pub mod validate;
 
+pub use errors::FallbackExhaustedError;
 pub use manager::FallbackManager;
 pub use types::*;
-pub use types::FallbackExhaustedError;
 pub use validate::validate_fallback_registry;

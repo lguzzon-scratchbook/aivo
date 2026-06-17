@@ -54,49 +54,5 @@ pub type FlatTargetList = Vec<ProviderModelPair>;
 /// Immutable index of all pre-flattened fallbacks, keyed by fallback ID.
 pub type FlattenedIndex = HashMap<String, FlatTargetList>;
 
-/// Validation error for configuration.
-#[derive(Debug, Clone)]
-pub struct ValidationError {
-    pub message: String,
-}
-
-impl ValidationError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for ValidationError {}
-
-/// Structured error returned when all fallback targets are exhausted.
-/// Implements spec §6: caller receives standard provider error with attempt history.
-#[derive(Debug, Clone)]
-pub struct FallbackExhaustedError {
-    pub fallback_id: String,
-    pub attempt_count: usize,
-    pub last_error_category: String, // e.g., "auth", "network", "provider_reject"
-    pub last_error_message: String,
-}
-
-impl std::fmt::Display for FallbackExhaustedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "All {} fallback targets for '{}' exhausted. Last error: {} ({})",
-            self.attempt_count, self.fallback_id, self.last_error_message, self.last_error_category
-        )
-    }
-}
-
-impl std::error::Error for FallbackExhaustedError {}
-
 /// Maximum nesting depth for flattening (§5.1).
 pub const MAX_FLATTEN_DEPTH: usize = 64;

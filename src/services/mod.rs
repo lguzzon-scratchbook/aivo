@@ -38,6 +38,7 @@ pub mod launch_runtime;
 pub mod log_store;
 pub mod model_compat;
 pub mod model_names;
+pub mod model_resolution;
 pub mod models_cache;
 pub mod nickname_registry;
 pub mod ollama;
@@ -62,6 +63,7 @@ pub mod session_crypto;
 pub mod session_store;
 pub mod session_transcript;
 pub mod share_config;
+pub mod sse_accumulator;
 pub mod system_env;
 pub mod usage_stats_store;
 
