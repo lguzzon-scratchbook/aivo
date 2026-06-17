@@ -13,4 +13,5 @@ pub mod validate;
 
 pub use manager::FallbackManager;
 pub use types::*;
+pub use types::FallbackExhaustedError;
 pub use validate::validate_fallback_registry;

@@ -104,17 +104,30 @@ impl StartCommand {
 
         let launch_model = resolve_model_placeholder(model.value.clone());
 
-        // Resolve fallback alias — use first matching target's model
+        // Resolve fallback alias — pick first matching target's model
         let launch_model = if let Some(ref m) = launch_model
             && self.session_store.is_fallback(m).await.unwrap_or(false)
         {
-            let pairs = crate::commands::fallback_resolve::resolve_fallback_targets(
-                &self.session_store,
-                m,
-                Some(&key.value),
-            )
-            .await?;
-            Some(pairs.into_iter().next().unwrap().1.model)
+            let (pairs, _timeout_ms) =
+                crate::commands::fallback_resolve::resolve_fallback_targets(
+                    &self.session_store,
+                    m,
+                    Some(&key.value),
+                )
+                .await?;
+            let target = pairs
+                .iter()
+                .find(|(k, _)| k.id == key.value.id)
+                .or(pairs.first());
+            match target {
+                Some((_, t)) => Some(t.model.clone()),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "No matching key found for fallback '{}'",
+                        m
+                    ));
+                }
+            }
         } else {
             launch_model
         };

@@ -4,12 +4,22 @@
 /// list of (key, target) pairs by matching provider names to stored API keys.
 /// Used by run.rs, chat.rs, and start.rs to avoid duplicating the key-matching
 /// iteration logic.
-use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 
 use crate::services::fallback::ProviderModelPair;
 use crate::services::session_store::{ApiKey, SessionStore};
+
+pub fn check_timeout(start: Instant, timeout_ms: Option<u64>) -> anyhow::Result<()> {
+    if let Some(timeout) = timeout_ms {
+        let elapsed = start.elapsed().as_millis() as u64;
+        if elapsed >= timeout {
+            anyhow::bail!("Fallback timeout exceeded ({}ms)", timeout);
+        }
+    }
+    Ok(())
+}
 
 /// Resolve a fallback alias to an ordered list of (key, target) pairs.
 ///
@@ -23,7 +33,7 @@ pub async fn resolve_fallback_targets(
     session_store: &SessionStore,
     fallback_id: &str,
     original_key: Option<&ApiKey>,
-) -> Result<Vec<(ApiKey, ProviderModelPair)>> {
+) -> Result<(Vec<(ApiKey, ProviderModelPair)>, Option<u64>)> {
     let targets = session_store
         .get_fallback_targets(fallback_id)
         .await
@@ -52,5 +62,8 @@ pub async fn resolve_fallback_targets(
         anyhow::bail!("All fallback targets for '{}' exhausted", fallback_id);
     }
 
-    Ok(resolved)
+    let fallbacks = session_store.get_fallbacks().await?;
+    let timeout_ms = fallbacks.get(fallback_id).and_then(|f| f.timeout_ms);
+
+    Ok((resolved, timeout_ms))
 }

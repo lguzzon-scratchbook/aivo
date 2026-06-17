@@ -373,7 +373,7 @@ impl RunCommand {
 
     /// Preview fallback targets (dry-run).
     async fn fallback_preview(&self, _tool: AIToolType, fallback_id: &str) -> Result<i32> {
-        let pairs = resolve_fallback_targets(&self.session_store, fallback_id, None).await?;
+        let (pairs, _timeout_ms) = resolve_fallback_targets(&self.session_store, fallback_id, None).await?;
 
         println!("Fallback: {} ({} targets)", fallback_id, pairs.len());
         for (i, (key, target)) in pairs.iter().enumerate() {
@@ -397,11 +397,15 @@ impl RunCommand {
         fallback_id: &str,
         original_key: Option<ApiKey>,
     ) -> Result<i32> {
-        let pairs =
-            resolve_fallback_targets(&self.session_store, fallback_id, original_key.as_ref())
-                .await?;
+        let (pairs, timeout_ms) =
+            resolve_fallback_targets(&self.session_store, fallback_id, original_key.as_ref()).await?;
+        let start = std::time::Instant::now();
+        let mut last_error_msg = String::new();
+        let mut last_error_cat = String::from("unknown");
 
-        for (key, target) in &pairs {
+        for (attempt, (key, target)) in pairs.iter().enumerate() {
+            crate::commands::fallback_resolve::check_timeout(start, timeout_ms)?;
+
             let options = LaunchOptions {
                 tool,
                 args: args.clone(),
@@ -415,16 +419,31 @@ impl RunCommand {
             if exit_code == 0 {
                 return Ok(0);
             }
+
+            last_error_msg = format!("exit code {}", exit_code);
+            last_error_cat = match exit_code {
+                1 => "user_error",
+                2 => "network",
+                3 => "auth",
+                _ => "provider_reject",
+            }
+            .to_string();
+
             eprintln!(
-                "  {} fallback target {}/{} failed (exit {})",
+                "  {} fallback target {}/{} failed ({})",
                 style::yellow("!"),
-                target.provider,
-                target.model,
-                exit_code
+                attempt + 1,
+                pairs.len(),
+                last_error_msg
             );
         }
 
-        anyhow::bail!("All fallback targets for '{}' exhausted", fallback_id)
+        Err(anyhow::anyhow!(crate::services::fallback::FallbackExhaustedError {
+            fallback_id: fallback_id.to_string(),
+            attempt_count: pairs.len(),
+            last_error_category: last_error_cat,
+            last_error_message: last_error_msg,
+        }))
     }
 
     /// Shows usage information

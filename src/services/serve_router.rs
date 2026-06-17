@@ -591,10 +591,10 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
             .get("model")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        if let Some(ref name) = model_name {
-            if store.is_fallback(name).await.unwrap_or(false) {
-                return handle_fallback_chat(body, name, state, store).await;
-            }
+        if let Some(ref name) = model_name
+            && store.is_fallback(name).await.unwrap_or(false)
+        {
+            return handle_fallback_chat(body, name, state, store).await;
         }
     }
 

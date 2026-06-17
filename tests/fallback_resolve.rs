@@ -129,3 +129,33 @@ async fn fallback_validation_rejects_empty() {
     assert!(errors.iter().any(|e| e.message.contains("empty sequence")));
     drop(result);
 }
+
+#[test]
+fn test_check_timeout_exceeds() {
+    use aivo::commands::fallback_resolve::check_timeout;
+    use std::time::{Duration, Instant};
+    let start = Instant::now() - Duration::from_millis(150);
+    let result = check_timeout(start, Some(100));
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Fallback timeout exceeded"));
+}
+
+#[tokio::test]
+async fn test_fallback_exhaustion_returns_structured_error() {
+    let store = make_store();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        "fail".to_string(),
+        aivo::services::fallback::FallbackDefinition {
+            id: "fail".into(),
+            description: None,
+            timeout_ms: None,
+            sequence: vec![make_pmp("unknown_provider", "m1")],
+        },
+    );
+    store.set_fallback("fail", &defs).await.unwrap();
+
+    let result = aivo::commands::fallback_resolve::resolve_fallback_targets(&store, "fail", None).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("exhausted"));
+}

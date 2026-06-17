@@ -260,23 +260,32 @@ impl ChatCommand {
             .await
             .unwrap_or(false)
         {
-            let pairs =
+            let (pairs, timeout_ms) =
                 resolve_fallback_targets(&self.session_store, &raw_model, Some(&key)).await?;
-            let (fb_key, target) = pairs.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!("No fallback targets available for '{}'", raw_model)
-            })?;
-            // If the resolved key differs from the current key, use it
-            if fb_key.id != key.id {
-                return Err(anyhow::anyhow!(
-                    "Fallback target '{}' uses key '{}', but chat is locked to '{}'. \
-                     Use 'aivo run --model {}' for cross-key fallback.",
-                    target.model,
-                    fb_key.display_name(),
-                    key.display_name(),
-                    raw_model
-                ));
+            let start = std::time::Instant::now();
+            let mut resolved = None;
+            for (target_key, target) in pairs.iter() {
+                crate::commands::fallback_resolve::check_timeout(start, timeout_ms)?;
+                if target_key.id == key.id {
+                    resolved = Some(target.model.clone());
+                    break;
+                }
             }
-            target.model
+            if let Some(model) = resolved {
+                model
+            } else {
+                eprintln!(
+                    "  {} fallback chat exhausted after {} attempts",
+                    style::yellow("!"),
+                    pairs.len()
+                );
+                return Err(anyhow::anyhow!(crate::services::fallback::FallbackExhaustedError {
+                    fallback_id: raw_model.clone(),
+                    attempt_count: pairs.len(),
+                    last_error_category: "user_error".to_string(),
+                    last_error_message: "No matching key found for fallback targets".to_string(),
+                }));
+            }
         } else {
             raw_model
         };
