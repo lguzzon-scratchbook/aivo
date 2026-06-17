@@ -59,7 +59,16 @@ pub enum Commands {
     Alias(AliasArgs),
 
     /// Manage fallback definitions (ordered lists of provider/model targets)
-    #[command(alias = "fb")]
+    #[command(alias = "fb", long_about = "Create, list, or remove fallback definitions.
+
+A fallback is a named alias for an ordered list of provider/model targets.
+When a fallback alias is used as --model, the system tries each target
+in sequence until one succeeds.
+
+Examples:
+  aivo fallback --set auto -- anthropic:claude-sonnet-4-6 openai:gpt-4o
+  aivo fallback --rm auto
+  aivo fallback --json")]
     Fallback(FallbackArgs),
 
     /// Show system info, keys, tools, and directory state

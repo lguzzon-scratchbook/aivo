@@ -230,4 +230,38 @@ impl FallbackCommand {
         );
         Ok(ExitCode::Success)
     }
+
+    pub fn print_help() {
+        println!("{} aivo fallback [--set <name> -- <targets> | --rm <name>]", style::bold("Usage:"));
+        println!();
+        println!("{}", style::dim("Create, list, or remove fallback definitions."));
+        println!();
+        println!("{}", style::bold("Actions:"));
+        let print_row = |label: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<32}", label)),
+                style::dim(desc)
+            );
+        };
+        print_row("(no args)", "List all fallback definitions");
+        print_row("--set <name> -- <targets>", "Create or update a fallback");
+        print_row("--rm <name>", "Remove a fallback definition");
+        println!();
+        println!("{}", style::bold("Options:"));
+        let print_opt = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<32}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_opt("--json", "Output fallback list as JSON (listing only)");
+        println!();
+        println!("{}", style::bold("Examples:"));
+        println!("  {}", style::dim("aivo fallback --set auto -- anthropic:claude-sonnet-4-6 openai:gpt-4o"));
+        println!("  {}", style::dim("aivo fallback --rm auto"));
+        println!("  {}", style::dim("aivo fallback"));
+        println!("  {}", style::dim("aivo fallback --json"));
+    }
 }
