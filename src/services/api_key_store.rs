@@ -366,6 +366,49 @@ impl ApiKeyStore {
             .insert(key_id.to_string(), model.to_string());
         self.ctx.save_raw(&config).await
     }
+
+    /// Ensures the aivo-starter key exists. Returns (key, is_new_user) or None
+    /// if the starter key has been dismissed.
+    pub(crate) async fn ensure_starter_key(&self) -> Option<(ApiKey, bool)> {
+        use crate::constants::{
+            AIVO_STARTER_EMPTY_SECRET, AIVO_STARTER_KEY_NAME, AIVO_STARTER_MODEL,
+            AIVO_STARTER_SENTINEL,
+        };
+        let config = self.ctx.load().await.ok()?;
+        if config.starter_key_dismissed {
+            return None;
+        }
+        let is_new_user = config.api_keys.is_empty();
+        // Check if starter key already exists
+        if let Some(existing) = config
+            .api_keys
+            .iter()
+            .find(|k| k.base_url == AIVO_STARTER_SENTINEL)
+        {
+            let key = self.get_key_by_id(&existing.id).await.ok().flatten()?;
+            return Some((key, is_new_user));
+        }
+        let id = self
+            .add_key_with_protocol(
+                AIVO_STARTER_KEY_NAME,
+                AIVO_STARTER_SENTINEL,
+                None,
+                AIVO_STARTER_EMPTY_SECRET,
+            )
+            .await
+            .ok()?;
+        let _ = self.set_chat_model(&id, AIVO_STARTER_MODEL).await;
+        let key = self.get_key_by_id(&id).await.ok().flatten()?;
+        Some((key, is_new_user))
+    }
+
+    /// Sets the starter_key_dismissed flag in the config.
+    pub(crate) async fn set_starter_key_dismissed(&self, dismissed: bool) -> Result<()> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        config.starter_key_dismissed = dismissed;
+        self.ctx.save_raw(&config).await
+    }
 }
 
 #[cfg(test)]
