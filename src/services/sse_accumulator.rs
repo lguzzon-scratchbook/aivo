@@ -72,15 +72,15 @@ impl AccumulatedResponse {
             return false;
         };
 
-        if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
-            if !id.is_empty() {
-                self.message_id = id.to_string();
-            }
+        if let Some(id) = chunk.get("id").and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            self.message_id = id.to_string();
         }
-        if let Some(model) = chunk.get("model").and_then(|v| v.as_str()) {
-            if !model.is_empty() {
-                self.model = model.to_string();
-            }
+        if let Some(model) = chunk.get("model").and_then(|v| v.as_str())
+            && !model.is_empty()
+        {
+            self.model = model.to_string();
         }
         if let Some(usage) = chunk.get("usage") {
             if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
@@ -121,19 +121,18 @@ impl AccumulatedResponse {
                         while self.tool_calls.len() <= idx {
                             self.tool_calls.push(AccumulatedToolCall::default());
                         }
-                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                            if !id.is_empty() {
-                                self.tool_calls[idx].id = id.to_string();
-                            }
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str())
+                            && !id.is_empty()
+                        {
+                            self.tool_calls[idx].id = id.to_string();
                         }
                         if let Some(name) = tc
                             .get("function")
                             .and_then(|f| f.get("name"))
                             .and_then(|v| v.as_str())
+                            && !name.is_empty()
                         {
-                            if !name.is_empty() {
-                                self.tool_calls[idx].name.push_str(name);
-                            }
+                            self.tool_calls[idx].name.push_str(name);
                         }
                         if let Some(args) = tc
                             .get("function")
@@ -150,25 +149,25 @@ impl AccumulatedResponse {
                     while self.tool_calls.is_empty() {
                         self.tool_calls.push(AccumulatedToolCall::default());
                     }
-                    if let Some(id) = function_call.get("id").and_then(|v| v.as_str()) {
-                        if !id.is_empty() {
-                            self.tool_calls[0].id = id.to_string();
-                        }
+                    if let Some(id) = function_call.get("id").and_then(|v| v.as_str())
+                        && !id.is_empty()
+                    {
+                        self.tool_calls[0].id = id.to_string();
                     }
-                    if let Some(name) = function_call.get("name").and_then(|v| v.as_str()) {
-                        if !name.is_empty() {
-                            self.tool_calls[0].name.push_str(name);
-                        }
+                    if let Some(name) = function_call.get("name").and_then(|v| v.as_str())
+                        && !name.is_empty()
+                    {
+                        self.tool_calls[0].name.push_str(name);
                     }
                     if let Some(args) = function_call.get("arguments").and_then(|v| v.as_str()) {
                         self.tool_calls[0].arguments.push_str(args);
                     }
                 }
 
-                if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                    if !fr.is_empty() {
-                        self.finish_reason = fr.to_string();
-                    }
+                if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str())
+                    && !fr.is_empty()
+                {
+                    self.finish_reason = fr.to_string();
                 }
             }
         }
