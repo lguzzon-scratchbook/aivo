@@ -2,6 +2,7 @@
 //! Provides session management and AI tool launching.
 
 pub mod ai_launcher;
+pub mod alias_store;
 pub mod anthropic_chat_request;
 pub mod anthropic_chat_response;
 pub mod anthropic_route_pipeline;

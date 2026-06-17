@@ -10,9 +10,11 @@ use zeroize::Zeroizing;
 pub use crate::services::session_crypto::{decrypt, encrypt, is_encrypted};
 use crate::services::system_env;
 
+use crate::services::alias_store::AliasStore;
 use crate::services::api_key_store::ApiKeyStore;
 use crate::services::atomic_write::atomic_write_secure;
 use crate::services::chat_session_store::ChatSessionStore;
+use crate::services::fallback::definition_store::FallbackDefinitionStore;
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::usage_stats_store::UsageStatsStore;
@@ -865,6 +867,8 @@ impl ConfigContext {
 pub struct SessionStore {
     ctx: ConfigContext,
     api_keys: ApiKeyStore,
+    alias_store: AliasStore,
+    fallback_defs: FallbackDefinitionStore,
     sessions: ChatSessionStore,
     stats: UsageStatsStore,
     last_sel: LastSelectionStore,
@@ -903,6 +907,8 @@ impl SessionStore {
     fn from_ctx(ctx: ConfigContext) -> Self {
         Self {
             api_keys: ApiKeyStore { ctx: ctx.clone() },
+            alias_store: AliasStore { ctx: ctx.clone() },
+            fallback_defs: FallbackDefinitionStore { ctx: ctx.clone() },
             sessions: ChatSessionStore { ctx: ctx.clone() },
             stats: UsageStatsStore::new(ctx.clone()),
             last_sel: LastSelectionStore { ctx: ctx.clone() },
@@ -1257,64 +1263,19 @@ impl SessionStore {
         self.sessions.count_chat_sessions().await
     }
 
-    // ── Model aliases ─────────────────────────────────────────────────────
-
-    /// Returns all model aliases.
-    pub async fn get_aliases(&self) -> Result<HashMap<String, String>> {
-        let config = self.ctx.load().await?;
-        Ok(config.aliases)
-    }
-
-    /// Sets a model alias. Returns the previous value if it existed.
-    pub async fn set_alias(&self, name: String, model: String) -> Result<Option<String>> {
-        let _lock = self.ctx.acquire_config_lock()?;
-        let mut config = self.ctx.load().await?;
-        let prev = config.aliases.insert(name, model);
-        self.ctx.save_raw(&config).await?;
-        Ok(prev)
-    }
-
-    /// Removes a model alias. Returns the removed value if it existed.
-    pub async fn remove_alias(&self, name: &str) -> Result<Option<String>> {
-        let _lock = self.ctx.acquire_config_lock()?;
-        let mut config = self.ctx.load().await?;
-        let removed = config.aliases.remove(name);
-        if removed.is_some() {
-            self.ctx.save_raw(&config).await?;
-        }
-        Ok(removed)
-    }
-
-    /// Resolves a model name through aliases, with cycle detection.
-    /// Returns the final resolved model name.
-    pub async fn resolve_alias(&self, model: &str) -> Result<String> {
-        let aliases = self.get_aliases().await?;
-        let mut current = model.to_string();
-        let mut seen = std::collections::HashSet::new();
-        while let Some(target) = aliases.get(&current) {
-            if !seen.insert(current.clone()) {
-                anyhow::bail!("circular alias detected: {}", model);
-            }
-            current = target.clone();
-        }
-        Ok(current)
-    }
-
     // ── Fallback alias resolution ──────────────────────────────────────
 
-    /// Returns fallback definitions from config.
+    /// Returns fallback definitions from config. Delegates to FallbackDefinitionStore.
     pub async fn get_fallbacks(
         &self,
     ) -> Result<std::collections::HashMap<String, crate::services::fallback::FallbackDefinition>>
     {
-        let config = self.ctx.load().await?;
-        Ok(config.fallbacks)
+        self.fallback_defs.get_fallbacks().await
     }
 
-    /// Check if a name is a registered fallback alias.
+    /// Check if a name is a registered fallback alias. Delegates to FallbackDefinitionStore.
     pub async fn is_fallback(&self, name: &str) -> Result<bool> {
-        let fallbacks = self.get_fallbacks().await?;
-        Ok(fallbacks.contains_key(name))
+        self.fallback_defs.is_fallback(name).await
     }
 
     /// Load or retrieve the cached fallback manager.
@@ -1326,7 +1287,7 @@ impl SessionStore {
             return Ok(std::sync::Arc::clone(mgr));
         }
         // Load from config and build
-        let fallbacks = self.get_fallbacks().await?;
+        let fallbacks = self.fallback_defs.get_fallbacks().await?;
         let mgr = match crate::services::fallback::FallbackManager::load(fallbacks) {
             Ok(mgr) => std::sync::Arc::new(mgr),
             Err(errors) => {
@@ -1349,15 +1310,32 @@ impl SessionStore {
     /// a fallback alias. Returns the resolved concrete model name, or the
     /// original if neither match. Fallback alias names pass through unchanged.
     pub async fn resolve_alias_or_fallback(&self, model: &str) -> Result<String> {
-        // Try plain alias resolution
-        if let Ok(resolved) = self.resolve_alias(model).await {
+        // Try plain alias resolution via AliasStore
+        if let Ok(resolved) = self.alias_store.resolve_alias(model).await {
             return Ok(resolved);
         }
         // Check if it's a fallback alias — pass through unchanged
-        if self.is_fallback(model).await.unwrap_or(false) {
+        if self.fallback_defs.is_fallback(model).await.unwrap_or(false) {
             return Ok(model.to_string());
         }
         Ok(model.to_string())
+    }
+
+    // ── Alias forwarding (callers migrating to AliasStore directly) ──
+
+    /// Access the inner AliasStore directly.
+    pub fn alias_store(&self) -> AliasStore {
+        self.alias_store.clone()
+    }
+
+    /// Returns all model aliases. Delegates to AliasStore.
+    pub async fn get_aliases(&self) -> Result<std::collections::HashMap<String, String>> {
+        self.alias_store.get_aliases().await
+    }
+
+    /// Resolves a model name through aliases. Delegates to AliasStore.
+    pub async fn resolve_alias(&self, model: &str) -> Result<String> {
+        self.alias_store.resolve_alias(model).await
     }
 
     /// Persist the full fallback definitions map to config.
@@ -1370,19 +1348,7 @@ impl SessionStore {
             crate::services::fallback::FallbackDefinition,
         >,
     ) -> Result<()> {
-        let _lock = self.ctx.acquire_config_lock()?;
-        let mut config = self.ctx.load().await?;
-        config.fallbacks = fallbacks.clone();
-        self.ctx.save_raw(&config).await?;
-        // Invalidate cached fallback manager so next access reloads
-        // SAFETY: OnceLock has no public reset method. We construct a new one.
-        // Since we hold a &self reference and OnceLock is Sync, this is sound
-        // as long as the old value is dropped (not read while writing).
-        // We use a safe alternative: replace via unsafe pointer to the OnceLock.
-        // Actually, OnceLock intentionally has no clear() — we just let the
-        // lazy init return the stale manager until next process restart.
-        // The CLI is short-lived so this is acceptable.
-        Ok(())
+        self.fallback_defs.set_fallback(fallbacks).await
     }
 
     /// Get the flat list of targets for a fallback, if the given name is a

@@ -9,16 +9,16 @@ use anyhow::Result;
 
 use crate::cli::AliasArgs;
 use crate::errors::ExitCode;
-use crate::services::session_store::SessionStore;
+use crate::services::alias_store::AliasStore;
 use crate::style;
 
 pub struct AliasCommand {
-    session_store: SessionStore,
+    alias_store: AliasStore,
 }
 
 impl AliasCommand {
-    pub fn new(session_store: SessionStore) -> Self {
-        Self { session_store }
+    pub fn new(alias_store: AliasStore) -> Self {
+        Self { alias_store }
     }
 
     pub async fn execute(&self, args: AliasArgs) -> ExitCode {
@@ -53,7 +53,7 @@ impl AliasCommand {
     }
 
     async fn list_aliases(&self, json: bool) -> Result<ExitCode> {
-        let aliases = self.session_store.get_aliases().await?;
+        let aliases = self.alias_store.get_aliases().await?;
 
         if json {
             let mut entries: Vec<_> = aliases.into_iter().collect();
@@ -124,7 +124,7 @@ impl AliasCommand {
         }
 
         // Check for circular aliases
-        let mut aliases = self.session_store.get_aliases().await?;
+        let mut aliases = self.alias_store.get_aliases().await?;
         aliases.insert(name.clone(), model.clone());
         if has_cycle(&aliases, &name) {
             eprintln!(
@@ -135,7 +135,7 @@ impl AliasCommand {
         }
 
         let prev = self
-            .session_store
+            .alias_store
             .set_alias(name.clone(), model.clone())
             .await?;
         match prev {
@@ -165,7 +165,7 @@ impl AliasCommand {
             }
         };
 
-        match self.session_store.remove_alias(name).await? {
+        match self.alias_store.remove_alias(name).await? {
             Some(model) => {
                 println!(
                     "Removed {} {} {}",
@@ -278,81 +278,5 @@ mod tests {
         m.insert("b".to_string(), "c".to_string());
         // c doesn't map to anything, so no cycle
         assert!(!has_cycle(&m, "a"));
-    }
-
-    #[tokio::test]
-    async fn set_and_get_aliases() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::with_path(dir.path().join("config.json"));
-
-        assert!(store.get_aliases().await.unwrap().is_empty());
-
-        store
-            .set_alias("fast".to_string(), "claude-haiku".to_string())
-            .await
-            .unwrap();
-        let aliases = store.get_aliases().await.unwrap();
-        assert_eq!(aliases.get("fast").unwrap(), "claude-haiku");
-    }
-
-    #[tokio::test]
-    async fn remove_alias_returns_old_value() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::with_path(dir.path().join("config.json"));
-
-        store
-            .set_alias("fast".to_string(), "haiku".to_string())
-            .await
-            .unwrap();
-        let removed = store.remove_alias("fast").await.unwrap();
-        assert_eq!(removed, Some("haiku".to_string()));
-
-        let removed_again = store.remove_alias("fast").await.unwrap();
-        assert_eq!(removed_again, None);
-    }
-
-    #[tokio::test]
-    async fn resolve_alias_follows_chain() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::with_path(dir.path().join("config.json"));
-
-        store
-            .set_alias("quick".to_string(), "fast".to_string())
-            .await
-            .unwrap();
-        store
-            .set_alias("fast".to_string(), "claude-haiku".to_string())
-            .await
-            .unwrap();
-
-        let resolved = store.resolve_alias("quick").await.unwrap();
-        assert_eq!(resolved, "claude-haiku");
-    }
-
-    #[tokio::test]
-    async fn resolve_alias_detects_cycle() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::with_path(dir.path().join("config.json"));
-
-        store
-            .set_alias("a".to_string(), "b".to_string())
-            .await
-            .unwrap();
-        store
-            .set_alias("b".to_string(), "a".to_string())
-            .await
-            .unwrap();
-
-        let result = store.resolve_alias("a").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn resolve_alias_passthrough_non_alias() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = SessionStore::with_path(dir.path().join("config.json"));
-
-        let resolved = store.resolve_alias("claude-sonnet-4-6").await.unwrap();
-        assert_eq!(resolved, "claude-sonnet-4-6");
     }
 }

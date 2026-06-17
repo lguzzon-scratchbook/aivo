@@ -1,3 +1,4 @@
+pub mod definition_store;
 pub mod errors;
 pub mod flatten;
 pub mod manager;

@@ -138,7 +138,7 @@ async fn main() {
     // Route to command handler
     let exit_code = match command {
         Commands::Alias(alias_args) => {
-            let command = AliasCommand::new(session_store);
+            let command = AliasCommand::new(session_store.alias_store());
             command.execute(alias_args).await
         }
 
