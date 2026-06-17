@@ -156,7 +156,8 @@ async fn main() {
             let key_explicit = chat_args.key.is_some();
             let key_override = key_or_exit(
                 resolve_key_override(
-                    &session_store,
+                    &session_store.api_key_store(),
+                    &session_store.last_selection_store(),
                     chat_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
                     KeyCompatContext::Chat,
@@ -202,7 +203,8 @@ async fn main() {
 
             let key_override = key_or_exit(
                 resolve_image_key_override(
-                    &session_store,
+                    &session_store.api_key_store(),
+                    &session_store.last_selection_store(),
                     image_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
                     KeyCompatContext::Image,
@@ -298,7 +300,8 @@ async fn main() {
                     .unwrap_or(KeyCompatContext::None);
                 let key_override = key_or_exit(
                     resolve_key_override(
-                        &session_store,
+                        &session_store.api_key_store(),
+                        &session_store.last_selection_store(),
                         key_flag.as_deref(),
                         KeyLookupMode::RequireActiveOrPrompt,
                         compat,
@@ -374,7 +377,8 @@ async fn main() {
         Commands::Models(models_args) => {
             let key_override = key_or_exit(
                 resolve_key_override(
-                    &session_store,
+                    &session_store.api_key_store(),
+                    &session_store.last_selection_store(),
                     models_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
                     KeyCompatContext::None,
@@ -394,7 +398,8 @@ async fn main() {
 
         Commands::Serve(serve_args) => {
             let key_override = match resolve_key_override(
-                &session_store,
+                &session_store.api_key_store(),
+                &session_store.last_selection_store(),
                 serve_args.key.as_deref(),
                 KeyLookupMode::PreferActiveAllowNone,
                 KeyCompatContext::None,

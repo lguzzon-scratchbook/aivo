@@ -3,8 +3,10 @@ use std::process;
 
 use crate::commands;
 use crate::errors::ExitCode;
+use crate::services::api_key_store::ApiKeyStore;
 use crate::services::key_compat::KeyCompatContext;
-use crate::services::session_store::{ApiKey, LastSelection, SessionStore};
+use crate::services::last_selection::{LastSelectionStore, SelectionScope};
+use crate::services::session_store::{ApiKey, LastSelection};
 use crate::style;
 
 #[allow(clippy::large_enum_variant)]
@@ -32,12 +34,14 @@ impl LastSelectionView {
     /// Reads the last-used record for this view, falling back to the default
     /// scope so a fresh image session can still inherit a chat-resolved key
     /// (the picker downstream can swap if it isn't compatible).
-    async fn read(&self, store: &SessionStore) -> Option<LastSelection> {
+    async fn read(&self, last_sel: &LastSelectionStore) -> Option<LastSelection> {
         match self {
-            LastSelectionView::Default => store.get_last_selection().await.ok().flatten(),
-            LastSelectionView::Image => match store.get_last_image_selection().await {
+            LastSelectionView::Default => {
+                last_sel.get(SelectionScope::Default).await.ok().flatten()
+            }
+            LastSelectionView::Image => match last_sel.get(SelectionScope::Image).await {
                 Ok(Some(sel)) => Some(sel),
-                _ => store.get_last_selection().await.ok().flatten(),
+                _ => last_sel.get(SelectionScope::Default).await.ok().flatten(),
             },
         }
     }
@@ -56,13 +60,15 @@ pub(crate) fn key_or_exit(result: anyhow::Result<KeyResolution>) -> Option<ApiKe
 }
 
 pub(crate) async fn resolve_key_override(
-    session_store: &SessionStore,
+    api_keys: &ApiKeyStore,
+    last_sel: &LastSelectionStore,
     key_flag: Option<&str>,
     mode: KeyLookupMode,
     compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
     resolve_key_override_scoped(
-        session_store,
+        api_keys,
+        last_sel,
         key_flag,
         mode,
         compat,
@@ -74,13 +80,15 @@ pub(crate) async fn resolve_key_override(
 /// Image-aware variant: prefers `last_image_selection` for picker defaults
 /// before falling back to the shared `last_selection`. Used by `aivo image`.
 pub(crate) async fn resolve_image_key_override(
-    session_store: &SessionStore,
+    api_keys: &ApiKeyStore,
+    last_sel: &LastSelectionStore,
     key_flag: Option<&str>,
     mode: KeyLookupMode,
     compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
     resolve_key_override_scoped(
-        session_store,
+        api_keys,
+        last_sel,
         key_flag,
         mode,
         compat,
@@ -90,30 +98,31 @@ pub(crate) async fn resolve_image_key_override(
 }
 
 async fn resolve_key_override_scoped(
-    session_store: &SessionStore,
+    api_keys: &ApiKeyStore,
+    last_sel: &LastSelectionStore,
     key_flag: Option<&str>,
     mode: KeyLookupMode,
     compat: KeyCompatContext,
     view: LastSelectionView,
 ) -> anyhow::Result<KeyResolution> {
     match key_flag {
-        Some("") => prompt_temporary_key_override(session_store, compat, view).await,
-        Some(key_id_or_name) => resolve_by_id_or_name_or_pick(session_store, key_id_or_name).await,
+        Some("") => prompt_temporary_key_override(api_keys, last_sel, compat, view).await,
+        Some(key_id_or_name) => resolve_by_id_or_name_or_pick(api_keys, key_id_or_name).await,
         None => match mode {
             KeyLookupMode::RequireActiveOrPrompt => {
-                match resolve_active_key_or_prompt(session_store, compat, view).await {
+                match resolve_active_key_or_prompt(api_keys, last_sel, compat, view).await {
                     Some(key) => Ok(KeyResolution::Selected(key)),
                     None => Ok(KeyResolution::MissingAuth),
                 }
             }
             KeyLookupMode::PreferActiveAllowNone => {
                 // Try last-used selection first (scoped to the view).
-                if let Some(last_sel) = view.read(session_store).await
-                    && let Ok(Some(key)) = session_store.get_key_by_id(&last_sel.key_id).await
+                if let Some(last_sel_rec) = view.read(last_sel).await
+                    && let Ok(Some(key)) = api_keys.get_key_by_id(&last_sel_rec.key_id).await
                 {
                     return Ok(KeyResolution::Selected(key));
                 }
-                match session_store.get_active_key().await? {
+                match api_keys.get_active_key().await? {
                     Some(key) => Ok(KeyResolution::Selected(key)),
                     None => Ok(KeyResolution::MissingAuth),
                 }
@@ -126,16 +135,14 @@ async fn resolve_key_override_scoped(
 /// name matches when a terminal is available; falls back to the low-level
 /// error otherwise so scripts/CI still get a clear failure.
 pub(crate) async fn resolve_by_id_or_name_or_pick(
-    session_store: &SessionStore,
+    api_keys: &ApiKeyStore,
     key_id_or_name: &str,
 ) -> anyhow::Result<KeyResolution> {
-    let matches = session_store
-        .find_keys_by_id_or_name(key_id_or_name)
-        .await?;
+    let matches = api_keys.find_keys_by_id_or_name(key_id_or_name).await?;
     match matches.len() {
         0 => {
             // Delegate to the existing error path for consistent messaging.
-            Err(session_store
+            Err(api_keys
                 .resolve_key_by_id_or_name(key_id_or_name)
                 .await
                 .expect_err("empty matches must produce a not-found error"))
@@ -143,7 +150,7 @@ pub(crate) async fn resolve_by_id_or_name_or_pick(
         1 => Ok(KeyResolution::Selected(matches.into_iter().next().unwrap())),
         _ => {
             if !io::stderr().is_terminal() {
-                return Err(session_store
+                return Err(api_keys
                     .resolve_key_by_id_or_name(key_id_or_name)
                     .await
                     .expect_err("ambiguous matches must produce an error"));
@@ -163,11 +170,12 @@ pub(crate) async fn resolve_by_id_or_name_or_pick(
 }
 
 async fn prompt_temporary_key_override(
-    session_store: &SessionStore,
+    api_keys: &ApiKeyStore,
+    last_sel: &LastSelectionStore,
     compat: KeyCompatContext,
     view: LastSelectionView,
 ) -> anyhow::Result<KeyResolution> {
-    let all_keys = session_store.get_keys().await?;
+    let all_keys = api_keys.get_keys().await?;
     if all_keys.is_empty() {
         eprintln!("{} No API keys configured.", style::yellow("Note:"));
         eprintln!();
@@ -180,8 +188,8 @@ async fn prompt_temporary_key_override(
         );
     }
 
-    let last_sel_key_id = view.read(session_store).await.map(|s| s.key_id);
-    let active_key_id = session_store
+    let last_sel_key_id = view.read(last_sel).await.map(|s| s.key_id);
+    let active_key_id = api_keys
         .get_active_key_info()
         .await
         .ok()
@@ -210,22 +218,23 @@ async fn prompt_temporary_key_override(
 }
 
 async fn resolve_active_key_or_prompt(
-    session_store: &SessionStore,
+    api_keys: &ApiKeyStore,
+    last_sel: &LastSelectionStore,
     compat: KeyCompatContext,
     view: LastSelectionView,
 ) -> Option<ApiKey> {
     // Try last-used selection first (scoped to the view).
-    if let Some(last_sel) = view.read(session_store).await
-        && let Ok(Some(key)) = session_store.get_key_by_id(&last_sel.key_id).await
+    if let Some(last_sel_rec) = view.read(last_sel).await
+        && let Ok(Some(key)) = api_keys.get_key_by_id(&last_sel_rec.key_id).await
     {
         return Some(key);
     }
     // Then active key
-    if let Ok(Some(key)) = session_store.get_active_key().await {
+    if let Ok(Some(key)) = api_keys.get_active_key().await {
         return Some(key);
     }
 
-    let all_keys = match session_store.get_keys().await {
+    let all_keys = match api_keys.get_keys().await {
         Ok(keys) => keys,
         Err(e) => {
             eprintln!("{} {}", style::red("Error:"), e);
@@ -255,14 +264,8 @@ async fn resolve_active_key_or_prompt(
     }
 
     let annotations = compat.annotations_for(&all_keys);
-    match commands::keys::prompt_select_key(
-        session_store,
-        &all_keys,
-        &annotations,
-        "Select a key",
-        0,
-    )
-    .await
+    match commands::keys::prompt_select_key(api_keys, &all_keys, &annotations, "Select a key", 0)
+        .await
     {
         Ok(Some(key)) => {
             eprintln!();
@@ -282,19 +285,29 @@ async fn resolve_active_key_or_prompt(
 #[cfg(test)]
 mod tests {
     use super::{KeyCompatContext, KeyLookupMode, KeyResolution, resolve_key_override};
-    use crate::services::session_store::SessionStore;
+    use crate::services::api_key_store::ApiKeyStore;
+    use crate::services::last_selection::LastSelectionStore;
+    use crate::services::session_store::{ConfigContext, SessionStore};
     use tempfile::TempDir;
 
-    fn temp_store() -> (TempDir, SessionStore) {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.json");
-        (temp_dir, SessionStore::with_path(config_path))
+    fn setup() -> (ApiKeyStore, LastSelectionStore, SessionStore, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.json");
+        let config_dir = dir.path().to_path_buf();
+        let ctx = ConfigContext {
+            config_path,
+            config_dir,
+        };
+        let api_keys = ApiKeyStore { ctx: ctx.clone() };
+        let last_sel = LastSelectionStore { ctx };
+        let store = SessionStore::with_path(dir.path().join("config.json"));
+        (api_keys, last_sel, store, dir)
     }
 
     #[tokio::test]
     async fn prefer_active_allow_none_returns_active_key() {
-        let (_temp_dir, store) = temp_store();
-        let id = store
+        let (api_keys, last_sel, _store, _dir) = setup();
+        let id = api_keys
             .add_key_with_protocol(
                 "openrouter",
                 "https://openrouter.ai/api/v1",
@@ -303,10 +316,11 @@ mod tests {
             )
             .await
             .unwrap();
-        store.set_active_key(&id).await.unwrap();
+        api_keys.set_active_key(&id).await.unwrap();
 
         let resolved = resolve_key_override(
-            &store,
+            &api_keys,
+            &last_sel,
             None,
             KeyLookupMode::PreferActiveAllowNone,
             KeyCompatContext::None,
@@ -321,12 +335,11 @@ mod tests {
 
     #[tokio::test]
     async fn prefer_active_allow_none_returns_missing_auth_without_keys() {
-        let (_temp_dir, store) = temp_store();
+        let (api_keys, last_sel, _store, _dir) = setup();
 
-        // resolve_key_override alone doesn't create the starter key;
-        // that's handled by main.rs before dispatching commands.
         let resolved = resolve_key_override(
-            &store,
+            &api_keys,
+            &last_sel,
             None,
             KeyLookupMode::PreferActiveAllowNone,
             KeyCompatContext::None,
@@ -338,14 +351,14 @@ mod tests {
 
     #[tokio::test]
     async fn prefer_active_allow_none_returns_starter_after_ensure() {
-        let (_temp_dir, store) = temp_store();
+        let (api_keys, last_sel, store, _dir) = setup();
 
-        // Simulate main.rs: ensure + activate for new users
         let (starter, _) = store.ensure_starter_key().await.unwrap();
-        store.set_active_key(&starter.id).await.unwrap();
+        api_keys.set_active_key(&starter.id).await.unwrap();
 
         let resolved = resolve_key_override(
-            &store,
+            &api_keys,
+            &last_sel,
             None,
             KeyLookupMode::PreferActiveAllowNone,
             KeyCompatContext::None,
@@ -363,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_starter_key_creates_and_is_idempotent() {
-        let (_temp_dir, store) = temp_store();
+        let (api_keys, _last_sel, store, _dir) = setup();
 
         let (key, is_new) = store
             .ensure_starter_key()
@@ -374,7 +387,7 @@ mod tests {
         assert!(is_new);
 
         // Verify chat model was pre-set
-        let model = store.get_chat_model(&key.id).await.unwrap();
+        let model = api_keys.get_chat_model(&key.id).await.unwrap();
         assert_eq!(
             model,
             Some(crate::constants::AIVO_STARTER_MODEL.to_string())
@@ -389,7 +402,7 @@ mod tests {
         assert!(!is_new2);
 
         // Only one key exists
-        let all_keys = store.get_keys().await.unwrap();
+        let all_keys = api_keys.get_keys().await.unwrap();
         assert_eq!(all_keys.len(), 1);
     }
 }

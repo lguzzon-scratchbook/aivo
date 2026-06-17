@@ -1328,6 +1328,16 @@ impl SessionStore {
         self.alias_store.clone()
     }
 
+    /// Access the inner ApiKeyStore directly.
+    pub fn api_key_store(&self) -> ApiKeyStore {
+        self.api_keys.clone()
+    }
+
+    /// Access the inner LastSelectionStore directly.
+    pub fn last_selection_store(&self) -> LastSelectionStore {
+        self.last_sel.clone()
+    }
+
     /// Returns all model aliases. Delegates to AliasStore.
     pub async fn get_aliases(&self) -> Result<std::collections::HashMap<String, String>> {
         self.alias_store.get_aliases().await

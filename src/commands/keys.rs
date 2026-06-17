@@ -13,6 +13,7 @@ use crate::commands::truncate_url_for_display;
 use crate::tui::FuzzySelect;
 
 use crate::errors::ExitCode;
+use crate::services::api_key_store::ApiKeyStore;
 use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -2115,7 +2116,7 @@ pub(crate) fn prompt_pick_key_without_activation(
 // Picks a key from `keys` and activates it. Returns `Ok(None)` if cancelled.
 #[allow(dead_code)] // used by binary crate (key_resolution.rs)
 pub(crate) async fn prompt_select_key(
-    session_store: &SessionStore,
+    api_keys: &ApiKeyStore,
     keys: &[ApiKey],
     annotations: &[Option<String>],
     prompt: &str,
@@ -2124,7 +2125,7 @@ pub(crate) async fn prompt_select_key(
     match prompt_pick_key(keys, annotations, prompt, default)? {
         Some(mut key) => {
             SessionStore::decrypt_key_secret(&mut key)?;
-            session_store.set_active_key(&key.id).await?;
+            api_keys.set_active_key(&key.id).await?;
             let preview = display_secret(&key);
             eprintln!(
                 "{} Activated key: {} {}",
