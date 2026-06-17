@@ -373,7 +373,8 @@ impl RunCommand {
 
     /// Preview fallback targets (dry-run).
     async fn fallback_preview(&self, _tool: AIToolType, fallback_id: &str) -> Result<i32> {
-        let (pairs, _timeout_ms) = resolve_fallback_targets(&self.session_store, fallback_id, None).await?;
+        let (pairs, _timeout_ms) =
+            resolve_fallback_targets(&self.session_store, fallback_id, None).await?;
 
         println!("Fallback: {} ({} targets)", fallback_id, pairs.len());
         for (i, (key, target)) in pairs.iter().enumerate() {
@@ -398,7 +399,8 @@ impl RunCommand {
         original_key: Option<ApiKey>,
     ) -> Result<i32> {
         let (pairs, timeout_ms) =
-            resolve_fallback_targets(&self.session_store, fallback_id, original_key.as_ref()).await?;
+            resolve_fallback_targets(&self.session_store, fallback_id, original_key.as_ref())
+                .await?;
         let start = std::time::Instant::now();
         let mut last_error_msg = String::new();
         let mut last_error_cat = String::from("unknown");
@@ -438,12 +440,14 @@ impl RunCommand {
             );
         }
 
-        Err(anyhow::anyhow!(crate::services::fallback::FallbackExhaustedError {
-            fallback_id: fallback_id.to_string(),
-            attempt_count: pairs.len(),
-            last_error_category: last_error_cat,
-            last_error_message: last_error_msg,
-        }))
+        Err(anyhow::anyhow!(
+            crate::services::fallback::FallbackExhaustedError {
+                fallback_id: fallback_id.to_string(),
+                attempt_count: pairs.len(),
+                last_error_category: last_error_cat,
+                last_error_message: last_error_msg,
+            }
+        ))
     }
 
     /// Shows usage information

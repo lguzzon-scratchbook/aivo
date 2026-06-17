@@ -279,12 +279,15 @@ impl ChatCommand {
                     style::yellow("!"),
                     pairs.len()
                 );
-                return Err(anyhow::anyhow!(crate::services::fallback::FallbackExhaustedError {
-                    fallback_id: raw_model.clone(),
-                    attempt_count: pairs.len(),
-                    last_error_category: "user_error".to_string(),
-                    last_error_message: "No matching key found for fallback targets".to_string(),
-                }));
+                return Err(anyhow::anyhow!(
+                    crate::services::fallback::FallbackExhaustedError {
+                        fallback_id: raw_model.clone(),
+                        attempt_count: pairs.len(),
+                        last_error_category: "user_error".to_string(),
+                        last_error_message: "No matching key found for fallback targets"
+                            .to_string(),
+                    }
+                ));
             }
         } else {
             raw_model

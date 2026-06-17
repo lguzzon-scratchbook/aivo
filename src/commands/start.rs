@@ -108,13 +108,12 @@ impl StartCommand {
         let launch_model = if let Some(ref m) = launch_model
             && self.session_store.is_fallback(m).await.unwrap_or(false)
         {
-            let (pairs, _timeout_ms) =
-                crate::commands::fallback_resolve::resolve_fallback_targets(
-                    &self.session_store,
-                    m,
-                    Some(&key.value),
-                )
-                .await?;
+            let (pairs, _timeout_ms) = crate::commands::fallback_resolve::resolve_fallback_targets(
+                &self.session_store,
+                m,
+                Some(&key.value),
+            )
+            .await?;
             let target = pairs
                 .iter()
                 .find(|(k, _)| k.id == key.value.id)
