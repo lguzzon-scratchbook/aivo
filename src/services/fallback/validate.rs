@@ -35,11 +35,49 @@ pub fn validate_fallback_registry(registry: &Registry) -> Result<(), Vec<Validat
 
 fn phase1(registry: &Registry, errors: &mut Vec<ValidationError>) {
     for fallback in registry.values() {
+        // Definition-level schema
+        if fallback.id.trim().is_empty() {
+            errors.push(ValidationError::new(
+                "Fallback ID cannot be empty or whitespace-only".to_string(),
+            ));
+        } else {
+            if fallback.id.contains(':') {
+                errors.push(ValidationError::new(format!(
+                    "Fallback '{}' contains reserved character ':' in its name",
+                    fallback.id,
+                )));
+            }
+            if fallback.id.contains('@') {
+                errors.push(ValidationError::new(format!(
+                    "Fallback '{}' contains reserved character '@' in its name",
+                    fallback.id,
+                )));
+            }
+        }
+
         if fallback.sequence.is_empty() {
             errors.push(ValidationError::new(format!(
                 "Fallback '{}' has an empty sequence",
                 fallback.id,
             )));
+        }
+
+        // Entry-level schema validation
+        for (i, entry) in fallback.sequence.iter().enumerate() {
+            if let Entry::ProviderModelPair(pmp) = entry {
+                if pmp.provider.is_empty() {
+                    errors.push(ValidationError::new(format!(
+                        "Fallback '{}' entry {} has empty provider",
+                        fallback.id, i,
+                    )));
+                }
+                if pmp.model.is_empty() {
+                    errors.push(ValidationError::new(format!(
+                        "Fallback '{}' entry {} has empty model",
+                        fallback.id, i,
+                    )));
+                }
+            }
         }
     }
 }
@@ -47,13 +85,26 @@ fn phase1(registry: &Registry, errors: &mut Vec<ValidationError>) {
 fn phase2(registry: &Registry, errors: &mut Vec<ValidationError>) {
     for fallback in registry.values() {
         for entry in &fallback.sequence {
-            if let Entry::FallbackReference(fr) = entry
-                && !registry.contains_key(&fr.fallback_id)
-            {
-                errors.push(ValidationError::new(format!(
-                    "Fallback '{}' references unknown id '{}'",
-                    fallback.id, fr.fallback_id,
-                )));
+            if let Entry::FallbackReference(fr) = entry {
+                if fr.fallback_id.trim().is_empty() {
+                    errors.push(ValidationError::new(format!(
+                        "Fallback '{}' has empty fallback reference",
+                        fallback.id,
+                    )));
+                } else {
+                    if !registry.contains_key(&fr.fallback_id) {
+                        errors.push(ValidationError::new(format!(
+                            "Fallback '{}' references unknown id '{}'",
+                            fallback.id, fr.fallback_id,
+                        )));
+                    }
+                    if fr.fallback_id.contains(':') {
+                        errors.push(ValidationError::new(format!(
+                            "Fallback '{}' references fallback '{}' which contains reserved character ':'",
+                            fallback.id, fr.fallback_id,
+                        )));
+                    }
+                }
             }
         }
     }
@@ -288,6 +339,175 @@ mod tests {
                 description: None,
                 timeout_ms: None,
                 sequence: vec![make_ref("primary"), make_pmp("openai", "gpt-4o")],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result);
+    }
+    #[test]
+    fn test_id_with_colon_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "anthropic:claude-sonnet".into(),
+            FallbackDefinition {
+                id: "anthropic:claude-sonnet".into(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![make_pmp("anthropic", "claude-sonnet-4-6")],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("reserved character ':'")));
+    }
+
+    #[test]
+    fn test_ref_with_colon_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "auto".into(),
+            FallbackDefinition {
+                id: "auto".into(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![make_ref("foo:bar")],
+            },
+        );
+        // The reference target "foo:bar" isn't a known fallback, but also contains ':'
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("reserved character ':'")));
+    }
+    #[test]
+    fn test_empty_id_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            String::new(),
+            FallbackDefinition {
+                id: String::new(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![make_pmp("anthropic", "claude-sonnet-4-6")],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("cannot be empty")));
+    }
+
+    #[test]
+    fn test_whitespace_id_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "   ".into(),
+            FallbackDefinition {
+                id: "   ".into(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![make_pmp("anthropic", "claude-sonnet-4-6")],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("cannot be empty")));
+    }
+
+    #[test]
+    fn test_id_with_at_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "@primary".into(),
+            FallbackDefinition {
+                id: "@primary".into(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![make_pmp("anthropic", "claude-sonnet-4-6")],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("reserved character '@'")));
+    }
+
+    #[test]
+    fn test_empty_provider_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "auto".into(),
+            FallbackDefinition {
+                id: "auto".into(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![Entry::ProviderModelPair(ProviderModelPair {
+                    provider: String::new(),
+                    model: "gpt-4o".into(),
+                })],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("empty provider")));
+    }
+
+    #[test]
+    fn test_empty_model_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "auto".into(),
+            FallbackDefinition {
+                id: "auto".into(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![Entry::ProviderModelPair(ProviderModelPair {
+                    provider: "anthropic".into(),
+                    model: String::new(),
+                })],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("empty model")));
+    }
+
+    #[test]
+    fn test_empty_ref_id_rejected() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "auto".into(),
+            FallbackDefinition {
+                id: "auto".into(),
+                description: None,
+                timeout_ms: None,
+                sequence: vec![make_ref("")],
+            },
+        );
+        let result = validate_fallback_registry(&registry);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("empty fallback reference")));
+    }
+
+    #[test]
+    fn test_valid_registry_still_ok_with_enhanced_rules() {
+        // Existing valid case should still pass with all new rules
+        let mut registry = Registry::new();
+        registry.insert(
+            "auto".into(),
+            FallbackDefinition {
+                id: "auto".into(),
+                description: Some("Auto fallback".into()),
+                timeout_ms: None,
+                sequence: vec![
+                    make_pmp("anthropic", "claude-sonnet-4-6"),
+                    make_pmp("openai", "gpt-4o"),
+                ],
             },
         );
         let result = validate_fallback_registry(&registry);

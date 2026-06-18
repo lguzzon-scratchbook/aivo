@@ -144,10 +144,19 @@ impl FallbackCommand {
     }
 
     async fn set_fallback(&self, name: &str, targets: &[String]) -> Result<ExitCode> {
-        if name.is_empty() {
-            anyhow::bail!("Fallback name cannot be empty");
+        if name.trim().is_empty() {
+            anyhow::bail!("Fallback name cannot be empty or whitespace-only");
         }
-
+        if name.contains('@') {
+            anyhow::bail!(
+                "Fallback name cannot contain '@' (reserved for fallback reference syntax)"
+            );
+        }
+        if name.contains(':') {
+            anyhow::bail!(
+                "Fallback name cannot contain ':' (reserved as provider:model delimiter)"
+            );
+        }
         if targets.is_empty() {
             anyhow::bail!(
                 "No targets specified. Usage: aivo fallback --set <name> -- <provider:model>..."
