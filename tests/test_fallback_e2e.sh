@@ -36,7 +36,8 @@ fi
 
 echo "=== Step 4: Create fallback ==="
 FALLBACK_ID="e2e-test-fallback"
-$AIVO fallback --set "$FALLBACK_ID" -- hyper:deepseek-v4-flash kiloGateway:kilo-auto/small
+$AIVO fallback --set "$FALLBACK_ID" -- kiloGateway:deepseek/deepseek-v4-flash
+$AIVO fallback list
 
 echo "=== Step 5: Run with fallback ==="
 # Capture stdout and stderr separately since claude -p output goes through MCP
