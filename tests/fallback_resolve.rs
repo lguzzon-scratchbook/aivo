@@ -165,3 +165,71 @@ async fn test_fallback_exhaustion_returns_structured_error() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("exhausted"));
 }
+/// Validate that a fallback ID containing `:` is rejected by the validator.
+#[test]
+fn fallback_id_with_colon_rejected() {
+    let mut defs = HashMap::new();
+    defs.insert(
+        "bad:name".to_string(),
+        FallbackDefinition {
+            id: "bad:name".into(),
+            description: Some("colon in name".into()),
+            timeout_ms: None,
+            sequence: vec![make_pmp("anthropic", "claude-sonnet-4-6")],
+        },
+    );
+    let result = aivo::services::fallback::validate_fallback_registry(&defs);
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("reserved character ':'")));
+}
+
+/// Validate that a fallback ID containing `:` is rejected at load time.
+#[test]
+fn fallback_load_rejects_colon() {
+    use aivo::services::fallback::FallbackManager;
+    use std::collections::HashMap;
+
+    let mut defs: HashMap<String, aivo::services::fallback::FallbackDefinition> = HashMap::new();
+    defs.insert(
+        "bad:name".to_string(),
+        aivo::services::fallback::FallbackDefinition {
+            id: "bad:name".into(),
+            description: None,
+            timeout_ms: None,
+            sequence: vec![aivo::services::fallback::Entry::ProviderModelPair(
+                aivo::services::fallback::ProviderModelPair {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                },
+            )],
+        },
+    );
+    let result = FallbackManager::load(defs);
+    assert!(result.is_err());
+}
+
+/// Validate that a fallback reference containing `:` is rejected.
+#[test]
+fn fallback_ref_with_colon_rejected() {
+    let mut defs = HashMap::new();
+    defs.insert(
+        "auto".to_string(),
+        FallbackDefinition {
+            id: "auto".into(),
+            description: None,
+            timeout_ms: None,
+            sequence: vec![
+                aivo::services::fallback::Entry::FallbackReference(
+                    aivo::services::fallback::FallbackReference {
+                        fallback_id: "bad:ref".into(),
+                    },
+                ),
+            ],
+        },
+    );
+    let result = aivo::services::fallback::validate_fallback_registry(&defs);
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("reserved character ':'")));
+}
