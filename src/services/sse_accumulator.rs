@@ -72,6 +72,16 @@ impl AccumulatedResponse {
             return false;
         };
 
+        self.extract_metadata(&chunk);
+        self.extract_usage(&chunk);
+
+        self.process_choices(&chunk);
+
+        false
+    }
+
+    /// Extract `id` and `model` from an SSE chunk.
+    fn extract_metadata(&mut self, chunk: &Value) {
         if let Some(id) = chunk.get("id").and_then(|v| v.as_str())
             && !id.is_empty()
         {
@@ -82,6 +92,10 @@ impl AccumulatedResponse {
         {
             self.model = model.to_string();
         }
+    }
+
+    /// Extract usage statistics from an SSE chunk.
+    fn extract_usage(&mut self, chunk: &Value) {
         if let Some(usage) = chunk.get("usage") {
             if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
                 self.input_tokens = v;
@@ -102,7 +116,10 @@ impl AccumulatedResponse {
                 self.cache_creation_input_tokens = Some(v);
             }
         }
+    }
 
+    /// Process `choices[].delta` to extract content, reasoning, tool_calls, function_calls, and finish_reason.
+    fn process_choices(&mut self, chunk: &Value) {
         if let Some(choices) = chunk.get("choices").and_then(|v| v.as_array()) {
             for choice in choices {
                 let delta = choice.get("delta").and_then(|v| v.as_object());
@@ -171,8 +188,6 @@ impl AccumulatedResponse {
                 }
             }
         }
-
-        false
     }
 
     /// Convert the accumulated state into a generic Chat Completions JSON response.

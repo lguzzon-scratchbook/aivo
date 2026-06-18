@@ -561,23 +561,8 @@ async fn handle_anthropic_to_upstream(
         }
     }
 
-    let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content)?;
-    // Only inject cache_control for Claude models — other providers don't support it
-    // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
-    if model_is_claude {
-        inject_chat_completions_cache_control(&mut simplified);
-    }
-    // Map Anthropic thinking config to OpenAI reasoning_effort
-    if let Some(thinking) = body.get("thinking")
-        && thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
-    {
-        simplified["reasoning_effort"] = json!("high");
-    }
-    cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
-    let requested_stream = simplified
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let (simplified, requested_stream) =
+        prepare_anthropic_conversion(&body, config, model_is_claude)?;
 
     let candidates = protocol_candidates(active_protocol);
     let mut first_error: Option<RouterResponse> = None;
@@ -600,150 +585,36 @@ async fn handle_anthropic_to_upstream(
 
         let outcome: AttemptOutcome<RouterResponse> = match protocol {
             ProviderProtocol::Google => {
-                req_body["stream"] = json!(false);
-                let model = openai_chat_model(&req_body, "gemini-2.5-pro");
-                let google_body = convert_openai_chat_to_gemini_request(
-                    &req_body,
-                    &OpenAIToGeminiConfig {
-                        default_model: "gemini-2.5-pro",
-                    },
-                );
-                let url = build_google_generate_content_url(&config.target_base_url, &model);
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&url)
-                        .headers(attempt_headers)
-                        .header("x-goog-api-key", config.target_api_key.as_str())
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&google_body),
-                    config.is_starter,
+                send_google_protocol(
+                    req_body,
+                    attempt_headers,
+                    config,
+                    requested_stream,
+                    client,
                 )
-                .send()
-                .await?;
-
-                let status_code = response.status().as_u16();
-                let response_body = response.text().await?;
-                let parsed = if is_protocol_mismatch(status_code) {
-                    None
-                } else {
-                    let google_response: Value = serde_json::from_str(&response_body)?;
-                    let openai_response =
-                        convert_gemini_to_openai_chat_response(&google_response, &model);
-                    Some(openai_chat_response_to_anthropic_router(
-                        &openai_response,
-                        requested_stream,
-                    )?)
-                };
-                classify_attempt(status_code, response_body, parsed)
+                .await?
             }
             ProviderProtocol::ResponsesApi => {
-                let mut responses_body = convert_chat_to_responses_request(&req_body)?;
-                responses_body["stream"] = json!(false);
-                let url = build_responses_url(&config.target_base_url, variant);
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&url)
-                        .headers(attempt_headers)
-                        .header("Authorization", format!("Bearer {}", config.target_api_key))
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&responses_body),
-                    config.is_starter,
+                send_responses_protocol(
+                    req_body,
+                    attempt_headers,
+                    config,
+                    variant,
+                    requested_stream,
+                    client,
                 )
-                .send()
-                .await?;
-
-                let status_code = response.status().as_u16();
-                let response_body = response.text().await?;
-                let parsed = if is_protocol_mismatch(status_code) {
-                    None
-                } else {
-                    let resp: Value = serde_json::from_str(&response_body)?;
-                    let openai_response = convert_responses_to_chat_response(&resp)?;
-                    Some(openai_chat_response_to_anthropic_router(
-                        &openai_response,
-                        requested_stream,
-                    )?)
-                };
-                classify_attempt(status_code, response_body, parsed)
+                .await?
             }
             _ => {
-                // OpenAI or Anthropic — use chat completions endpoint
-                let url = http_utils::build_target_url(
-                    &config.target_base_url,
-                    variant.apply("/v1/chat/completions"),
-                );
-                let mut response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&url)
-                        .headers(attempt_headers)
-                        .header("Authorization", format!("Bearer {}", config.target_api_key))
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&req_body),
-                    config.is_starter,
+                send_chat_completions_protocol(
+                    req_body,
+                    attempt_headers,
+                    config,
+                    variant,
+                    client,
+                    socket,
                 )
-                .send()
-                .await?;
-
-                let status_code = response.status().as_u16();
-                if is_protocol_mismatch(status_code) {
-                    let body = response.text().await.unwrap_or_default();
-                    AttemptOutcome::Mismatch {
-                        status: status_code,
-                        body,
-                    }
-                } else {
-                    let is_streaming = response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|ct| ct.contains("text/event-stream"))
-                        .unwrap_or(false);
-
-                    // Stream OpenAI SSE → Anthropic SSE directly to socket
-                    if status_code == 200 && is_streaming {
-                        use tokio::io::AsyncWriteExt;
-                        let headers =
-                            http_utils::http_chunked_response_head(200, "text/event-stream");
-                        socket.write_all(headers.as_bytes()).await?;
-                        let mut converter = OpenAIStreamConverter::new();
-                        while let Some(chunk) = response.chunk().await? {
-                            let converted = converter.push_bytes(&chunk)?;
-                            if !converted.is_empty() {
-                                let formatted = http_utils::format_http_chunk(converted.as_bytes());
-                                socket.write_all(&formatted).await?;
-                            }
-                        }
-                        let tail = converter.finish()?;
-                        if !tail.is_empty() {
-                            let formatted = http_utils::format_http_chunk(tail.as_bytes());
-                            socket.write_all(&formatted).await?;
-                        }
-                        socket.write_all(b"0\r\n\r\n").await?;
-                        commit_protocol_switch(active_protocol, protocol, variant, attempt);
-                        request_succeeded.store(true, Ordering::Relaxed);
-                        return Ok(RouterResponse::AlreadyStreamed);
-                    }
-
-                    let response_body = response.text().await?;
-                    let r = if status_code == 200 && response_body.starts_with("data:") {
-                        let anthropic_sse =
-                            convert_openai_sse_to_anthropic(&response_body, status_code)?;
-                        RouterResponse::Buffered {
-                            status: 200,
-                            content_type: "text/event-stream".to_string(),
-                            body: anthropic_sse.into_bytes(),
-                        }
-                    } else {
-                        let anthropic_response =
-                            convert_openai_to_anthropic(&response_body, status_code)?;
-                        RouterResponse::Buffered {
-                            status: status_code,
-                            content_type: CONTENT_TYPE_JSON.to_string(),
-                            body: anthropic_response.into_bytes(),
-                        }
-                    };
-                    AttemptOutcome::Success(r)
-                }
+                .await?
             }
         };
 
@@ -768,6 +639,203 @@ async fn handle_anthropic_to_upstream(
         content_type: CONTENT_TYPE_JSON.to_string(),
         body: b"{\"error\":\"No compatible protocol found\"}".to_vec(),
     }))
+}
+/// Prepare the Anthropic request body for OpenAI protocol conversion.
+/// Handles body simplification, cache control injection, thinking→reasoning mapping,
+/// and max_tokens capping.
+fn prepare_anthropic_conversion(
+    body: &Value,
+    config: &AnthropicToOpenAIRouterConfig,
+    model_is_claude: bool,
+) -> Result<(Value, bool)> {
+    let mut simplified = anthropic_to_openai(body, config.requires_reasoning_content)?;
+    // Only inject cache_control for Claude models — other providers don't support it
+    // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
+    if model_is_claude {
+        inject_chat_completions_cache_control(&mut simplified);
+    }
+    // Map Anthropic thinking config to OpenAI reasoning_effort
+    if let Some(thinking) = body.get("thinking")
+        && thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
+    {
+        simplified["reasoning_effort"] = json!("high");
+    }
+    cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
+    let requested_stream = simplified
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok((simplified, requested_stream))
+}
+
+/// Send request via Google provider protocol (Gemini).
+async fn send_google_protocol(
+    mut req_body: Value,
+    attempt_headers: HeaderMap,
+    config: &AnthropicToOpenAIRouterConfig,
+    requested_stream: bool,
+    client: &reqwest::Client,
+) -> Result<AttemptOutcome<RouterResponse>> {
+    req_body["stream"] = json!(false);
+    let model = openai_chat_model(&req_body, "gemini-2.5-pro");
+    let google_body = convert_openai_chat_to_gemini_request(
+        &req_body,
+        &OpenAIToGeminiConfig {
+            default_model: "gemini-2.5-pro",
+        },
+    );
+    let url = build_google_generate_content_url(&config.target_base_url, &model);
+    let response = device_fingerprint::maybe_with_starter_headers(
+        client
+            .post(&url)
+            .headers(attempt_headers)
+            .header("x-goog-api-key", config.target_api_key.as_str())
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .json(&google_body),
+        config.is_starter,
+    )
+    .send()
+    .await?;
+
+    let status_code = response.status().as_u16();
+    let response_body = response.text().await?;
+    let parsed = if is_protocol_mismatch(status_code) {
+        None
+    } else {
+        let google_response: Value = serde_json::from_str(&response_body)?;
+        let openai_response =
+            convert_gemini_to_openai_chat_response(&google_response, &model);
+        Some(openai_chat_response_to_anthropic_router(
+            &openai_response,
+            requested_stream,
+        )?)
+    };
+    Ok(classify_attempt(status_code, response_body, parsed))
+}
+
+/// Send request via ResponsesApi protocol.
+async fn send_responses_protocol(
+    req_body: Value,
+    attempt_headers: HeaderMap,
+    config: &AnthropicToOpenAIRouterConfig,
+    variant: PathVariant,
+    requested_stream: bool,
+    client: &reqwest::Client,
+) -> Result<AttemptOutcome<RouterResponse>> {
+    let mut responses_body = convert_chat_to_responses_request(&req_body)?;
+    responses_body["stream"] = json!(false);
+    let url = build_responses_url(&config.target_base_url, variant);
+    let response = device_fingerprint::maybe_with_starter_headers(
+        client
+            .post(&url)
+            .headers(attempt_headers)
+            .header("Authorization", format!("Bearer {}", config.target_api_key))
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .json(&responses_body),
+        config.is_starter,
+    )
+    .send()
+    .await?;
+
+    let status_code = response.status().as_u16();
+    let response_body = response.text().await?;
+    let parsed = if is_protocol_mismatch(status_code) {
+        None
+    } else {
+        let resp: Value = serde_json::from_str(&response_body)?;
+        let openai_response = convert_responses_to_chat_response(&resp)?;
+        Some(openai_chat_response_to_anthropic_router(
+            &openai_response,
+            requested_stream,
+        )?)
+    };
+    Ok(classify_attempt(status_code, response_body, parsed))
+}
+
+/// Send request via chat completions (OpenAI / Anthropic) protocol.
+/// Handles streaming directly to the socket when the upstream returns SSE.
+async fn send_chat_completions_protocol(
+    req_body: Value,
+    attempt_headers: HeaderMap,
+    config: &AnthropicToOpenAIRouterConfig,
+    variant: PathVariant,
+    client: &reqwest::Client,
+    socket: &mut tokio::net::TcpStream,
+) -> Result<AttemptOutcome<RouterResponse>> {
+    let url = http_utils::build_target_url(
+        &config.target_base_url,
+        variant.apply("/v1/chat/completions"),
+    );
+    let mut response = device_fingerprint::maybe_with_starter_headers(
+        client
+            .post(&url)
+            .headers(attempt_headers)
+            .header("Authorization", format!("Bearer {}", config.target_api_key))
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .json(&req_body),
+        config.is_starter,
+    )
+    .send()
+    .await?;
+
+    let status_code = response.status().as_u16();
+    if is_protocol_mismatch(status_code) {
+        let body = response.text().await.unwrap_or_default();
+        return Ok(AttemptOutcome::Mismatch {
+            status: status_code,
+            body,
+        });
+    }
+
+    let is_streaming = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+
+    // Stream OpenAI SSE → Anthropic SSE directly to socket
+    if status_code == 200 && is_streaming {
+        use tokio::io::AsyncWriteExt;
+        let headers =
+            http_utils::http_chunked_response_head(200, "text/event-stream");
+        socket.write_all(headers.as_bytes()).await?;
+        let mut converter = OpenAIStreamConverter::new();
+        while let Some(chunk) = response.chunk().await? {
+            let converted = converter.push_bytes(&chunk)?;
+            if !converted.is_empty() {
+                let formatted = http_utils::format_http_chunk(converted.as_bytes());
+                socket.write_all(&formatted).await?;
+            }
+        }
+        let tail = converter.finish()?;
+        if !tail.is_empty() {
+            let formatted = http_utils::format_http_chunk(tail.as_bytes());
+            socket.write_all(&formatted).await?;
+        }
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(AttemptOutcome::Success(RouterResponse::AlreadyStreamed));
+    }
+
+    let response_body = response.text().await?;
+    let r = if status_code == 200 && response_body.starts_with("data:") {
+        let anthropic_sse =
+            convert_openai_sse_to_anthropic(&response_body, status_code)?;
+        RouterResponse::Buffered {
+            status: 200,
+            content_type: "text/event-stream".to_string(),
+            body: anthropic_sse.into_bytes(),
+        }
+    } else {
+        let anthropic_response =
+            convert_openai_to_anthropic(&response_body, status_code)?;
+        RouterResponse::Buffered {
+            status: status_code,
+            content_type: CONTENT_TYPE_JSON.to_string(),
+            body: anthropic_response.into_bytes(),
+        }
+    };
+    Ok(AttemptOutcome::Success(r))
 }
 
 fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Result<Value> {

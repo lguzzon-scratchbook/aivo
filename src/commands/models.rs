@@ -640,6 +640,7 @@ pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Resu
 /// `chat_only` is true (the default), applies `is_text_chat_model` to the
 /// OpenAI-compatible / Anthropic / CloudflareSearch branches so chat pickers
 /// don't surface image, audio, or embedding models. Set to false for the
+/// Fetch models from the provider using the key's listing strategy.
 /// image command and `aivo models`, which show the full catalog.
 async fn fetch_models_detailed_filtered(
     client: &Client,
@@ -657,210 +658,29 @@ async fn fetch_models_detailed_filtered(
     let profile = provider_profile_for_key(key);
 
     let raw: Vec<ModelInfo> = match profile.model_listing_strategy {
-        ModelListingStrategy::Static(models) => Ok::<_, anyhow::Error>(
-            models
-                .iter()
-                .map(|s| ModelInfo::id_only(s.to_string()))
-                .collect(),
-        ),
+        ModelListingStrategy::Static(models) => {
+            fetch_models_static_list(models)
+        }
         ModelListingStrategy::AivoStarter => {
-            let starter_base = crate::constants::AIVO_STARTER_REAL_URL;
-            let url = format!("{}/v1/models", starter_base.trim_end_matches('/'));
-            let response = crate::services::device_fingerprint::with_starter_headers(
-                client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", key.key.as_str())),
-            )
-            .send()
-            .await?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("API returned {} — {}", status, body);
-            }
-
-            let resp: OpenAIModelsResponse = response.json().await?;
-            Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
+            fetch_models_starter(client, key).await
         }
         ModelListingStrategy::Ollama => {
-            crate::services::ollama::ensure_ready().await?;
-            let ids = crate::services::ollama::list_models().await?;
-            Ok(ids.into_iter().map(ModelInfo::id_only).collect())
+            fetch_models_ollama().await
         }
         ModelListingStrategy::Copilot => {
-            let tm = CopilotTokenManager::new(key.key.as_str().to_string());
-            let (copilot_token, api_endpoint) = tm.get_token().await?;
-            let url = format!("{}/models", api_endpoint.trim_end_matches('/'));
-            let response = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", copilot_token))
-                .header("Editor-Version", COPILOT_EDITOR_VERSION)
-                .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
-                .header("X-GitHub-Api-Version", "2025-10-01")
-                .send()
-                .await?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("Copilot API returned {} — {}", status, body);
-            }
-
-            let resp: OpenAIModelsResponse = response.json().await?;
-            Ok(resp
-                .data
-                .into_iter()
-                .filter(|m| is_copilot_chat_model(&m.id))
-                .map(|m| m.into_model_info())
-                .collect())
+            fetch_models_copilot(client, key).await
         }
         ModelListingStrategy::Google => {
-            let url = build_google_models_url(base);
-            let response = client
-                .get(&url)
-                .header("x-goog-api-key", key.key.as_str())
-                .send()
-                .await?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("API returned {} — {}", status, body);
-            }
-
-            let resp: GeminiModelsResponse = response.json().await?;
-            Ok(resp
-                .models
-                .into_iter()
-                .filter(|m| {
-                    m.supported_generation_methods
-                        .iter()
-                        .any(|method| method == "generateContent")
-                })
-                .map(|m| {
-                    let id = m
-                        .name
-                        .strip_prefix("models/")
-                        .unwrap_or(&m.name)
-                        .to_string();
-                    ModelInfo {
-                        context: m.input_token_limit.map(format_token_count),
-                        max_output: m.output_token_limit.map(format_token_count),
-                        input_price: None,
-                        output_price: None,
-                        multiplier: None,
-                        id,
-                    }
-                })
-                .collect())
+            fetch_models_google(client, key, base).await
         }
         ModelListingStrategy::Anthropic => {
-            let url = build_anthropic_models_url(&key.base_url);
-            let response = client
-                .get(&url)
-                .header("x-api-key", key.key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .send()
-                .await?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("API returned {} — {}", status, body);
-            }
-
-            let resp: OpenAIModelsResponse = response.json().await?;
-            Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
+            fetch_models_anthropic(client, key).await
         }
         ModelListingStrategy::CloudflareSearch => {
-            let cloudflare_base = cloudflare_ai_base(base)
-                .ok_or_else(|| anyhow::anyhow!("Failed to normalize Cloudflare AI base URL"))?;
-            let auth = format!("Bearer {}", key.key.as_str());
-            let mut page = 1u32;
-            let mut seen = HashSet::new();
-            let mut models = Vec::new();
-
-            loop {
-                let url = format!(
-                    "{}/models/search?hide_experimental=true&page={}&per_page=100",
-                    cloudflare_base, page
-                );
-                let response = client
-                    .get(&url)
-                    .header("Authorization", &auth)
-                    .send()
-                    .await?;
-
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    anyhow::bail!("API returned {} from {} — {}", status, url, body);
-                }
-
-                let resp: CloudflareModelsResponse = response.json().await?;
-                for model in resp.result.into_iter().map(cloudflare_model_name) {
-                    if seen.insert(model.clone()) {
-                        models.push(ModelInfo::id_only(model));
-                    }
-                }
-
-                let total_pages = resp
-                    .result_info
-                    .and_then(|info| info.total_pages)
-                    .unwrap_or(page);
-                if page >= total_pages {
-                    break;
-                }
-                page += 1;
-            }
-
-            Ok(models)
+            fetch_models_cloudflare(client, key, base).await
         }
         ModelListingStrategy::OpenAiCompatible => {
-            let model_endpoints = |b: &str| [format!("{}/v1/models", b), format!("{}/models", b)];
-            let mut candidates = Vec::new();
-            if let Some(origin) = url_origin(base)
-                && origin != base
-            {
-                candidates.extend(model_endpoints(&origin));
-            }
-            candidates.extend(model_endpoints(base));
-            let auth = format!("Bearer {}", key.key.as_str());
-
-            let mut last_err = String::new();
-            let mut success: Option<Vec<ModelInfo>> = None;
-            for url in &candidates {
-                let response = client
-                    .get(url)
-                    .header("Authorization", &auth)
-                    .send()
-                    .await?;
-
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    last_err = format!("API returned {} from {} — {}", status, url, body);
-                    continue;
-                }
-
-                let body = response.text().await.unwrap_or_default();
-                match serde_json::from_str::<OpenAIModelsResponse>(&body) {
-                    Ok(resp) => {
-                        success =
-                            Some(resp.data.into_iter().map(|m| m.into_model_info()).collect());
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = format!("Invalid models response from {}: {}", url, e);
-                    }
-                }
-            }
-
-            match success {
-                Some(v) => Ok(v),
-                None => anyhow::bail!("{}", last_err),
-            }
+            fetch_models_openai_compatible(client, key, base).await
         }
     }?;
 
@@ -871,6 +691,226 @@ async fn fetch_models_detailed_filtered(
     } else {
         raw
     })
+}
+
+fn fetch_models_static_list(models: &[&str]) -> Result<Vec<ModelInfo>, anyhow::Error> {
+    Ok(models
+        .iter()
+        .map(|s| ModelInfo::id_only(s.to_string()))
+        .collect())
+}
+
+async fn fetch_models_starter(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>, anyhow::Error> {
+    let starter_base = crate::constants::AIVO_STARTER_REAL_URL;
+    let url = format!("{}/v1/models", starter_base.trim_end_matches('/'));
+    let response = crate::services::device_fingerprint::with_starter_headers(
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", key.key.as_str())),
+    )
+    .send()
+    .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let resp: OpenAIModelsResponse = response.json().await?;
+    Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
+}
+
+async fn fetch_models_ollama() -> Result<Vec<ModelInfo>, anyhow::Error> {
+    crate::services::ollama::ensure_ready().await?;
+    let ids = crate::services::ollama::list_models().await?;
+    Ok(ids.into_iter().map(ModelInfo::id_only).collect())
+}
+
+async fn fetch_models_copilot(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>, anyhow::Error> {
+    let tm = CopilotTokenManager::new(key.key.as_str().to_string());
+    let (copilot_token, api_endpoint) = tm.get_token().await?;
+    let url = format!("{}/models", api_endpoint.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", copilot_token))
+        .header("Editor-Version", COPILOT_EDITOR_VERSION)
+        .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+        .header("X-GitHub-Api-Version", "2025-10-01")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Copilot API returned {} — {}", status, body);
+    }
+
+    let resp: OpenAIModelsResponse = response.json().await?;
+    Ok(resp
+        .data
+        .into_iter()
+        .filter(|m| is_copilot_chat_model(&m.id))
+        .map(|m| m.into_model_info())
+        .collect())
+}
+
+async fn fetch_models_google(client: &Client, key: &ApiKey, base: &str) -> Result<Vec<ModelInfo>, anyhow::Error> {
+    let url = build_google_models_url(base);
+    let response = client
+        .get(&url)
+        .header("x-goog-api-key", key.key.as_str())
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let resp: GeminiModelsResponse = response.json().await?;
+    Ok(resp
+        .models
+        .into_iter()
+        .filter(|m| {
+            m.supported_generation_methods
+                .iter()
+                .any(|method| method == "generateContent")
+        })
+        .map(|m| {
+            let id = m
+                .name
+                .strip_prefix("models/")
+                .unwrap_or(&m.name)
+                .to_string();
+            ModelInfo {
+                context: m.input_token_limit.map(format_token_count),
+                max_output: m.output_token_limit.map(format_token_count),
+                input_price: None,
+                output_price: None,
+                multiplier: None,
+                id,
+            }
+        })
+        .collect())
+}
+
+async fn fetch_models_anthropic(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>, anyhow::Error> {
+    let url = build_anthropic_models_url(&key.base_url);
+    let response = client
+        .get(&url)
+        .header("x-api-key", key.key.as_str())
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API returned {} — {}", status, body);
+    }
+
+    let resp: OpenAIModelsResponse = response.json().await?;
+    Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
+}
+
+async fn fetch_models_cloudflare(
+    client: &Client,
+    key: &ApiKey,
+    base: &str,
+) -> Result<Vec<ModelInfo>, anyhow::Error> {
+    let cloudflare_base = cloudflare_ai_base(base)
+        .ok_or_else(|| anyhow::anyhow!("Failed to normalize Cloudflare AI base URL"))?;
+    let auth = format!("Bearer {}", key.key.as_str());
+    let mut page = 1u32;
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+
+    loop {
+        let url = format!(
+            "{}/models/search?hide_experimental=true&page={}&per_page=100",
+            cloudflare_base, page
+        );
+        let response = client
+            .get(&url)
+            .header("Authorization", &auth)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("API returned {} from {} — {}", status, url, body);
+        }
+
+        let resp: CloudflareModelsResponse = response.json().await?;
+        for model in resp.result.into_iter().map(cloudflare_model_name) {
+            if seen.insert(model.clone()) {
+                models.push(ModelInfo::id_only(model));
+            }
+        }
+
+        let total_pages = resp
+            .result_info
+            .and_then(|info| info.total_pages)
+            .unwrap_or(page);
+        if page >= total_pages {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(models)
+}
+
+async fn fetch_models_openai_compatible(
+    client: &Client,
+    key: &ApiKey,
+    base: &str,
+) -> Result<Vec<ModelInfo>, anyhow::Error> {
+    let model_endpoints = |b: &str| [format!("{}/v1/models", b), format!("{}/models", b)];
+    let mut candidates = Vec::new();
+    if let Some(origin) = url_origin(base)
+        && origin != base
+    {
+        candidates.extend(model_endpoints(&origin));
+    }
+    candidates.extend(model_endpoints(base));
+    let auth = format!("Bearer {}", key.key.as_str());
+
+    let mut last_err = String::new();
+    let mut success: Option<Vec<ModelInfo>> = None;
+    for url in &candidates {
+        let response = client
+            .get(url)
+            .header("Authorization", &auth)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            last_err = format!("API returned {} from {} — {}", status, url, body);
+            continue;
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        match serde_json::from_str::<OpenAIModelsResponse>(&body) {
+            Ok(resp) => {
+                success = Some(resp.data.into_iter().map(|m| m.into_model_info()).collect());
+                break;
+            }
+            Err(e) => {
+                last_err = format!("Invalid models response from {}: {}", url, e);
+            }
+        }
+    }
+
+    match success {
+        Some(v) => Ok(v),
+        None => anyhow::bail!("{}", last_err),
+    }
 }
 
 fn build_google_models_url(base_url: &str) -> String {

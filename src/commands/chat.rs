@@ -172,7 +172,6 @@ impl ChatCommand {
             }
         }
     }
-
     async fn execute_internal(
         &self,
         model_flag: Option<String>,
@@ -182,6 +181,37 @@ impl ChatCommand {
         key_override: Option<ApiKey>,
         json: bool,
     ) -> Result<ExitCode> {
+        let key = self.resolve_chat_key(key_override).await?;
+        let client = crate::services::http_utils::router_http_client();
+        let cwd =
+            crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
+        let raw_model = self.resolve_chat_model(&client, &key, model_flag, refresh).await?;
+        let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
+        let pending_attachments = build_pending_attachments(&attachments)?;
+        let mut key = key;
+        let copilot_tm = self.prepare_chat_environment(&mut key, &raw_model).await?;
+
+        if let Some(input) = one_shot {
+            return self
+                .execute_one_shot_chat(
+                    &client, key, copilot_tm, &model, &raw_model,
+                    input, pending_attachments, json, &cwd,
+                )
+                .await;
+        }
+
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            anyhow::bail!(
+                "Interactive chat now uses a full-screen TUI. Run it in a terminal, or use -x/--execute for non-interactive mode."
+            );
+        }
+
+        self.launch_chat_tui(client, key, copilot_tm, cwd, raw_model, model, pending_attachments)
+            .await
+    }
+
+    /// Resolves the API key for chat: from override, active key, or OAuth swap.
+    async fn resolve_chat_key(&self, key_override: Option<ApiKey>) -> Result<ApiKey> {
         let mut key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
@@ -191,14 +221,11 @@ impl ChatCommand {
                         "{} No API key configured. Run 'aivo keys add' first.",
                         style::red("Error:")
                     );
-                    return Ok(ExitCode::AuthError);
+                    anyhow::bail!(ExitCode::AuthError);
                 }
             },
         };
 
-        // OAuth entries target subscription backends only the native CLIs can
-        // speak — plain /v1/chat/completions, /v1/messages, and
-        // generateContent endpoints reject them.
         if key.is_any_oauth() {
             key = match crate::commands::keys::swap_incompatible_key(
                 &self.session_store,
@@ -209,26 +236,27 @@ impl ChatCommand {
             .await?
             {
                 Some(k) => k,
-                None => return Ok(ExitCode::UserError),
+                None => anyhow::bail!(ExitCode::UserError),
             };
         }
 
-        let client = crate::services::http_utils::router_http_client();
-        let cwd =
-            crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
+        Ok(key)
+    }
 
+    /// Resolves the model for chat: from --model flag, picker, or fallback alias.
+    async fn resolve_chat_model(
+        &self,
+        client: &reqwest::Client,
+        key: &ApiKey,
+        model_flag: Option<String>,
+        refresh: bool,
+    ) -> Result<String> {
         let raw_model = match self.resolve_model(&key.id, model_flag).await? {
             Some(m) => m,
             None => {
                 ensure_picker_terminal("model", "--model <name>")?;
-                // Fetch the full catalog and annotate non-chat models as
-                // disabled rather than hiding them — users see why image /
-                // audio / embedding entries aren't selectable.
                 let models_list = crate::commands::models::fetch_all_models_cached(
-                    &client,
-                    &key,
-                    &self.cache,
-                    refresh,
+                    client, key, &self.cache, refresh,
                 )
                 .await
                 .unwrap_or_default();
@@ -243,25 +271,18 @@ impl ChatCommand {
                     crate::services::model_compat::text_chat_annotations(&models_list);
                 match crate::commands::models::prompt_model_picker(models_list, None, annotations) {
                     Some(selected) => {
-                        self.session_store
-                            .set_chat_model(&key.id, &selected)
-                            .await?;
+                        self.session_store.set_chat_model(&key.id, &selected).await?;
                         selected
                     }
-                    None => return Ok(ExitCode::Success),
+                    None => anyhow::bail!(ExitCode::Success),
                 }
             }
         };
 
         // Resolve fallback alias — pick the first matching target's model
-        let raw_model = if self
-            .session_store
-            .is_fallback(&raw_model)
-            .await
-            .unwrap_or(false)
-        {
+        let raw_model = if self.session_store.is_fallback(&raw_model).await.unwrap_or(false) {
             let (pairs, timeout_ms) =
-                resolve_fallback_targets(&self.session_store, &raw_model, Some(&key)).await?;
+                resolve_fallback_targets(&self.session_store, &raw_model, Some(key)).await?;
             let start = std::time::Instant::now();
             let mut resolved = None;
             for (target_key, target) in pairs.iter() {
@@ -279,15 +300,12 @@ impl ChatCommand {
                     style::yellow("!"),
                     pairs.len()
                 );
-                return Err(anyhow::anyhow!(
-                    crate::services::fallback::FallbackExhaustedError {
-                        fallback_id: raw_model.clone(),
-                        attempt_count: pairs.len(),
-                        last_error_category: "user_error".to_string(),
-                        last_error_message: "No matching key found for fallback targets"
-                            .to_string(),
-                    }
-                ));
+                anyhow::bail!(crate::services::fallback::FallbackExhaustedError {
+                    fallback_id: raw_model.clone(),
+                    attempt_count: pairs.len(),
+                    last_error_category: "user_error".to_string(),
+                    last_error_message: "No matching key found for fallback targets".to_string(),
+                });
             }
         } else {
             raw_model
@@ -304,26 +322,27 @@ impl ChatCommand {
             .map(|s| s.tool);
         let _ = self
             .session_store
-            .set_last_selection(
-                &key,
-                existing_tool.as_deref().unwrap_or("chat"),
-                Some(&raw_model),
-            )
+            .set_last_selection(key, existing_tool.as_deref().unwrap_or("chat"), Some(&raw_model))
             .await;
 
-        let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
-        let pending_attachments = build_pending_attachments(&attachments)?;
+        Ok(raw_model)
+    }
 
-        // Resolve sentinel base URLs to actual URLs before any HTTP calls.
+    /// Resolves sentinel base URLs (ollama, aivo-starter) and creates the
+    /// Copilot token manager when needed.
+    async fn prepare_chat_environment(
+        &self,
+        key: &mut ApiKey,
+        raw_model: &str,
+    ) -> Result<Option<Arc<CopilotTokenManager>>> {
         if key.base_url == "ollama" {
             crate::services::ollama::ensure_ready().await?;
-            crate::services::ollama::ensure_model(&raw_model).await?;
+            crate::services::ollama::ensure_model(raw_model).await?;
             key.base_url = crate::services::ollama::ollama_openai_base_url();
         } else if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
             key.base_url = crate::constants::AIVO_STARTER_REAL_URL.to_string();
         }
 
-        // Create once so its token cache is reused across messages in the session.
         let copilot_tm = if key.base_url == "copilot" {
             Some(Arc::new(CopilotTokenManager::new(
                 key.key.as_str().to_string(),
@@ -332,129 +351,132 @@ impl ChatCommand {
             None
         };
 
-        if let Some(input) = one_shot {
-            let one_shot_input = if input.is_empty() {
-                sanitize_one_shot_message(read_one_shot_message_from_stdin()?)?
-            } else {
-                let input = sanitize_one_shot_message(input)?;
-                let stdin_context = read_stdin_if_piped()?;
-                compose_one_shot_prompt(&input, stdin_context.as_deref())
-            };
-            let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
+        Ok(copilot_tm)
+    }
 
-            let history = vec![ChatMessage {
-                role: "user".to_string(),
-                content: one_shot_input,
-                reasoning_content: None,
-                attachments: one_shot_attachments,
-            }];
-            let mut format = detect_initial_chat_format(&key.base_url);
-            self.session_store
-                .record_selection(&key.id, "chat", Some(&raw_model))
-                .await?;
-            let (spinning, spinner_handle) = style::start_spinner(None);
-            let mut current_section: Option<&'static str> = None;
-            let mut on_chunk = |chunk| {
-                if json {
-                    return Ok(());
-                }
-                match chunk {
-                    ChatResponseChunk::Reasoning(text) => {
-                        if current_section != Some("thinking") {
-                            if current_section.is_some() {
-                                print!("\n\n");
-                            }
-                            println!("Thinking:");
-                            current_section = Some("thinking");
-                        }
-                        print!("{text}");
-                    }
-                    ChatResponseChunk::Content(text) => {
-                        if current_section == Some("thinking") {
-                            print!("\n\nAnswer:\n");
-                        }
-                        current_section = Some("answer");
-                        print!("{text}");
-                    }
-                }
-                io::stdout().flush()?;
-                Ok(())
-            };
-            // Install a Ctrl+C handler so SIGINT cancels the in-flight request
-            // cleanly: dropping the `send_message_turn` future closes the HTTP
-            // connection before the process exits. Without this branch the
-            // default SIGINT terminates the process abruptly, leaving the
-            // server to keep generating.
-            let result = tokio::select! {
-                res = send_message_turn(
-                    &client,
-                    &key,
-                    copilot_tm.as_deref(),
-                    &model,
-                    &history,
-                    &mut format,
-                    &spinning,
-                    json,
-                    &mut on_chunk,
-                ) => res,
-                _ = tokio::signal::ctrl_c() => {
-                    style::stop_spinner(&spinning);
-                    let _ = spinner_handle.await;
-                    eprintln!();
-                    return Ok(ExitCode::ToolExit(130));
-                }
-            };
-            style::stop_spinner(&spinning);
-            let _ = spinner_handle.await;
+    /// Executes a one-shot chat: prepares the prompt, sends the request,
+    /// handles streaming output, and records usage.
+#[allow(clippy::too_many_arguments)]
+    async fn execute_one_shot_chat(
+        &self,
+        client: &reqwest::Client,
+        key: ApiKey,
+        copilot_tm: Option<Arc<CopilotTokenManager>>,
+        model: &str,
+        raw_model: &str,
+        input: String,
+        pending_attachments: Vec<MessageAttachment>,
+        json: bool,
+        cwd: &str,
+    ) -> Result<ExitCode> {
+        let one_shot_input = if input.is_empty() {
+            sanitize_one_shot_message(read_one_shot_message_from_stdin()?)?
+        } else {
+            let input = sanitize_one_shot_message(input)?;
+            let stdin_context = read_stdin_if_piped()?;
+            compose_one_shot_prompt(&input, stdin_context.as_deref())
+        };
+        let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
 
-            match result {
-                Ok(turn) => {
-                    let prompt_text: String = history.iter().map(|m| m.content.as_str()).collect();
-                    let usage = turn.usage_or_estimate(&prompt_text);
-                    self.session_store
-                        .record_tokens(
-                            &key.id,
-                            Some(&raw_model),
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            usage.cache_read_input_tokens,
-                            usage.cache_creation_input_tokens,
-                        )
-                        .await?;
-                    let _ = log_chat_turn(
-                        &self.session_store,
-                        &key,
-                        &raw_model,
-                        Some(&cwd),
-                        None,
-                        &history[0],
-                        &turn.content,
-                        turn.reasoning_content.as_deref(),
-                        &usage,
-                    )
-                    .await;
-                    if json {
-                        let body = turn.raw_body.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "provider did not return a non-streaming body; --json cannot serialize partial streaming output"
-                            )
-                        })?;
-                        println!("{}", serde_json::to_string_pretty(&body)?);
-                    } else {
-                        println!();
-                    }
-                    return Ok(ExitCode::Success);
-                }
-                Err(e) => return Err(e),
+        let history = vec![ChatMessage {
+            role: "user".to_string(),
+            content: one_shot_input,
+            reasoning_content: None,
+            attachments: one_shot_attachments,
+        }];
+        let mut format = detect_initial_chat_format(&key.base_url);
+        self.session_store
+            .record_selection(&key.id, "chat", Some(raw_model))
+            .await?;
+
+        let (spinning, spinner_handle) = style::start_spinner(None);
+        let mut current_section: Option<&'static str> = None;
+        let mut on_chunk = |chunk: ChatResponseChunk| -> Result<()> {
+            if json {
+                return Ok(());
             }
-        }
+            match chunk {
+                ChatResponseChunk::Reasoning(text) => {
+                    if current_section != Some("thinking") {
+                        if current_section.is_some() {
+                            print!("\n\n");
+                        }
+                        println!("Thinking:");
+                        current_section = Some("thinking");
+                    }
+                    print!("{text}");
+                }
+                ChatResponseChunk::Content(text) => {
+                    if current_section == Some("thinking") {
+                        print!("\n\nAnswer:\n");
+                    }
+                    current_section = Some("answer");
+                    print!("{text}");
+                }
+            }
+            io::stdout().flush()?;
+            Ok(())
+        };
 
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            anyhow::bail!(
-                "Interactive chat now uses a full-screen TUI. Run it in a terminal, or use -x/--execute for non-interactive mode."
-            );
-        }
+        let result = tokio::select! {
+            res = send_message_turn(
+                client, &key, copilot_tm.as_deref(), model, &history,
+                &mut format, &spinning, json, &mut on_chunk,
+            ) => res,
+            _ = tokio::signal::ctrl_c() => {
+                style::stop_spinner(&spinning);
+                let _ = spinner_handle.await;
+                eprintln!();
+                return Ok(ExitCode::ToolExit(130));
+            }
+        };
+        style::stop_spinner(&spinning);
+        let _ = spinner_handle.await;
 
+        match result {
+            Ok(turn) => {
+                let prompt_text: String = history.iter().map(|m| m.content.as_str()).collect();
+                let usage = turn.usage_or_estimate(&prompt_text);
+                self.session_store
+                    .record_tokens(
+                        &key.id, Some(raw_model),
+                        usage.prompt_tokens, usage.completion_tokens,
+                        usage.cache_read_input_tokens, usage.cache_creation_input_tokens,
+                    )
+                    .await?;
+                let _ = log_chat_turn(
+                    &self.session_store, &key, raw_model, Some(cwd), None,
+                    &history[0], &turn.content, turn.reasoning_content.as_deref(), &usage,
+                )
+                .await;
+                if json {
+                    let body = turn.raw_body.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "provider did not return a non-streaming body; --json cannot serialize partial streaming output"
+                        )
+                    })?;
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                } else {
+                    println!();
+                }
+                Ok(ExitCode::Success)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+#[allow(clippy::too_many_arguments)]
+    /// Launches the interactive chat TUI.
+    async fn launch_chat_tui(
+        &self,
+        client: reqwest::Client,
+        key: ApiKey,
+        copilot_tm: Option<Arc<CopilotTokenManager>>,
+        cwd: String,
+        raw_model: String,
+        model: String,
+        pending_attachments: Vec<MessageAttachment>,
+    ) -> Result<ExitCode> {
         let initial_session = new_chat_session_id();
         let initial_history = Vec::new();
         let startup_notice = attachment_notice(&pending_attachments);

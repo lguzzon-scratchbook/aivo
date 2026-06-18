@@ -156,7 +156,7 @@ impl RunCommand {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
     async fn execute_internal(
         &self,
         tool: Option<&str>,
@@ -171,49 +171,72 @@ impl RunCommand {
         context_selector: Option<String>,
         as_name: Option<String>,
     ) -> anyhow::Result<ExitCode> {
+        let ai_tool = self.resolve_tool(tool).await?;
+        let client = http_utils::router_http_client();
+        let key_override = self.resolve_run_key(key_override, ai_tool).await?;
+        let tool_str = ai_tool.as_str();
+        let resolved_model = self.resolve_run_model(&client, &key_override, model, explicit_model_flag, refresh, ai_tool).await?;
+
+        if let Some(ref key) = key_override {
+            let _ = self
+                .session_store
+                .set_last_selection(key, tool_str, resolved_model.as_deref())
+                .await;
+        }
+
+        let launch_model = resolve_model_placeholder(resolved_model);
+
+        let args = if let Some(selector) = context_selector {
+            maybe_inject_context(ai_tool, args, &selector).await
+        } else {
+            args
+        };
+
+        let (args, _share_cleanup) = self.setup_mcp_wiring(ai_tool, args, as_name).await;
+
+        self.dispatch_run_launch(ai_tool, args, debug, dry_run, env, launch_model, key_override)
+            .await
+    }
+
+    /// Resolves and validates the AI tool name from the positional argument.
+    async fn resolve_tool(&self, tool: Option<&str>) -> Result<AIToolType> {
         let tool = match tool {
             Some(t) => t,
             None => {
                 Self::print_help();
-                return Ok(ExitCode::UserError);
+                anyhow::bail!(ExitCode::UserError);
             }
         };
 
-        // Handle help flags
         if tool == "--help" || tool == "-h" {
             Self::print_help();
-            return Ok(ExitCode::Success);
+            anyhow::bail!(ExitCode::Success);
         }
 
-        // Validate tool
-        let ai_tool = match AIToolType::parse(tool) {
-            Some(t) => t,
+        match AIToolType::parse(tool) {
+            Some(t) => Ok(t),
             None => {
                 eprintln!("{} Unknown AI tool '{}'", style::red("Error:"), tool);
                 eprintln!();
                 eprintln!("Available tools:");
-                eprintln!(
-                    "  {}    {}",
-                    style::cyan("claude"),
-                    style::dim("Claude Code")
-                );
+                eprintln!("  {}    {}", style::cyan("claude"), style::dim("Claude Code"));
                 eprintln!("  {}     {}", style::cyan("codex"), style::dim("Codex"));
                 eprintln!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
                 eprintln!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
                 eprintln!("  {}        {}", style::cyan("pi"), style::dim("Pi"));
                 eprintln!();
-                eprintln!(
-                    "{}",
-                    style::dim("Usage: aivo run <tool> [options] [args...]")
-                );
-                return Ok(ExitCode::UserError);
+                eprintln!("{}", style::dim("Usage: aivo run <tool> [options] [args...]"));
+                anyhow::bail!(ExitCode::UserError);
             }
-        };
+        }
+    }
 
-        // OAuth keys carry serialized tokens only the matching native CLI can
-        // consume (shadow CODEX_HOME, CLAUDE_CODE_OAUTH_TOKEN, shadow
-        // GEMINI_CLI_HOME); every other tool would see an unusable JSON blob.
-        let mut key_override = key_override;
+    /// Swaps OAuth-incompatible keys when the tool cannot use them.
+    async fn resolve_run_key(
+        &self,
+        mut key_override: Option<ApiKey>,
+        ai_tool: AIToolType,
+    ) -> Result<Option<ApiKey>> {
         if let Some(ref key) = key_override
             && ai_tool.oauth_incompat_reason(key).is_some()
         {
@@ -227,120 +250,105 @@ impl RunCommand {
             .await?
             {
                 Some(new_key) => key_override = Some(new_key),
-                None => return Ok(ExitCode::UserError),
+                None => anyhow::bail!(ExitCode::UserError),
             }
         }
+        Ok(key_override)
+    }
 
-        let client = http_utils::router_http_client();
-        let resolved_model = if let Some(ref key) = key_override {
+    /// Resolves the model for the run command.
+    async fn resolve_run_model(
+        &self,
+        client: &Client,
+        key_override: &Option<ApiKey>,
+        model: Option<String>,
+        explicit_model_flag: bool,
+        refresh: bool,
+        ai_tool: AIToolType,
+    ) -> Result<Option<String>> {
+        if let Some(key) = &key_override {
             let outcome = self
-                .resolve_model(&client, key, model, explicit_model_flag, refresh, ai_tool)
+                .resolve_model(client, key, model, explicit_model_flag, refresh, ai_tool)
                 .await?;
-            match outcome {
-                ModelOutcome::Cancelled => return Ok(ExitCode::Success),
+            Ok(match outcome {
+                ModelOutcome::Cancelled => anyhow::bail!(ExitCode::Success),
                 ModelOutcome::Model(m) => Some(m),
                 ModelOutcome::UseDefault => None,
-            }
+            })
         } else {
-            // key_override is always resolved in main.rs before reaching here; this
-            // branch is unreachable in normal operation. Bail defensively rather than
-            // silently discarding the picker trigger.
             anyhow::bail!("Internal error: no active key available for model resolution");
-        };
-
-        if let Some(ref key) = key_override {
-            let _ = self
-                .session_store
-                .set_last_selection(key, tool, resolved_model.as_deref())
-                .await;
         }
+    }
 
-        let launch_model = resolve_model_placeholder(resolved_model);
+    /// Sets up MCP wiring: nickname registration and cross-tool share.
+    async fn setup_mcp_wiring(
+        &self,
+        ai_tool: AIToolType,
+        args: Vec<String>,
+        as_name: Option<String>,
+    ) -> (Vec<String>, ShareCleanup) {
+        let cwd = system_env::current_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let registry_root = nickname_registry::registry_dir_for_cwd(&cwd);
 
-        // Optional context injection: inject exactly one past session.
-        let args = if let Some(selector) = context_selector {
-            maybe_inject_context(ai_tool, args, &selector).await
-        } else {
-            args
-        };
-
-        // Cross-tool MCP wiring: always enabled. Each tool gets a nickname
-        // (explicit via `--as reviewer`, or auto-derived from the tool name)
-        // and an aivo MCP server so peers can call list_sessions / get_session.
-        let (args, _share_cleanup) = {
-            let cwd = system_env::current_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            let registry_root = nickname_registry::registry_dir_for_cwd(&cwd);
-
-            // Register: explicit --as name, or auto-name from tool (claude, codex, …)
-            let (nickname, registry_guard) = if let Some(ref root) = registry_root {
-                if let Some(ref explicit) = as_name {
-                    match nickname_registry::register(explicit, ai_tool.as_str(), root).await {
-                        Ok(guard) => (explicit.clone(), Some(guard)),
-                        Err(e) => {
-                            eprintln!(
-                                "  {} --as: {}; launching without nickname.",
-                                style::yellow("!"),
-                                e
-                            );
-                            (explicit.clone(), None)
-                        }
-                    }
-                } else {
-                    match nickname_registry::register_auto(ai_tool.as_str(), root).await {
-                        Ok((name, guard)) => (name, Some(guard)),
-                        Err(_) => (ai_tool.as_str().to_string(), None),
+        let (nickname, registry_guard) = if let Some(ref root) = registry_root {
+            if let Some(ref explicit) = as_name {
+                match nickname_registry::register(explicit, ai_tool.as_str(), root).await {
+                    Ok(guard) => (explicit.clone(), Some(guard)),
+                    Err(e) => {
+                        eprintln!("  {} --as: {}; launching without nickname.", style::yellow("!"), e);
+                        (explicit.clone(), None)
                     }
                 }
             } else {
-                (
-                    as_name
-                        .clone()
-                        .unwrap_or_else(|| ai_tool.as_str().to_string()),
-                    None,
-                )
-            };
-
-            let fallback = args.clone();
-            match maybe_enable_share(ai_tool, args, &cwd, &nickname).await {
-                Ok((new_args, mut cleanup)) => {
-                    if let Some(guard) = registry_guard {
-                        cleanup.set_registry_guard(guard);
-                    }
-                    (new_args, cleanup)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  {} MCP wiring failed: {}; launching without cross-tool context.",
-                        style::yellow("!"),
-                        e
-                    );
-                    (fallback, ShareCleanup::empty())
+                match nickname_registry::register_auto(ai_tool.as_str(), root).await {
+                    Ok((name, guard)) => (name, Some(guard)),
+                    Err(_) => (ai_tool.as_str().to_string(), None),
                 }
             }
+        } else {
+            (
+                as_name.unwrap_or_else(|| ai_tool.as_str().to_string()),
+                None,
+            )
         };
 
-        // Launch the AI tool (with fallback support)
+        let fallback = args.clone();
+        match maybe_enable_share(ai_tool, args, &cwd, &nickname).await {
+            Ok((new_args, mut cleanup)) => {
+                if let Some(guard) = registry_guard {
+                    cleanup.set_registry_guard(guard);
+                }
+                (new_args, cleanup)
+            }
+            Err(e) => {
+                eprintln!("  {} MCP wiring failed: {}; launching without cross-tool context.", style::yellow("!"), e);
+                (fallback, ShareCleanup::empty())
+            }
+        }
+    }
+
+    /// Dispatches the launch, handling fallback vs direct and dry-run.
+#[allow(clippy::too_many_arguments)]
+    async fn dispatch_run_launch(
+        &self,
+        ai_tool: AIToolType,
+        args: Vec<String>,
+        debug: bool,
+        dry_run: bool,
+        env: Option<HashMap<String, String>>,
+        launch_model: Option<String>,
+        key_override: Option<ApiKey>,
+    ) -> Result<ExitCode> {
         let exit_code = if let Some(ref model_str) = launch_model {
-            if self
-                .session_store
-                .is_fallback(model_str)
-                .await
-                .unwrap_or(false)
-            {
+            if self.session_store.is_fallback(model_str).await.unwrap_or(false) {
                 if dry_run {
                     self.fallback_preview(ai_tool, model_str).await?
                 } else {
-                    self.fallback_launch(ai_tool, args, debug, env, model_str, key_override)
-                        .await?
+                    self.fallback_launch(ai_tool, args, debug, env, model_str, key_override).await?
                 }
             } else {
                 let options = LaunchOptions {
-                    tool: ai_tool,
-                    args,
-                    debug,
-                    model: launch_model,
-                    env,
-                    key_override,
+                    tool: ai_tool, args, debug, model: launch_model, env, key_override,
                 };
                 if dry_run {
                     let plan = self.ai_launcher.prepare_launch(&options).await?;
@@ -351,12 +359,7 @@ impl RunCommand {
             }
         } else {
             let options = LaunchOptions {
-                tool: ai_tool,
-                args,
-                debug,
-                model: launch_model,
-                env,
-                key_override,
+                tool: ai_tool, args, debug, model: launch_model, env, key_override,
             };
             if dry_run {
                 let plan = self.ai_launcher.prepare_launch(&options).await?;

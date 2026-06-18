@@ -275,12 +275,9 @@ fn openai_to_anthropic(resp: &Value, model: &str) -> Result<Value> {
     )?)
 }
 
-fn anthropic_to_responses(body: &Value) -> Value {
-    let mut input = Vec::new();
+/// Extract system prompt from Anthropic-format body (string or array of text blocks).
+fn extract_system_prompt(body: &Value) -> String {
     let mut instructions = String::new();
-    let mut fc_counter = 0u64;
-
-    // System prompt → instructions
     if let Some(system) = body.get("system") {
         if let Some(s) = system.as_str() {
             instructions = s.to_string();
@@ -295,6 +292,75 @@ fn anthropic_to_responses(body: &Value) -> Value {
             }
         }
     }
+    instructions
+}
+
+/// Process a message's content array of blocks (text, tool_use, tool_result)
+/// and push the corresponding input items.
+fn process_content_blocks(
+    blocks: &[Value],
+    role: &str,
+    input: &mut Vec<Value>,
+    fc_counter: &mut u64,
+) {
+    let mut user_text = String::new();
+    let mut asst_parts: Vec<Value> = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "text" => {
+                let text = block["text"].as_str().unwrap_or("");
+                if role == "assistant" {
+                    asst_parts.push(json!({"type": "output_text", "text": text}));
+                } else if !text.is_empty() {
+                    if !user_text.is_empty() {
+                        user_text.push('\n');
+                    }
+                    user_text.push_str(text);
+                }
+            }
+            "tool_use" => {
+                if !asst_parts.is_empty() {
+                    input.push(json!({
+                        "type": "message", "role": "assistant",
+                        "content": asst_parts
+                    }));
+                    asst_parts = Vec::new();
+                }
+                *fc_counter += 1;
+                let arguments = serde_json::to_string(&block["input"]).unwrap_or_default();
+                input.push(json!({
+                    "type": "function_call",
+                    "id": format!("fc_{}", fc_counter),
+                    "call_id": block["id"],
+                    "name": block["name"],
+                    "arguments": arguments
+                }));
+            }
+            "tool_result" => {
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": block["tool_use_id"],
+                    "output": extract_tool_result_text(block)
+                }));
+            }
+            _ => {}
+        }
+    }
+    if !user_text.is_empty() {
+        input.push(json!({"type": "message", "role": role, "content": user_text}));
+    }
+    if !asst_parts.is_empty() {
+        input.push(json!({
+            "type": "message", "role": "assistant",
+            "content": asst_parts
+        }));
+    }
+}
+
+fn anthropic_to_responses(body: &Value) -> Value {
+    let mut input = Vec::new();
+    let instructions = extract_system_prompt(body);
+    let mut fc_counter = 0u64;
 
     // Messages → input items
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
@@ -319,58 +385,7 @@ fn anthropic_to_responses(body: &Value) -> Value {
                 continue;
             };
 
-            let mut user_text = String::new();
-            let mut asst_parts: Vec<Value> = Vec::new();
-            for block in blocks {
-                match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                    "text" => {
-                        let text = block["text"].as_str().unwrap_or("");
-                        if role == "assistant" {
-                            asst_parts.push(json!({"type": "output_text", "text": text}));
-                        } else if !text.is_empty() {
-                            if !user_text.is_empty() {
-                                user_text.push('\n');
-                            }
-                            user_text.push_str(text);
-                        }
-                    }
-                    "tool_use" => {
-                        if !asst_parts.is_empty() {
-                            input.push(json!({
-                                "type": "message", "role": "assistant",
-                                "content": asst_parts
-                            }));
-                            asst_parts = Vec::new();
-                        }
-                        fc_counter += 1;
-                        let arguments = serde_json::to_string(&block["input"]).unwrap_or_default();
-                        input.push(json!({
-                            "type": "function_call",
-                            "id": format!("fc_{fc_counter}"),
-                            "call_id": block["id"],
-                            "name": block["name"],
-                            "arguments": arguments
-                        }));
-                    }
-                    "tool_result" => {
-                        input.push(json!({
-                            "type": "function_call_output",
-                            "call_id": block["tool_use_id"],
-                            "output": extract_tool_result_text(block)
-                        }));
-                    }
-                    _ => {}
-                }
-            }
-            if !user_text.is_empty() {
-                input.push(json!({"type": "message", "role": role, "content": user_text}));
-            }
-            if !asst_parts.is_empty() {
-                input.push(json!({
-                    "type": "message", "role": "assistant",
-                    "content": asst_parts
-                }));
-            }
+            process_content_blocks(blocks, role, &mut input, &mut fc_counter);
         }
     }
 

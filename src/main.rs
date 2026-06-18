@@ -832,70 +832,25 @@ fn extract_aivo_flags(
     let mut i = 0;
     while i < passthrough_args.len() {
         let arg = &passthrough_args[i];
-        if let Some(value) = arg.strip_prefix("--model=") {
-            if !value.is_empty() && model.is_none() {
-                model = Some(value.to_string());
-            } else {
-                remaining_args.push(arg.clone());
-            }
-        } else if (arg == "--model" || arg == "-m") && model.is_none() {
-            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
-                model = Some(passthrough_args[i + 1].clone());
-                i += 1;
-            } else {
-                // --model with no value → trigger interactive picker
-                model = Some(String::new());
-            }
-        } else if let Some(value) = arg.strip_prefix("--key=") {
-            if !value.is_empty() && key_flag.is_none() {
-                key_flag = Some(value.to_string());
-            } else {
-                remaining_args.push(arg.clone());
-            }
-        } else if (arg == "--key" || arg == "-k") && key_flag.is_none() {
-            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
-                key_flag = Some(passthrough_args[i + 1].clone());
-                i += 1;
-            } else {
-                key_flag = Some(String::new());
-            }
-        } else if arg == "--debug" {
-            debug = true;
-        } else if arg == "--dry-run" {
-            dry_run = true;
-        } else if arg == "--refresh" || arg == "-r" {
-            refresh = true;
-        } else if arg == "--as" && i + 1 < passthrough_args.len() {
-            as_name = Some(passthrough_args[i + 1].clone());
+        if let Some(consumed) = try_extract_model(arg, &mut model, passthrough_args, i) {
+            i += consumed;
+        } else if let Some(consumed) = try_extract_key(arg, &mut key_flag, passthrough_args, i) {
+            i += consumed;
+        } else if arg == "--debug" || arg == "--dry-run" || arg == "--refresh" || arg == "-r" {
+            if arg == "--debug" { debug = true; }
+            else if arg == "--dry-run" { dry_run = true; }
+            else { refresh = true; }
             i += 1;
-        } else if let Some(value) = arg.strip_prefix("--as=") {
-            if !value.is_empty() {
-                as_name = Some(value.to_string());
-            }
-        } else if let Some(value) = arg
-            .strip_prefix("--context=")
-            .or_else(|| arg.strip_prefix("-c="))
-        {
-            if context.is_none() {
-                context = Some(value.to_string());
-            }
-        } else if (arg == "--context" || arg == "-c") && context.is_none() {
-            // Bare flag (no value): open the interactive picker.
-            context = Some(String::new());
-        } else if let Some(value) = arg
-            .strip_prefix("--env=")
-            .or_else(|| arg.strip_prefix("-e="))
-        {
-            if !value.is_empty() {
-                env_strings.push(value.to_string());
-            }
-        } else if (arg == "--env" || arg == "-e") && i + 1 < passthrough_args.len() {
-            env_strings.push(passthrough_args[i + 1].clone());
-            i += 1;
+        } else if let Some(consumed) = try_extract_as_flag(arg, &mut as_name, passthrough_args, i) {
+            i += consumed;
+        } else if let Some(consumed) = try_extract_context_flag(arg, &mut context, passthrough_args, i) {
+            i += consumed;
+        } else if let Some(consumed) = try_extract_env_flag(arg, &mut env_strings, passthrough_args, i) {
+            i += consumed;
         } else {
             remaining_args.push(arg.clone());
+            i += 1;
         }
-        i += 1;
     }
 
     ExtractedFlags {
@@ -910,6 +865,90 @@ fn extract_aivo_flags(
         context,
     }
 }
+
+/// Try to extract --model=VAL or --model VAL / -m VAL. Returns number of args consumed (0 or 2).
+fn try_extract_model(arg: &str, model: &mut Option<String>, args: &[String], i: usize) -> Option<usize> {
+    if let Some(value) = arg.strip_prefix("--model=") {
+        if !value.is_empty() && model.is_none() {
+            *model = Some(value.to_string());
+        }
+        return Some(1);
+    }
+    if (arg == "--model" || arg == "-m") && model.is_none() {
+        if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+            *model = Some(args[i + 1].clone());
+            return Some(2);
+        }
+        *model = Some(String::new());
+        return Some(1);
+    }
+    None
+}
+
+/// Try to extract --key=VAL or --key VAL / -k VAL.
+fn try_extract_key(arg: &str, key_flag: &mut Option<String>, args: &[String], i: usize) -> Option<usize> {
+    if let Some(value) = arg.strip_prefix("--key=") {
+        if !value.is_empty() && key_flag.is_none() {
+            *key_flag = Some(value.to_string());
+        }
+        return Some(1);
+    }
+    if (arg == "--key" || arg == "-k") && key_flag.is_none() {
+        if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+            *key_flag = Some(args[i + 1].clone());
+            return Some(2);
+        }
+        *key_flag = Some(String::new());
+        return Some(1);
+    }
+    None
+}
+
+
+/// Try to extract --as=VAL or --as VAL.
+fn try_extract_as_flag(arg: &str, as_name: &mut Option<String>, args: &[String], i: usize) -> Option<usize> {
+    if arg == "--as" && as_name.is_none() && i + 1 < args.len() {
+        *as_name = Some(args[i + 1].clone());
+        return Some(2);
+    }
+    if let Some(value) = arg.strip_prefix("--as=") {
+        if !value.is_empty() && as_name.is_none() {
+            *as_name = Some(value.to_string());
+        }
+        return Some(1);
+    }
+    None
+}
+
+/// Try to extract --context=VAL, -c=VAL, --context, -c.
+fn try_extract_context_flag(arg: &str, context: &mut Option<String>, _args: &[String], _i: usize) -> Option<usize> {
+    if let Some(value) = arg.strip_prefix("--context=").or_else(|| arg.strip_prefix("-c=")) {
+        if context.is_none() {
+            *context = Some(value.to_string());
+        }
+        return Some(1);
+    }
+    if (arg == "--context" || arg == "-c") && context.is_none() {
+        *context = Some(String::new());
+        return Some(1);
+    }
+    None
+}
+
+/// Try to extract --env=VAL, -e=VAL, --env VAL, -e VAL.
+fn try_extract_env_flag(arg: &str, env_strings: &mut Vec<String>, args: &[String], i: usize) -> Option<usize> {
+    if let Some(value) = arg.strip_prefix("--env=").or_else(|| arg.strip_prefix("-e=")) {
+        if !value.is_empty() {
+            env_strings.push(value.to_string());
+        }
+        return Some(1);
+    }
+    if (arg == "--env" || arg == "-e") && i + 1 < args.len() {
+        env_strings.push(args[i + 1].clone());
+        return Some(2);
+    }
+    None
+ }
 
 #[cfg(test)]
 mod tests {

@@ -13,11 +13,11 @@ use crate::commands::models::fetch_models;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
+use crate::services::request_log::RequestLogger;
 use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch,
 };
-use crate::services::request_log::RequestLogger;
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, convert_chat_response_to_responses_sse,
     convert_responses_to_chat_request,
@@ -25,6 +25,9 @@ use crate::services::responses_to_chat_router::{
 use crate::services::serve_responses::{
     OpenAIToResponsesStreamConverter, convert_chat_response_to_responses_json,
     convert_chat_sse_to_responses_sse,
+};
+use crate::services::serve_stream_converters::{
+    AnthropicToOpenAIStreamConverter, GeminiToOpenAIStreamConverter,
 };
 use crate::services::serve_upstream::{
     RouterResponse, StreamingBody, UpstreamRequestContext, send_anthropic_chat, send_gemini_chat,
@@ -840,114 +843,182 @@ async fn write_router_response(
                 extra_headers,
             );
             socket.write_all(headers.as_bytes()).await?;
-
-            match *body {
-                StreamingBody::Upstream(mut upstream) => {
-                    while let Some(chunk) = upstream.chunk().await? {
-                        write_chunk(socket, &chunk).await?;
-                    }
-                }
-                StreamingBody::Anthropic {
-                    mut upstream,
-                    mut converter,
-                } => {
-                    while let Some(chunk) = upstream.chunk().await? {
-                        let mapped = converter.push_bytes(&chunk)?;
-                        if !mapped.is_empty() {
-                            write_chunk(socket, mapped.as_bytes()).await?;
-                        }
-                    }
-                    let tail = converter.finish()?;
-                    if !tail.is_empty() {
-                        write_chunk(socket, tail.as_bytes()).await?;
-                    }
-                }
-                StreamingBody::Gemini {
-                    mut upstream,
-                    mut converter,
-                } => {
-                    while let Some(chunk) = upstream.chunk().await? {
-                        let mapped = converter.push_bytes(&chunk)?;
-                        if !mapped.is_empty() {
-                            write_chunk(socket, mapped.as_bytes()).await?;
-                        }
-                    }
-                    let tail = converter.finish()?;
-                    if !tail.is_empty() {
-                        write_chunk(socket, tail.as_bytes()).await?;
-                    }
-                }
-                StreamingBody::Responses {
-                    source,
-                    mut converter,
-                } => {
-                    match *source {
-                        StreamingBody::Upstream(mut upstream) => {
-                            while let Some(chunk) = upstream.chunk().await? {
-                                let mapped = converter.push_bytes(&chunk)?;
-                                if !mapped.is_empty() {
-                                    write_chunk(socket, mapped.as_bytes()).await?;
-                                }
-                            }
-                        }
-                        StreamingBody::Anthropic {
-                            mut upstream,
-                            converter: mut openai_converter,
-                        } => {
-                            while let Some(chunk) = upstream.chunk().await? {
-                                let openai = openai_converter.push_bytes(&chunk)?;
-                                if !openai.is_empty() {
-                                    let mapped = converter.push_bytes(openai.as_bytes())?;
-                                    if !mapped.is_empty() {
-                                        write_chunk(socket, mapped.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            let openai_tail = openai_converter.finish()?;
-                            if !openai_tail.is_empty() {
-                                let mapped = converter.push_bytes(openai_tail.as_bytes())?;
-                                if !mapped.is_empty() {
-                                    write_chunk(socket, mapped.as_bytes()).await?;
-                                }
-                            }
-                        }
-                        StreamingBody::Gemini {
-                            mut upstream,
-                            converter: mut openai_converter,
-                        } => {
-                            while let Some(chunk) = upstream.chunk().await? {
-                                let openai = openai_converter.push_bytes(&chunk)?;
-                                if !openai.is_empty() {
-                                    let mapped = converter.push_bytes(openai.as_bytes())?;
-                                    if !mapped.is_empty() {
-                                        write_chunk(socket, mapped.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            let openai_tail = openai_converter.finish()?;
-                            if !openai_tail.is_empty() {
-                                let mapped = converter.push_bytes(openai_tail.as_bytes())?;
-                                if !mapped.is_empty() {
-                                    write_chunk(socket, mapped.as_bytes()).await?;
-                                }
-                            }
-                        }
-                        StreamingBody::Responses { .. } => {
-                            anyhow::bail!("nested responses stream sources are not supported");
-                        }
-                    }
-
-                    let tail = converter.finish()?;
-                    if !tail.is_empty() {
-                        write_chunk(socket, tail.as_bytes()).await?;
-                    }
-                }
-            }
-
+            write_streaming_body(socket, *body).await?;
             socket.write_all(b"0\r\n\r\n").await?;
         }
     }
 
+    Ok(())
+}
+
+async fn write_streaming_body(
+    socket: &mut tokio::net::TcpStream,
+    body: StreamingBody,
+) -> Result<()> {
+    match body {
+        StreamingBody::Upstream(upstream) => write_raw_upstream(socket, upstream).await,
+        StreamingBody::Anthropic {
+            upstream,
+            converter,
+        } => write_anthropic_stream(socket, upstream, converter).await,
+        StreamingBody::Gemini {
+            upstream,
+            converter,
+        } => write_gemini_stream(socket, upstream, converter).await,
+        StreamingBody::Responses {
+            source,
+            converter,
+        } => write_responses_stream(socket, *source, converter).await,
+    }
+}
+
+async fn write_raw_upstream(
+    socket: &mut tokio::net::TcpStream,
+    mut upstream: reqwest::Response,
+) -> Result<()> {
+    while let Some(chunk) = upstream.chunk().await? {
+        write_chunk(socket, &chunk).await?;
+    }
+    Ok(())
+}
+
+async fn write_anthropic_stream(
+    socket: &mut tokio::net::TcpStream,
+    mut upstream: reqwest::Response,
+    mut converter: AnthropicToOpenAIStreamConverter,
+) -> Result<()> {
+    while let Some(chunk) = upstream.chunk().await? {
+        let mapped = converter.push_bytes(&chunk)?;
+        if !mapped.is_empty() {
+            write_chunk(socket, mapped.as_bytes()).await?;
+        }
+    }
+    let tail = converter.finish()?;
+    if !tail.is_empty() {
+        write_chunk(socket, tail.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+async fn write_gemini_stream(
+    socket: &mut tokio::net::TcpStream,
+    mut upstream: reqwest::Response,
+    mut converter: GeminiToOpenAIStreamConverter,
+) -> Result<()> {
+    while let Some(chunk) = upstream.chunk().await? {
+        let mapped = converter.push_bytes(&chunk)?;
+        if !mapped.is_empty() {
+            write_chunk(socket, mapped.as_bytes()).await?;
+        }
+    }
+    let tail = converter.finish()?;
+    if !tail.is_empty() {
+        write_chunk(socket, tail.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// Writes a Responses-format stream whose source is another StreamingBody.
+/// The source may be a raw upstream (single conversion) or an Anthropic/Gemini
+/// stream (double conversion: inner → OpenAI chat → Responses SSE).
+async fn write_responses_stream(
+    socket: &mut tokio::net::TcpStream,
+    source: StreamingBody,
+    mut converter: OpenAIToResponsesStreamConverter,
+) -> Result<()> {
+    match source {
+        StreamingBody::Upstream(upstream) => {
+            write_converted_stream(socket, upstream, &mut converter).await?;
+        }
+        StreamingBody::Anthropic {
+            upstream,
+            converter: inner,
+        } => {
+            write_double_converted(socket, upstream, inner, &mut converter).await?;
+        }
+        StreamingBody::Gemini {
+            upstream,
+            converter: inner,
+        } => {
+            write_gemini_double_converted(socket, upstream, inner, &mut converter).await?;
+        }
+        StreamingBody::Responses { .. } => {
+            anyhow::bail!("nested responses stream sources are not supported");
+        }
+    }
+
+    let tail = converter.finish()?;
+    if !tail.is_empty() {
+        write_chunk(socket, tail.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// Passes upstream chunks through a single converter, writing to the socket.
+async fn write_converted_stream(
+    socket: &mut tokio::net::TcpStream,
+    mut upstream: reqwest::Response,
+    converter: &mut OpenAIToResponsesStreamConverter,
+) -> Result<()> {
+    while let Some(chunk) = upstream.chunk().await? {
+        let mapped = converter.push_bytes(&chunk)?;
+        if !mapped.is_empty() {
+            write_chunk(socket, mapped.as_bytes()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Passes upstream chunks through an inner converter (Anthropic/Gemini → OpenAI
+/// chat), then through an outer Responses converter, writing the result.
+async fn write_double_converted(
+    socket: &mut tokio::net::TcpStream,
+    mut upstream: reqwest::Response,
+    mut inner_converter: AnthropicToOpenAIStreamConverter,
+    outer_converter: &mut OpenAIToResponsesStreamConverter,
+) -> Result<()> {
+    while let Some(chunk) = upstream.chunk().await? {
+        let openai = inner_converter.push_bytes(&chunk)?;
+        if !openai.is_empty() {
+            let mapped = outer_converter.push_bytes(openai.as_bytes())?;
+            if !mapped.is_empty() {
+                write_chunk(socket, mapped.as_bytes()).await?;
+            }
+        }
+    }
+    let openai_tail = inner_converter.finish()?;
+    if !openai_tail.is_empty() {
+        let mapped = outer_converter.push_bytes(openai_tail.as_bytes())?;
+        if !mapped.is_empty() {
+            write_chunk(socket, mapped.as_bytes()).await?;
+        }
+    }
+    Ok(())
+ }
+/// Passes Gemini upstream chunks through an inner converter (Gemini → OpenAI
+/// chat), then through an outer Responses converter, writing the result.
+async fn write_gemini_double_converted(
+    socket: &mut tokio::net::TcpStream,
+    mut upstream: reqwest::Response,
+    mut inner_converter: GeminiToOpenAIStreamConverter,
+    outer_converter: &mut OpenAIToResponsesStreamConverter,
+) -> Result<()> {
+    while let Some(chunk) = upstream.chunk().await? {
+        let openai = inner_converter.push_bytes(&chunk)?;
+        if !openai.is_empty() {
+            let mapped = outer_converter.push_bytes(openai.as_bytes())?;
+            if !mapped.is_empty() {
+                write_chunk(socket, mapped.as_bytes()).await?;
+            }
+        }
+    }
+    let openai_tail = inner_converter.finish()?;
+    if !openai_tail.is_empty() {
+        let mapped = outer_converter.push_bytes(openai_tail.as_bytes())?;
+        if !mapped.is_empty() {
+            write_chunk(socket, mapped.as_bytes()).await?;
+        }
+    }
     Ok(())
 }
 

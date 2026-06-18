@@ -1632,12 +1632,6 @@ impl KeysCommand {
         provided_name: Option<&str>,
         add_options: AddKeyOptions<'_>,
     ) -> Result<ExitCode> {
-        use std::io;
-
-        fn read_line(prompt: &str) -> io::Result<String> {
-            term_read_line(&style::dim(prompt))
-        }
-
         if provided_name.is_some() && add_options.name.is_some() {
             eprintln!(
                 "{} Specify the key name either positionally or with --name",
@@ -1650,23 +1644,13 @@ impl KeysCommand {
         // in raw mode, which breaks backspace in the first prompt.
         restore_cooked_mode();
         let mut name_was_prompted = false;
-        let name = if let Some(n) = add_options.name.or(provided_name) {
-            n.to_string()
-        } else if add_options.base_url.is_some() && add_options.key.is_some() {
-            String::new()
-        } else {
-            name_was_prompted = true;
-            keys_ui::step_header(1, 3, "Name", "a short label for this key");
-            read_line("Name (optional): ")?
-        };
+        let name = self.resolve_key_name(provided_name, &add_options, &mut name_was_prompted).await?;
 
         let is_starter_name = name == "aivo-starter" || name == "aivo starter";
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_starter_name;
 
         if interactive {
-            // Echo the name when it came from arg/flag so the user sees what
-            // was used before the provider picker takes over.
             if !name_was_prompted && !name.is_empty() {
                 println!("{} {}", style::dim("Name:"), style::cyan(&name));
             }
@@ -1676,219 +1660,21 @@ impl KeysCommand {
         let base_url = if is_starter_name {
             crate::constants::AIVO_STARTER_SENTINEL.to_string()
         } else {
-            let detected_url = detect_base_url(&name);
-            let mut provided_base_url = add_options.base_url.map(str::to_string);
-            loop {
-                let value = if let Some(value) = provided_base_url.take() {
-                    value
-                } else {
-                    let prompt = match detected_url {
-                        Some(default) => format!("Base URL [{}]: ", default),
-                        None => "Base URL: ".to_string(),
-                    };
-                    let input = read_line(&prompt)?;
-                    if input.is_empty() {
-                        detected_url.unwrap_or("").to_string()
-                    } else {
-                        input
-                    }
-                };
-                let picker_hint =
-                    "run 'aivo keys add' (no flags) and pick it from the provider list";
-                let picker_rejections: &[(&str, &str)] = &[
-                    ("copilot", "GitHub Copilot login needs the device flow"),
-                    ("ollama", "Ollama setup needs a local installation check"),
-                    (
-                        crate::services::codex_oauth::CODEX_OAUTH_SENTINEL,
-                        "Codex ChatGPT login needs browser auth",
-                    ),
-                    (
-                        crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL,
-                        "Claude Code login needs browser auth",
-                    ),
-                    (
-                        crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL,
-                        "Gemini login needs browser auth",
-                    ),
-                ];
-                let reject = |msg: String| -> Option<ExitCode> {
-                    eprintln!("{} {msg}", style::red("Error:"));
-                    add_options
-                        .base_url
-                        .is_some()
-                        .then_some(ExitCode::UserError)
-                };
-                if let Some((_, reason)) = picker_rejections.iter().find(|(s, _)| value == *s) {
-                    if let Some(code) = reject(format!("{reason} — {picker_hint}.")) {
-                        return Ok(code);
-                    }
-                    continue;
-                }
-                if value == "aivo-starter" || value == "aivo starter" {
-                    if let Some(code) =
-                        reject("Use 'aivo keys add aivo-starter' instead.".to_string())
-                    {
-                        return Ok(code);
-                    }
-                    continue;
-                }
-                if value.starts_with("http://") || value.starts_with("https://") {
-                    break value;
-                }
-                if let Some(code) = reject("URL must start with http:// or https://".to_string()) {
-                    return Ok(code);
-                }
-            }
+            self.prompt_base_url(&name, add_options).await?
         };
 
-        // GitHub Copilot: use device flow instead of manual key entry
+        // Provider-specific setup
         if base_url == "copilot" {
-            if add_options.key.is_some() {
-                eprintln!(
-                    "{} GitHub Copilot uses device login; run 'aivo keys add' (no flags) and pick GitHub Copilot.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-
-            keys_ui::provider_info(COPILOT_INFO.0, COPILOT_INFO.1);
-
-            // Check for an existing Copilot key and prompt to replace
-            let existing_keys = self.session_store.get_keys().await?;
-            let existing_copilot_id =
-                if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "copilot") {
-                    let answer = read_line(&format!(
-                        "{} Copilot key '{}' (ID: {}) already exists. Replace it? [y/N] ",
-                        style::yellow("Warning:"),
-                        existing.name,
-                        existing.id
-                    ))?;
-                    if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
-                        println!("Aborted.");
-                        return Ok(ExitCode::Success);
-                    }
-                    Some(existing.id.clone())
-                } else {
-                    None
-                };
-
-            let token = crate::services::copilot_auth::device_flow_login().await?;
-
-            // Device flow succeeded — now safe to remove the old key
-            if let Some(old_id) = existing_copilot_id {
-                self.session_store.delete_key(&old_id).await?;
-            }
-
-            let id = self
-                .session_store
-                .add_key_with_protocol(&name, "copilot", None, &token)
-                .await?;
-            self.finalize_add(
-                &id,
-                &name,
-                "Provider: GitHub Copilot",
-                Some(("aivo run claude", "(uses Copilot subscription)")),
-            )
-            .await?;
-
-            sync_models_in_background(&id, &base_url);
-            return Ok(ExitCode::Success);
+            return self.add_copilot_key(&name, &add_options).await;
         }
-
-        // Ollama: verify installation, no API key needed
         if base_url == "ollama" {
-            if add_options.key.is_some() {
-                eprintln!(
-                    "{} Ollama runs locally without authentication. Do not pass --key.",
-                    style::red("Error:")
-                );
-                return Ok(ExitCode::UserError);
-            }
-
-            keys_ui::provider_info(OLLAMA_INFO.0, OLLAMA_INFO.1);
-
-            crate::services::ollama::ensure_ready().await?;
-
-            // Check for an existing Ollama key and prompt to replace
-            let existing_keys = self.session_store.get_keys().await?;
-            let existing_ollama_id =
-                if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "ollama") {
-                    let answer = read_line(&format!(
-                        "{} Ollama key '{}' (ID: {}) already exists. Replace it? [y/N] ",
-                        style::yellow("Warning:"),
-                        existing.name,
-                        existing.id
-                    ))?;
-                    if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
-                        println!("Aborted.");
-                        return Ok(ExitCode::Success);
-                    }
-                    Some(existing.id.clone())
-                } else {
-                    None
-                };
-
-            if let Some(old_id) = existing_ollama_id {
-                self.session_store.delete_key(&old_id).await?;
-            }
-
-            let id = self
-                .session_store
-                .add_key_with_protocol(&name, "ollama", None, "ollama-local")
-                .await?;
-            self.finalize_add(
-                &id,
-                &name,
-                "Provider: Ollama (local)",
-                Some(("aivo models", "(list local models)")),
-            )
-            .await?;
-
-            return Ok(ExitCode::Success);
+            return self.add_ollama_key(&name, &add_options).await;
         }
-
-        // Aivo starter: free provider, no API key needed
         if base_url == crate::constants::AIVO_STARTER_SENTINEL {
-            keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
-
-            if let Some(code) = self.notify_if_starter_already_added().await? {
-                return Ok(code);
-            }
-
-            // Clear the dismissed flag so ensure_starter_key works again
-            let _ = self.session_store.set_starter_key_dismissed(false).await;
-
-            let (starter, _) = self
-                .session_store
-                .ensure_starter_key()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("Failed to create aivo starter key"))?;
-            self.finalize_add(
-                &starter.id,
-                &name,
-                "Provider: aivo starter (free)",
-                Some(("aivo chat", "(start chatting)")),
-            )
-            .await?;
-
-            return Ok(ExitCode::Success);
+            return self.add_starter_key(&name).await;
         }
 
-        let key = if let Some(key) = add_options.key {
-            key.to_string()
-        } else {
-            loop {
-                let input = term_read_secret(&style::dim("API Key: "))?;
-                if !input.is_empty() {
-                    break input;
-                }
-
-                let prompt = style::yellow("Save without an API key?");
-                if confirm(&prompt)? {
-                    break String::new();
-                }
-            }
-        };
+        let key = self.prompt_api_key(add_options).await?;
 
         let id = self
             .session_store
@@ -1904,6 +1690,265 @@ impl KeysCommand {
 
         sync_models_in_background(&id, &base_url);
         Ok(ExitCode::Success)
+    }
+
+    /// Resolves the key name from positional arg, --name flag, or interactive prompt.
+    async fn resolve_key_name(
+        &self,
+        provided_name: Option<&str>,
+        add_options: &AddKeyOptions<'_>,
+        name_was_prompted: &mut bool,
+    ) -> Result<String> {
+        use std::io;
+        fn read_line(prompt: &str) -> io::Result<String> {
+            term_read_line(&style::dim(prompt))
+        }
+
+        Ok(if let Some(n) = add_options.name.or(provided_name) {
+            n.to_string()
+        } else if add_options.base_url.is_some() && add_options.key.is_some() {
+            String::new()
+        } else {
+            *name_was_prompted = true;
+            keys_ui::step_header(1, 3, "Name", "a short label for this key");
+            read_line("Name (optional): ")?
+        })
+    }
+
+    /// Prompts for and validates the base URL, handling picker rejections
+    /// and format validation. Returns the validated base URL.
+    async fn prompt_base_url(
+        &self,
+        name: &str,
+        add_options: AddKeyOptions<'_>,
+    ) -> Result<String> {
+        use std::io;
+        fn read_line(prompt: &str) -> io::Result<String> {
+            term_read_line(&style::dim(prompt))
+        }
+
+        let detected_url = detect_base_url(name);
+        let mut provided_base_url = add_options.base_url.map(str::to_string);
+        loop {
+            let value = if let Some(value) = provided_base_url.take() {
+                value
+            } else {
+                let prompt = match detected_url {
+                    Some(default) => format!("Base URL [{}]: ", default),
+                    None => "Base URL: ".to_string(),
+                };
+                let input = read_line(&prompt)?;
+                if input.is_empty() {
+                    detected_url.unwrap_or("").to_string()
+                } else {
+                    input
+                }
+            };
+
+            let picker_hint =
+                "run 'aivo keys add' (no flags) and pick it from the provider list";
+            let picker_rejections: &[(&str, &str)] = &[
+                ("copilot", "GitHub Copilot login needs the device flow"),
+                ("ollama", "Ollama setup needs a local installation check"),
+                (
+                    crate::services::codex_oauth::CODEX_OAUTH_SENTINEL,
+                    "Codex ChatGPT login needs browser auth",
+                ),
+                (
+                    crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL,
+                    "Claude Code login needs browser auth",
+                ),
+                (
+                    crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL,
+                    "Gemini login needs browser auth",
+                ),
+            ];
+            if let Some((_, reason)) = picker_rejections.iter().find(|(s, _)| value == *s) {
+                eprintln!("{} {reason} — {picker_hint}.", style::red("Error:"));
+                if add_options.base_url.is_some() {
+                    anyhow::bail!(reason);
+                }
+                continue;
+            }
+            if value == "aivo-starter" || value == "aivo starter" {
+                eprintln!("{} Use 'aivo keys add aivo-starter' instead.", style::red("Error:"));
+                if add_options.base_url.is_some() {
+                    anyhow::bail!("interactive providers require using 'aivo keys add' without --base-url");
+                }
+                continue;
+            }
+            if value.starts_with("http://") || value.starts_with("https://") {
+                break Ok(value);
+            }
+            eprintln!("{} URL must start with http:// or https://", style::red("Error:"));
+            if add_options.base_url.is_some() {
+                anyhow::bail!("invalid URL: {}", value);
+            }
+        }
+    }
+
+    /// Adds a Copilot key via device flow.
+    async fn add_copilot_key(
+        &self,
+        name: &str,
+        add_options: &AddKeyOptions<'_>,
+    ) -> Result<ExitCode> {
+        use std::io;
+        fn read_line(prompt: &str) -> io::Result<String> {
+            term_read_line(&style::dim(prompt))
+        }
+
+        if add_options.key.is_some() {
+            eprintln!(
+                "{} GitHub Copilot uses device login; run 'aivo keys add' (no flags) and pick GitHub Copilot.",
+                style::red("Error:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
+        keys_ui::provider_info(COPILOT_INFO.0, COPILOT_INFO.1);
+
+        let existing_keys = self.session_store.get_keys().await?;
+        let existing_copilot_id =
+            if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "copilot") {
+                let answer = read_line(&format!(
+                    "{} Copilot key '{}' (ID: {}) already exists. Replace it? [y/N] ",
+                    style::yellow("Warning:"),
+                    existing.name,
+                    existing.id
+                ))?;
+                if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
+                    println!("Aborted.");
+                    return Ok(ExitCode::Success);
+                }
+                Some(existing.id.clone())
+            } else {
+                None
+            };
+
+        let token = crate::services::copilot_auth::device_flow_login().await?;
+
+        if let Some(old_id) = existing_copilot_id {
+            self.session_store.delete_key(&old_id).await?;
+        }
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(name, "copilot", None, &token)
+            .await?;
+        self.finalize_add(
+            &id,
+            name,
+            "Provider: GitHub Copilot",
+            Some(("aivo run claude", "(uses Copilot subscription)")),
+        )
+        .await?;
+
+        sync_models_in_background(&id, "copilot");
+        Ok(ExitCode::Success)
+    }
+
+    /// Adds an Ollama key (local, no API key needed).
+    async fn add_ollama_key(
+        &self,
+        name: &str,
+        add_options: &AddKeyOptions<'_>,
+    ) -> Result<ExitCode> {
+        use std::io;
+        fn read_line(prompt: &str) -> io::Result<String> {
+            term_read_line(&style::dim(prompt))
+        }
+
+        if add_options.key.is_some() {
+            eprintln!(
+                "{} Ollama runs locally without authentication. Do not pass --key.",
+                style::red("Error:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
+        keys_ui::provider_info(OLLAMA_INFO.0, OLLAMA_INFO.1);
+        crate::services::ollama::ensure_ready().await?;
+
+        let existing_keys = self.session_store.get_keys().await?;
+        let existing_ollama_id =
+            if let Some(existing) = existing_keys.iter().find(|k| k.base_url == "ollama") {
+                let answer = read_line(&format!(
+                    "{} Ollama key '{}' (ID: {}) already exists. Replace it? [y/N] ",
+                    style::yellow("Warning:"),
+                    existing.name,
+                    existing.id
+                ))?;
+                if !matches!(answer.to_lowercase().as_str(), "y" | "yes") {
+                    println!("Aborted.");
+                    return Ok(ExitCode::Success);
+                }
+                Some(existing.id.clone())
+            } else {
+                None
+            };
+
+        if let Some(old_id) = existing_ollama_id {
+            self.session_store.delete_key(&old_id).await?;
+        }
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(name, "ollama", None, "ollama-local")
+            .await?;
+        self.finalize_add(
+            &id,
+            name,
+            "Provider: Ollama (local)",
+            Some(("aivo models", "(list local models)")),
+        )
+        .await?;
+
+        Ok(ExitCode::Success)
+    }
+
+    /// Adds an aivo starter key (free, no API key needed).
+    async fn add_starter_key(&self, name: &str) -> Result<ExitCode> {
+        keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
+
+        if let Some(code) = self.notify_if_starter_already_added().await? {
+            return Ok(code);
+        }
+
+        let _ = self.session_store.set_starter_key_dismissed(false).await;
+
+        let (starter, _) = self
+            .session_store
+            .ensure_starter_key()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Failed to create aivo starter key"))?;
+        self.finalize_add(
+            &starter.id,
+            name,
+            "Provider: aivo starter (free)",
+            Some(("aivo chat", "(start chatting)")),
+        )
+        .await?;
+
+        Ok(ExitCode::Success)
+    }
+
+    /// Prompts for the API key (secret input).
+    async fn prompt_api_key(&self, add_options: AddKeyOptions<'_>) -> Result<String> {
+        if let Some(key) = add_options.key {
+            return Ok(key.to_string());
+        }
+
+        loop {
+            let input = term_read_secret(&style::dim("API Key: "))?;
+            if !input.is_empty() {
+                break Ok(input);
+            }
+            let prompt = style::yellow("Save without an API key?");
+            if confirm(&prompt)? {
+                break Ok(String::new());
+            }
+        }
     }
 
     /// Removes an API key by ID or name
