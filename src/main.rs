@@ -28,6 +28,7 @@ use key_resolution::{
 use services::ai_launcher::AIToolType;
 use services::key_compat::KeyCompatContext;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
+use services::system_env;
 
 /// Known AI tool names that can be used as shortcut aliases for `run`.
 const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
@@ -496,9 +497,22 @@ fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
         return raw_args;
     }
 
-    if TOOL_ALIASES.contains(&raw_args[1].as_str()) {
+    let first = &raw_args[1];
+
+    // Built-in tool aliases: aivo claude → aivo run claude
+    if TOOL_ALIASES.contains(&first.as_str()) {
         let mut rewritten = vec![raw_args[0].clone(), "run".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
+        return rewritten;
+    }
+
+    // Legacy launcher aliases from config: aivo fre → aivo run claude --key ... --model ...
+    if let Some(expansion) = try_expand_launcher_alias(first) {
+        let mut rewritten = vec![raw_args[0].clone(), "run".to_string(), expansion.tool];
+        rewritten.extend(expansion.args);
+        if raw_args.len() > 2 {
+            rewritten.extend_from_slice(&raw_args[2..]);
+        }
         return rewritten;
     }
 
@@ -521,6 +535,33 @@ fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
     }
 
     raw_args
+}
+
+/// Tries to expand a legacy launcher alias from `~/.config/aivo/config.json`.
+/// Legacy aliases are stored as `{"tool": "claude", "args": ["--key", "..."]}`
+/// objects in the `aliases` map (from older @yuanchuan/aivo versions).
+///
+/// Returns the tool name and args if the alias was found and is a launcher type.
+fn try_expand_launcher_alias(name: &str) -> Option<crate::services::alias_store::AliasLauncher> {
+    use crate::services::alias_store::AliasLauncher;
+    use std::path::PathBuf;
+
+    let config_dir = system_env::home_dir()
+        .map(|p| p.join(".config").join("aivo"))
+        .unwrap_or_else(|| PathBuf::from(".config/aivo"));
+    let config_path = config_dir.join("config.json");
+
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let aliases = parsed.get("aliases")?.as_object()?;
+    let entry = aliases.get(name)?;
+
+    // Only expand object-typed aliases (launcher type), not simple string aliases
+    if !entry.is_object() {
+        return None;
+    }
+
+    serde_json::from_value::<AliasLauncher>(entry.clone()).ok()
 }
 
 /// Prints help information

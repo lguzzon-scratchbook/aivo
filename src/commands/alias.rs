@@ -53,20 +53,35 @@ impl AliasCommand {
     }
 
     async fn list_aliases(&self, json: bool) -> Result<ExitCode> {
-        let aliases = self.alias_store.get_aliases().await?;
+        let simple = self.alias_store.get_aliases().await?;
+        let launchers = self.alias_store.get_alias_launchers().await?;
 
         if json {
-            let mut entries: Vec<_> = aliases.into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            let payload: serde_json::Map<String, serde_json::Value> = entries
-                .into_iter()
-                .map(|(name, model)| (name, serde_json::Value::String(model)))
+            let mut payload = serde_json::Map::new();
+            let mut sorted_names: Vec<&str> = simple
+                .keys()
+                .chain(launchers.keys())
+                .map(|s| s.as_str())
                 .collect();
+            sorted_names.sort();
+            sorted_names.dedup();
+            for name in sorted_names {
+                if let Some(model) = simple.get(name) {
+                    payload.insert(name.to_string(), serde_json::Value::String(model.clone()));
+                } else if let Some(launcher) = launchers.get(name) {
+                    payload.insert(
+                        name.to_string(),
+                        serde_json::to_value(launcher).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(ExitCode::Success);
         }
 
-        if aliases.is_empty() {
+        let display_entries = self.alias_store.get_all_display_entries().await?;
+
+        if display_entries.is_empty() {
             println!("{}", style::dim("No aliases defined."));
             println!();
             println!(
@@ -76,16 +91,17 @@ impl AliasCommand {
             return Ok(ExitCode::Success);
         }
 
-        let mut entries: Vec<_> = aliases.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let max_name = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-        for (name, model) in &entries {
+        let max_name = display_entries
+            .iter()
+            .map(|(n, _)| n.len())
+            .max()
+            .unwrap_or(0);
+        for (name, value) in &display_entries {
             println!(
                 "{:width$} {} {}",
                 style::cyan(name),
                 style::dim("->"),
-                model,
+                value,
                 width = max_name
             );
         }
