@@ -34,5 +34,6 @@ graphify-out/
 .dolt/
 *.db
 .beads-credential-key
-.beads/proxieddb/
+.beads/
 .agents/
+.env
