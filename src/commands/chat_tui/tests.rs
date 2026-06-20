@@ -6226,6 +6226,11 @@ fn test_prepare_submit_action_bare_bang_errors() {
     assert!(app.prepare_submit_action().is_err());
 }
 
+// Unix-only: drives the `!cmd` PTY with POSIX commands (`printf`) that the
+// Windows shell (PowerShell) doesn't provide, and a PTY read that blocks until
+// the child exits would stall the tokio runtime drop on Windows. The `!cmd`
+// feature itself is cross-platform; only this Unix-command assertion is gated.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_run_local_command_is_display_only() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6250,6 +6255,9 @@ async fn test_run_local_command_is_display_only() {
     assert_eq!(sent_to_model, 0);
 }
 
+// Unix-only: see `test_run_local_command_is_display_only` — POSIX `printf`
+// through the PTY isn't portable to the Windows shell.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_local_command_streams_then_commits() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6290,6 +6298,9 @@ async fn test_local_command_neutralizes_pager() {
     );
 }
 
+// Unix-only: `yes` (the infinite-flood command this caps) has no PowerShell
+// equivalent, and the PTY drive is Unix-oriented like the sibling tests above.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_local_command_caps_huge_output() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
