@@ -21,9 +21,6 @@ const DOWNLOAD_BASE: &str = "https://getaivo.dev/dl";
 /// the trust anchor: a compromised download host can't forge an update without
 /// it. Authenticity check; the SHA-256 stays as a corruption check.
 const MINISIGN_PUBKEY: &str = "RWTXF3LNcIUx6667XJo3zslNJQPdcNqMagE/Qp7AQUZTQ2BoghNzgwd7";
-const NPM_UPDATE_COMMAND: &str = "npm install -g @yuanchuan/aivo@latest";
-#[cfg(not(windows))]
-const NPM_UPDATE_ARGS: [&str; 3] = ["install", "-g", "@yuanchuan/aivo@latest"];
 
 pub struct UpdateCommand {
     client: Client,
@@ -43,7 +40,7 @@ impl UpdateCommand {
         );
         println!(
             "{}",
-            style::dim("Delegates to Homebrew or npm when installed via those package managers.")
+            style::dim("Delegates to Homebrew when installed that way.")
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -107,9 +104,6 @@ impl UpdateCommand {
                 match manager.kind {
                     PackageManager::Homebrew => {
                         return Ok(self.update_via_homebrew());
-                    }
-                    PackageManager::Npm => {
-                        return self.update_via_npm(&manager);
                     }
                     PackageManager::Cargo => {
                         eprintln!(
@@ -562,52 +556,6 @@ impl UpdateCommand {
             }
         }
     }
-
-    fn update_via_npm(&self, manager: &ManagedInstall) -> Result<ExitCode> {
-        #[cfg(windows)]
-        {
-            eprintln!(
-                "{} Windows npm installs are updated by the npm shim, not by aivo.exe directly.",
-                style::yellow("Warning:")
-            );
-            eprintln!("  {} {}", style::dim("Run:"), style::green("aivo update"));
-            eprintln!(
-                "  {} {}",
-                style::dim("Or repair with:"),
-                style::green(manager.upgrade_command)
-            );
-            Ok(ExitCode::UserError)
-        }
-
-        #[cfg(not(windows))]
-        let npm_path = resolve_command_path("npm").ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not find npm on PATH. Run this command manually: {}",
-                manager.upgrade_command
-            )
-        })?;
-
-        #[cfg(not(windows))]
-        {
-            println!("{} Updating via npm...", style::arrow_symbol());
-            println!(
-                "  {} {}",
-                style::dim("Running:"),
-                style::green(manager.upgrade_command)
-            );
-
-            let status = Command::new(&npm_path)
-                .args(NPM_UPDATE_ARGS)
-                .status()
-                .with_context(|| format!("Failed to launch npm at {}", npm_path.display()))?;
-
-            Ok(if status.success() {
-                ExitCode::Success
-            } else {
-                ExitCode::UserError
-            })
-        }
-    }
 }
 
 /// Verifies `data` against a detached minisign `signature` using `pubkey_b64`
@@ -837,7 +785,6 @@ fn normalize_install_path(path: &Path) -> String {
 enum PackageManager {
     Homebrew,
     Cargo,
-    Npm,
 }
 
 /// Information about a detected package manager
@@ -847,8 +794,10 @@ struct ManagedInstall {
     upgrade_command: &'static str,
 }
 
-/// Detects whether the binary is managed by a package manager based on its path.
-/// Returns None if the binary appears to be a direct download or AIVO_PATH is set.
+/// Detects whether the binary is managed by a package manager that should update
+/// itself (Homebrew, Cargo), based on its path. Returns None for a direct download,
+/// an npm install (which self-updates natively — `npm install -g` can't replace the
+/// in-use global binary on Windows), or when AIVO_PATH is set.
 fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
     // If AIVO_PATH is explicitly set, user opted into this path — skip detection
     if env::var("AIVO_PATH").is_ok() {
@@ -857,13 +806,12 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
 
     let path_str = normalize_install_path(install_path);
 
-    // npm: .../node_modules/@yuanchuan/aivo/...
+    // An npm install self-updates natively, so it's not a "managed" install. This
+    // must come before the Homebrew check: an npm global install under Homebrew's
+    // node prefix (e.g. /opt/homebrew/lib/node_modules/@yuanchuan/aivo/...) matches
+    // the `/homebrew/` substring below and would otherwise misroute to `brew upgrade`.
     if path_str.contains("/node_modules/") {
-        return Some(ManagedInstall {
-            kind: PackageManager::Npm,
-            name: "npm",
-            upgrade_command: NPM_UPDATE_COMMAND,
-        });
+        return None;
     }
 
     // Homebrew: /opt/homebrew/Cellar/..., /usr/local/Cellar/..., /home/linuxbrew/.linuxbrew/Cellar/...
@@ -1008,14 +956,13 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
         );
     }
 
+    // npm installs self-update natively (not via `npm install -g`, which can't
+    // replace the in-use global binary on Windows), so npm is NOT a managed install:
+    // detection returns None and `update` takes the native download path.
     #[test]
     fn test_detect_npm_global() {
         let path = Path::new("/opt/homebrew/lib/node_modules/@yuanchuan/aivo/native/aivo");
-        let result = detect_managed_install(path);
-        assert!(result.is_some());
-        let m = result.unwrap();
-        assert_eq!(m.name, "npm");
-        assert_eq!(m.upgrade_command, NPM_UPDATE_COMMAND);
+        assert!(detect_managed_install(path).is_none());
     }
 
     #[test]
@@ -1023,9 +970,7 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
         let path = Path::new(
             "/Users/user/.nvm/versions/node/v22.0.0/lib/node_modules/@yuanchuan/aivo/native/aivo",
         );
-        let result = detect_managed_install(path);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "npm");
+        assert!(detect_managed_install(path).is_none());
     }
 
     #[test]
@@ -1033,11 +978,7 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
         let path = Path::new(
             r"C:\Users\user\AppData\Roaming\npm\node_modules\@yuanchuan\aivo\native\aivo.exe",
         );
-        let result = detect_managed_install(path);
-        assert!(result.is_some());
-        let m = result.unwrap();
-        assert_eq!(m.name, "npm");
-        assert_eq!(m.upgrade_command, NPM_UPDATE_COMMAND);
+        assert!(detect_managed_install(path).is_none());
     }
 
     #[test]
