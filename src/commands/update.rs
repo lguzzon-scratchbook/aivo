@@ -835,6 +835,66 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
     None
 }
 
+/// The clean npm launcher shim (`bin/aivo.js`), embedded at build time so the
+/// native binary can repair a stale one in place. Kept byte-identical to the
+/// shipped file via `include_str!`. The clean shim just execs this binary for
+/// every subcommand — no npm.
+#[cfg(any(windows, test))]
+const CLEAN_NPM_SHIM: &str = include_str!("../../npm/bin/aivo.js");
+
+/// True if `content` is a pre-0.31.1 npm shim that hijacks `aivo update` into
+/// `npm install -g` on Windows. That shim pulls in `lib/update`'s
+/// `shouldDelegateWindowsNpmUpdate`; the clean shim has no such marker.
+#[cfg(any(windows, test))]
+fn shim_is_stale(content: &str) -> bool {
+    content.contains("shouldDelegateWindowsNpmUpdate")
+}
+
+/// Heal a pre-0.31.1 npm launcher shim that intercepts `aivo update` and runs
+/// `npm install -g` (Windows only). The old `bin/aivo.js` can't replace itself —
+/// npm can't overwrite the in-use file — and bare `aivo update` never reaches
+/// this binary, so it loops through npm forever. But every OTHER command
+/// (`aivo update --force`, `aivo --version`, `aivo chat`, …) DOES run this
+/// binary, so we rewrite the stale shim to the clean one from here. Best-effort
+/// and silent: any failure just leaves `aivo update --force` as the escape hatch.
+#[cfg(windows)]
+pub(crate) fn repair_npm_shim() {
+    if let Ok(exe) = env::current_exe() {
+        repair_npm_shim_at(&exe);
+    }
+}
+
+/// Testable core of [`repair_npm_shim`]: given the running binary's path, rewrite
+/// a stale sibling `bin/aivo.js` to the clean shim. Split out so it can be tested
+/// against a fake package layout without depending on `current_exe()`.
+#[cfg(any(windows, test))]
+fn repair_npm_shim_at(exe: &Path) {
+    // Only touch an actual npm install of our package.
+    if !normalize_install_path(exe).contains("/node_modules/") {
+        return;
+    }
+    // Package layout: `<pkg>/native/aivo.exe` alongside `<pkg>/bin/aivo.js`.
+    let Some(shim) = exe
+        .parent()
+        .and_then(|native_dir| native_dir.parent())
+        .map(|pkg_root| pkg_root.join("bin").join("aivo.js"))
+    else {
+        return;
+    };
+    let Ok(current) = std::fs::read_to_string(&shim) else {
+        return;
+    };
+    if !shim_is_stale(&current) {
+        return;
+    }
+    // Write a sibling temp then rename over the shim, so a crash mid-write can't
+    // leave a truncated `aivo.js` that fails to launch.
+    let tmp = shim.with_file_name(format!("aivo.js.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, CLEAN_NPM_SHIM).is_ok() && std::fs::rename(&tmp, &shim).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,6 +1098,75 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
         let path = Path::new("/usr/local/bin/aivo");
         let result = detect_managed_install(path);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn clean_npm_shim_is_not_stale() {
+        // The embedded clean shim must never trip the staleness check, or repair
+        // would rewrite it on every startup.
+        assert!(!shim_is_stale(CLEAN_NPM_SHIM));
+        // Sanity: it really is the exec-native shim.
+        assert!(CLEAN_NPM_SHIM.contains("getInstalledBinaryPath"));
+    }
+
+    #[test]
+    fn old_intercepting_shim_is_stale() {
+        let old = r#"const { shouldDelegateWindowsNpmUpdate } = require("../lib/update");"#;
+        assert!(shim_is_stale(old));
+        // A clean shim body (no npm-delegation marker) is left alone.
+        assert!(!shim_is_stale(
+            r#"const { getInstalledBinaryPath } = require("../lib/paths");"#
+        ));
+    }
+
+    #[test]
+    fn repair_rewrites_only_a_stale_npm_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fake npm layout: <pkg>/native/aivo.exe alongside <pkg>/bin/aivo.js.
+        let pkg = dir.path().join("node_modules/@yuanchuan/aivo");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::create_dir_all(pkg.join("native")).unwrap();
+        let shim = pkg.join("bin").join("aivo.js");
+        let exe = pkg.join("native").join("aivo.exe");
+        std::fs::write(&exe, b"binary").unwrap();
+
+        // A pre-0.31.1 intercepting shim is rewritten to the clean one.
+        std::fs::write(
+            &shim,
+            "require(\"../lib/update\").shouldDelegateWindowsNpmUpdate();",
+        )
+        .unwrap();
+        repair_npm_shim_at(&exe);
+        assert_eq!(std::fs::read_to_string(&shim).unwrap(), CLEAN_NPM_SHIM);
+
+        // Idempotent: a second pass leaves the now-clean shim untouched.
+        repair_npm_shim_at(&exe);
+        assert_eq!(std::fs::read_to_string(&shim).unwrap(), CLEAN_NPM_SHIM);
+
+        // No temp file left behind in bin/.
+        let leftover = std::fs::read_dir(pkg.join("bin"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover, "repair left a temp file behind");
+    }
+
+    #[test]
+    fn repair_ignores_non_npm_install() {
+        let dir = tempfile::tempdir().unwrap();
+        // A direct install (no node_modules in the path).
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::create_dir_all(dir.path().join("native")).unwrap();
+        let shim = dir.path().join("bin").join("aivo.js");
+        let exe = dir.path().join("native").join("aivo");
+        std::fs::write(&exe, b"binary").unwrap();
+        let stale = "shouldDelegateWindowsNpmUpdate marker";
+        std::fs::write(&shim, stale).unwrap();
+
+        repair_npm_shim_at(&exe);
+
+        // Untouched — not an npm install, so not ours to heal.
+        assert_eq!(std::fs::read_to_string(&shim).unwrap(), stale);
     }
 
     #[test]
