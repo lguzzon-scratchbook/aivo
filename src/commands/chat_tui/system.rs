@@ -1,10 +1,14 @@
 use super::*;
 
-use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::ChildKiller;
+#[cfg(unix)]
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::Read;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, io::Write};
 
@@ -111,24 +115,24 @@ const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LINE_CHARS: usize = 2000;
 /// Wall-clock ceiling on a `!cmd` run; on hit the child is killed.
 const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-/// Windows-only grace after the child exits, letting the reader drain trailing
-/// ConPTY output before we close the pseudoconsole (`ClosePseudoConsole` can drop
-/// not-yet-read bytes). Best-effort: output mostly streams live as it's produced,
-/// so this only covers the final buffered chunk.
-#[cfg(windows)]
-const PTY_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// A spawned `!cmd`: the open PTY, a line reader over its (merged stdout+stderr)
 /// output, and the child handle (for `wait`/exit status). The command runs under a
 /// pseudo-terminal so child programs line-buffer and stream live — the way grok's
 /// CLI does it; plain pipes let many programs (`find`, `git`, builds) block-buffer,
 /// so their output wouldn't appear until they exit.
+///
+/// Unix only. Windows uses plain pipes (see [`PipeShell`]) because `portable-pty`'s
+/// ConPTY backend never returns EOF on the output pipe when the child exits — the
+/// blocking read can hang the run indefinitely (`!cmd` never completed on Windows).
+#[cfg(unix)]
 pub(super) struct PtyShell {
     master: Box<dyn MasterPty + Send>,
     reader: Box<dyn Read + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
 
+#[cfg(unix)]
 impl PtyShell {
     /// A killer for the child, so the app can stop a running command on `esc` or
     /// exit (aborting the blocking read task alone won't kill the child).
@@ -139,6 +143,7 @@ impl PtyShell {
 
 /// Spawn `command` through the platform shell in `cwd` under a PTY. Returns the
 /// pieces the caller streams from; `Err` only on PTY/spawn failure.
+#[cfg(unix)]
 pub(super) fn spawn_pty_shell(command: &str, cwd: &std::path::Path) -> std::io::Result<PtyShell> {
     // One shell-selection source of truth with the agent's `run_bash`: POSIX `sh`
     // on Unix, PowerShell on Windows (see `agent::sandbox::bare_shell`). `!cmd` is
@@ -187,12 +192,11 @@ pub(super) fn spawn_pty_shell(command: &str, cwd: &std::path::Path) -> std::io::
 /// killed — once output crosses [`MAX_CAPTURED_LINES`]/[`MAX_CAPTURED_BYTES`]
 /// (`truncated`) or [`SHELL_TIMEOUT`] elapses. Runs under `spawn_blocking`.
 ///
-/// The reader lives on its own thread because closing the PTY is what unblocks a
-/// blocked read on Windows: `portable-pty`'s ConPTY output pipe never returns EOF
-/// when the child exits — only `ClosePseudoConsole` (dropping `master`) does — so a
-/// single-threaded read-then-close would hang forever. Waiting on the child here
-/// lets us drop `master` the moment it exits, unblocking the reader on every
-/// platform (broken pipe on Windows; on Unix the read already EOF'd).
+/// The reader lives on its own thread so the controller can drop `master` to give
+/// any still-writing grandchild (e.g. `yes &`) an EIO the instant the foreground
+/// child exits, instead of the read holding the pty open. Unix only — Windows runs
+/// `!cmd` through plain pipes ([`run_pipe_to_completion`]).
+#[cfg(unix)]
 pub(super) fn run_pty_to_completion(shell: PtyShell, tx: UnboundedSender<RuntimeEvent>) {
     let PtyShell {
         master,
@@ -284,21 +288,10 @@ pub(super) fn run_pty_to_completion(shell: PtyShell, tx: UnboundedSender<Runtime
         poll = (poll * 2).min(std::time::Duration::from_millis(50));
     }
 
-    // Windows: the reader is still blocked (ConPTY won't EOF on child exit), and
-    // `ClosePseudoConsole` can discard output it hasn't read yet — a short grace lets
-    // it drain first. Skipped on Unix (the read already EOF'd when the slave closed)
-    // and on timeout (we're tearing down regardless).
-    #[cfg(windows)]
-    if !timed_out {
-        std::thread::sleep(PTY_DRAIN_GRACE);
-    }
-
-    // Close the PTY. Dropping our last `master` handle calls `ClosePseudoConsole` on
-    // Windows — which unblocks the reader's blocked `read()` (broken pipe) — and on
-    // Unix gives EIO to any still-writing grandchild (e.g. `yes &`) so it dies instead
-    // of holding the pty open. LOAD-BEARING: `master` must be the last live PTY handle
-    // (the slave is dropped in `spawn_pty_shell` and `master` is never cloned) or the
-    // reader never unblocks and the `join` below hangs.
+    // Close the PTY. Dropping our last `master` handle gives EIO to any still-writing
+    // grandchild (e.g. `yes &`) so it dies instead of holding the pty open, and lets
+    // the reader's `read()` EOF. The slave was dropped in `spawn_pty_shell` and
+    // `master` is never cloned, so this is the last live PTY handle.
     drop(master);
 
     // Reap a child we stopped (cap/timeout) so it doesn't linger as a zombie; its exit
@@ -340,20 +333,28 @@ pub(super) fn run_pty_to_completion(shell: PtyShell, tx: UnboundedSender<Runtime
     });
 }
 
-/// Clean one raw output line (strip the PTY's ANSI/color escapes and control
-/// bytes, cap an over-long line), emit it, and roll the line/byte counters.
-/// Returns `true` once a capture cap is crossed (caller should stop and kill).
+/// Strip one raw output line's ANSI/color escapes and control bytes, and cap an
+/// over-long (newline-less) line so a binary stream can't become one giant line.
+/// Shared by the Unix PTY reader and the Windows pipe readers.
+fn clean_output_line(raw: &[u8]) -> String {
+    let mut line = strip_ansi_and_controls(&String::from_utf8_lossy(raw));
+    if line.chars().count() > MAX_LINE_CHARS {
+        line = line.chars().take(MAX_LINE_CHARS).collect();
+        line.push('…');
+    }
+    line
+}
+
+/// Emit one cleaned output line and roll the line/byte counters. Returns `true`
+/// once a capture cap is crossed (caller should stop and kill).
+#[cfg(unix)]
 fn emit_pty_line(
     tx: &UnboundedSender<RuntimeEvent>,
     raw: &[u8],
     lines: &mut usize,
     bytes: &mut usize,
 ) -> bool {
-    let mut line = strip_ansi_and_controls(&String::from_utf8_lossy(raw));
-    if line.chars().count() > MAX_LINE_CHARS {
-        line = line.chars().take(MAX_LINE_CHARS).collect();
-        line.push('…');
-    }
+    let line = clean_output_line(raw);
     *lines += 1;
     *bytes += line.len() + 1;
     // PTY merges stdout+stderr into one stream, so everything renders as stdout.
@@ -362,6 +363,311 @@ fn emit_pty_line(
         line,
     });
     *lines >= MAX_CAPTURED_LINES || *bytes >= MAX_CAPTURED_BYTES
+}
+
+// ---------------------------------------------------------------------------
+// Windows `!cmd`: plain pipes, not ConPTY
+// ---------------------------------------------------------------------------
+//
+// `portable-pty`'s ConPTY backend never delivers EOF on the output pipe when the
+// child exits, so the blocking PTY read hangs forever and `!cmd` never completes
+// (the run sits at "running…" with no output). Plain pipes — the same mechanism
+// the agent's `run_bash` uses successfully on Windows — close deterministically
+// when the child exits, so the reader threads EOF and the run finishes. The cost
+// is that a program which block-buffers when stdout isn't a tty won't stream line
+// by line (its output appears when it exits); correctness over live streaming.
+
+/// A spawned `!cmd` on Windows: the child (shared so a killer can stop it on `esc`
+/// or app exit) and its piped stdout/stderr, read on dedicated threads.
+#[cfg(windows)]
+pub(super) struct PipeShell {
+    child: Arc<Mutex<std::process::Child>>,
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+}
+
+/// Kills the shared child on `esc`/app exit. Mirrors `portable-pty`'s `ChildKiller`
+/// so `LocalCommandRun` holds one killer type across platforms. `Debug` is required
+/// because `ChildKiller: Debug`.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct PipeChildKiller {
+    child: Arc<Mutex<std::process::Child>>,
+}
+
+#[cfg(windows)]
+impl ChildKiller for PipeChildKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        if let Ok(mut child) = self.child.lock() {
+            // An already-exited child returns `InvalidInput` here; ignore it.
+            let _ = child.kill();
+        }
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(windows)]
+impl PipeShell {
+    pub(super) fn killer_handle(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(PipeChildKiller {
+            child: self.child.clone(),
+        })
+    }
+}
+
+/// Spawn `command` through the platform shell in `cwd` with piped stdout/stderr and
+/// no stdin (so an interactive prompt fails fast instead of blocking). `Err` only on
+/// spawn failure.
+#[cfg(windows)]
+pub(super) fn spawn_pipe_shell(command: &str, cwd: &std::path::Path) -> std::io::Result<PipeShell> {
+    // Same shell-selection source of truth as the agent's `run_bash` (PowerShell on
+    // Windows); `!cmd` is the user's own command, so it runs bare (no sandbox wrap).
+    let invocation = crate::agent::sandbox::bare_shell(command);
+    let mut cmd = Command::new(invocation.program.as_str());
+    cmd.args(&invocation.args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Neutralize pagers/credential prompts so output streams straight through and
+        // nothing blocks waiting for a keypress (matches the Unix PTY path's env).
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    Ok(PipeShell {
+        child: Arc::new(Mutex::new(child)),
+        stdout,
+        stderr,
+    })
+}
+
+/// Read one pipe (stdout or stderr) to EOF, emitting a [`RuntimeEvent::LocalCommandLine`]
+/// per newline, until the capture caps are crossed (then it flags `truncated`, kills
+/// the child, and stops). EOF arrives when the child exits and closes its write end.
+#[cfg(windows)]
+fn pipe_reader<R: Read>(
+    mut reader: R,
+    is_err: bool,
+    tx: UnboundedSender<RuntimeEvent>,
+    lines: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: Arc<std::sync::atomic::AtomicUsize>,
+    truncated: Arc<AtomicBool>,
+    child: Arc<Mutex<std::process::Child>>,
+) {
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    'read: loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break, // EOF (child exited / pipe closed) or read error
+            Ok(n) => {
+                for &byte in &buf[..n] {
+                    // Flush a line on newline, or when a newline-less run gets over-long
+                    // so `acc` can't grow without bound. The trailing `\r` of a Windows
+                    // `\r\n` is dropped by `strip_ansi_and_controls` in `emit_pipe_line`.
+                    let flush = byte == b'\n' || acc.len() >= MAX_LINE_CHARS * 4;
+                    if byte != b'\n' {
+                        acc.push(byte);
+                    }
+                    if flush {
+                        let capped = emit_pipe_line(&tx, &acc, is_err, &lines, &bytes);
+                        acc.clear();
+                        if capped {
+                            truncated.store(true, Ordering::Release);
+                            if let Ok(mut c) = child.lock() {
+                                let _ = c.kill();
+                            }
+                            break 'read;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Flush a trailing partial line (output without a final newline).
+    if !acc.is_empty() {
+        let _ = emit_pipe_line(&tx, &acc, is_err, &lines, &bytes);
+    }
+}
+
+/// Like [`emit_pty_line`] but for the Windows pipe path: shared atomic counters
+/// (two reader threads share the caps) and an explicit stdout/stderr flag.
+#[cfg(windows)]
+fn emit_pipe_line(
+    tx: &UnboundedSender<RuntimeEvent>,
+    raw: &[u8],
+    is_err: bool,
+    lines: &std::sync::atomic::AtomicUsize,
+    bytes: &std::sync::atomic::AtomicUsize,
+) -> bool {
+    let line = clean_output_line(raw);
+    let total_lines = lines.fetch_add(1, Ordering::Relaxed) + 1;
+    let added = line.len() + 1;
+    let total_bytes = bytes.fetch_add(added, Ordering::Relaxed) + added;
+    let _ = tx.send(RuntimeEvent::LocalCommandLine { is_err, line });
+    total_lines >= MAX_CAPTURED_LINES || total_bytes >= MAX_CAPTURED_BYTES
+}
+
+/// Drive a [`PipeShell`] to completion (Windows counterpart of
+/// [`run_pty_to_completion`]): two reader threads stream stdout/stderr live while
+/// this thread waits for the child and enforces [`SHELL_TIMEOUT`], then joins the
+/// readers and emits a terminal [`RuntimeEvent::LocalCommandDone`]. Runs under
+/// `spawn_blocking`.
+#[cfg(windows)]
+pub(super) fn run_pipe_to_completion(shell: PipeShell, tx: UnboundedSender<RuntimeEvent>) {
+    let PipeShell {
+        child,
+        stdout,
+        stderr,
+    } = shell;
+    let truncated = Arc::new(AtomicBool::new(false));
+    let lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let spawn_reader = |reader: Option<Box<dyn Read + Send>>, is_err: bool| {
+        reader.map(|reader| {
+            let tx = tx.clone();
+            let lines = lines.clone();
+            let bytes = bytes.clone();
+            let truncated = truncated.clone();
+            let child = child.clone();
+            std::thread::spawn(move || {
+                pipe_reader(reader, is_err, tx, lines, bytes, truncated, child)
+            })
+        })
+    };
+    let out_thread = spawn_reader(stdout.map(|r| Box::new(r) as Box<dyn Read + Send>), false);
+    let err_thread = spawn_reader(stderr.map(|r| Box::new(r) as Box<dyn Read + Send>), true);
+
+    // Controller: poll for child exit, enforcing the wall-clock ceiling. `try_wait`
+    // is non-blocking, so the lock is held only briefly and never contends with a
+    // reader's kill. On timeout, kill the child (closing the pipes so the readers
+    // EOF); a reader hitting the cap sets `truncated` and kills the child itself.
+    let start = std::time::Instant::now();
+    let mut timed_out = false;
+    let mut exit_status = None;
+    let mut poll = std::time::Duration::from_millis(10);
+    loop {
+        let waited = match child.lock() {
+            Ok(mut c) => c.try_wait(),
+            Err(_) => break, // poisoned (a reader panicked) — stop waiting
+        };
+        match waited {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if truncated.load(Ordering::Acquire) {
+            break;
+        }
+        if start.elapsed() >= SHELL_TIMEOUT {
+            timed_out = true;
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
+            break;
+        }
+        std::thread::sleep(poll);
+        poll = (poll * 2).min(std::time::Duration::from_millis(50));
+    }
+
+    // The child has exited or been killed, so its stdout/stderr write ends close and
+    // the reader threads EOF; joining them drains the final output. (A backgrounded
+    // grandchild still holding the pipe is the one case a join can wait on — the same
+    // behavior as the agent's `run_bash`; the user can still `esc` to abandon it.)
+    if let Some(handle) = out_thread {
+        let _ = handle.join();
+    }
+    if let Some(handle) = err_thread {
+        let _ = handle.join();
+    }
+
+    // Reap a child we stopped (cap/timeout) for its status; unused on that path.
+    if exit_status.is_none()
+        && let Ok(mut c) = child.lock()
+    {
+        exit_status = c.try_wait().ok().flatten();
+    }
+
+    let truncated = truncated.load(Ordering::Acquire);
+    if timed_out {
+        let _ = tx.send(RuntimeEvent::LocalCommandLine {
+            is_err: true,
+            line: "command timed out after 120s".to_string(),
+        });
+    }
+
+    // A natural finish reports the real exit code; a run WE stopped (cap/timeout)
+    // reports -1 and folds timeout into `truncated` for the render.
+    let stopped_early = truncated || timed_out;
+    let exit_code = match exit_status {
+        Some(status) if !stopped_early => status.code().map(i64::from).unwrap_or(-1),
+        _ => -1,
+    };
+    let _ = tx.send(RuntimeEvent::LocalCommandDone {
+        exit_code,
+        truncated: stopped_early,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Cross-platform `!cmd` dispatch
+// ---------------------------------------------------------------------------
+
+/// A spawned `!cmd`, backed by a PTY on Unix and plain pipes on Windows. The caller
+/// (`start_local_command`) is platform-agnostic: it spawns one of these, grabs a
+/// killer, and hands it to [`run_local_to_completion`].
+pub(super) enum LocalShell {
+    #[cfg(unix)]
+    Pty(PtyShell),
+    #[cfg(windows)]
+    Pipe(PipeShell),
+}
+
+impl LocalShell {
+    pub(super) fn killer_handle(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        match self {
+            #[cfg(unix)]
+            LocalShell::Pty(shell) => shell.killer_handle(),
+            #[cfg(windows)]
+            LocalShell::Pipe(shell) => shell.killer_handle(),
+        }
+    }
+}
+
+/// Spawn `command` for `!cmd` in `cwd`, choosing the platform backend.
+pub(super) fn spawn_local_shell(
+    command: &str,
+    cwd: &std::path::Path,
+) -> std::io::Result<LocalShell> {
+    #[cfg(unix)]
+    {
+        Ok(LocalShell::Pty(spawn_pty_shell(command, cwd)?))
+    }
+    #[cfg(windows)]
+    {
+        Ok(LocalShell::Pipe(spawn_pipe_shell(command, cwd)?))
+    }
+}
+
+/// Drive a spawned `!cmd` to completion (the platform backend's runner). Runs under
+/// `spawn_blocking`.
+pub(super) fn run_local_to_completion(shell: LocalShell, tx: UnboundedSender<RuntimeEvent>) {
+    match shell {
+        #[cfg(unix)]
+        LocalShell::Pty(shell) => run_pty_to_completion(shell, tx),
+        #[cfg(windows)]
+        LocalShell::Pipe(shell) => run_pipe_to_completion(shell, tx),
+    }
 }
 
 pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {

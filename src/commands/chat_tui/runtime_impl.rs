@@ -1106,9 +1106,10 @@ impl ChatTuiApp {
         } else {
             self.real_cwd.clone()
         };
-        // Spawn under a PTY (fast, blocking) so the child line-buffers and streams;
-        // hold its killer so esc can stop it. The blocking read runs on a worker.
-        let shell = match spawn_pty_shell(&command, std::path::Path::new(&cwd)) {
+        // Spawn the command (PTY on Unix for live line-buffered streaming, plain pipes
+        // on Windows where ConPTY never EOFs); hold its killer so esc can stop it. The
+        // blocking read runs on a worker.
+        let shell = match spawn_local_shell(&command, std::path::Path::new(&cwd)) {
             Ok(shell) => shell,
             Err(err) => {
                 self.notice = Some((ERROR, format!("Failed to run command: {err}")));
@@ -1118,7 +1119,7 @@ impl ChatTuiApp {
         let killer = shell.killer_handle();
         let tx = self.tx.clone();
         let task = tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || run_pty_to_completion(shell, tx)).await;
+            let _ = tokio::task::spawn_blocking(move || run_local_to_completion(shell, tx)).await;
         });
         self.local_command = Some(LocalCommandRun {
             task,

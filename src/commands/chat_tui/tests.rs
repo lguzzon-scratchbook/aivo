@@ -6557,9 +6557,10 @@ fn test_render_main_local_command_no_clip() {
 }
 
 /// Drive a started `!cmd` to completion: drain runtime events until the run
-/// commits to history (clearing `local_command`).
-// Only the `#[cfg(unix)]` PTY `!cmd` tests above drive this; unused on Windows.
-#[cfg(unix)]
+/// commits to history (clearing `local_command`). Bounded so a `!cmd` that never
+/// finishes (the Windows ConPTY hang this guards against) fails the test instead of
+/// hanging the runner forever.
+#[cfg(any(unix, windows))]
 async fn run_local_command_to_completion(app: &mut ChatTuiApp) {
     for _ in 0..5000 {
         app.handle_runtime_events().await.unwrap();
@@ -6569,6 +6570,30 @@ async fn run_local_command_to_completion(app: &mut ChatTuiApp) {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     panic!("local command did not finish in time");
+}
+
+// Windows counterpart of `test_local_command_streams_then_commits`: `!cmd` runs
+// through plain pipes (not ConPTY), whose output EOFs when the child exits — so the
+// run must stream output AND commit (clear `local_command`). The bug this guards
+// against left every `!cmd` stuck at "running…" forever. Uses a PowerShell command
+// since `bare_shell` spawns PowerShell on Windows.
+#[cfg(windows)]
+#[tokio::test]
+async fn test_local_command_pipe_streams_then_commits() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.start_local_command("Write-Output a; Write-Output b; Write-Output c".to_string());
+    assert!(app.local_command.is_some());
+
+    run_local_command_to_completion(&mut app).await;
+
+    // Committed exactly once (run finished), with the streamed output and exit 0.
+    assert!(app.local_command.is_none(), "the run must finish, not hang");
+    let step = app.history.last().expect("history entry");
+    assert_eq!(step.role, "local_command");
+    assert!(step.content.contains('a') && step.content.contains('c'));
+    assert!(step.content.contains("\"exit_code\":0"));
 }
 
 #[test]
