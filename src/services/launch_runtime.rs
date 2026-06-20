@@ -885,16 +885,18 @@ async fn link_or_default(
 }
 
 /// Symlinks the user's mutable `~/.pi/agent/` state (rules, tools,
-/// prompts, themes, git-sourced packages, mcp.json) into the temp dir.
-/// Dirs are pre-created so first-time `pi install <git-pkg>` lands in
-/// the real home instead of vanishing with the temp dir. `mcp.json`
-/// goes through the same symlink → hard-link → copy chain as the other
-/// linked files so MCP servers stay reachable on Windows without
-/// Developer Mode. On Windows without Developer Mode dir symlinks fail;
-/// in-session writes to those dirs are then lost — same gap as
-/// `codex_home_shadow`.
+/// prompts, themes, git- and npm-sourced packages, mcp.json) into the
+/// temp dir. Dirs are pre-created so a first-time `pi install <pkg>`
+/// lands in the real home instead of vanishing with the temp dir.
+/// `mcp.json` goes through the same symlink → hard-link → copy chain as
+/// the other linked files so MCP servers stay reachable on Windows
+/// without Developer Mode. On Windows without Developer Mode dir
+/// symlinks fail; in-session writes to those dirs are then lost — same
+/// gap as `codex_home_shadow`.
 async fn link_pi_agent_state(real_agent: &Path, dest: &Path) {
-    for d in ["rules", "tools", "prompts", "themes", "git"] {
+    // Add new pi state dirs here as they appear. `bin/`, `sessions/`,
+    // `models.json` are absent on purpose (each handled specially).
+    for d in ["rules", "tools", "prompts", "themes", "git", "npm"] {
         let real = real_agent.join(d);
         if tokio::fs::create_dir_all(&real).await.is_ok() {
             let _ = symlink_dir(&real, &dest.join(d)).await;
@@ -2092,9 +2094,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_pi_agent_dir_persists_first_time_npm_package_install() {
+        // npm packages land under <agentDir>/npm/; without the link Pi
+        // re-installs them every launch (issue #8). Like git packages, an
+        // install into the temp dir must persist back to the real home.
+        let real = tempfile::tempdir().unwrap();
+        let (_env, agent) = launch_pi_agent(Some(real.path())).await;
+
+        assert!(real.path().join("npm").is_dir());
+
+        let installed = agent.join("npm/node_modules/pi-newpkg");
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(installed.join("package.json"), "{\"name\":\"pi-newpkg\"}")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.path().join("npm/node_modules/pi-newpkg/package.json"))
+                .await
+                .unwrap(),
+            "{\"name\":\"pi-newpkg\"}"
+        );
+    }
+
+    #[tokio::test]
     async fn write_pi_agent_dir_links_user_customization() {
         let real = tempfile::tempdir().unwrap();
-        for d in ["rules", "tools", "prompts", "themes", "git"] {
+        for d in ["rules", "tools", "prompts", "themes", "git", "npm"] {
             tokio::fs::create_dir_all(real.path().join(d))
                 .await
                 .unwrap();
@@ -2120,7 +2146,7 @@ mod tests {
                 .unwrap(),
             "{\"servers\":{}}"
         );
-        for d in ["tools", "prompts", "themes", "git"] {
+        for d in ["tools", "prompts", "themes", "git", "npm"] {
             assert!(agent.join(d).is_dir(), "{d} missing");
         }
 
