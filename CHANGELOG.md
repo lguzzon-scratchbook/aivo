@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.31.1
+
+- feat(gemini): remove Google OAuth sign-in for the gemini CLI (8d3b793)
+- fix(chat): unblock `!cmd` on Windows ConPTY by closing the PTY to end the read (3e30ffe)
+- fix(update): self-update npm installs natively instead of via npm (755be07)
+
 ## v0.31.0
 
 `aivo chat` is now a native, in-process coding agent. It reads and edits
