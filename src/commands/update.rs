@@ -15,6 +15,12 @@ use crate::style;
 
 const DOWNLOAD_BASE: &str = "https://getaivo.dev/dl";
 
+/// Source for `--sync-model-data`: refreshes model metadata between releases.
+const MODELS_DEV_API: &str = "https://models.dev/api.json";
+
+/// Download ceiling (the file is ~2 MB today); bounds memory if the host misbehaves.
+const MODELS_DEV_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Ed25519 public key (the base64 line of `aivo.pub`) that every self-update
 /// download is verified against. The matching secret key lives only in CI
 /// secrets and signs each release artifact into a detached `.minisig`. This is
@@ -59,11 +65,16 @@ impl UpdateCommand {
             "--rollback",
             "Restore the previous version from the last update backup",
         );
+        print_opt(
+            "--sync-model-data",
+            "Refresh model data from models.dev; leaves the binary alone",
+        );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo update"));
         println!("  {}", style::dim("aivo update --force"));
         println!("  {}", style::dim("aivo update --rollback"));
+        println!("  {}", style::dim("aivo update --sync-model-data"));
     }
 
     /// Creates a new UpdateCommand instance
@@ -85,10 +96,35 @@ impl UpdateCommand {
         })
     }
 
-    /// Executes the update command
+    /// Executes the update command (binary only — model data is refreshed
+    /// separately via `aivo update --sync-model-data`).
     pub async fn execute(&self, force: bool) -> ExitCode {
         match self.execute_internal(force).await {
             Ok(code) => code,
+            Err(e) => {
+                self.handle_error(e);
+                ExitCode::UserError
+            }
+        }
+    }
+
+    /// Refreshes the model-limits snapshot from live models.dev, leaving the
+    /// binary untouched (`aivo update --sync-model-data`). Returns non-zero on
+    /// failure since the refresh is the user's explicit request.
+    pub async fn execute_sync_model_data(&self) -> ExitCode {
+        println!(
+            "{} Refreshing model data from models.dev...",
+            style::arrow_symbol()
+        );
+        match self.refresh_model_data().await {
+            Ok(count) => {
+                println!(
+                    "  {} {}",
+                    style::dim("Model data:"),
+                    style::green(format!("updated ({count} models)"))
+                );
+                ExitCode::Success
+            }
             Err(e) => {
                 self.handle_error(e);
                 ExitCode::UserError
@@ -174,6 +210,62 @@ impl UpdateCommand {
         );
 
         Ok(ExitCode::Success)
+    }
+
+    /// Fetches and transforms `models.dev/api.json`, writing the snapshot to the
+    /// override path the limits cascade overlays. Returns the model count.
+    async fn refresh_model_data(&self) -> Result<usize> {
+        let bytes = self
+            .fetch_capped(MODELS_DEV_API, MODELS_DEV_MAX_BYTES)
+            .await
+            .context("Failed to fetch models.dev")?;
+        let api_json = String::from_utf8(bytes).context("models.dev returned invalid UTF-8")?;
+        let (snapshot_json, count) = crate::services::model_data_sync::transform(&api_json)
+            .context("Failed to transform models.dev data")?;
+
+        let path = crate::services::model_metadata::override_model_limits_path()
+            .context("Could not resolve the aivo config directory")?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        // Temp + rename so an interrupted write can't leave a truncated file.
+        let tmp = path.with_file_name(format!("model_limits.json.{}.tmp", std::process::id()));
+        tokio::fs::write(&tmp, snapshot_json.as_bytes())
+            .await
+            .with_context(|| format!("Failed to write {}", tmp.display()))?;
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            tokio::fs::remove_file(&tmp).await.ok();
+            return Err(e).with_context(|| format!("Failed to replace {}", path.display()));
+        }
+        Ok(count)
+    }
+
+    /// Downloads `url` into memory, enforcing a byte cap (via `Content-Length`
+    /// up front, then while streaming).
+    async fn fetch_capped(&self, url: &str, cap: u64) -> Result<Vec<u8>> {
+        let mut response = self
+            .client
+            .get(url)
+            .header("User-Agent", "aivo-cli")
+            .send()
+            .await
+            .context("Request failed")?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("HTTP {}", response.status()));
+        }
+        if let Some(len) = response.content_length()
+            && len > cap
+        {
+            return Err(anyhow::anyhow!("response too large ({len} bytes)"));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await.context("Error reading response")? {
+            if buf.len() as u64 + chunk.len() as u64 > cap {
+                return Err(anyhow::anyhow!("response exceeded {cap} bytes"));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 
     /// Fetches the latest version string from the R2-backed `/dl/latest` endpoint.

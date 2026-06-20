@@ -775,7 +775,13 @@ pub async fn run() -> ! {
         }
 
         Commands::Update(update_args) => match UpdateCommand::new() {
-            Ok(command) => command.execute(update_args.force).await,
+            Ok(command) => {
+                if update_args.sync_model_data {
+                    command.execute_sync_model_data().await
+                } else {
+                    command.execute(update_args.force).await
+                }
+            }
             Err(e) => {
                 eprintln!(
                     "{} Failed to initialize update command: {}",

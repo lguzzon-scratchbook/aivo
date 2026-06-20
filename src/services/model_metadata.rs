@@ -37,21 +37,59 @@ pub struct ResolvedLimits {
     pub caps: Option<&'static ModelLimits>,
 }
 
+/// Row: `[context, output, flags, efforts]` — see `sync_model_limits.py` and
+/// `model_data_sync.rs`, which writes the override in this same shape.
+type LimitRow = (Option<u64>, Option<u64>, String, String);
+
 #[derive(Deserialize)]
 struct SnapshotFile {
     // BTreeMap: sorted iteration keeps fold-collision resolution deterministic.
-    // Row: [context, output, flags, efforts] — see sync_model_limits.py.
-    models: std::collections::BTreeMap<String, (Option<u64>, Option<u64>, String, String)>,
+    models: std::collections::BTreeMap<String, LimitRow>,
 }
 
 /// Keys folded (lowercase, `.`→`-`) so dot/dash version spellings match
 /// (`claude-sonnet-4.6` ↔ `claude-sonnet-4-6`). Collisions keep the larger
-/// context.
-static SNAPSHOT: LazyLock<HashMap<String, ModelLimits>> = LazyLock::new(|| {
+/// context. The embedded snapshot is the floor; the user override written by
+/// `aivo update --sync-model-data` is overlaid on top, winning per id.
+static SNAPSHOT: LazyLock<HashMap<String, ModelLimits>> = LazyLock::new(build_snapshot);
+
+fn build_snapshot() -> HashMap<String, ModelLimits> {
+    let mut rows = embedded_rows();
+    // Tests skip the overlay so assertions don't depend on the dev's real
+    // `~/.config/aivo`.
+    if !cfg!(test)
+        && let Some(over) = load_override_rows()
+    {
+        merge_rows(&mut rows, over); // override wins per id
+    }
+    fold_rows(rows)
+}
+
+fn embedded_rows() -> std::collections::BTreeMap<String, LimitRow> {
     let parsed: SnapshotFile = serde_json::from_str(include_str!("../data/model_limits.json"))
         .expect("embedded model_limits.json is valid");
-    let mut map: HashMap<String, ModelLimits> = HashMap::with_capacity(parsed.models.len());
-    for (id, (context, output, flags, efforts)) in parsed.models {
+    parsed.models
+}
+
+/// Best-effort: a missing, corrupt, or future-format file yields `None` (the
+/// embedded floor stands). Never panics — a bad file must not brick lookups.
+fn load_override_rows() -> Option<std::collections::BTreeMap<String, LimitRow>> {
+    let path = override_model_limits_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let parsed: SnapshotFile = serde_json::from_str(&text).ok()?;
+    (!parsed.models.is_empty()).then_some(parsed.models)
+}
+
+fn merge_rows(
+    base: &mut std::collections::BTreeMap<String, LimitRow>,
+    over: std::collections::BTreeMap<String, LimitRow>,
+) {
+    base.extend(over);
+}
+
+fn fold_rows(rows: std::collections::BTreeMap<String, LimitRow>) -> HashMap<String, ModelLimits> {
+    let mut map: HashMap<String, ModelLimits> = HashMap::with_capacity(rows.len());
+    for (id, (context, output, flags, efforts)) in rows {
         let limits = ModelLimits {
             context,
             output,
@@ -76,7 +114,14 @@ static SNAPSHOT: LazyLock<HashMap<String, ModelLimits>> = LazyLock::new(|| {
         }
     }
     map
-});
+}
+
+/// Path of the user-refreshed snapshot, beside `config.json`. Written by
+/// `aivo update --sync-model-data`, overlaid by the loader above.
+pub fn override_model_limits_path() -> Option<std::path::PathBuf> {
+    crate::services::system_env::home_dir()
+        .map(|p| p.join(".config").join("aivo").join("model_limits.json"))
+}
 
 /// Folded keys sorted longest-first so the substring fallback picks the most
 /// specific entry; keys < 6 chars excluded to avoid false hits (`o1`, `gpt-4`).
@@ -392,6 +437,62 @@ mod tests {
     fn unknown_models_return_none() {
         assert_eq!(snapshot_limits("totally-unknown-model-xyz"), None);
         assert_eq!(snapshot_limits(""), None);
+    }
+
+    #[test]
+    fn override_rows_win_over_embedded_floor() {
+        use std::collections::BTreeMap;
+        let mut base: BTreeMap<String, LimitRow> = BTreeMap::new();
+        base.insert(
+            "model-a".into(),
+            (Some(100), Some(10), "t".into(), String::new()),
+        );
+        base.insert(
+            "model-b".into(),
+            (Some(200), None, String::new(), String::new()),
+        );
+        let mut over: BTreeMap<String, LimitRow> = BTreeMap::new();
+        // model-a refreshed to a *smaller* context — fresh data still wins.
+        over.insert(
+            "model-a".into(),
+            (Some(50), Some(5), "tr".into(), String::new()),
+        );
+        over.insert(
+            "model-c".into(),
+            (Some(300), None, String::new(), String::new()),
+        );
+        merge_rows(&mut base, over);
+        let folded = fold_rows(base);
+        assert_eq!(folded["model-a"].context, Some(50));
+        assert!(folded["model-a"].reasoning);
+        assert_eq!(folded["model-b"].context, Some(200)); // untouched embedded id
+        assert_eq!(folded["model-c"].context, Some(300)); // new id from override
+    }
+
+    #[test]
+    fn fold_collapses_dot_and_dash_keeping_larger_context() {
+        use std::collections::BTreeMap;
+        let mut rows: BTreeMap<String, LimitRow> = BTreeMap::new();
+        rows.insert(
+            "foo-1.5".into(),
+            (Some(128_000), None, "t".into(), String::new()),
+        );
+        rows.insert(
+            "foo-1-5".into(),
+            (Some(200_000), None, "t".into(), String::new()),
+        );
+        let folded = fold_rows(rows);
+        // Both fold to `foo-1-5`; the larger context wins regardless of order.
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded["foo-1-5"].context, Some(200_000));
+    }
+
+    #[test]
+    fn override_path_sits_beside_config_json() {
+        if let Some(p) = override_model_limits_path() {
+            assert_eq!(p.file_name().unwrap(), "model_limits.json");
+            assert_eq!(p.parent().unwrap().file_name().unwrap(), "aivo");
+        }
     }
 
     #[tokio::test]

@@ -612,6 +612,9 @@ pub struct UpdateArgs {
     /// Restore the previous version from the last update backup
     #[arg(long)]
     pub rollback: bool,
+    /// Refresh model data from models.dev (context windows, capabilities); leaves the binary alone
+    #[arg(long)]
+    pub sync_model_data: bool,
 }
 
 /// Arguments for the info command
