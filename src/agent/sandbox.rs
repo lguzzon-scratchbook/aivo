@@ -16,19 +16,37 @@
 //!   `__agent-sandbox` subcommand (dispatched in `run::run`) which installs the
 //!   ruleset and then spawns the shell (Landlock confinement is inherited by
 //!   children). Degrades to no confinement on kernels without Landlock.
-//! - **Windows**: no-op for now. Windows has no path-allowlist write-confinement
-//!   primitive comparable to seatbelt/Landlock — restricted tokens / integrity
-//!   levels gate by ACL not by path (and would break ordinary writes), Job
-//!   Objects govern CPU/memory not the filesystem, and AppContainer (the nearest
-//!   fit) is heavyweight and brittle for an arbitrary `cmd /C`. The heuristic
-//!   destructive-command gate still applies. AppContainer is the eventual path
-//!   if pursued.
+//! - **Windows**: no-op for now (writes are NOT confined). Windows has no
+//!   path-allowlist write-confinement primitive comparable to seatbelt/Landlock —
+//!   restricted tokens / integrity levels gate by ACL not by path (and would
+//!   break ordinary writes), Job Objects govern CPU/memory not the filesystem,
+//!   and AppContainer (the nearest fit) is heavyweight and brittle for an
+//!   arbitrary PowerShell command. The heuristic destructive-command gate still
+//!   applies. AppContainer is the eventual path if pursued.
 //!
 //! Default-on where supported; opt out everywhere with `AIVO_AGENT_NO_SANDBOX=1`.
 
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by `run::run` in the real CLI binary to signal that this process
+/// dispatches the hidden `__agent-sandbox` subcommand, so `wrap_shell` may
+/// relaunch it for Landlock confinement. Stays false in test / embedding
+/// binaries that never run that entrypoint — relaunching one of *them* as
+/// `__agent-sandbox` (which they don't handle) makes every Linux `run_bash`
+/// fail with the harness's own "Unrecognized option: 'workspace'".
+#[cfg(target_os = "linux")]
+static RELAUNCH_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable the Landlock self-relaunch for this process. Called once, early, by
+/// `run::run` (the entrypoint that handles the `__agent-sandbox` subcommand).
+#[cfg(target_os = "linux")]
+pub fn enable_landlock_relaunch() {
+    RELAUNCH_ENABLED.store(true, Ordering::Relaxed);
+}
 
 /// The program + args `run_bash` should actually spawn for a given shell command
 /// — either a sandbox wrapper around the shell, or the bare shell when no
@@ -83,43 +101,77 @@ pub fn wrap_shell(command: &str, cwd: &Path) -> ShellInvocation {
         };
     }
 
-    // Linux: re-execute ourselves as the hidden `__agent-sandbox` subcommand,
-    // which installs a Landlock ruleset (confining writes to `cwd` + caches) and
-    // then runs the shell. Falls through to the bare shell if `current_exe`
-    // can't be resolved.
+    // Linux: relaunch ourselves as the hidden `__agent-sandbox` subcommand, which
+    // installs a Landlock ruleset (confining writes to `cwd` + caches) and then
+    // runs the shell — but only when the real CLI enabled it (see
+    // `RELAUNCH_ENABLED`); a test/embedding binary doesn't handle the subcommand,
+    // so relaunching it would just fail. Falls through to the bare shell when off
+    // or `current_exe` can't be resolved.
     #[cfg(target_os = "linux")]
     if active()
+        && RELAUNCH_ENABLED.load(Ordering::Relaxed)
         && let Ok(exe) = std::env::current_exe()
     {
-        return ShellInvocation {
-            program: exe.to_string_lossy().into_owned(),
-            args: vec![
-                "__agent-sandbox".to_string(),
-                "--workspace".to_string(),
-                cwd.to_string_lossy().into_owned(),
-                "--".to_string(),
-                "sh".to_string(),
-                "-c".to_string(),
-                command.to_string(),
-            ],
-        };
+        return landlock_relaunch(exe.to_string_lossy().into_owned(), cwd, command);
     }
 
     bare_shell(command)
+}
+
+/// The relaunch invocation that runs `command`'s shell under Landlock: start this
+/// binary again as the hidden `__agent-sandbox` subcommand, which installs the
+/// ruleset then `sh -c`'s the command. Split out so the wiring is unit-testable
+/// without touching the global relaunch flag (which concurrent tests share).
+#[cfg(target_os = "linux")]
+fn landlock_relaunch(exe: String, cwd: &Path, command: &str) -> ShellInvocation {
+    ShellInvocation {
+        program: exe,
+        args: vec![
+            "__agent-sandbox".to_string(),
+            "--workspace".to_string(),
+            cwd.to_string_lossy().into_owned(),
+            "--".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            command.to_string(),
+        ],
+    }
 }
 
 /// The plain shell invocation with no sandbox wrapper. Used by `wrap_shell` when
 /// no sandbox applies, and by `run_bash`'s escalation path when the user
 /// approves re-running a sandbox-blocked command outside the workspace.
 pub fn bare_shell(command: &str) -> ShellInvocation {
-    let (program, flag) = if cfg!(windows) {
-        ("cmd", "/C")
+    // PowerShell on Windows, not `cmd`: the agent (and the model driving it) leans
+    // on POSIX-ish commands, and PowerShell's aliases/cmdlets (`ls`, `cat`,
+    // `Select-String`) cover far more of them than `cmd` does. The engine's system
+    // prompt tells the model which shell it has via `shell_label`. POSIX `sh`
+    // everywhere else.
+    if cfg!(windows) {
+        ShellInvocation {
+            program: "powershell.exe".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ],
+        }
     } else {
-        ("sh", "-c")
-    };
-    ShellInvocation {
-        program: program.to_string(),
-        args: vec![flag.to_string(), command.to_string()],
+        ShellInvocation {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), command.to_string()],
+        }
+    }
+}
+
+/// Human name of the shell `run_bash` (and the TUI `!cmd`) spawn commands through
+/// on this platform, injected into the engine's system prompt so the model writes
+/// commands in the right syntax. Must stay in sync with [`bare_shell`].
+pub fn shell_label() -> &'static str {
+    if cfg!(windows) {
+        "PowerShell"
+    } else {
+        "POSIX sh"
     }
 }
 
@@ -427,17 +479,48 @@ mod linux_tests {
     }
 
     #[test]
-    fn wrap_shell_reexecs_through_subcommand_when_active() {
+    fn landlock_relaunch_has_subcommand_shape() {
+        // The relaunch invocation's shape, tested directly (no global flag, so it
+        // can't race concurrent run_bash tests into relaunching the test binary).
+        let inv = landlock_relaunch("/usr/bin/aivo".to_string(), Path::new("/tmp"), "echo hi");
+        assert_eq!(inv.program, "/usr/bin/aivo");
+        assert_eq!(inv.args[0], "__agent-sandbox");
+        assert!(inv.args.iter().any(|a| a == "--workspace"));
+        assert!(inv.args.iter().any(|a| a == "--"));
+        assert_eq!(inv.args.last().unwrap(), "echo hi");
+    }
+
+    #[test]
+    fn wrap_shell_is_bare_until_relaunch_is_enabled() {
+        // The relaunch flag is off in the test harness (only `run::run` sets it),
+        // so `wrap_shell` must NOT relaunch the test binary — it falls through to
+        // the bare shell. This is the guard that keeps `run_bash` working on Linux
+        // CI, where Landlock is active but the binary isn't the real CLI.
         let inv = wrap_shell("echo hi", Path::new("/tmp"));
-        if active() && inv.program != "sh" {
-            // Re-exec form (current_exe resolved).
-            assert_eq!(inv.args[0], "__agent-sandbox");
-            assert!(inv.args.iter().any(|a| a == "--workspace"));
-            assert!(inv.args.iter().any(|a| a == "--"));
-            assert_eq!(inv.args.last().unwrap(), "echo hi");
+        assert_eq!(inv.program, "sh");
+        assert_eq!(inv.args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    /// `bare_shell` always passes the command through as its LAST arg, and
+    /// `shell_label` names the program it picks — the two must agree per platform
+    /// (the system prompt relies on the label matching the real shell).
+    #[test]
+    fn bare_shell_and_label_agree_for_this_platform() {
+        let inv = bare_shell("echo hi");
+        assert_eq!(inv.args.last().unwrap(), "echo hi");
+        if cfg!(windows) {
+            assert_eq!(inv.program, "powershell.exe");
+            assert_eq!(shell_label(), "PowerShell");
+            assert!(inv.args.iter().any(|a| a == "-Command"));
         } else {
-            // Sandbox off (or current_exe failed) → bare shell.
             assert_eq!(inv.program, "sh");
+            assert_eq!(shell_label(), "POSIX sh");
+            assert_eq!(inv.args[0], "-c");
         }
     }
 }

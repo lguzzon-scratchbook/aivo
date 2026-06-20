@@ -1862,6 +1862,24 @@ For a large, self-contained chunk of work — a deep investigation that would cl
 something a stronger model should handle — you can hand it to a fresh sub-agent with `subagent` (pass \
 `model` to use a stronger model) and build on its result. For ordinary steps, just use your own tools."
     );
+    let os = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    p.push_str(&format!(
+        "\n\nEnvironment: this host runs {os}; your `run_bash` runs each command through {shell}, \
+so write every command in {shell} syntax — don't assume a different OS's shell.",
+        shell = crate::agent::sandbox::shell_label()
+    ));
+    if cfg!(windows) {
+        p.push_str(
+            " On Windows that means PowerShell, not bash: use cmdlets/aliases (`Select-String` not \
+`grep`, `Get-Content` not `cat`, `Get-ChildItem` not `find`, `curl.exe` or `Invoke-RestMethod` not \
+the `curl` alias) and chain with `;` (not `&&`). Paths use `\\`.",
+        );
+    }
     if !guides.is_empty() {
         p.push_str(&format!(
             "\n\nThis project has convention file(s): {}. Before you create or edit ANY file here, \
@@ -3389,6 +3407,16 @@ mod tests {
         // now points at convention files as a place to find build/test commands.)
         let none = system_prompt("/tmp/proj", "", &[], &[]);
         assert!(!none.contains("This project has convention file"));
+    }
+
+    #[test]
+    fn system_prompt_names_the_host_shell() {
+        // The model is told which shell `run_bash` uses so it writes commands in
+        // the right syntax (not bash on a Windows host). The label must match what
+        // `sandbox::bare_shell` actually spawns on this platform.
+        let p = system_prompt("/tmp/proj", "", &[], &[]);
+        assert!(p.contains("Environment:"));
+        assert!(p.contains(crate::agent::sandbox::shell_label()));
     }
 
     #[test]

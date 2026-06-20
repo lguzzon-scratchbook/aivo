@@ -4188,6 +4188,29 @@ fn test_clipboard_command_candidates_are_platform_specific() {
 }
 
 #[test]
+fn test_clipboard_read_candidates_are_platform_specific() {
+    assert_eq!(
+        clipboard_read_candidates(ClipboardOs::Macos)
+            .into_iter()
+            .map(|command| command.program)
+            .collect::<Vec<_>>(),
+        vec!["pbpaste"]
+    );
+    assert_eq!(
+        clipboard_read_candidates(ClipboardOs::Linux)
+            .into_iter()
+            .map(|command| command.program)
+            .collect::<Vec<_>>(),
+        vec!["wl-paste", "xclip", "xsel"]
+    );
+    assert_eq!(
+        clipboard_read_candidates(ClipboardOs::Windows)[0].program,
+        "powershell.exe"
+    );
+    assert!(clipboard_read_candidates(ClipboardOs::Other).is_empty());
+}
+
+#[test]
 fn test_parse_slash_command_with_argument() {
     assert_eq!(
         parse_slash_command("model claude-sonnet-4").unwrap(),

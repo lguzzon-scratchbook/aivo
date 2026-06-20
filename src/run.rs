@@ -119,6 +119,11 @@ pub async fn run() -> ! {
         if raw_args.get(1).map(String::as_str) == Some("__agent-sandbox") {
             crate::agent::sandbox::run_sandbox_child(&raw_args);
         }
+        // Past the dispatch above: this is the real CLI process, which DOES handle
+        // the `__agent-sandbox` subcommand, so the agent's Landlock sandbox is
+        // cleared to relaunch it. Test/embedding binaries never reach here, so
+        // they leave it off and run the bare shell instead of relaunching themselves.
+        crate::agent::sandbox::enable_landlock_relaunch();
     }
 
     fast_crypto_guard();

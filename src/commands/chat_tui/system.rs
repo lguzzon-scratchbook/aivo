@@ -9,27 +9,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, io::Write};
 
 pub(super) fn read_system_clipboard() -> Result<ClipboardPayload> {
+    // Image paste is macOS-only (NSPasteboard via `swift`); text paste works on
+    // every platform via the same CLI tools the copy path uses (see
+    // `clipboard_read_candidates`).
     #[cfg(target_os = "macos")]
-    {
-        if let Some(attachment) = read_macos_clipboard_image()? {
-            return Ok(ClipboardPayload::Attachment(attachment));
-        }
-
-        let text = read_command_stdout("pbpaste", &[])?;
-        if text.is_empty() {
-            Ok(ClipboardPayload::Empty)
-        } else {
-            Ok(ClipboardPayload::Text(text))
-        }
+    if let Some(attachment) = read_macos_clipboard_image()? {
+        return Ok(ClipboardPayload::Attachment(attachment));
     }
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(ClipboardPayload::Empty)
-    }
+    let text = read_clipboard_text();
+    Ok(if text.is_empty() {
+        ClipboardPayload::Empty
+    } else {
+        ClipboardPayload::Text(text)
+    })
 }
 
-#[cfg(target_os = "macos")]
+/// Best-effort read of the clipboard's text via the platform's CLI tools, trying
+/// each until one succeeds. Returns "" when none is installed or the clipboard is
+/// empty (mirrors macOS, where `pbpaste` always exists) — the caller renders that
+/// as "Clipboard is empty" rather than an error, and ordinary terminal paste
+/// (bracketed paste → `Event::Paste`) is unaffected either way.
+fn read_clipboard_text() -> String {
+    for candidate in clipboard_read_candidates(current_clipboard_os()) {
+        if let Ok(text) = read_command_stdout(candidate.program, candidate.args) {
+            return text;
+        }
+    }
+    String::new()
+}
+
 pub(super) fn read_command_stdout(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
@@ -125,11 +134,10 @@ impl PtyShell {
 /// Spawn `command` through the platform shell in `cwd` under a PTY. Returns the
 /// pieces the caller streams from; `Err` only on PTY/spawn failure.
 pub(super) fn spawn_pty_shell(command: &str, cwd: &std::path::Path) -> std::io::Result<PtyShell> {
-    let (program, flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
-    };
+    // One shell-selection source of truth with the agent's `run_bash`: POSIX `sh`
+    // on Unix, PowerShell on Windows (see `agent::sandbox::bare_shell`). `!cmd` is
+    // the user's own command, so it runs unconfined (bare, no sandbox wrapper).
+    let invocation = crate::agent::sandbox::bare_shell(command);
     let to_io = |e: anyhow::Error| std::io::Error::other(e.to_string());
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -139,9 +147,10 @@ pub(super) fn spawn_pty_shell(command: &str, cwd: &std::path::Path) -> std::io::
             pixel_height: 0,
         })
         .map_err(to_io)?;
-    let mut cmd = CommandBuilder::new(program);
-    cmd.arg(flag);
-    cmd.arg(command);
+    let mut cmd = CommandBuilder::new(invocation.program.as_str());
+    for arg in &invocation.args {
+        cmd.arg(arg);
+    }
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
     // `!cmd` runs under a PTY (so children line-buffer and stream) but we never
@@ -416,6 +425,37 @@ pub(super) fn clipboard_command_candidates(os: ClipboardOs) -> Vec<ClipboardComm
         ClipboardOs::Windows => vec![ClipboardCommand {
             program: "powershell.exe",
             args: &["-NoProfile", "-Command", "Set-Clipboard"],
+        }],
+        ClipboardOs::Other => Vec::new(),
+    }
+}
+
+/// The CLI tools that print the clipboard's text to stdout, tried in order — the
+/// read counterpart of [`clipboard_command_candidates`]. (Image paste is handled
+/// separately and is macOS-only.)
+pub(super) fn clipboard_read_candidates(os: ClipboardOs) -> Vec<ClipboardCommand> {
+    match os {
+        ClipboardOs::Macos => vec![ClipboardCommand {
+            program: "pbpaste",
+            args: &[],
+        }],
+        ClipboardOs::Linux => vec![
+            ClipboardCommand {
+                program: "wl-paste",
+                args: &["--no-newline"],
+            },
+            ClipboardCommand {
+                program: "xclip",
+                args: &["-selection", "clipboard", "-o"],
+            },
+            ClipboardCommand {
+                program: "xsel",
+                args: &["--clipboard", "--output"],
+            },
+        ],
+        ClipboardOs::Windows => vec![ClipboardCommand {
+            program: "powershell.exe",
+            args: &["-NoProfile", "-Command", "Get-Clipboard"],
         }],
         ClipboardOs::Other => Vec::new(),
     }
