@@ -80,7 +80,10 @@ mod tests {
         let ctx = KeyCompatContext::Chat;
         assert_eq!(ctx.incompat_reason(&claude), Some("needs `aivo claude`"));
         assert_eq!(ctx.incompat_reason(&codex), Some("needs `aivo codex`"));
-        assert_eq!(ctx.incompat_reason(&gemini), Some("needs `aivo gemini`"));
+        assert_eq!(
+            ctx.incompat_reason(&gemini),
+            Some("Gemini sign-in removed — re-add with an API key")
+        );
         assert!(ctx.incompat_reason(&regular).is_none());
     }
 

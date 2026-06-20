@@ -212,8 +212,10 @@ impl RunCommand {
         };
 
         // OAuth keys carry serialized tokens only the matching native CLI can
-        // consume (shadow CODEX_HOME, CLAUDE_CODE_OAUTH_TOKEN, shadow
-        // GEMINI_CLI_HOME); every other tool would see an unusable JSON blob.
+        // consume (shadow CODEX_HOME, CLAUDE_CODE_OAUTH_TOKEN); every other
+        // tool would see an unusable JSON blob. Legacy `gemini-oauth` keys are
+        // defunct (sign-in removed) and rejected before launch via
+        // `oauth_incompat_reason`.
         let mut key_override = key_override;
 
         // Bare `hf:` opens a picker; rewrite to a concrete ref so the
@@ -548,9 +550,9 @@ impl RunCommand {
             "-k, --key <id|name>",
             "Select API key by ID or name (-k opens key picker)",
         );
-        if is("claude") || is("codex") || is("codex-app") || is("gemini") {
+        if is("claude") || is("codex") || is("codex-app") {
             let relogin_desc = if generic {
-                "Force OAuth re-login for the selected key (codex / codex-app / gemini / claude)"
+                "Force OAuth re-login for the selected key (codex / codex-app / claude)"
             } else {
                 "Force OAuth re-login for the selected key"
             };

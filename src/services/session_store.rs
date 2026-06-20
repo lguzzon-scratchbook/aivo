@@ -261,9 +261,11 @@ impl ApiKey {
         self.base_url == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
     }
 
-    /// True when this entry stores a Google OAuth credential bundle for the
-    /// `gemini` CLI (encrypted `GeminiOAuthCredential` JSON in `key`) rather
-    /// than a plain API key.
+    /// True when this entry is a legacy Gemini Google-OAuth credential bundle
+    /// for the `gemini` CLI (encrypted token JSON in `key`). The OAuth sign-in
+    /// flow has been removed; such keys are recognized only so they're redacted,
+    /// excluded from exports, and rejected at launch rather than mistaken for a
+    /// plain API key. See `services::gemini_oauth`.
     pub fn is_gemini_oauth(&self) -> bool {
         self.base_url == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
     }
@@ -296,7 +298,7 @@ impl ApiKey {
         } else if self.is_codex_oauth() {
             Some("needs `aivo codex`")
         } else if self.is_gemini_oauth() {
-            Some("needs `aivo gemini`")
+            Some("Gemini sign-in removed — re-add with an API key")
         } else {
             None
         }

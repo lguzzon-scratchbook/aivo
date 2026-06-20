@@ -1,5 +1,5 @@
-//! Force-relogin helpers for the three OAuth-backed key types
-//! (codex / gemini / claude). Drives the same browser flow that
+//! Force-relogin helpers for the OAuth-backed key types
+//! (codex / claude). Drives the same browser flow that
 //! `aivo keys add` uses, persists the new credential into aivo's
 //! store, and returns the refreshed `ApiKey` so the caller can hand
 //! it straight to the launch path.
@@ -24,11 +24,10 @@ pub async fn relogin_key(session_store: &SessionStore, key: &ApiKey) -> Result<A
         let json = creds.to_json()?;
         persist(session_store, key, &json).await
     } else if key.is_gemini_oauth() {
-        let creds = crate::services::gemini_oauth::interactive_login()
-            .await
-            .map_err(|e| e.context("gemini re-login"))?;
-        let json = creds.to_json()?;
-        persist(session_store, key, &json).await
+        Err(anyhow!(
+            "Gemini OAuth sign-in has been removed — re-add '{}' with a Gemini API key (`aivo keys add`).",
+            key.display_name()
+        ))
     } else if key.is_claude_oauth() {
         let creds = crate::services::claude_oauth::spawn_setup_token_and_capture()
             .await
@@ -37,7 +36,7 @@ pub async fn relogin_key(session_store: &SessionStore, key: &ApiKey) -> Result<A
         persist(session_store, key, &json).await
     } else {
         Err(anyhow!(
-            "--relogin only applies to OAuth keys (codex / gemini / claude); '{}' is a plain API key",
+            "--relogin only applies to OAuth keys (codex / claude); '{}' is a plain API key",
             key.display_name()
         ))
     }

@@ -17,8 +17,8 @@ use crate::services::launch_args::{
     merge_preview_env, preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
-    cleanup_runtime_artifacts, finalize_codex_oauth, finalize_gemini_oauth,
-    persist_runtime_discoveries, prepare_runtime_env, process_pi_sessions, record_launch_state,
+    cleanup_runtime_artifacts, finalize_codex_oauth, persist_runtime_discoveries,
+    prepare_runtime_env, process_pi_sessions, record_launch_state,
 };
 use crate::services::log_store::{LogEvent, new_log_id};
 use crate::services::model_names::{is_gpt_chat_model_name, is_openai_style_model_name};
@@ -143,8 +143,7 @@ impl AIToolType {
     /// or `None` when the key is compatible.
     pub fn oauth_incompat_reason(&self, key: &ApiKey) -> Option<&'static str> {
         let matches_tool = (*self == AIToolType::Claude && key.is_claude_oauth())
-            || (self.is_codex_family() && key.is_codex_oauth())
-            || (*self == AIToolType::Gemini && key.is_gemini_oauth());
+            || (self.is_codex_family() && key.is_codex_oauth());
         if matches_tool {
             None
         } else {
@@ -609,7 +608,6 @@ impl AILauncher {
         .await;
 
         finalize_codex_oauth(&self.session_store, runtime.codex_oauth_sync).await;
-        finalize_gemini_oauth(&self.session_store, runtime.gemini_oauth_sync).await;
 
         // The codex model catalog tempfile is referenced by the GUI's wrapper
         // for the duration of the Codex.app session. If we cleaned it up here
@@ -916,9 +914,10 @@ impl AILauncher {
         if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
-        // OAuth entries are pinned to the native Google endpoint (handled by
-        // the shadow GEMINI_CLI_HOME in launch_runtime). No router protocol
-        // applies.
+        // Legacy Gemini OAuth entries (sign-in flow removed) have no REST
+        // endpoint, so no router protocol applies. They're rejected before
+        // launch via `oauth_incompat_reason`; this guard just avoids seeding a
+        // bogus route if such a key reaches protocol resolution another way.
         if key.is_gemini_oauth() {
             return Ok(key);
         }

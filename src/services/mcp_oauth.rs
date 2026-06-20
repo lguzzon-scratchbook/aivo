@@ -15,10 +15,11 @@
 //!    (RFC 8707): browser flow via [`browser_open`] + the shared ephemeral
 //!    loopback callback, then a token exchange.
 //!
-//! The PKCE pair, `state`, and the loopback callback server are the same ones
-//! the gemini/codex OAuth flows use. The resulting [`McpOAuthCredential`]
-//! carries everything needed to silently `refresh` later without re-running
-//! discovery; persistence + the `/mcp` authorize UX live in a later phase.
+//! The PKCE pair and `state` are the same primitives the codex OAuth flow
+//! uses; the loopback callback server lives in [`loopback_oauth_callback`].
+//! The resulting [`McpOAuthCredential`] carries everything needed to silently
+//! `refresh` later without re-running discovery; persistence + the `/mcp`
+//! authorize UX live in a later phase.
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -37,7 +38,7 @@ const CLIENT_NAME: &str = "aivo";
 
 /// Tokens + the metadata needed to refresh without re-discovery, persisted
 /// (encrypted, in a later phase) per MCP server. `expiry_date` is milliseconds
-/// since epoch, matching the gemini credential format.
+/// since epoch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct McpOAuthCredential {
     pub access_token: String,
@@ -502,8 +503,9 @@ pub async fn authorize(
     on_authorize_url: impl FnOnce(&str),
 ) -> Result<McpOAuthCredential> {
     use crate::services::browser_open;
-    use crate::services::gemini_oauth::CALLBACK_PATH;
-    use crate::services::gemini_oauth_callback::{bind_loopback, wait_for_callback};
+    use crate::services::loopback_oauth_callback::{
+        CALLBACK_PATH, bind_loopback, wait_for_callback,
+    };
     use std::time::Duration;
 
     let client = crate::services::http_utils::router_http_client_with_timeout(30);

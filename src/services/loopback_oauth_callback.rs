@@ -1,9 +1,10 @@
-//! Single-shot local HTTP server that captures the OAuth
-//! `/oauth2callback` redirect for the Gemini Google OAuth flow.
+//! Single-shot local HTTP server that captures an OAuth `/oauth2callback`
+//! redirect on an ephemeral loopback port. Used by the MCP OAuth flow
+//! (`mcp_oauth`).
 //!
 //! Unlike Codex's `codex_oauth_callback` — which must bind a registered
-//! port — Google's Installed-App flow accepts *any* loopback port, so we
-//! bind an ephemeral `127.0.0.1:0` and thread the assigned port into the
+//! port — the flows here use providers that accept *any* loopback port, so
+//! we bind an ephemeral `127.0.0.1:0` and thread the assigned port into the
 //! authorize URL before printing it.
 
 use anyhow::{Context, Result, anyhow};
@@ -11,7 +12,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::services::gemini_oauth::CALLBACK_PATH;
+/// Redirect URI path segment. Any loopback port + path is accepted by the
+/// providers we drive here; `/oauth2callback` mirrors the common convention.
+pub const CALLBACK_PATH: &str = "/oauth2callback";
 
 /// Owns a bound loopback listener + its assigned port. Split from
 /// `wait_for_callback` so callers can embed the port in the authorize URL
@@ -30,7 +33,7 @@ impl LoopbackBinding {
 pub async fn bind_loopback() -> Result<LoopbackBinding> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
-        .context("bind Gemini OAuth callback listener on 127.0.0.1:0")?;
+        .context("bind OAuth callback listener on 127.0.0.1:0")?;
     let port = listener.local_addr().context("resolve bound port")?.port();
     Ok(LoopbackBinding { listener, port })
 }
@@ -204,7 +207,7 @@ const SUCCESS_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>aivo — signed in</title>
+  <title>aivo — authorized</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
            background: #0b0b0e; color: #e5e7eb; display: flex; align-items: center;
@@ -217,7 +220,7 @@ const SUCCESS_HTML: &str = r#"<!doctype html>
 </head>
 <body>
   <div class="card">
-    <h1>Signed in to Gemini.</h1>
+    <h1>Authorized.</h1>
     <p>You can close this tab and return to your terminal.</p>
   </div>
 </body>

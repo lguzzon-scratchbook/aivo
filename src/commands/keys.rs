@@ -547,10 +547,6 @@ const CLAUDE_OAUTH_INFO: (&str, &str) = (
     "Claude Code (Anthropic)",
     "sign in to your Anthropic account — multiple accounts supported",
 );
-const GEMINI_OAUTH_INFO: (&str, &str) = (
-    "Gemini (Google)",
-    "sign in with Google — multiple accounts supported",
-);
 const CURSOR_INFO: (&str, &str) = (
     "Cursor",
     "uses cursor-agent login or CURSOR_API_KEY for model discovery",
@@ -2030,7 +2026,6 @@ impl KeysCommand {
             Copilot,
             CodexOAuth,
             ClaudeOAuth,
-            GeminiOAuth,
             Cursor,
             Ollama,
             Starter,
@@ -2062,10 +2057,6 @@ impl KeysCommand {
                 ),
                 ProviderChoice::ClaudeOAuth => (
                     "Claude Code (Anthropic)",
-                    "browser login — multi-account".to_string(),
-                ),
-                ProviderChoice::GeminiOAuth => (
-                    "Gemini (Google)",
                     "browser login — multi-account".to_string(),
                 ),
                 ProviderChoice::Cursor => ("Cursor", "cursor-agent login/API key".to_string()),
@@ -2103,7 +2094,6 @@ impl KeysCommand {
                     "copilot" => Some(ProviderChoice::Copilot),
                     "codex" => Some(ProviderChoice::CodexOAuth),
                     "claude" => Some(ProviderChoice::ClaudeOAuth),
-                    "gemini" => Some(ProviderChoice::GeminiOAuth),
                     "cursor" => Some(ProviderChoice::Cursor),
                     _ => None,
                 }
@@ -2136,7 +2126,6 @@ impl KeysCommand {
             ProviderChoice::Copilot,
             ProviderChoice::CodexOAuth,
             ProviderChoice::ClaudeOAuth,
-            ProviderChoice::GeminiOAuth,
             ProviderChoice::Cursor,
         ] {
             if hoisted_special == Some(choice) {
@@ -2187,7 +2176,6 @@ impl KeysCommand {
             ProviderChoice::Copilot => self.add_copilot_interactive(name).await,
             ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
             ProviderChoice::ClaudeOAuth => self.add_claude_oauth_interactive(name).await,
-            ProviderChoice::GeminiOAuth => self.add_gemini_oauth_interactive(name).await,
             ProviderChoice::Cursor => self.add_cursor_interactive(name, None).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
@@ -2394,47 +2382,6 @@ impl KeysCommand {
             final_name,
             "Signed in to Claude Code",
             Some(("aivo run claude", "(launches claude with this account)")),
-        )
-        .await?;
-        Ok(ExitCode::Success)
-    }
-
-    /// Interactive Google OAuth sign-in for the `gemini` CLI. Multiple
-    /// accounts supported — each login produces a fresh key entry named
-    /// after the account's email. Tokens are stored encrypted; at launch
-    /// time aivo projects them into a shadow `GEMINI_CLI_HOME` so the
-    /// native `gemini` CLI reads them without touching the user's real
-    /// `~/.gemini/`.
-    async fn add_gemini_oauth_interactive(&self, name: &str) -> Result<ExitCode> {
-        use crate::services::gemini_oauth::{GEMINI_OAUTH_SENTINEL, interactive_login};
-
-        keys_ui::provider_info(GEMINI_OAUTH_INFO.0, GEMINI_OAUTH_INFO.1);
-        keys_ui::step_header(
-            3,
-            3,
-            "Sign in",
-            "follow the URL below — the browser opens automatically if possible",
-        );
-
-        let creds = interactive_login().await?;
-        let derived_name = creds.email.clone().unwrap_or_else(|| "gemini".to_string());
-        let final_name = if name.is_empty() { &derived_name } else { name };
-        let creds_json = creds.to_json()?;
-
-        let id = self
-            .session_store
-            .add_key_with_protocol(final_name, GEMINI_OAUTH_SENTINEL, None, &creds_json)
-            .await?;
-
-        let email_line = match creds.email.as_deref() {
-            Some(email) => format!("Signed in as {}", email),
-            None => "Signed in to Gemini".to_string(),
-        };
-        self.finalize_add(
-            &id,
-            final_name,
-            &email_line,
-            Some(("aivo run gemini", "(launches gemini with this account)")),
         )
         .await?;
         Ok(ExitCode::Success)
@@ -2845,10 +2792,6 @@ impl KeysCommand {
                     (
                         crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL,
                         "Claude Code login needs browser auth",
-                    ),
-                    (
-                        crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL,
-                        "Gemini login needs browser auth",
                     ),
                 ];
                 let reject = |msg: String| -> Option<ExitCode> {
