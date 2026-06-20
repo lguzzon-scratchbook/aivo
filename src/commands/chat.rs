@@ -962,19 +962,13 @@ impl ChatCommand {
         println!();
         println!(
             "{}",
-            style::dim("Start the interactive full-screen chat TUI with streaming responses.")
-        );
-        println!(
-            "{}",
             style::dim(
-                "Uses the active API key and opens a transcript/composer interface in your terminal."
+                "Start the interactive chat TUI with streaming responses, or send one prompt with -p."
             )
         );
         println!(
             "{}",
-            style::dim(
-                "Slash commands are available inside chat: /new, /resume, /model, /key, /agent, /attach, /detach, /help, /exit."
-            )
+            style::dim("Type /help inside chat for slash commands and keybindings.")
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -1022,64 +1016,9 @@ impl ChatCommand {
             "Print the resolved key, model, endpoint, and agent without connecting",
         );
         println!();
-        println!("{}", style::bold("Slash Commands:"));
-        let print_cmd = |label: &str, desc: &str| {
-            println!(
-                "  {}{}",
-                style::cyan(format!("{:<18}", label)),
-                style::dim(desc)
-            );
-        };
-        print_cmd("/new", "Start a fresh chat with the current key and model");
-        print_cmd("/resume [query]", "Resume a saved chat from this directory");
-        print_cmd("/model [name]", "Switch the current chat model");
-        print_cmd(
-            "/key [id|name]",
-            "Switch to another saved key for this chat",
-        );
-        print_cmd(
-            "/attach <path>",
-            "Attach a text file or image to the next message",
-        );
-        print_cmd("/detach <n>", "Remove one queued attachment by number");
-        print_cmd(
-            "/agent [name]",
-            "Switch agent profile (name, or 'default' to reset); only at chat start",
-        );
-        print_cmd(
-            "/goal <objective>",
-            "Work autonomously toward a goal until done ('/goal stop' to end)",
-        );
-        print_cmd(
-            "/rewind",
-            "Rewind to an earlier turn and revert file edits made since",
-        );
-        print_cmd("/help / /exit", "Open command help / leave chat");
-        print_cmd("//message", "Send a literal leading slash");
-        println!();
-        println!("{}", style::bold("Keys:"));
-        let print_key = |label: &str, desc: &str| {
-            println!(
-                "  {}{}",
-                style::cyan(format!("{:<22}", label)),
-                style::dim(desc)
-            );
-        };
-        print_key("Enter / Ctrl+J", "Send message / insert newline");
-        print_key("Ctrl+V", "Paste system clipboard (text or image)");
-        print_key("Ctrl+R / F1", "Open resume picker / show help");
-        print_key("Ctrl+P / Ctrl+N", "Previous / next input");
-        print_key("Ctrl+M", "Change model");
-        print_key("AIVO_REDUCE_MOTION=1", "Disable chat TUI motion effects");
-        println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo chat"));
-        println!("  {}", style::dim("aivo chat --model gpt-4o"));
         println!("  {}", style::dim("aivo chat -m claude-sonnet-4-5"));
-        println!(
-            "  {}",
-            style::dim("aivo chat hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
-        );
         println!(
             "  {}",
             style::dim("aivo chat --attach README.md --attach screenshot.png")
@@ -1088,17 +1027,10 @@ impl ChatCommand {
             "  {}",
             style::dim("aivo chat -p \"Explain Rust lifetimes\"")
         );
-        println!("  {}", style::dim("aivo chat -p"));
-        println!("  {}", style::dim("aivo -p \"Summarize this repository\""));
-        println!(
-            "  {}",
-            style::dim("aivo \"Summarize this repository\"  # bare quoted prompt")
-        );
         println!(
             "  {}",
             style::dim("git diff | aivo chat -p \"Summarize changes in one sentence\"")
         );
-        println!("  {}", style::dim("cat error.log | aivo -p"));
     }
 }
 
