@@ -202,65 +202,6 @@ fn chat_route_to_persist(
     Some((model, route))
 }
 
-/// If `cwd` is too broad to be a safe agent workspace, return a phrase naming
-/// why (for the confirmation prompt); else `None`. "Too broad" means the agent's
-/// free-write zone would engulf the home directory, the filesystem root, or any
-/// directory holding aivo's own config/key store. Pure — `canonicalize` is
-/// best-effort, falling back to the literal path so non-existent paths still
-/// compare lexically.
-fn overbroad_workspace_reason(
-    cwd: &Path,
-    home: Option<&Path>,
-    config_dir: &Path,
-) -> Option<&'static str> {
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let cwd = canon(cwd);
-    // Filesystem root (no parent) — e.g. "/" or "C:\".
-    if cwd.parent().is_none() {
-        return Some("the filesystem root");
-    }
-    if let Some(home) = home
-        && canon(home) == cwd
-    {
-        return Some("your home directory");
-    }
-    // The key store lives under cwd → the agent could rewrite it without a
-    // prompt. Catches `~`, `~/.config`, and any other ancestor of the store.
-    if canon(config_dir).starts_with(&cwd) {
-        return Some("a directory that holds aivo's config and key store");
-    }
-    None
-}
-
-/// Warn that the workspace is over-broad and ask whether to proceed. The safe
-/// default is NO; off a TTY we fail closed unless `AIVO_AGENT_TRUST_CWD` opts in.
-fn confirm_overbroad_workspace(reason: &str) -> bool {
-    use std::io::{IsTerminal, Write};
-    if std::env::var("AIVO_AGENT_TRUST_CWD").is_ok_and(|v| !v.is_empty() && v != "0") {
-        return true;
-    }
-    eprintln!("  {} Starting the agent in {}.", style::yellow("!"), reason);
-    eprintln!(
-        "    It can read and write freely here without per-file prompts — including \
-shell startup files, ~/.ssh, and the key store."
-    );
-    if !std::io::stdin().is_terminal() {
-        eprintln!(
-            "    Refusing in a non-interactive run — cd into a project, or set \
-AIVO_AGENT_TRUST_CWD=1 to override."
-        );
-        return false;
-    }
-    eprint!("    Continue anyway? [y/N] ");
-    let _ = std::io::stderr().flush();
-    let mut input = String::new();
-    match std::io::stdin().read_line(&mut input) {
-        // EOF (^D) / read error is a non-answer → take the safe default (no).
-        Ok(0) | Err(_) => false,
-        Ok(_) => matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-    }
-}
-
 /// ChatCommand provides an interactive REPL for chatting with AI models
 pub struct ChatCommand {
     session_store: SessionStore,
@@ -520,19 +461,6 @@ impl ChatCommand {
                     agent.as_deref(),
                 )
                 .await;
-        }
-
-        // Refuse to treat an over-broad directory as a free-write workspace
-        // without explicit confirmation: in the home dir, the filesystem root,
-        // or any directory holding aivo's own config/key store, the agent could
-        // silently rewrite shell rc files, ~/.ssh, or the encrypted key store.
-        if let Some(reason) = overbroad_workspace_reason(
-            &std::env::current_dir().unwrap_or_default(),
-            crate::services::system_env::home_dir().as_deref(),
-            self.session_store.config_dir(),
-        ) && !confirm_overbroad_workspace(reason)
-        {
-            return Ok(ExitCode::UserError);
         }
 
         // Bare `hf:` opens a picker; rewrite to a concrete ref.
@@ -2853,34 +2781,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn overbroad_workspace_flags_home_root_and_keystore_ancestors() {
-        let home = Path::new("/home/alice");
-        let config = Path::new("/home/alice/.config/aivo");
-
-        // Home directory itself, the filesystem root, and ancestors of the key
-        // store are all over-broad.
-        assert!(overbroad_workspace_reason(home, Some(home), config).is_some());
-        assert!(overbroad_workspace_reason(Path::new("/"), Some(home), config).is_some());
-        assert!(
-            overbroad_workspace_reason(Path::new("/home/alice/.config"), Some(home), config)
-                .is_some(),
-            "a directory containing the key store is over-broad"
-        );
-
-        // An ordinary project directory is fine, even when it shares a prefix
-        // with the home path.
-        assert!(
-            overbroad_workspace_reason(Path::new("/home/alice/projects/app"), Some(home), config)
-                .is_none()
-        );
-        // A sibling of the config dir does not contain it.
-        assert!(
-            overbroad_workspace_reason(Path::new("/home/alice/.cache"), Some(home), config)
-                .is_none()
-        );
-    }
 
     #[test]
     fn build_one_shot_persist_inputs_includes_assistant_turn() {
