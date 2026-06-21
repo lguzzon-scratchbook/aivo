@@ -242,6 +242,7 @@ Update to the latest version. Delegates to Homebrew or npm when installed by tho
 aivo update
 aivo update --force                          # force even if pkg-managed
 aivo update --rollback                       # restore previous backup
+aivo update --sync-model-data                # sync model metadata
 ```
 
 ## plugins

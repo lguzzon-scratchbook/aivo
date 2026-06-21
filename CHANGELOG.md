@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.31.2
+
+Model data now refreshes without a release: `aivo update --sync-model-data`
+regenerates the embedded model-limits snapshot from live models.dev.
+
+- feat(update): add `--sync-model-data` to refresh model data from models.dev (4cd7051)
+- feat(models): resolve model names against the provider catalog (a6bf370)
+- feat(chat): scope input-history recall by launch directory (9df2a4e)
+- feat(chat): record `/commands` in input history and dedupe consecutive entries (cb60860)
+- feat(chat): cap input history at 100 and title the composer rule with position (614fc56)
+- feat(stats): span the scan progress counter across native tools and plugins (0407f8f)
+- fix(models): let an override win per folded id when overlaying refreshed limits (9ded5fd)
+- fix(update): self-heal the stale npm launcher shim on Windows (d7f0424)
+- fix(chat): run `!cmd` through plain pipes on Windows, not ConPTY (80555d9)
+- chore(chat): simplify `chat --help` output (6de5134)
+- chore(chat): remove the over-broad-workspace launch warning (6867500)
+
 ## v0.31.1
 
 - feat(gemini): remove Google OAuth sign-in for the gemini CLI (8d3b793)
