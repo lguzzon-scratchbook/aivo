@@ -642,6 +642,37 @@ async fn test_ctrl_p_navigate_command_menu_before_history() {
 }
 
 #[tokio::test]
+async fn test_history_nav_past_recalled_slash_command() {
+    // Recalling a `/command` from history must not pop the command menu and
+    // steal the arrow keys — ↑ keeps walking history past it.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_history = vec!["older".to_string(), "/help".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    // First ↑ recalls the newest entry (a slash command); the menu stays hidden.
+    assert_eq!(app.draft, "/help");
+    assert_eq!(app.draft_history_index, Some(1));
+    assert!(app.visible_command_menu().is_none());
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    // Second ↑ continues up through history rather than navigating the menu.
+    assert_eq!(app.draft, "older");
+    assert_eq!(app.draft_history_index, Some(0));
+
+    // ↓ steps back down past the slash command, too.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.draft, "/help");
+    assert_eq!(app.draft_history_index, Some(1));
+}
+
+#[tokio::test]
 async fn test_escape_dismisses_command_menu_until_query_changes() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -958,6 +989,7 @@ fn make_test_app(
         command_menu: CommandMenuState::default(),
         skill_commands: Vec::new(),
         draft_history: Vec::new(),
+        draft_history_all: Vec::new(),
         draft_history_index: None,
         draft_history_stash: None,
         session_id: String::new(),
@@ -7009,11 +7041,84 @@ fn test_overlay_hides_input_cursor() {
 fn test_persisted_draft_history_roundtrip() {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("chat_history");
-    let history = vec!["first".to_string(), "second".to_string()];
+    let history = vec![
+        DraftHistoryEntry {
+            cwd: "/work/a".to_string(),
+            text: "first".to_string(),
+        },
+        DraftHistoryEntry {
+            cwd: "/work/b".to_string(),
+            text: "second".to_string(),
+        },
+    ];
 
     save_persisted_draft_history_to_path(&path, &history).unwrap();
 
-    assert_eq!(load_persisted_draft_history_from_path(&path), history);
+    let loaded = load_persisted_draft_history_from_path(&path);
+    let pairs: Vec<(String, String)> = loaded
+        .into_iter()
+        .map(|entry| (entry.cwd, entry.text))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("/work/a".to_string(), "first".to_string()),
+            ("/work/b".to_string(), "second".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_draft_history_view_filters_by_cwd() {
+    let all = vec![
+        DraftHistoryEntry {
+            cwd: String::new(),
+            text: "legacy".to_string(),
+        },
+        DraftHistoryEntry {
+            cwd: "/work/a".to_string(),
+            text: "in-a".to_string(),
+        },
+        DraftHistoryEntry {
+            cwd: "/work/b".to_string(),
+            text: "in-b".to_string(),
+        },
+    ];
+
+    // Current dir's entries plus the legacy fallback; other dirs filtered out.
+    assert_eq!(
+        draft_history_view(&all, "/work/a"),
+        vec!["legacy".to_string(), "in-a".to_string()]
+    );
+    assert_eq!(
+        draft_history_view(&all, "/work/b"),
+        vec!["legacy".to_string(), "in-b".to_string()]
+    );
+    // A fresh dir sees only the legacy fallback.
+    assert_eq!(
+        draft_history_view(&all, "/work/new"),
+        vec!["legacy".to_string()]
+    );
+}
+
+#[test]
+fn test_legacy_plaintext_history_loads_untagged() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("chat_history");
+    // The old writer encrypted raw newline-joined prompt lines (no JSON).
+    let blob = crate::services::session_store::encrypt("old one\nold two").unwrap();
+    std::fs::write(&path, blob).unwrap();
+
+    let loaded = load_persisted_draft_history_from_path(&path);
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.iter().all(|entry| entry.cwd.is_empty()));
+    assert_eq!(loaded[0].text, "old one");
+    assert_eq!(loaded[1].text, "old two");
+    // Untagged entries surface in every dir's view.
+    assert_eq!(
+        draft_history_view(&loaded, "/anywhere"),
+        vec!["old one".to_string(), "old two".to_string()]
+    );
 }
 
 #[test]

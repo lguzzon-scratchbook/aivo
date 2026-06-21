@@ -2,7 +2,7 @@ use super::*;
 
 impl ChatTuiApp {
     pub(super) fn persist_draft_history(&self) {
-        let _ = save_persisted_draft_history(&self.draft_history);
+        let _ = save_persisted_draft_history(&self.draft_history_all);
     }
 
     pub(super) fn is_busy(&self) -> bool {

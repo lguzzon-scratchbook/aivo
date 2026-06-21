@@ -1569,16 +1569,25 @@ impl ChatTuiApp {
         if input.is_empty() {
             return;
         }
-        // Drop consecutive duplicates (shell `ignoredups` behavior): re-running
-        // the same command or recalling an entry with up-arrow and resending it
-        // shouldn't stack identical rows. Non-adjacent repeats are kept.
+        // Drop consecutive duplicates (shell `ignoredups`), judged against the
+        // current dir's view. Non-adjacent repeats are kept.
         if self.draft_history.last().map(String::as_str) != Some(input) {
             self.draft_history.push(input.to_string());
-            // Bound the recall list (and its on-disk file) to the most recent
-            // `MAX_DRAFT_HISTORY` entries, dropping the oldest first.
             let overflow = self.draft_history.len().saturating_sub(MAX_DRAFT_HISTORY);
             if overflow > 0 {
                 self.draft_history.drain(..overflow);
+            }
+            // Mirror into the global list, tagged with the launch dir.
+            self.draft_history_all.push(DraftHistoryEntry {
+                cwd: self.real_cwd.clone(),
+                text: input.to_string(),
+            });
+            let overflow = self
+                .draft_history_all
+                .len()
+                .saturating_sub(MAX_DRAFT_HISTORY_TOTAL);
+            if overflow > 0 {
+                self.draft_history_all.drain(..overflow);
             }
         }
         self.draft_history_index = None;

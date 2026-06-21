@@ -90,6 +90,12 @@ impl ChatTuiApp {
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
         // Remembered across sessions (the user picked "remember last choice").
         let auto_approve = params.session_store.get_chat_auto_approve().await;
+        // The launch dir keys the recall view; the persisted file stays global.
+        let real_cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let draft_history_all = load_persisted_draft_history();
+        let draft_history = draft_history_view(&draft_history_all, &real_cwd);
         Ok(Self {
             session_store: params.session_store,
             cache: params.cache,
@@ -97,9 +103,7 @@ impl ChatTuiApp {
             key: params.key,
             copilot_tm: params.copilot_tm,
             cwd: params.cwd,
-            real_cwd: std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            real_cwd,
             git_branch: None,
             git_branch_checked_at: None,
             raw_model: params.raw_model,
@@ -112,7 +116,8 @@ impl ChatTuiApp {
             cursor: 0,
             command_menu: CommandMenuState::default(),
             skill_commands: Vec::new(),
-            draft_history: load_persisted_draft_history(),
+            draft_history,
+            draft_history_all,
             draft_history_index: None,
             draft_history_stash: None,
             session_id: params.initial_session,

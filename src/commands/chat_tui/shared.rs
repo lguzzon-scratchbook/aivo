@@ -1310,6 +1310,14 @@ pub(super) struct GoalState {
     pub(super) max: usize,
 }
 
+/// One persisted input-history entry, tagged with the launch dir it was typed
+/// in. Legacy plain-text lines load with an empty `cwd` (shown everywhere).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct DraftHistoryEntry {
+    pub(super) cwd: String,
+    pub(super) text: String,
+}
+
 pub(super) struct ChatTuiApp {
     pub(super) session_store: SessionStore,
     pub(super) cache: ModelsCache,
@@ -1345,7 +1353,12 @@ pub(super) struct ChatTuiApp {
     /// startup and after any skill mutation; read by the `/` menu and command
     /// resolver. Empty when no skills are available.
     pub(super) skill_commands: Vec<SkillCommand>,
+    /// Up-arrow recall list for the current launch dir — the cwd-filtered view
+    /// of `draft_history_all` that `history_prev`/`history_next` walk.
     pub(super) draft_history: Vec<String>,
+    /// Full global history across every dir; persisted source of truth that the
+    /// `draft_history` view is derived from.
+    pub(super) draft_history_all: Vec<DraftHistoryEntry>,
     pub(super) draft_history_index: Option<usize>,
     pub(super) draft_history_stash: Option<String>,
     pub(super) session_id: String,

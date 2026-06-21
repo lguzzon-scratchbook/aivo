@@ -43,12 +43,27 @@ pub(super) async fn load_resume_session(
     LoadedSession::from_state(session).map_err(|err| err.to_string())
 }
 
-pub(super) fn load_persisted_draft_history() -> Vec<String> {
+/// Per-directory recall view: entries typed in `cwd` plus legacy un-attributed
+/// ones (empty `cwd`), oldest-first, capped to the last `MAX_DRAFT_HISTORY`.
+pub(super) fn draft_history_view(all: &[DraftHistoryEntry], cwd: &str) -> Vec<String> {
+    let mut view: Vec<String> = all
+        .iter()
+        .filter(|entry| entry.cwd == cwd || entry.cwd.is_empty())
+        .map(|entry| entry.text.clone())
+        .collect();
+    let overflow = view.len().saturating_sub(MAX_DRAFT_HISTORY);
+    if overflow > 0 {
+        view.drain(..overflow);
+    }
+    view
+}
+
+pub(super) fn load_persisted_draft_history() -> Vec<DraftHistoryEntry> {
     let path = draft_history_path();
     load_persisted_draft_history_from_path(&path)
 }
 
-pub(super) fn load_persisted_draft_history_from_path(path: &Path) -> Vec<String> {
+pub(super) fn load_persisted_draft_history_from_path(path: &Path) -> Vec<DraftHistoryEntry> {
     let Ok(data) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -56,34 +71,42 @@ pub(super) fn load_persisted_draft_history_from_path(path: &Path) -> Vec<String>
         return Vec::new();
     };
 
-    let mut entries: Vec<String> = plain
+    let mut entries: Vec<DraftHistoryEntry> = plain
         .lines()
         .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
+        .map(|line| {
+            // A non-JSON line is a legacy untagged prompt → empty `cwd`.
+            serde_json::from_str::<DraftHistoryEntry>(line).unwrap_or(DraftHistoryEntry {
+                cwd: String::new(),
+                text: line.to_owned(),
+            })
+        })
         .collect();
-    // Keep only the most recent `MAX_DRAFT_HISTORY` entries — a file written
-    // before the cap existed can be arbitrarily long; trim it on load.
-    let overflow = entries.len().saturating_sub(MAX_DRAFT_HISTORY);
+    let overflow = entries.len().saturating_sub(MAX_DRAFT_HISTORY_TOTAL);
     if overflow > 0 {
         entries.drain(..overflow);
     }
     entries
 }
 
-pub(super) fn save_persisted_draft_history(history: &[String]) -> io::Result<()> {
+pub(super) fn save_persisted_draft_history(history: &[DraftHistoryEntry]) -> io::Result<()> {
     let path = draft_history_path();
     save_persisted_draft_history_to_path(&path, history)
 }
 
 pub(super) fn save_persisted_draft_history_to_path(
     path: &Path,
-    history: &[String],
+    history: &[DraftHistoryEntry],
 ) -> io::Result<()> {
     if history.is_empty() {
         return Ok(());
     }
 
-    let joined = history.join("\n");
+    let joined = history
+        .iter()
+        .filter_map(|entry| serde_json::to_string(entry).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
     let encrypted = crate::services::session_store::encrypt(&joined).map_err(io::Error::other)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

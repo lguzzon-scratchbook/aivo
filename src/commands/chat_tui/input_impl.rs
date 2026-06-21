@@ -229,6 +229,13 @@ impl ChatTuiApp {
     }
 
     pub(super) fn visible_command_menu(&self) -> Option<VisibleCommandMenu> {
+        // While recalling input history (↑/↓), keep arrows driving history
+        // navigation — don't pop the dropdown for a recalled `/command` and let
+        // it hijack the very keys used to keep scrolling. The menu returns once
+        // the user edits the recalled draft (which leaves history navigation).
+        if self.draft_history_index.is_some() {
+            return None;
+        }
         if self.command_menu.dismissed {
             return None;
         }
