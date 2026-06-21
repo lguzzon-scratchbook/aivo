@@ -81,7 +81,29 @@ impl StatsCommand {
                 return ExitCode::UserError;
             }
         };
-        let global = global_stats::collect_all(args.refresh, cutoff).await;
+        let keys = self.store.get_keys().await.unwrap_or_default();
+        let key_ids: HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+        let plugins = crate::plugin::coding_agent_plugin_names();
+        let aivo_tool_counts = aggregate_tool_counts(&stats, &key_ids, &plugins);
+
+        // Launched, self-reporting coding-agent plugins, counted up front so the
+        // `(x/N)` counter spans native tools *and* plugins. `is_native_tool`
+        // guards the rare plugin-shadows-a-builtin case (the scan owns those).
+        let mut probe_targets: Vec<String> = Vec::new();
+        for (tool, &count) in &aivo_tool_counts {
+            if tool.as_str() != "chat"
+                && count > 0
+                && !global_stats::is_native_tool(tool)
+                && crate::plugin::stats::probes_stats(tool)
+            {
+                probe_targets.push(tool.clone());
+            }
+        }
+        probe_targets.sort();
+        let native_count = global_stats::native_present_count();
+        let total_steps = native_count + probe_targets.len();
+
+        let global = global_stats::collect_all(args.refresh, cutoff, probe_targets.len()).await;
 
         if stats.is_empty() && global.is_empty() {
             if args.json {
@@ -91,18 +113,13 @@ impl StatsCommand {
             return ExitCode::Success;
         }
 
-        let keys = self.store.get_keys().await.unwrap_or_default();
         let fmt = if args.numbers {
             format_number
         } else {
             format_human
         };
 
-        let key_ids: HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
-        let plugins = crate::plugin::coding_agent_plugin_names();
-
         let mut tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
-        let aivo_tool_counts = aggregate_tool_counts(&stats, &key_ids, &plugins);
         for (tool, gs) in &global {
             if !is_valid_tool(tool, &plugins) {
                 continue;
@@ -140,21 +157,34 @@ impl StatsCommand {
             })
             .map(|(tool, &count)| (tool, count))
             .collect();
-        // Each probe spawns the plugin binary (5s timeout) — run them all
-        // concurrently up front instead of serially inside the loop.
-        let probe_reports: HashMap<&str, crate::plugin::stats::PluginStatsReport> =
-            futures::future::join_all(
-                pending
-                    .iter()
-                    .filter(|(tool, _)| crate::plugin::stats::probes_stats(tool))
-                    .map(|(tool, _)| async move {
-                        (tool.as_str(), crate::plugin::stats::probe_stats(tool).await)
-                    }),
+        // Probe concurrently (each spawns the plugin binary, 5s timeout), but
+        // drive the stream so the `(x/N)` counter advances as each finishes.
+        let probe_progress =
+            !probe_targets.is_empty() && std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let mut probe_futs: futures::stream::FuturesUnordered<_> = probe_targets
+            .iter()
+            .map(
+                |tool| async move { (tool.clone(), crate::plugin::stats::probe_stats(tool).await) },
             )
-            .await
-            .into_iter()
-            .filter_map(|(tool, report)| report.map(|r| (tool, r)))
             .collect();
+        let mut probe_reports: HashMap<String, crate::plugin::stats::PluginStatsReport> =
+            HashMap::new();
+        let mut probed = 0usize;
+        {
+            use futures::StreamExt as _;
+            while let Some((tool, report)) = probe_futs.next().await {
+                probed += 1;
+                if probe_progress {
+                    global_stats::render_step(native_count + probed, total_steps, &tool);
+                }
+                if let Some(report) = report {
+                    probe_reports.insert(tool, report);
+                }
+            }
+        }
+        if probe_progress {
+            global_stats::clear_progress_line();
+        }
         for &(tool, count) in &pending {
             let report = probe_reports.get(tool.as_str());
             let summary = match (report, cutoff) {

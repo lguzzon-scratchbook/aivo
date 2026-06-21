@@ -73,15 +73,19 @@ struct StatsCache {
 /// Collect global stats for all known tools sequentially.
 /// Sequential avoids progress line flickering (all tools share one stderr line).
 /// Returns a map of tool name → stats (only tools with data).
+///
+/// `extra_steps` (the caller's following plugin-probe steps) folds into the
+/// `(x/N)` denominator so it spans native tools *and* plugins, not a constant 5.
 pub async fn collect_all(
     refresh: bool,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    extra_steps: usize,
 ) -> HashMap<String, GlobalToolStats> {
-    let tools = ["claude", "codex", "gemini", "opencode", "pi"];
-    let total_tools = tools.len();
+    let tools = native_present_tools();
+    let total_steps = tools.len() + extra_steps;
     let mut result = HashMap::new();
-    for (i, tool) in tools.iter().enumerate() {
-        let step = Some((i + 1, total_tools));
+    for (i, &tool) in tools.iter().enumerate() {
+        let step = Some((i + 1, total_steps));
         if let Ok(Some(stats)) = collect_with_step(tool, refresh, step, cutoff).await
             && (stats.total_tokens() > 0 || stats.sessions > 0)
         {
@@ -275,6 +279,50 @@ fn aggregate_cache_filtered(
 // Infrastructure helpers
 // ---------------------------------------------------------------------------
 
+/// Built-in tools aivo scans directly, as opposed to coding-agent plugins
+/// (accounted via launch counts and `--aivo-stats` probes).
+pub fn is_native_tool(tool: &str) -> bool {
+    matches!(tool, "claude" | "codex" | "gemini" | "opencode" | "pi")
+}
+
+/// True when `tool`'s native data store exists on disk.
+fn native_data_present(tool: &str) -> bool {
+    let Some(home) = system_env::home_dir() else {
+        return false;
+    };
+    match tool {
+        // claude's stats-cache.json survives projects-dir pruning, so either counts.
+        "claude" => {
+            home.join(".claude").join("projects").exists()
+                || home.join(".claude").join("stats-cache.json").exists()
+        }
+        "codex" => home.join(".codex").join("sessions").exists(),
+        "gemini" => home.join(".gemini").join("tmp").exists(),
+        "opencode" => home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db")
+            .exists(),
+        "pi" => home.join(".pi").join("agent").join("sessions").exists(),
+        _ => false,
+    }
+}
+
+/// Native tools (in scan order) whose data is present on disk.
+fn native_present_tools() -> Vec<&'static str> {
+    ["claude", "codex", "gemini", "opencode", "pi"]
+        .into_iter()
+        .filter(|t| native_data_present(t))
+        .collect()
+}
+
+/// Native-tool count for the next `collect_all`; the caller adds its probe
+/// count to size the `(x/N)` counter.
+pub fn native_present_count() -> usize {
+    native_present_tools().len()
+}
+
 fn tool_data_dir(tool: &str) -> Option<PathBuf> {
     let home = system_env::home_dir()?;
     match tool {
@@ -346,6 +394,21 @@ fn print_progress(current: usize, total: usize, step: Option<(usize, usize)>) {
         step_prefix,
         crate::style::dim("reading")
     );
+}
+
+/// Render one probe-phase step on the shared progress line: a step counter and
+/// the plugin name (fixed-width, so a shorter name can't leave a tail behind).
+pub fn render_step(current: usize, total: usize, detail: &str) {
+    eprint!(
+        "\r({current}/{total}) {} {:<12}",
+        crate::style::dim("reading"),
+        detail
+    );
+}
+
+/// Clear the shared progress line once the probe phase finishes.
+pub fn clear_progress_line() {
+    eprint!("\r{:<40}\r", "");
 }
 
 async fn read_cache(path: &Path) -> Option<StatsCache> {
@@ -1004,9 +1067,19 @@ mod tests {
 
     #[tokio::test]
     async fn collect_all_accepts_cutoff_signature() {
-        // Compile-time check: the new signature accepts an Option<DateTime<Utc>>.
-        let _ = collect_all(false, None).await;
-        let _ = collect_all(false, Some(chrono::Utc::now())).await;
+        // Compile-time check on the signature (cutoff + extra-steps count).
+        let _ = collect_all(false, None, 0).await;
+        let _ = collect_all(false, Some(chrono::Utc::now()), 3).await;
+    }
+
+    #[test]
+    fn is_native_tool_matches_the_scanned_set() {
+        for t in ["claude", "codex", "gemini", "opencode", "pi"] {
+            assert!(is_native_tool(t), "{t} should be native");
+        }
+        for t in ["amp", "grok", "omp", "copilot", "cursor", "chat", ""] {
+            assert!(!is_native_tool(t), "{t} should not be native");
+        }
     }
 
     fn parse_claude_line(line: &str) -> (u64, u64, u64, u64, Option<String>) {
