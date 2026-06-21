@@ -10,6 +10,19 @@ fn test_matches_fuzzy() {
 }
 
 #[test]
+fn test_chat_mouse_enabled_policy() {
+    // No override: on everywhere except Termux, where taps must keep toggling
+    // the soft keyboard instead of being eaten as mouse events.
+    assert!(chat_mouse_enabled_for(None, false));
+    assert!(!chat_mouse_enabled_for(None, true));
+    // Explicit override wins in both directions, even under Termux.
+    assert!(!chat_mouse_enabled_for(Some("1"), false));
+    assert!(!chat_mouse_enabled_for(Some("yes"), true));
+    assert!(chat_mouse_enabled_for(Some("0"), true));
+    assert!(chat_mouse_enabled_for(Some("false"), true));
+}
+
+#[test]
 fn test_cursor_position_multiline() {
     assert_eq!(cursor_position("hello", 5, 10, 2), (7, 0));
     assert_eq!(cursor_position("hello\nworld", 11, 10, 2), (7, 1));

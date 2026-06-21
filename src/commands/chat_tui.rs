@@ -307,10 +307,20 @@ fn chat_scroll_speed() -> usize {
 }
 
 fn chat_mouse_enabled() -> bool {
-    env::var("AIVO_CHAT_DISABLE_MOUSE")
-        .ok()
-        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true)
+    chat_mouse_enabled_for(
+        env::var("AIVO_CHAT_DISABLE_MOUSE").ok().as_deref(),
+        crate::services::termux_exec::is_termux(),
+    )
+}
+
+/// Pure mouse-capture policy, split out for testing. Off by default under
+/// Termux, where capturing the mouse makes screen taps stop toggling the soft
+/// keyboard; an explicit `AIVO_CHAT_DISABLE_MOUSE` override wins either way.
+fn chat_mouse_enabled_for(disable_override: Option<&str>, is_termux: bool) -> bool {
+    if let Some(value) = disable_override {
+        return !matches!(value, "1" | "true" | "TRUE" | "yes" | "YES");
+    }
+    !is_termux
 }
 
 #[cfg(test)]

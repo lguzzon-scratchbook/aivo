@@ -997,7 +997,7 @@ fn print_help_json() {
         "environment": [
             { "name": "AIVO_REDUCE_MOTION", "desc": "Disable chat TUI motion effects (=1)" },
             { "name": "AIVO_PREVIEW", "desc": "Force-disable (=0) or force-enable (=1) terminal image preview" },
-            { "name": "AIVO_CHAT_DISABLE_MOUSE", "desc": "Disable mouse capture in chat TUI (=1)" },
+            { "name": "AIVO_CHAT_DISABLE_MOUSE", "desc": "Disable mouse capture in chat TUI (=1; auto-off under Termux, =0 re-enables)" },
             { "name": "AIVO_CHAT_SCROLL_SPEED", "desc": "Lines scrolled per wheel tick in chat TUI (default 3)" },
             { "name": "AIVO_PATH", "desc": "Override the install path detected by `aivo update`" },
             { "name": "AIVO_SHARE_BASE_URL", "desc": "Override the public tunnel endpoint used by `aivo logs share`" },
