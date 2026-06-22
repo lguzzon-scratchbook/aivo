@@ -2279,14 +2279,26 @@ fn is_format_mismatch(e: &anyhow::Error) -> bool {
         || crate::services::provider_protocol::is_format_unsupported_error(&msg)
 }
 
-/// Returns true when the error suggests trying the Responses API.
-/// Matches the specific "unsupported_api_for_model" code as well as any 400 error,
-/// since newer models may only be accessible via /v1/responses.
+/// True when a failed `/chat/completions` attempt should be retried on the
+/// Responses API: an explicit "use /responses" signal, or a bare 400 that might
+/// just be the wrong endpoint. A 400 carrying a structured error envelope (e.g.
+/// "does not support image inputs") is a real rejection — retrying would mask it
+/// behind a 404 from a `/responses` path the provider may not even serve.
 fn is_responses_api_required(e: &anyhow::Error) -> bool {
-    let msg = e.to_string().to_lowercase();
-    msg.contains("unsupported_api_for_model")
-        || msg.contains("400 bad request")
-        || (msg.contains("not accessible") && msg.contains("/chat/completions"))
+    let msg = e.to_string();
+    let lower = msg.to_lowercase();
+    if lower.contains("unsupported_api_for_model")
+        || (lower.contains("not accessible") && lower.contains("/chat/completions"))
+    {
+        return true;
+    }
+    lower.contains("400 bad request")
+        && !crate::services::provider_protocol::is_request_error_envelope(error_response_body(&msg))
+}
+
+/// The `{body}` half of an `API returned {status} — {body}` sender error.
+fn error_response_body(msg: &str) -> &str {
+    msg.split_once(" — ").map(|(_, body)| body).unwrap_or(msg)
 }
 
 /// Sends a chat request via the OpenAI Responses API (/v1/responses).
@@ -3154,6 +3166,26 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
     fn test_is_responses_api_required_unrelated_error() {
         let e = anyhow::anyhow!("API returned 401 Unauthorized");
         assert!(!is_responses_api_required(&e));
+    }
+
+    #[test]
+    fn test_is_responses_api_required_skips_structured_400() {
+        // A 400 with an error envelope is a real rejection (here: no image
+        // support) — surface it, don't retry on /responses. The opencode-zen bug.
+        let e = anyhow::anyhow!(
+            r#"API returned 400 Bad Request — {{"error":{{"object":"error","type":"invalid_request_error","code":"invalid_request_error","message":"Error from provider: This model does not support image inputs"}}}}"#
+        );
+        assert!(!is_responses_api_required(&e));
+    }
+
+    #[test]
+    fn test_error_response_body_extracts_after_separator() {
+        assert_eq!(
+            error_response_body("API returned 400 Bad Request — {\"error\":1}"),
+            "{\"error\":1}"
+        );
+        // No separator → whole string.
+        assert_eq!(error_response_body("plain message"), "plain message");
     }
 
     #[test]
