@@ -537,6 +537,11 @@ impl RunCommand {
             );
             print_opt("--1m", "Shorthand for --max-context=1m");
             print_opt("--2m", "Shorthand for --max-context=2m");
+        } else {
+            print_opt(
+                "--max-context <size>",
+                "Set the context window for a model aivo doesn't know yet (e.g. 200k, 1m)",
+            );
         }
         if tool != Some("codex-app") {
             print_opt(

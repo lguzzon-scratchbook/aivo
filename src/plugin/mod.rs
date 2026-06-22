@@ -431,6 +431,8 @@ pub(crate) struct AivoFlags {
     /// `--dry-run` present: preview the resolved key/model/command instead of
     /// launching (mirrors native `aivo run --dry-run`).
     pub dry_run: bool,
+    /// `--max-context <SIZE>`: manual context-window size (raw; parsed by caller).
+    pub max_context: Option<String>,
     /// argv with aivo-owned flags removed. Tool-specific flags and prompt args
     /// are preserved.
     pub rest: Vec<String>,
@@ -445,6 +447,7 @@ pub(crate) fn extract_aivo_flags(args: &[String]) -> AivoFlags {
     let mut model: Option<String> = None;
     let mut debug_log: Option<PathBuf> = None;
     let mut dry_run = false;
+    let mut max_context: Option<String> = None;
     let mut rest: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -479,6 +482,17 @@ pub(crate) fn extract_aivo_flags(args: &[String]) -> AivoFlags {
             debug_log.get_or_insert_with(|| debug_path_from_value(rest_path));
         } else if a == "--dry-run" {
             dry_run = true;
+        } else if let Some(v) = a.strip_prefix("--max-context=") {
+            max_context.get_or_insert_with(|| v.to_string());
+        } else if a == "--max-context" {
+            if max_context.is_none()
+                && let Some(n) = args
+                    .get(i + 1)
+                    .filter(|n| !n.is_empty() && !n.starts_with('-'))
+            {
+                max_context = Some(n.clone());
+                i += 1;
+            }
         } else {
             rest.push(args[i].clone());
         }
@@ -489,6 +503,7 @@ pub(crate) fn extract_aivo_flags(args: &[String]) -> AivoFlags {
         model,
         debug_log,
         dry_run,
+        max_context,
         rest,
     }
 }

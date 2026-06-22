@@ -356,29 +356,35 @@ pub async fn run() -> ! {
             // *then* gets told their flag is malformed. The tier itself
             // (1m/2m/12m/…) isn't validated; aivo passes whatever the user
             // gave through to Claude as a `[<N>m]` model-name suffix.
-            let max_context = if let Some(value) = max_context.as_deref() {
-                let Some(canonical) = parse_context_token(value) else {
-                    eprintln!(
-                        "{} --max-context expects a value like '1m' or '12m' (got {:?}).",
-                        style::red("Error:"),
-                        value
-                    );
-                    process::exit(ExitCode::UserError.code());
-                };
-                let parsed_tool = run_args.tool.as_deref().and_then(AIToolType::parse);
-                let supported = parsed_tool.is_some_and(|t| matches!(t, AIToolType::Claude));
-                if !supported {
-                    let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
-                    eprintln!(
-                        "{} --max-context only applies to `aivo run claude` (got {}).",
-                        style::red("Error:"),
-                        tool_name
-                    );
-                    process::exit(ExitCode::UserError.code());
+            // Claude takes `--max-context` as its `1m`/`2m` beta tag; every other
+            // tool takes it as a manual window size, set via the resolve_limits
+            // override.
+            let parsed_tool = run_args.tool.as_deref().and_then(AIToolType::parse);
+            let max_context = match max_context.as_deref() {
+                Some(value) if parsed_tool == Some(AIToolType::Claude) => {
+                    let Some(canonical) = parse_context_token(value) else {
+                        eprintln!(
+                            "{} --max-context expects a value like '1m' or '12m' (got {:?}).",
+                            style::red("Error:"),
+                            value
+                        );
+                        process::exit(ExitCode::UserError.code());
+                    };
+                    Some(canonical)
                 }
-                Some(canonical)
-            } else {
-                None
+                Some(value) => {
+                    let Some(tokens) = services::model_metadata::parse_context_size(value) else {
+                        eprintln!(
+                            "{} --max-context expects a size like '200k', '1m', or '128000' (got {:?}).",
+                            style::red("Error:"),
+                            value
+                        );
+                        process::exit(ExitCode::UserError.code());
+                    };
+                    services::model_metadata::set_context_window_override(tokens);
+                    None
+                }
+                None => None,
             };
             let key_flag = extracted.key_flag;
             let dry_run = extracted.dry_run;

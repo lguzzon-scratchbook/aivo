@@ -65,6 +65,22 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     // still selects a key, but a bare `-k` uses the active key (no picker).
     let manages_km = plan.is_coding_agent || plan.has("endpoint");
     let flags = super::extract_aivo_flags(args);
+    // `--max-context` (coding-agent only, like --debug/--dry-run): a manual window
+    // for an unknown model, reaching the plugin via AIVO_MODEL_CONTEXT_WINDOW.
+    if plan.is_coding_agent
+        && let Some(value) = flags.max_context.as_deref()
+    {
+        match crate::services::model_metadata::parse_context_size(value) {
+            Some(tokens) => crate::services::model_metadata::set_context_window_override(tokens),
+            None => {
+                eprintln!(
+                    "{} --max-context expects a size like '200k', '1m', or '128000' (got {value:?}).",
+                    style::red("Error:")
+                );
+                return crate::errors::ExitCode::UserError.code();
+            }
+        }
+    }
     // `--dry-run` previews the resolved plan instead of launching — coding-agent only (it
     // mirrors native `aivo run --dry-run`; other plugins keep their own `--dry-run`).
     let dry_run = plan.is_coding_agent && flags.dry_run;

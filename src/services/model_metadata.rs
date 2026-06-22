@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 
@@ -262,16 +263,57 @@ pub async fn resolve_limits(
     };
     let snap = snapshot_limits(stripped);
     ResolvedLimits {
+        // `--max-context` override: fills an unknown window, never overrides a known one.
         context: live
             .as_ref()
             .and_then(|m| m.context_window)
-            .or_else(|| snap.and_then(|s| s.context)),
+            .or_else(|| snap.and_then(|s| s.context))
+            .or_else(context_window_override),
         output: live
             .as_ref()
             .and_then(|m| m.max_output_tokens)
             .or_else(|| snap.and_then(|s| s.output)),
         caps: snap,
     }
+}
+
+/// Process-wide `--max-context` override (tokens), 0 = unset; read as the last
+/// resort in [`resolve_limits`] so every coding agent picks up a manual window.
+/// An atomic, not an env var, so setting it can't race the serve threads.
+static CONTEXT_WINDOW_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Set (or clear, with 0) the manual context-window override.
+pub fn set_context_window_override(tokens: u64) {
+    CONTEXT_WINDOW_OVERRIDE.store(tokens, Ordering::Relaxed);
+}
+
+fn context_window_override() -> Option<u64> {
+    match CONTEXT_WINDOW_OVERRIDE.load(Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Parse a `--max-context` size into tokens: a bare integer or a `k`/`m` suffix
+/// (`200k`, `1m`, `128000`), case-insensitive. `None` if unparseable or <= 0.
+pub fn parse_context_size(s: &str) -> Option<u64> {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(n) = lower.strip_suffix('k') {
+        (n, 1_000f64)
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, 1_000_000f64)
+    } else {
+        (lower.as_str(), 1f64)
+    };
+    let num: f64 = num.trim().parse().ok()?;
+    if !num.is_finite() || num <= 0.0 {
+        return None;
+    }
+    let tokens = (num * mult).round();
+    (tokens >= 1.0).then_some(tokens as u64)
 }
 
 #[cfg(test)]
@@ -444,6 +486,21 @@ mod tests {
     fn unknown_models_return_none() {
         assert_eq!(snapshot_limits("totally-unknown-model-xyz"), None);
         assert_eq!(snapshot_limits(""), None);
+    }
+
+    #[test]
+    fn parse_context_size_accepts_suffixes_and_rejects_garbage() {
+        assert_eq!(parse_context_size("128000"), Some(128_000));
+        assert_eq!(parse_context_size("200k"), Some(200_000));
+        assert_eq!(parse_context_size("200K"), Some(200_000));
+        assert_eq!(parse_context_size("1m"), Some(1_000_000));
+        assert_eq!(parse_context_size("2M"), Some(2_000_000));
+        assert_eq!(parse_context_size("1.5m"), Some(1_500_000));
+        assert_eq!(parse_context_size("  256k "), Some(256_000));
+        // Rejected: empty, non-numeric, zero/negative, bad suffix.
+        for bad in ["", "abc", "0", "-5", "10g", "k"] {
+            assert_eq!(parse_context_size(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
