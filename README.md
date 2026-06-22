@@ -79,12 +79,12 @@ Manage saved API keys. Stored AES-256-GCM encrypted in the user config directory
 
 ```bash
 aivo keys                                    # list
-aivo keys add                                # interactive picker (OAuth flows + custom URLs)
-aivo keys use openrouter                     # switch active key (or just `aivo use openrouter`)
+aivo keys add                                # interactive picker
+aivo keys use openrouter                     # switch active key
 aivo keys cat | edit | rm <name>
 ```
 
-One-liner
+One-liner.
 
 ```bash
 aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --key sk-xxx
@@ -95,12 +95,12 @@ aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --key sk-xxx
 Move keys between machines via a password-encrypted file:
 
 ```bash
-aivo keys export ~/keys.aivo     # prompts for password
-aivo keys import ~/keys.aivo     # same password on the other machine
-aivo keys import https://example.com/keys.aivo   # or from a URL
+aivo keys export ~/bak.keys     # prompts for password
+aivo keys import ~/bak.keys     # same password on the other machine
+aivo keys import https://example.com/bak.keys   # or from a URL
 
 # non-interactive with password on stdin
-aivo keys export ~/keys.aivo --password-stdin <<< "my secret password"
+aivo keys export ~/bak.keys --password-stdin <<< "my secret password"
 ```
 
 ## models
@@ -190,7 +190,7 @@ Short names for models or launch presets. Both share one namespace.
 ```bash
 aivo alias                                   # list
 aivo alias fast=claude-haiku-4-5             # model alias
-aivo alias quick claude --key work -m fast --1m   # launch alias
+aivo alias quick claude --key work -m fast   # launch alias
 
 aivo claude -m fast                          # use anywhere `-m` is accepted
 aivo quick                                   # invoke launch alias directly
