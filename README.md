@@ -80,13 +80,15 @@ Manage saved API keys. Stored AES-256-GCM encrypted in the user config directory
 ```bash
 aivo keys                                    # list
 aivo keys add                                # interactive picker (OAuth flows + custom URLs)
-aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --key sk-xxx
 aivo keys use openrouter                     # switch active key (or just `aivo use openrouter`)
 aivo keys cat | edit | rm <name>
-aivo keys ping --all                         # health-check all keys
 ```
 
-Any endpoint implementing a supported protocol can be saved.
+One-liner
+
+```bash
+aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --key sk-xxx
+```
 
 ### Export & import
 
@@ -151,7 +153,7 @@ The local `llama-server` is configured from the model, no setup required: it run
 
 ```bash
 AIVO_LLAMA_CTX=16384      # override the context size (e.g. on a low-RAM machine)
-AIVO_LLAMA_ARGS='--temp 0.1'  # pass extra llama-server flags (appended last, override aivo's)
+AIVO_LLAMA_ARGS='--temp 0.1'  # pass extra llama-server flags (override aivo's)
 AIVO_LLAMA_MMPROJ=off     # skip the auto-detected vision projector
 AIVO_LLAMA_DRAFT=off      # skip the auto-detected speculative-decoding draft model
 AIVO_LLAMA_NGL=20         # GPU layers to offload (AIVO_GPU=cpu disables GPU)
@@ -253,7 +255,7 @@ as `aivo <name>`. Plugins run with your privileges; install only ones you trust.
 
 ```bash
 aivo plugins install ./aivo-amp              # local file or http(s) URL
-aivo plugins install github:owner/aivo-amp   # GitHub release (OS/arch asset, or Node-package source)
+aivo plugins install github:owner/aivo-amp   # GitHub release (OS/arch asset)
 aivo plugins install npm:aivo-foo            # npm package (node shim)
 aivo plugins install cargo:aivo-bar          # cargo install from crates.io
 aivo amp --help                              # runs the sibling aivo-amp
