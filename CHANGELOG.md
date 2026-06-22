@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.31.3
+
+`/rewind` is now reliable and surgical: it reverts only the files the agent
+changed and never restores the wrong tree.
+
+- feat(chat): render model thinking, add `/config` + Ctrl+T toggle, request reasoning (564977e)
+- feat(chat): extend drag-to-copy to the whole screen, not just the transcript (0623ff7)
+- feat(debug): log `phase=cancelled` when a request is dropped before send() resolves (bd8d6af)
+- fix(chat): make `/rewind` reliable and surgical (6545a48)
+- fix(chat): keep `/goal` machine text out of input-history recall (d65d31b)
+- fix(chat): default mouse capture off under Termux so taps keep toggling the keyboard (1feeeab)
+- fix(models): treat per-million `/v1/models` pricing as-is; add publicai provider (5a60c52)
+- chore(chat): improve model listing layout (00a617c)
+
 ## v0.31.2
 
 Model data now refreshes without a release: `aivo update --sync-model-data`
