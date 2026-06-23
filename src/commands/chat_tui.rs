@@ -95,6 +95,10 @@ impl ChatTuiApp {
             auto_approve,
             thinking_enabled,
         } = params.session_store.get_chat_toggles().await;
+        // Move any pre-existing `/skills` + `/mcp` opt-outs out of config.json (where
+        // a routine key/route/selection write — or an older aivo binary — can drop
+        // them) into chat-prefs.json, before the chat flow writes config.json.
+        params.session_store.migrate_disabled_toggles().await;
         // The launch dir keys the recall view; the persisted file stays global.
         let real_cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())

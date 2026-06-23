@@ -1024,17 +1024,24 @@ pub struct StoredConfig {
     /// Prevents auto-recreation until the user explicitly re-adds it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub starter_key_dismissed: bool,
-    /// Skill names the user turned OFF in `/skills`; excluded from the agent's
-    /// system prompt + `skill` tool. Empty = every discovered skill is enabled.
+    /// Legacy seed for the `/skills` opt-outs. Storage moved to chat-prefs.json
+    /// (`disabledSkills`) so the high-frequency config.json writers (`run`/`start`/
+    /// `serve`, key edits, route learning) — and any older aivo binary that predates
+    /// the field — can't drop it on a cross-version round trip. `migrate_disabled_
+    /// toggles` copies this into chat-prefs at startup; it stays serialized here as a
+    /// read fallback until then, but chat-prefs is authoritative once present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_skills: Vec<String>,
-    /// MCP server names the user turned OFF in `/mcp`; skipped at connect time so
-    /// their tools aren't offered. Empty = every configured server is enabled.
-    /// Applies to both user- and project-scoped servers: a repo's `.mcp.json`
-    /// server connects by default like any other (the user owns what's in their
-    /// own project) — disable it here to opt out.
+    /// Legacy seed for the `/mcp` opt-outs. Moved to chat-prefs.json
+    /// (`disabledMcpServers`) for the same reason as `disabled_skills`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_mcp_servers: Vec<String>,
+    /// Catch-all for config keys this binary doesn't recognize (e.g. a field a
+    /// newer aivo added). Without it serde silently drops unknown keys on load, so
+    /// the next save erases them — letting an older binary that shares config.json
+    /// wipe a newer one's settings. Flattened so unknown keys round-trip verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Deserialize directory_starts supporting both legacy flat format and new nested format.
@@ -1136,6 +1143,7 @@ impl StoredConfig {
             starter_key_dismissed: false,
             disabled_skills: Vec::new(),
             disabled_mcp_servers: Vec::new(),
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -1285,6 +1293,14 @@ impl ConfigContext {
             )),
         }
     }
+}
+
+/// Collect the string elements of a JSON array, skipping non-string entries.
+fn json_str_array(arr: &[serde_json::Value]) -> Vec<String> {
+    arr.iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 // ── SessionStore facade ───────────────────────────────────────────────────────
@@ -1630,38 +1646,120 @@ impl SessionStore {
         self.api_keys.ctx.save_raw(&config).await
     }
 
-    /// Skill names the user has turned off in `/skills`.
+    /// Skill names the user has turned off in `/skills`. Backed by chat-prefs.json
+    /// (`disabledSkills`) — see [`Self::get_disabled_list`].
     pub async fn get_disabled_skills(&self) -> Result<Vec<String>> {
-        Ok(self.api_keys.ctx.load().await?.disabled_skills)
+        Ok(self.get_disabled_list("disabledSkills").await)
     }
 
     /// Enable or disable one skill by name (idempotent). Disabled skills are kept
     /// out of the agent's system prompt + `skill` tool.
     pub async fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<()> {
-        let _lock = self.api_keys.ctx.acquire_config_lock()?;
-        let mut config = self.api_keys.ctx.load().await?;
-        config.disabled_skills.retain(|n| n != name);
-        if !enabled {
-            config.disabled_skills.push(name.to_string());
-        }
-        self.api_keys.ctx.save_raw(&config).await
+        self.set_disabled_list("disabledSkills", name, enabled)
+            .await
     }
 
-    /// MCP server names the user has turned off in `/mcp`.
+    /// MCP server names the user has turned off in `/mcp`. Backed by chat-prefs.json
+    /// (`disabledMcpServers`) — see [`Self::get_disabled_list`].
     pub async fn get_disabled_mcp_servers(&self) -> Result<Vec<String>> {
-        Ok(self.api_keys.ctx.load().await?.disabled_mcp_servers)
+        Ok(self.get_disabled_list("disabledMcpServers").await)
     }
 
     /// Enable or disable one MCP server by name (idempotent). Disabled servers are
     /// skipped at connect time so their tools aren't offered to the agent.
     pub async fn set_mcp_server_enabled(&self, name: &str, enabled: bool) -> Result<()> {
-        let _lock = self.api_keys.ctx.acquire_config_lock()?;
-        let mut config = self.api_keys.ctx.load().await?;
-        config.disabled_mcp_servers.retain(|n| n != name);
-        if !enabled {
-            config.disabled_mcp_servers.push(name.to_string());
+        self.set_disabled_list("disabledMcpServers", name, enabled)
+            .await
+    }
+
+    /// A "disabled names" list (skills or MCP servers) read from chat-prefs.json by
+    /// `key`. chat-prefs is an opaque JSON map that round-trips verbatim through any
+    /// build (even an older chat that doesn't know the key), so — unlike the typed
+    /// config.json — these can't be dropped on a cross-version write. Falls back to
+    /// the legacy config.json field until the first toggle migrates the value over;
+    /// once the chat-prefs key exists it is authoritative and the stale config.json
+    /// field is ignored (and dropped on the next config write — it's `skip_serializing`).
+    async fn get_disabled_list(&self, key: &str) -> Vec<String> {
+        match self
+            .read_chat_prefs()
+            .await
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+        {
+            Some(arr) => json_str_array(arr),
+            None => self.legacy_disabled(key).await,
         }
-        self.api_keys.ctx.save_raw(&config).await
+    }
+
+    /// Toggle one `name` in the chat-prefs `key` list (idempotent), seeding from the
+    /// legacy config.json field on the first write so no earlier opt-out is lost.
+    /// Writes only chat-prefs.json, leaving config.json (and the key store) untouched.
+    async fn set_disabled_list(&self, key: &str, name: &str, enabled: bool) -> Result<()> {
+        let mut prefs = self.read_chat_prefs().await;
+        let mut names = match prefs.get(key).and_then(serde_json::Value::as_array) {
+            Some(arr) => json_str_array(arr),
+            None => self.legacy_disabled(key).await,
+        };
+        names.retain(|n| n != name);
+        if !enabled {
+            names.push(name.to_string());
+        }
+        prefs.insert(
+            key.to_string(),
+            serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
+        );
+        self.write_chat_prefs(&prefs).await
+    }
+
+    /// The pre-migration value of a `disabled*` list still living in config.json.
+    /// Empty when config is absent/unreadable.
+    async fn legacy_disabled(&self, key: &str) -> Vec<String> {
+        let Ok(config) = self.load().await else {
+            return Vec::new();
+        };
+        match key {
+            "disabledSkills" => config.disabled_skills,
+            "disabledMcpServers" => config.disabled_mcp_servers,
+            _ => Vec::new(),
+        }
+    }
+
+    /// One-time move of the `/skills` + `/mcp` opt-outs from the legacy config.json
+    /// fields into chat-prefs.json. Run once at chat startup so an existing opt-out
+    /// reaches the clobber-proof store promptly — before an older aivo binary (which
+    /// drops the unknown config.json field) gets a chance to wipe it. Idempotent:
+    /// a chat-prefs key that already exists wins and is never overwritten, and a
+    /// legacy field that's empty/absent is skipped, so there's nothing to do on the
+    /// common path. Best-effort; a write failure just defers to the read fallback.
+    pub async fn migrate_disabled_toggles(&self) {
+        let prefs = self.read_chat_prefs().await;
+        let need_skills = !prefs.contains_key("disabledSkills");
+        let need_mcp = !prefs.contains_key("disabledMcpServers");
+        if !need_skills && !need_mcp {
+            return;
+        }
+        let Ok(config) = self.load().await else {
+            return;
+        };
+        let migrate_skills = need_skills && !config.disabled_skills.is_empty();
+        let migrate_mcp = need_mcp && !config.disabled_mcp_servers.is_empty();
+        if !migrate_skills && !migrate_mcp {
+            return;
+        }
+        let mut prefs = prefs;
+        let to_json = |names: Vec<String>| {
+            serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect())
+        };
+        if migrate_skills {
+            prefs.insert("disabledSkills".into(), to_json(config.disabled_skills));
+        }
+        if migrate_mcp {
+            prefs.insert(
+                "disabledMcpServers".into(),
+                to_json(config.disabled_mcp_servers),
+            );
+        }
+        let _ = self.write_chat_prefs(&prefs).await;
     }
 
     /// Gets all keys and the active key ID without decrypting secrets.
@@ -2608,6 +2706,160 @@ mod tests {
         // Writing the new key takes precedence on the next read.
         store.set_chat_thinking_enabled(true).await.unwrap();
         assert!(store.get_chat_thinking_enabled().await);
+    }
+
+    #[tokio::test]
+    async fn disabled_toggles_persist_in_chat_prefs_not_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path.clone());
+
+        store.set_skill_enabled("repo-study", false).await.unwrap();
+        store.set_mcp_server_enabled("fs", false).await.unwrap();
+
+        // Reads round-trip.
+        assert_eq!(
+            store.get_disabled_skills().await.unwrap(),
+            vec!["repo-study"]
+        );
+        assert_eq!(store.get_disabled_mcp_servers().await.unwrap(), vec!["fs"]);
+
+        // They live in chat-prefs.json, never the (key-bearing) config.json.
+        let prefs: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(temp_dir.path().join("chat-prefs.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prefs["disabledSkills"][0], "repo-study");
+        assert_eq!(prefs["disabledMcpServers"][0], "fs");
+        assert!(
+            !tokio::fs::try_exists(&config_path).await.unwrap(),
+            "toggling must not create/write config.json"
+        );
+
+        // Re-enabling removes the entry.
+        store.set_skill_enabled("repo-study", true).await.unwrap();
+        assert!(store.get_disabled_skills().await.unwrap().is_empty());
+    }
+
+    /// The original bug: toggles lived in config.json, so any other config writer
+    /// (here `set_active_key`) that round-tripped the file would drop them. Now
+    /// they live in chat-prefs.json, so a config rewrite leaves them intact.
+    #[tokio::test]
+    async fn config_rewrite_does_not_clobber_disabled_toggles() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id = store
+            .add_key_with_protocol("k", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+        store.set_skill_enabled("repo-study", false).await.unwrap();
+
+        // A wholesale config.json rewrite from an unrelated setter.
+        store.set_active_key(&id).await.unwrap();
+
+        assert_eq!(
+            store.get_disabled_skills().await.unwrap(),
+            vec!["repo-study"]
+        );
+    }
+
+    /// A config.json written by an older binary still carries `disabled_skills`
+    /// inline; the first read honors it and the first toggle migrates the whole
+    /// set into chat-prefs.json without losing the pre-existing opt-out.
+    #[tokio::test]
+    async fn legacy_config_disabled_skills_migrate_on_first_toggle() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        tokio::fs::write(
+            &config_path,
+            br#"{"api_keys": [], "disabled_skills": ["old-skill"]}"#,
+        )
+        .await
+        .unwrap();
+        let store = SessionStore::with_path(config_path);
+
+        // Read falls back to the legacy field before any migration.
+        assert_eq!(
+            store.get_disabled_skills().await.unwrap(),
+            vec!["old-skill"]
+        );
+
+        // The first toggle seeds from the legacy field, so the prior opt-out
+        // survives alongside the new one.
+        store.set_skill_enabled("new-skill", false).await.unwrap();
+        let mut disabled = store.get_disabled_skills().await.unwrap();
+        disabled.sort();
+        assert_eq!(disabled, vec!["new-skill", "old-skill"]);
+    }
+
+    /// `migrate_disabled_toggles` (run at chat startup) copies the legacy config.json
+    /// opt-outs into chat-prefs.json so a later config rewrite can't drop them, even
+    /// if the user never toggles. Idempotent and non-destructive to existing prefs.
+    #[tokio::test]
+    async fn eager_migration_moves_legacy_toggles_to_chat_prefs() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        tokio::fs::write(
+            &config_path,
+            br#"{"api_keys": [], "disabled_skills": ["x"], "disabled_mcp_servers": ["fs"]}"#,
+        )
+        .await
+        .unwrap();
+        let store = SessionStore::with_path(config_path.clone());
+
+        store.migrate_disabled_toggles().await;
+
+        let prefs: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(temp_dir.path().join("chat-prefs.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prefs["disabledSkills"][0], "x");
+        assert_eq!(prefs["disabledMcpServers"][0], "fs");
+
+        // Now a wholesale config rewrite that drops the legacy fields can't lose them.
+        let id = store
+            .add_key_with_protocol("k", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+        store.set_active_key(&id).await.unwrap();
+        assert_eq!(store.get_disabled_skills().await.unwrap(), vec!["x"]);
+        assert_eq!(store.get_disabled_mcp_servers().await.unwrap(), vec!["fs"]);
+
+        // Idempotent: an existing chat-prefs value is never overwritten by a later run.
+        store.set_skill_enabled("x", true).await.unwrap(); // user re-enables x
+        store.migrate_disabled_toggles().await; // must NOT resurrect "x"
+        assert!(store.get_disabled_skills().await.unwrap().is_empty());
+    }
+
+    /// Forward-compat guard: a config key this binary doesn't recognize must
+    /// survive a load→save round-trip instead of being silently dropped.
+    #[tokio::test]
+    async fn unknown_config_field_round_trips() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        tokio::fs::write(
+            &config_path,
+            br#"{"api_keys": [], "futureFeatureFlag": {"nested": true}}"#,
+        )
+        .await
+        .unwrap();
+        let store = SessionStore::with_path(config_path.clone());
+
+        // A wholesale rewrite via a normal setter.
+        store
+            .add_key_with_protocol("k", "http://localhost", None, "sk-test")
+            .await
+            .unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&config_path).await.unwrap()).unwrap();
+        assert_eq!(raw["futureFeatureFlag"]["nested"], true);
     }
 
     #[tokio::test]
