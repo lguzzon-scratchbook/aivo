@@ -125,6 +125,11 @@ pub struct ServeRouter {
     /// stderr. `aivo chat` runs this router in-process behind a raw-mode TUI, so
     /// stray `eprintln!`s would corrupt the screen / land in the prompt box.
     quiet: bool,
+    /// Caller-owned route cache for the primary upstream. When set, the serve
+    /// learns into it instead of a throwaway one, so the owner can seed a known
+    /// protocol and read confirmed routes back. `aivo chat` shares one across its
+    /// per-turn serves.
+    seed_route_cache: Option<Arc<RouteCache>>,
 }
 
 struct ServeState {
@@ -169,7 +174,15 @@ impl ServeRouter {
             usage_tool: None,
             run_tally: None,
             quiet: false,
+            seed_route_cache: None,
         }
+    }
+
+    /// Use a caller-owned route cache so the learned protocol can be seeded and
+    /// read back. Used by `aivo chat` to share one across its per-turn serves.
+    pub fn with_route_cache(mut self, cache: Arc<RouteCache>) -> Self {
+        self.seed_route_cache = Some(cache);
+        self
     }
 
     pub fn with_logger(mut self, logger: Option<RequestLogger>) -> Self {
@@ -257,6 +270,15 @@ impl ServeRouter {
 
         let initial_protocol = self.config.upstream_protocol;
         let timeout = self.config.timeout;
+        // A caller-owned cache (shared across `aivo chat` turns) wins; otherwise
+        // each run gets a fresh throwaway cache seeded at the upstream protocol.
+        let route_cache = self.seed_route_cache.unwrap_or_else(|| {
+            Arc::new(RouteCache::new(
+                "serve",
+                initial_protocol,
+                std::collections::BTreeMap::new(),
+            ))
+        });
 
         let failover_entries: Vec<FailoverEntry> = self
             .failover_keys
@@ -307,11 +329,7 @@ impl ServeRouter {
             client: router_http_client_with_timeout(timeout),
             key: self.key,
             copilot_tokens,
-            route_cache: Arc::new(RouteCache::new(
-                "serve",
-                initial_protocol,
-                std::collections::BTreeMap::new(),
-            )),
+            route_cache,
             log_store: self.log_store,
             logger: self.logger,
             failover_keys: Arc::new(failover_entries),

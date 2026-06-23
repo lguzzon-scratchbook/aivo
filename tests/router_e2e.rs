@@ -428,20 +428,92 @@ async fn gemini_router_cascades_to_chat_upstream_and_learns_route() {
 const CHAT_REQ: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#;
 
 async fn start_serve(fake: &FakeProvider, protocol: ProviderProtocol) -> u16 {
+    start_serve_opt(fake, protocol, None).await
+}
+
+/// `start_serve`, optionally injecting a caller-owned route cache (the seam
+/// `aivo chat` uses to remember the negotiated protocol across turns/launches).
+async fn start_serve_opt(
+    fake: &FakeProvider,
+    protocol: ProviderProtocol,
+    cache: Option<Arc<aivo::services::route_cache::RouteCache>>,
+) -> u16 {
     let tmp = tempfile::tempdir().unwrap();
     let log_store = LogStore::new(tmp.path().to_path_buf());
     // tempdir leaks for the test's lifetime; the router holds only the path.
     std::mem::forget(tmp);
-    let router = ServeRouter::new(
+    let mut router = ServeRouter::new(
         serve_config(fake.base_url(), protocol),
         test_key(&fake.base_url()),
         log_store,
     );
+    if let Some(cache) = cache {
+        router = router.with_route_cache(cache);
+    }
     let (_handle, _shutdown, port) = router
         .start_background_with_addr("127.0.0.1", 0)
         .await
         .unwrap();
     port
+}
+
+/// An injected cache must capture the protocol the serve auto-switched to (and
+/// mark it confirmed), so `aivo chat` can persist it after the turn.
+#[tokio::test]
+async fn serve_router_learns_into_injected_route_cache() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Messages, Mode::Ok)]);
+    let cache = Arc::new(aivo::services::route_cache::RouteCache::new(
+        "chat",
+        ProviderProtocol::Openai,
+        BTreeMap::new(),
+    ));
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache.clone())).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+
+    // The shared cache now holds the negotiated route: Anthropic, confirmed.
+    let slot = cache.resolve("test-model");
+    assert_eq!(slot.current().0, ProviderProtocol::Anthropic);
+    assert!(slot.is_confirmed(), "proven route must be confirmed");
+    let dirty = cache.dirty_routes();
+    assert_eq!(dirty.len(), 1, "dirty routes: {dirty:?}");
+    assert_eq!(dirty[0].0, "test-model");
+    assert_eq!(dirty[0].1.protocol, "anthropic");
+}
+
+/// A cache seeded with a model's confirmed route makes the serve skip the
+/// protocol probe — the cross-turn/cross-launch memory that stops `aivo chat`'s
+/// agent path re-negotiating every turn.
+#[tokio::test]
+async fn serve_router_seeded_route_skips_probe() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Messages, Mode::Ok)]);
+    let mut seed = BTreeMap::new();
+    seed.insert(
+        "test-model".to_string(),
+        aivo::services::route_cache::PersistedRoute {
+            protocol: "anthropic".to_string(),
+            path_variant: String::new(),
+        },
+    );
+    // Default guess is OpenAI, but the seed pins Anthropic as already-proven.
+    let cache = Arc::new(aivo::services::route_cache::RouteCache::new(
+        "chat",
+        ProviderProtocol::Openai,
+        seed,
+    ));
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache)).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert_eq!(
+        fake.hit_count(Endpoint::Chat),
+        0,
+        "seeded route must skip the chat probe: {:?}",
+        fake.hits()
+    );
 }
 
 #[tokio::test]

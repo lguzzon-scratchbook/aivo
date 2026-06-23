@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::route_cache::PersistedRoute;
 
 impl ChatTuiApp {
     /// Drains queued runtime events; `true` if any were handled (caller repaints).
@@ -456,6 +457,8 @@ impl ChatTuiApp {
         self.pending_submit = None;
         self.agent_permission = None;
         self.stop_agent_serve();
+        // Adopt + persist the protocol the serve negotiated this turn.
+        self.persist_agent_route().await;
         // Prefer the engine's provider-measured fill (last step's prompt+completion);
         // fall back to the chars/4 transcript estimate only when no usage was reported.
         if context_tokens > 0 {
@@ -687,25 +690,58 @@ impl ChatTuiApp {
         Ok(())
     }
 
-    /// Persist the learned route if new/changed, and update the in-memory key so
-    /// later turns this session don't rewrite it.
-    async fn persist_chat_route(&mut self) {
-        let Some((model_key, route)) =
-            chat_route_to_persist(&self.key, &self.raw_model, &self.format)
-        else {
-            return;
+    /// After an agent turn: point `self.format` at the wire the serve proved for
+    /// the current model (so an attachment turn's plain-chat fallback follows it),
+    /// then persist every confirmed route the shared cache learned — including
+    /// subagent models — so they survive across launches.
+    async fn persist_agent_route(&mut self) {
+        let cache = match &self.agent_route_cache {
+            Some((key_id, cache)) if *key_id == self.key.id => cache.clone(),
+            _ => return,
         };
+        let slot = cache.resolve(&self.model);
+        if slot.is_confirmed() {
+            self.format = chat_format_from_protocol(slot.current().0);
+        }
+        // Skip routes already on the key so a long session doesn't rewrite config.
+        let tool = cache.tool();
+        let stored = self.key.routes_for_tool(tool);
+        let fresh: Vec<_> = cache
+            .dirty_routes()
+            .into_iter()
+            .filter(|(model, route)| {
+                stored.get(model).and_then(PersistedRoute::to_byte) != route.to_byte()
+            })
+            .collect();
+        self.apply_chat_routes(tool, fresh).await;
+    }
+
+    /// Persist the plain-chat turn's learned route, if new/changed.
+    async fn persist_chat_route(&mut self) {
+        if let Some(route) = chat_route_to_persist(&self.key, &self.raw_model, &self.format) {
+            self.apply_chat_routes("chat", vec![route]).await;
+        }
+    }
+
+    /// Write learned routes to the key (disk + in-memory key); no-op when empty.
+    async fn apply_chat_routes(&mut self, tool: &str, routes: Vec<(String, PersistedRoute)>) {
+        if routes.is_empty() {
+            return;
+        }
         if self
             .session_store
-            .merge_routes(&self.key.id, "chat", &[(model_key.clone(), route.clone())])
+            .merge_routes(&self.key.id, tool, &routes)
             .await
             .is_ok()
         {
-            self.key
+            let entry = self
+                .key
                 .protocol_routes
-                .entry("chat".to_string())
-                .or_default()
-                .insert(model_key, route);
+                .entry(tool.to_string())
+                .or_default();
+            for (model, route) in routes {
+                entry.insert(model, route);
+            }
         }
     }
 

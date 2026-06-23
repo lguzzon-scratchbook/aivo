@@ -180,6 +180,7 @@ impl ChatTuiApp {
             pending_agent_messages: None,
             goal_mode: None,
             agent_engine: None,
+            agent_route_cache: None,
             mcp_client: None,
             mcp_connecting: false,
             mcp_connect_progress: std::collections::HashMap::new(),

@@ -1553,6 +1553,13 @@ pub(super) struct ChatTuiApp {
     /// In-process agent for API-key chats (the agent path); `None` until the
     /// first agent turn, rebuilt on key/model switch, cleared on `/new`.
     pub(super) agent_engine: Option<AgentSession>,
+    /// `(key_id, cache)` shared across the agent path's per-turn serves so the
+    /// learned wire protocol is remembered across turns/launches instead of
+    /// re-probed. Seeded from the key's `chat` routes; rebuilt on key switch.
+    pub(super) agent_route_cache: Option<(
+        String,
+        std::sync::Arc<crate::services::route_cache::RouteCache>,
+    )>,
     /// Connected MCP servers, shared across engine rebuilds so the servers spawn
     /// once per session. `None` until the first background connect resolves.
     pub(super) mcp_client: Option<std::sync::Arc<crate::agent::mcp::McpClient>>,

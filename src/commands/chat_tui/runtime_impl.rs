@@ -437,6 +437,26 @@ impl ChatTuiApp {
         }));
     }
 
+    /// Get (or lazily build) the per-key route cache the agent serves share.
+    /// Seeded from the key's `chat` routes + the provider default, so a known
+    /// model starts confirmed (no re-probe). Rebuilt when the key changes.
+    fn agent_route_cache(&mut self) -> std::sync::Arc<crate::services::route_cache::RouteCache> {
+        if let Some((key_id, cache)) = &self.agent_route_cache
+            && *key_id == self.key.id
+        {
+            return cache.clone();
+        }
+        let protocol =
+            crate::services::provider_profile::provider_profile_for_key(&self.key).default_protocol;
+        let cache = std::sync::Arc::new(crate::services::route_cache::RouteCache::new(
+            "chat",
+            protocol,
+            self.key.routes_for_tool("chat"),
+        ));
+        self.agent_route_cache = Some((self.key.id.clone(), cache.clone()));
+        cache
+    }
+
     /// Run one agent turn: (re)build the in-process engine, start a per-turn
     /// loopback serve, then drive `engine.run_turn` on a background task that
     /// streams text/tool-steps and permission requests back as `RuntimeEvent`s.
@@ -593,7 +613,11 @@ impl ChatTuiApp {
             Some(auth.clone()),
             std::collections::HashMap::new(),
         );
+        // Shared cache: serve seeds from the known protocol and learns into a
+        // place `persist_agent_route` can write back after the turn.
+        let route_cache = self.agent_route_cache();
         let router = ServeRouter::new(config, self.key.clone(), self.session_store.logs())
+            .with_route_cache(route_cache)
             .with_usage_accounting(self.session_store.clone(), "chat".to_string())
             // The chat TUI owns the terminal in raw mode; router progress lines on
             // stderr (protocol auto-switch, failover) would corrupt the prompt box.
