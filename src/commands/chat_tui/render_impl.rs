@@ -18,6 +18,31 @@ fn overlay_content_rect(area: Rect) -> Rect {
     })
 }
 
+/// Draw a `↓ Jump to bottom` pill — dark text on a light chip — centered on the
+/// bottom row of `area`. Returns its rect, or `None` when even the short form won't
+/// fit; falls back to a compact label on a narrow transcript.
+fn render_jump_to_bottom(frame: &mut Frame<'_>, area: Rect) -> Option<Rect> {
+    if area.height == 0 {
+        return None;
+    }
+    // A light chip with dark text reads cleanly against the dark transcript.
+    let style = Style::default()
+        .fg(Color::Rgb(30, 33, 35))
+        .bg(Color::Rgb(206, 210, 213));
+    let label = [" ↓ Jump to bottom ", " ↓ bottom "]
+        .into_iter()
+        .find(|l| l.chars().count() as u16 + 2 <= area.width)?;
+    let width = label.chars().count() as u16;
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height - 1,
+        width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+    Some(rect)
+}
+
 impl ChatTuiApp {
     pub(super) fn is_transcript_empty(&self) -> bool {
         self.history.is_empty()
@@ -1092,6 +1117,7 @@ impl ChatTuiApp {
             // column as the transcript content does once a message arrives — without
             // this the banner jumps 2 cols right when the first message lands.
             self.render_empty_state(frame, transcript_text_area);
+            self.jump_to_bottom_hit = None;
         } else {
             // Pre-wrapped above → render with wrap OFF so rendered rows match.
             // ratatui's `Paragraph` does NOT virtualize: `.scroll((y, 0))` still
@@ -1130,6 +1156,12 @@ impl ChatTuiApp {
                     .end_symbol(None);
                 frame.render_stateful_widget(scrollbar, transcript_view_area, &mut scrollbar_state);
             }
+            // Clickable jump-to-bottom pill (like Ctrl+End), only while scrolled up.
+            self.jump_to_bottom_hit = if self.transcript_scroll < max_scroll {
+                render_jump_to_bottom(frame, transcript_view_area)
+            } else {
+                None
+            };
         }
 
         if let Some(plan_panel_area) = plan_panel_area {

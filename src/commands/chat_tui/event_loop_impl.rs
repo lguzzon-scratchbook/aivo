@@ -1278,6 +1278,14 @@ impl ChatTuiApp {
                 self.scroll_down_lines(self.scroll_speed)
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // The jump-to-bottom pill claims the click before composer/selection.
+                if !self.overlay.blocks_input()
+                    && let Some(hit) = self.jump_to_bottom_hit
+                    && rect_contains(hit, (mouse.column, mouse.row))
+                {
+                    self.scroll_to_bottom();
+                    return Ok(false);
+                }
                 // A press in the composer also drops the caret there; a drag still selects.
                 if self.should_show_input_cursor()
                     && !self.overlay.blocks_input()

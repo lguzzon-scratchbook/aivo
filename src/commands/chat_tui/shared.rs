@@ -1478,6 +1478,9 @@ pub(super) struct ChatTuiApp {
     pub(super) transcript_width: u16,
     pub(super) transcript_view_height: u16,
     pub(super) transcript_hitbox: Option<TranscriptHitbox>,
+    /// Click region of the "jump to bottom" pill from the last render; `None` when
+    /// it isn't shown (transcript pinned to the bottom, or no overflow).
+    pub(super) jump_to_bottom_hit: Option<Rect>,
     /// The composer text region from the last render, for mouse cursor-placement
     /// and the key-handler's wrap math (it needs the width before the next frame).
     /// `None` until the first render.

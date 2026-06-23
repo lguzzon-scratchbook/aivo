@@ -1028,6 +1028,7 @@ fn make_test_app(
         transcript_width: 0,
         transcript_view_height: 0,
         transcript_hitbox: None,
+        jump_to_bottom_hit: None,
         composer_text_area: None,
         composer_scroll: 0,
         transcript_cache: None,
@@ -4401,6 +4402,68 @@ async fn test_open_overlay_left_drag_selects_overlay_text() {
     assert_eq!(
         app.selected_screen_text().as_deref(),
         Some("command output line one")
+    );
+}
+
+/// The jump-to-bottom pill appears only while scrolled up (content below the
+/// viewport), and clicking it pins back to the latest output.
+#[tokio::test]
+async fn jump_to_bottom_pill_shows_when_scrolled_up_and_clicks_to_latest() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Enough turns to overflow an 80x24 viewport, so a scrollbar (and the pill) apply.
+    for i in 0..40 {
+        app.history.push(ChatMessage {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+            content: format!("message line {i}"),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+
+    let render = |app: &mut ChatTuiApp| {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    };
+
+    // Pinned to the bottom → no pill.
+    app.follow_output = true;
+    render(&mut app);
+    assert!(
+        app.jump_to_bottom_hit.is_none(),
+        "pill hidden while following the bottom"
+    );
+
+    // Scroll to the top → content below the viewport, pill appears bottom-right.
+    app.follow_output = false;
+    app.transcript_scroll = 0;
+    render(&mut app);
+    let hit = app
+        .jump_to_bottom_hit
+        .expect("pill shown while scrolled up");
+
+    // Click it → pins back to the latest output.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.x,
+        row: hit.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    assert!(
+        app.follow_output,
+        "clicking the pill jumps to the latest output"
+    );
+
+    // Following again → the pill is gone.
+    render(&mut app);
+    assert!(
+        app.jump_to_bottom_hit.is_none(),
+        "pill hidden after jumping to the bottom"
     );
 }
 

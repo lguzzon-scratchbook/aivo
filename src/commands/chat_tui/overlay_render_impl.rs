@@ -1232,6 +1232,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
             ("PgUp/PgDn", "scroll half page"),
             ("Ctrl+↑/↓", "scroll 3 lines"),
             ("Ctrl+Home/End", "jump to top/bottom"),
+            ("Click ↓ pill", "jump to latest (when scrolled up)"),
             ("Mouse wheel", "scroll transcript"),
         ],
     ),
