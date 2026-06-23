@@ -874,6 +874,16 @@ async fn full_catalog_cached(key: &ApiKey, cache: &ModelsCache) -> Option<Vec<St
     (!cursor_cache_looks_corrupt(key, &cached)).then_some(cached)
 }
 
+/// Whether the key's cached catalog is still within its TTL. OAuth and Ollama
+/// keys can't be harvested (`warm_full_catalog_metadata` no-ops), so they count
+/// as fresh to skip a pointless warm.
+pub(crate) async fn full_catalog_metadata_fresh(key: &ApiKey, cache: &ModelsCache) -> bool {
+    if key.is_any_oauth() || crate::services::provider_profile::is_ollama_base(&key.base_url) {
+        return true;
+    }
+    full_catalog_cached(key, cache).await.is_some()
+}
+
 /// Cache-first catalog fetch for the interactive model picker, shared by the
 /// `run`/`start`/`chat` pickers. Returns instantly on a cache hit; shows a
 /// "Fetching models…" spinner only while a genuine network fetch runs — a hit
@@ -1477,6 +1487,44 @@ mod tests {
             model_cache_key_for_key(&other),
         );
         assert!(full_catalog_cache_key_for_key(&other).ends_with("#all"));
+    }
+
+    #[tokio::test]
+    async fn full_catalog_metadata_fresh_tracks_cache_ttl() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let key = make_key("https://api.getaivo.dev");
+
+        // No entry yet → stale.
+        assert!(!full_catalog_metadata_fresh(&key, &cache).await);
+
+        // Just written → fresh.
+        cache
+            .set(
+                &full_catalog_cache_key_for_key(&key),
+                vec!["aivo/starter".to_string()],
+            )
+            .await;
+        assert!(full_catalog_metadata_fresh(&key, &cache).await);
+    }
+
+    #[tokio::test]
+    async fn full_catalog_metadata_fresh_reports_expired_entry_as_stale() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models-cache.json");
+        // fetched_at = 0 is past the TTL.
+        let key = make_key("https://api.getaivo.dev");
+        let entry = serde_json::json!({
+            full_catalog_cache_key_for_key(&key): {
+                "models": ["aivo/starter"],
+                "fetched_at": 0u64
+            }
+        });
+        tokio::fs::write(&path, serde_json::to_string(&entry).unwrap())
+            .await
+            .unwrap();
+        let cache = ModelsCache::with_path(path);
+        assert!(!full_catalog_metadata_fresh(&key, &cache).await);
     }
 
     #[test]

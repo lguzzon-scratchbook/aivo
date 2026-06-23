@@ -229,10 +229,12 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
     // Surface discovered skills as `/`-typeable slash commands (e.g. `/repo-study`)
     // before the first keystroke, so the command menu suggests them right away.
     app.refresh_skill_commands().await;
-    // The `-m <model>` path never fetches the catalog, so the window is often
-    // unknown at startup. Warm it in the background and update the footer stat
-    // when it resolves — best-effort, silent if the provider omits the window.
-    if app.context_window == 0 {
+    // Warm the catalog in the background when the window is unknown or the
+    // cache is stale, so server-side edits (e.g. reasoning-effort levels)
+    // refresh on the next launch. Best-effort.
+    let catalog_stale =
+        !crate::commands::models::full_catalog_metadata_fresh(&app.key, &app.cache).await;
+    if app.context_window == 0 || catalog_stale {
         let cache = app.cache.clone();
         let key = app.key.clone();
         let client = app.client.clone();
