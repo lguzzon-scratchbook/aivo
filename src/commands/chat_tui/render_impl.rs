@@ -272,7 +272,7 @@ impl ChatTuiApp {
         }
         // Only render the live tail once the answer has started: during the
         // thinking-only phase the spinner already shows "thinking (Xs ...)", and a
-        // folded `▸ thinking` line here would double it. The summary is frozen at
+        // folded `▸ thought` line here would double it. The summary is frozen at
         // the answer's start so it matches the committed form (no jump on commit).
         if !self.pending_response.is_empty() {
             let live_reasoning = (self.thinking_enabled && !self.pending_reasoning.is_empty())

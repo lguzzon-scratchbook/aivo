@@ -1333,7 +1333,7 @@ fn test_build_transcript_folds_streaming_reasoning_when_enabled() {
     let plain = transcript.plain_lines.join("\n");
 
     // Live reasoning renders folded so it doesn't expand then collapse as the answer streams.
-    assert!(plain.contains("▸ thinking"));
+    assert!(plain.contains("▸ thought"));
     assert!(!plain.contains("Inspecting the request"));
     assert!(plain.contains("Working on it"));
 }
@@ -1357,7 +1357,7 @@ fn test_no_folded_summary_during_thinking_only_phase() {
 
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(
-        !plain.contains("▸ thinking"),
+        !plain.contains("▸ thought"),
         "no folded summary during the thinking-only phase: {plain}"
     );
     assert!(!plain.contains("Working out the approach"));
@@ -1375,7 +1375,7 @@ fn test_build_transcript_hides_streaming_reasoning_when_disabled() {
     let transcript = app.build_transcript();
     let plain = transcript.plain_lines.join("\n");
 
-    assert!(!plain.contains("▸ thinking"));
+    assert!(!plain.contains("▸ thought"));
     assert!(!plain.contains("Inspecting the request"));
     assert!(plain.contains("Working on it"));
 }
@@ -1535,13 +1535,13 @@ fn test_thinking_block_has_distinct_bar_color() {
             .position(|l| l.contains(needle))
             .and_then(|i| t.bar_colors[i])
     };
-    // A committed turn folds its thinking to the `▸ thinking` summary.
-    let thinking_bar = bar_for("▸ thinking");
+    // A committed turn folds its thinking to the `▸ thought` summary.
+    let thinking_bar = bar_for("▸ thought");
     let answer_bar = bar_for("the answer");
     assert_eq!(
         thinking_bar,
-        Some(MUTED),
-        "thinking summary uses the muted bar"
+        Some(THINKING_GUTTER),
+        "thinking summary uses the dim gutter bar"
     );
     assert_eq!(answer_bar, Some(ACCENT), "answer uses the accent bar");
     assert_ne!(thinking_bar, answer_bar);
@@ -1562,7 +1562,7 @@ fn test_history_reasoning_folds_when_thinking_enabled() {
     app.thinking_enabled = true;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let shown = app.build_transcript().plain_lines.join("\n");
-    assert!(shown.contains("▸ thinking"), "folded summary present");
+    assert!(shown.contains("▸ thought"), "folded summary present");
     assert!(
         !shown.contains("the private chain of thought"),
         "full reasoning stays folded"
@@ -1572,7 +1572,7 @@ fn test_history_reasoning_folds_when_thinking_enabled() {
     app.thinking_enabled = false;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let hidden = app.build_transcript().plain_lines.join("\n");
-    assert!(!hidden.contains("▸ thinking"));
+    assert!(!hidden.contains("▸ thought"));
     assert!(!hidden.contains("the private chain of thought"));
     assert!(hidden.contains("the answer"));
 }
@@ -1594,7 +1594,7 @@ fn test_click_thinking_header_toggles_inline_expansion() {
         });
     }
     // Simulate the rendered rows: each assistant turn is an answer line preceded
-    // by its folded `▸ thinking` header, in display (top→bottom) order.
+    // by its folded `▸ thought` header, in display (top→bottom) order.
     let hitbox = |rows: Vec<&str>| {
         Some(TranscriptHitbox {
             area: Rect::new(0, 0, 40, 10),
@@ -1603,9 +1603,9 @@ fn test_click_thinking_header_toggles_inline_expansion() {
         })
     };
     app.transcript_hitbox = hitbox(vec![
-        "▸ thinking · 1 line",
+        "▸ thought · 1 line",
         "first answer",
-        "▸ thinking · 1 line",
+        "▸ thought · 1 line",
         "second answer",
     ]);
 
@@ -1616,9 +1616,9 @@ fn test_click_thinking_header_toggles_inline_expansion() {
 
     // Re-click the now-expanded `▾` header collapses it.
     app.transcript_hitbox = hitbox(vec![
-        "▸ thinking · 1 line",
+        "▸ thought · 1 line",
         "first answer",
-        "▾ thinking · 1 line",
+        "▾ thought · 1 line",
         "  SECOND cot",
         "second answer",
     ]);
@@ -1627,9 +1627,9 @@ fn test_click_thinking_header_toggles_inline_expansion() {
 
     // First header → first block (history index 0).
     app.transcript_hitbox = hitbox(vec![
-        "▸ thinking · 1 line",
+        "▸ thought · 1 line",
         "first answer",
-        "▸ thinking · 1 line",
+        "▸ thought · 1 line",
         "second answer",
     ]);
     assert!(app.toggle_thinking_at_row(0));
@@ -1657,13 +1657,13 @@ fn test_thinking_summary_shows_duration_else_line_count() {
 
     // No recorded duration → fall back to the line count.
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("▸ thinking · 2 lines"), "{plain}");
+    assert!(plain.contains("▸ thought · 2 lines"), "{plain}");
 
     // A recorded duration → seconds (2300ms rounds to 2s).
     app.reasoning_durations.insert(0, 2300);
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("▸ thinking · 2s"), "{plain}");
+    assert!(plain.contains("▸ thought for 2s"), "{plain}");
 }
 
 #[test]
@@ -2347,6 +2347,21 @@ fn test_wrap_styled_line_word_wraps_and_hard_breaks() {
     assert_eq!(joined, "abcdefghij");
     for r in &rows {
         assert!(r.plain.chars().count() <= 4);
+    }
+
+    // Leading whitespace is a hanging indent: continuation rows re-apply it so
+    // wrapped text (e.g. expanded reasoning) stays aligned under the first line.
+    let indented = Line::from("  alpha beta gamma");
+    let rows = wrap_styled_line(&indented.spans, 9);
+    let plains: Vec<&str> = rows.iter().map(|r| r.plain.as_str()).collect();
+    assert!(rows.len() >= 2, "should wrap: {plains:?}");
+    for r in &rows {
+        assert!(r.plain.starts_with("  "), "row lost indent: {:?}", r.plain);
+        assert!(
+            r.plain.chars().count() <= 9,
+            "row exceeds width: {:?}",
+            r.plain
+        );
     }
 }
 

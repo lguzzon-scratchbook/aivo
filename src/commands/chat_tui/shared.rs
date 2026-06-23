@@ -3,6 +3,10 @@ use super::*;
 pub(super) const TEXT: Color = Color::Rgb(224, 225, 221);
 pub(super) const MUTED: Color = Color::Rgb(136, 142, 139);
 pub(super) const FAINT: Color = Color::Rgb(92, 99, 102);
+// Left gutter bar for the folded/expanded `▾ thought` reasoning block: kept much
+// dimmer than the muted reasoning text so the block recedes — a faint trace just
+// above the dark background, not a competing accent.
+pub(super) const THINKING_GUTTER: Color = Color::Rgb(60, 64, 66);
 // GrokNight-style magenta accent on a neutral dark base.
 pub(super) const ACCENT: Color = Color::Rgb(213, 108, 196);
 pub(super) const ASSISTANT: Color = Color::Rgb(174, 202, 161);
@@ -1641,11 +1645,11 @@ pub(super) struct ChatTuiApp {
     /// the body-cache key, so a flip repaints.
     pub(super) expanded_thinking: std::collections::HashSet<usize>,
     /// Thinking duration (ms) per committed assistant turn, by history index;
-    /// drives the folded `▸ thinking · Ns` summary. In-memory only, cleared
+    /// drives the folded `▸ thought for Ns` summary. In-memory only, cleared
     /// alongside `expanded_thinking`.
     pub(super) reasoning_durations: std::collections::HashMap<usize, u64>,
     /// When the current segment's reasoning started streaming (first reasoning
-    /// chunk), for the live `▸ thinking · Ns` timer. `None` between segments.
+    /// chunk), for the live `▸ thought for Ns` timer. `None` between segments.
     pub(super) reasoning_started_at: Option<Instant>,
     /// The current segment's thinking duration (ms), frozen when the answer began
     /// streaming so the displayed time excludes answer-streaming. `None` until the

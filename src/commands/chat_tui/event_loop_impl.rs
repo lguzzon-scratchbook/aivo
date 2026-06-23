@@ -247,7 +247,7 @@ impl ChatTuiApp {
     }
 
     /// Commit an assistant segment to history with its thinking duration (for the
-    /// folded `▸ thinking · Ns` summary). A reasoning-only segment (thought, then a
+    /// folded `▸ thought for Ns` summary). A reasoning-only segment (thought, then a
     /// tool call with no prose) still commits — the empty-content message renders
     /// just the thinking summary before the tool step. Resets the thinking clock so
     /// the next segment times from its own first reasoning.
@@ -565,7 +565,7 @@ impl ChatTuiApp {
             // of arriving in network-sized bursts.
             ChatResponseChunk::Content(text) => {
                 // Answer starting ends this segment's thinking — freeze the duration
-                // so the folded `▸ thinking · Ns` excludes answer-streaming time.
+                // so the folded `▸ thought for Ns` excludes answer-streaming time.
                 if self.reasoning_started_at.is_some() && self.reasoning_elapsed_ms.is_none() {
                     self.reasoning_elapsed_ms = self.segment_reasoning_ms();
                 }
@@ -1692,7 +1692,7 @@ impl ChatTuiApp {
         })
     }
 
-    /// History indices of assistant turns that render a `▸ thinking` header, in
+    /// History indices of assistant turns that render a `▸ thought` header, in
     /// display order — the Nth header row maps to the Nth entry (each such turn
     /// renders exactly one header row). The live streaming summary is absent: it has
     /// no history index and isn't expandable inline. Empty when thinking is off.
@@ -1759,7 +1759,7 @@ impl ChatTuiApp {
         true
     }
 
-    /// If transcript `row` is a `▸`/`▾ thinking` header, toggle that block's inline
+    /// If transcript `row` is a `▸`/`▾ thought` header, toggle that block's inline
     /// expansion and return `true`. Counts header rows from the top to get the
     /// block's ordinal, then maps it to a committed message via
     /// [`Self::reasoning_message_indices`] — they stay in lockstep because each

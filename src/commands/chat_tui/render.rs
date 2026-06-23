@@ -57,9 +57,27 @@ pub(super) fn wrap_styled_line(spans: &[Span<'static>], width: usize) -> Vec<Sty
     }
     let cw = |c: char| UnicodeWidthChar::width(c).unwrap_or(0).max(1);
 
-    // Tokenize into alternating whitespace / word runs.
+    // Leading whitespace becomes a hanging indent: it's stripped off, the body is
+    // wrapped to the remaining width, and the indent is re-applied to every row so
+    // continuation rows align under the first line's text instead of falling back
+    // to the gutter (e.g. a wrapped `▾ thought` reasoning line stays indented).
+    // Disabled when the indent leaves no room for text. Lines that fit unwrapped
+    // are unaffected — the body still fits in one row, so the result is identical.
+    let indent_len = chars
+        .iter()
+        .take_while(|(c, _)| *c == ' ' || *c == '\t')
+        .count();
+    let indent: &[(char, Style)] = &chars[..indent_len];
+    let indent_w: usize = indent.iter().map(|(c, _)| cw(*c)).sum();
+    let (indent, body, avail) = if indent_w > 0 && indent_w < width {
+        (indent.to_vec(), &chars[indent_len..], width - indent_w)
+    } else {
+        (Vec::new(), &chars[..], width)
+    };
+
+    // Tokenize the body into alternating whitespace / word runs.
     let mut tokens: Vec<Token> = Vec::new();
-    for (c, st) in chars {
+    for &(c, st) in body {
         let is_space = c == ' ' || c == '\t';
         let w = cw(c);
         match tokens.last_mut() {
@@ -84,14 +102,14 @@ pub(super) fn wrap_styled_line(spans: &[Span<'static>], width: usize) -> Vec<Sty
         width: tw,
     } in tokens
     {
-        if cur_w + tw <= width {
+        if cur_w + tw <= avail {
             cur.extend(buf);
             cur_w += tw;
         } else if is_space {
             // Whitespace that won't fit ends the row; drop it (no leading space).
             rows.push(std::mem::take(&mut cur));
             cur_w = 0;
-        } else if tw <= width {
+        } else if tw <= avail {
             // Word fits on a fresh row.
             if !cur.is_empty() {
                 rows.push(std::mem::take(&mut cur));
@@ -103,7 +121,7 @@ pub(super) fn wrap_styled_line(spans: &[Span<'static>], width: usize) -> Vec<Sty
             // Word longer than the width: hard-break across rows.
             for (c, st) in buf {
                 let w = cw(c);
-                if cur_w + w > width && !cur.is_empty() {
+                if cur_w + w > avail && !cur.is_empty() {
                     rows.push(std::mem::take(&mut cur));
                     cur_w = 0;
                 }
@@ -115,7 +133,17 @@ pub(super) fn wrap_styled_line(spans: &[Span<'static>], width: usize) -> Vec<Sty
     if !cur.is_empty() || rows.is_empty() {
         rows.push(cur);
     }
-    rows.iter().map(|r| styled_line_from_chars(r)).collect()
+    rows.iter()
+        .map(|r| {
+            if indent.is_empty() {
+                styled_line_from_chars(r)
+            } else {
+                let mut row = indent.clone();
+                row.extend_from_slice(r);
+                styled_line_from_chars(&row)
+            }
+        })
+        .collect()
 }
 
 /// Build a [`StyledLine`] from per-character styles, coalescing runs of the same
@@ -510,10 +538,10 @@ pub(super) fn extend_without_leading_blank(
     lines.extend(rendered);
 }
 
-/// Leading marker of a folded reasoning header (`▸ thinking · N lines`).
-pub(super) const THINKING_SUMMARY_PREFIX: &str = "▸ thinking";
-/// Leading marker of an expanded reasoning header (`▾ thinking · N lines`).
-pub(super) const THINKING_EXPANDED_PREFIX: &str = "▾ thinking";
+/// Leading marker of a folded reasoning header (`▸ thought for 2s`).
+pub(super) const THINKING_SUMMARY_PREFIX: &str = "▸ thought";
+/// Leading marker of an expanded reasoning header (`▾ thought for 2s`).
+pub(super) const THINKING_EXPANDED_PREFIX: &str = "▾ thought";
 
 /// Whether a rendered transcript row is a clickable thinking header (collapsed
 /// `▸` or expanded `▾`). The click handler maps a click back to its block; the
@@ -523,12 +551,13 @@ pub(super) fn is_thinking_header(row: &str) -> bool {
     row.starts_with(THINKING_SUMMARY_PREFIX) || row.starts_with(THINKING_EXPANDED_PREFIX)
 }
 
-/// Human "thinking · X" suffix: a duration when known (`2s`, `1m 5s`), else the
-/// line count as a fallback (e.g. cursor turns / resumed history with no timing).
+/// Human suffix after the `thought` marker: `for <duration>` when timing is
+/// known (`for <1s`, `for 2s`, `for 1m 5s`), else a `· N lines` fallback
+/// (e.g. cursor turns / resumed history with no timing).
 fn thinking_suffix(reasoning: &str, duration_ms: Option<u64>) -> String {
     if let Some(ms) = duration_ms {
         let secs = (ms + 500) / 1000;
-        return if secs == 0 {
+        let dur = if secs == 0 {
             "<1s".to_string()
         } else if secs < 60 {
             format!("{secs}s")
@@ -537,15 +566,16 @@ fn thinking_suffix(reasoning: &str, duration_ms: Option<u64>) -> String {
         } else {
             format!("{}m {}s", secs / 60, secs % 60)
         };
+        return format!("for {dur}");
     }
     let count = normalized_reasoning_lines(reasoning).len();
     let unit = if count == 1 { "line" } else { "lines" };
-    format!("{count} {unit}")
+    format!("· {count} {unit}")
 }
 
 fn reasoning_header(prefix: &str, reasoning: &str, duration_ms: Option<u64>) -> StyledLine {
     line_with_plain(vec![Span::styled(
-        format!("{prefix} · {}", thinking_suffix(reasoning, duration_ms)),
+        format!("{prefix} {}", thinking_suffix(reasoning, duration_ms)),
         Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
     )])
 }
@@ -564,7 +594,7 @@ pub(super) fn render_reasoning_summary(
     ));
 }
 
-/// Expanded form: the `▾ thinking` header above the full reasoning, indented so
+/// Expanded form: the `▾ thought` header above the full reasoning, indented so
 /// content rows aren't matched as headers (see `is_thinking_header`).
 pub(super) fn render_reasoning_block(
     lines: &mut Vec<StyledLine>,
@@ -576,6 +606,9 @@ pub(super) fn render_reasoning_block(
         reasoning,
         duration_ms,
     ));
+    // A blank row sets the reasoning body off from the title (the gutter bar
+    // continues through it, so the block still reads as one unit).
+    lines.push(blank_line());
 
     let reasoning_lines = normalized_reasoning_lines(reasoning);
     let mut had_line = false;
@@ -658,7 +691,7 @@ pub(super) fn push_assistant_blocks(
         } else {
             render_reasoning_block(&mut block, view.text, view.duration_ms);
         }
-        push_block(lines, bars, block, Some(MUTED));
+        push_block(lines, bars, block, Some(THINKING_GUTTER));
         if !content.is_empty() {
             // A barless blank separates the muted thinking gutter from the answer's.
             lines.push(blank_line());
@@ -1116,7 +1149,7 @@ pub(super) fn render_local_command(
         }
         OutputView::Collapsed => {
             if total > shown {
-                // Clickable expander (the `▸ thinking` fold affordance). A truncated
+                // Clickable expander (the `▸ thought` fold affordance). A truncated
                 // capture still notes the cut, since expand shows only what we held.
                 let suffix = if truncated { ", truncated" } else { "" };
                 lines.push(line_with_plain(vec![Span::styled(
