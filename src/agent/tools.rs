@@ -195,6 +195,18 @@ pub fn is_parallel_safe(name: &str) -> bool {
     matches!(name, "read_file" | "glob" | "grep" | "web_fetch")
 }
 
+/// Whether a tool only reads — never touches the workspace. A conservative
+/// allowlist: a missing read-only tool just costs a redundant `/rewind` snapshot,
+/// but classifying a mutating tool here would lose its rewind point. Kept distinct
+/// from [`is_parallel_safe`] on purpose — that answers a concurrency question, and
+/// e.g. `list_dir` is read-only here yet not parallel-run there.
+pub fn is_read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_dir" | "glob" | "grep" | "web_fetch"
+    )
+}
+
 /// Whether a tool call warrants a confirmation prompt. Only genuinely risky
 /// actions are gated — a destructive shell command, or a write/edit that leaves
 /// the working directory. Ordinary in-project edits and benign commands
@@ -1894,6 +1906,17 @@ mod tests {
         assert!(!is_mutating("read_file"));
         assert!(bash_looks_destructive("rm -rf /tmp/x"));
         assert!(!bash_looks_destructive("ls -la"));
+    }
+
+    #[test]
+    fn read_only_classification() {
+        // `list_dir` is read-only here even though `is_parallel_safe` omits it —
+        // the lazy `/rewind` snapshot gate must not regress on this.
+        assert!(is_read_only("list_dir"));
+        assert!(is_read_only("read_file"));
+        assert!(!is_read_only("write_file"));
+        assert!(!is_read_only("run_bash"));
+        assert!(!is_read_only("subagent"));
     }
 
     #[test]

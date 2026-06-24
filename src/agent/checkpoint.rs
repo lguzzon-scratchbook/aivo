@@ -15,12 +15,18 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 /// Cap on files in a single snapshot before it's skipped (turn = non-revertible).
 const DEFAULT_MAX_FILES: usize = 20_000;
 /// Cap on bytes in a single snapshot before it's skipped.
 const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Wall-clock budget for the size probe: `git ls-files -o` can spend seconds
+/// traversing a pathological tree before the first path, so the entry-count cap
+/// alone can't bound it. Overrun → treat the tree as too large.
+const PROBE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Patterns excluded from snapshots when the work tree is NOT a git repo (so it
 /// has no `.gitignore` of its own). Inside a real repo we rely solely on the
@@ -47,8 +53,13 @@ pub struct CheckpointStore {
     dir: Option<tempfile::TempDir>,
     /// Cached `git --version` probe.
     git_ok: Option<bool>,
+    /// Permanent reason file-revert is off (home / filesystem-root launch dir),
+    /// computed once at construction; `None` when healthy. Tree-size skips are
+    /// separate and per-turn (see `snapshot`).
+    location_block: Option<&'static str>,
     max_files: usize,
     max_bytes: u64,
+    probe_budget: Duration,
 }
 
 impl CheckpointStore {
@@ -57,9 +68,17 @@ impl CheckpointStore {
             cwd: cwd.to_path_buf(),
             dir: None,
             git_ok: None,
+            location_block: location_block_for(cwd),
             max_files: DEFAULT_MAX_FILES,
             max_bytes: DEFAULT_MAX_BYTES,
+            probe_budget: PROBE_BUDGET,
         }
+    }
+
+    /// The permanent reason `/rewind` file-revert is off (broad launch dir), or
+    /// `None`. The TUI surfaces it once. Per-turn size skips are excluded by design.
+    pub fn permanent_disabled_reason(&self) -> Option<&'static str> {
+        self.location_block
     }
 
     /// Tiny caps for tests that exercise the size guard.
@@ -92,10 +111,18 @@ impl CheckpointStore {
     /// Snapshot the current work tree → tree SHA. `None` when git is unavailable,
     /// init fails, or the tree exceeds the size guard (turn = non-revertible).
     pub async fn snapshot(&mut self) -> Option<String> {
+        // A broad launch dir (home / root) is rejected once, at construction —
+        // never walked.
+        if self.location_block.is_some() {
+            return None;
+        }
         if !self.git_available().await {
             return None;
         }
         let git_dir = self.ensure_init().await?;
+        // Per-turn size guard: skip THIS snapshot when the tree is too large or too
+        // slow to enumerate, but don't latch — a tree that shrinks (or a transient
+        // IO stall that tripped the probe budget) re-enables on the next turn.
         if self.exceeds_cap(&git_dir).await {
             return None;
         }
@@ -299,36 +326,74 @@ impl CheckpointStore {
             .unwrap_or(false)
     }
 
-    /// True when the files git would snapshot exceed the size guard. Sums sizes
-    /// without hashing (`ls-files`). Counts both tracked (`-c`) and untracked
-    /// (`-o`) files, so a tracked file that balloons later still trips the cap —
-    /// `--others` alone would miss it once the first snapshot tracked everything.
+    /// True when the tree git would snapshot exceeds the size guard. Streams
+    /// `ls-files` under an entry-count cap and a wall-clock [`PROBE_BUDGET`] (the
+    /// count cap alone can't bound walk *time*), killing the walk the instant
+    /// either trips. Counts tracked (`-c`) and untracked (`-o`) files, so a tracked
+    /// file that balloons later still trips it.
     async fn exceeds_cap(&self, git_dir: &Path) -> bool {
-        let out = match self
-            .git(git_dir)
-            .args(["ls-files", "-c", "-o", "--exclude-standard", "-z"])
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => o,
-            _ => return false,
+        let mut cmd = self.git(git_dir);
+        cmd.args(["ls-files", "-c", "-o", "--exclude-standard", "-z"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            // Without this, dropping the child on timeout/early-break would leave
+            // `git ls-files` walking the whole tree in the background — the very
+            // stat churn this guard exists to avoid.
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return false,
         };
-        let mut files = 0usize;
-        let mut bytes = 0u64;
-        for rel in out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-            files += 1;
-            if files > self.max_files {
-                return true;
-            }
-            let path = self.cwd.join(path_from_git_bytes(rel));
-            if let Ok(md) = std::fs::metadata(&path) {
-                bytes = bytes.saturating_add(md.len());
-                if bytes > self.max_bytes {
+        let Some(stdout) = child.stdout.take() else {
+            return false; // kill_on_drop reaps the child
+        };
+        let mut reader = BufReader::new(stdout);
+        let max_files = self.max_files;
+        let max_bytes = self.max_bytes;
+        let cwd = &self.cwd;
+        let scan = async move {
+            let mut rel = Vec::new();
+            let mut files = 0usize;
+            let mut bytes = 0u64;
+            loop {
+                rel.clear();
+                match reader.read_until(0, &mut rel).await {
+                    Ok(0) => return false, // enumerated fully, under the caps
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+                // Drop the NUL terminator; skip a stray empty record.
+                if rel.last() == Some(&0) {
+                    rel.pop();
+                }
+                if rel.is_empty() {
+                    continue;
+                }
+                files += 1;
+                if files > max_files {
                     return true;
                 }
+                let path = cwd.join(path_from_git_bytes(&rel));
+                // Async + symlink_metadata: the stat must be an `.await` point so
+                // the budget can actually fire (the runtime is single-threaded; a
+                // blocking std::fs stat would freeze it), and `symlink_metadata`
+                // must NOT follow a link into a slow/huge target.
+                if let Ok(md) = tokio::fs::symlink_metadata(&path).await {
+                    bytes = bytes.saturating_add(md.len());
+                    if bytes > max_bytes {
+                        return true;
+                    }
+                }
             }
-        }
-        false
+        };
+        // A timeout means the walk couldn't even enumerate in time → too large.
+        let over = tokio::time::timeout(self.probe_budget, scan)
+            .await
+            .unwrap_or(true);
+        // Stop the walk now rather than waiting for kill-on-drop at scope end.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        over
     }
 
     /// Remove now-empty parent directories of a deleted file, up to (not incl.)
@@ -345,6 +410,31 @@ impl CheckpointStore {
             cur = dir.parent();
         }
     }
+}
+
+/// Permanent reason a launch dir must never be tree-snapshotted (home / root),
+/// or `None`. Canonicalizes both cwd and home so a symlinked, aliased, or
+/// relative (`.`) launch path still matches — without it, those slip past the
+/// raw prefix test and `git ls-files -o` walks the whole home tree.
+fn location_block_for(cwd: &Path) -> Option<&'static str> {
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let home =
+        crate::services::system_env::home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
+    classify_location(&cwd, home.as_deref())
+}
+
+/// Pure classifier (no IO) for [`location_block_for`], split out so it's testable
+/// without touching the real `$HOME`. `cwd`/`home` are assumed already absolute.
+/// `home.starts_with(cwd)` is true when cwd IS home or an ancestor of it (`/`,
+/// `/Users`); a subdir of home (a real project) is not caught and falls through.
+fn classify_location(cwd: &Path, home: Option<&Path>) -> Option<&'static str> {
+    if cwd.parent().is_none() {
+        return Some("filesystem root");
+    }
+    if home.is_some_and(|home| home.starts_with(cwd)) {
+        return Some("home directory");
+    }
+    None
 }
 
 /// Decode a NUL-delimited git path (`-z`) into a `PathBuf`. On Unix, preserve the
@@ -562,6 +652,115 @@ mod tests {
             store.snapshot().await.is_none(),
             "a ballooning tracked file trips the guard"
         );
+    }
+
+    #[test]
+    fn classify_location_flags_home_root_and_ancestors() {
+        let home = Path::new("/Users/alice");
+        // Filesystem root and home are blocked; ancestors of home are too.
+        assert_eq!(
+            classify_location(Path::new("/"), Some(home)),
+            Some("filesystem root")
+        );
+        assert_eq!(classify_location(home, Some(home)), Some("home directory"));
+        assert_eq!(
+            classify_location(Path::new("/Users"), Some(home)),
+            Some("home directory"),
+        );
+        // A real project under home, and an unrelated dir, are fine.
+        assert_eq!(
+            classify_location(Path::new("/Users/alice/proj"), Some(home)),
+            None
+        );
+        assert_eq!(classify_location(Path::new("/tmp/x"), Some(home)), None);
+        // Root precedes the home check, so HOME="/" classifies as root, not home.
+        assert_eq!(
+            classify_location(Path::new("/"), Some(Path::new("/"))),
+            Some("filesystem root"),
+        );
+        // No home known → nothing to compare against.
+        assert_eq!(classify_location(home, None), None);
+    }
+
+    #[tokio::test]
+    async fn oversized_tree_skips_snapshot_but_reenables_when_shrunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        for i in 0..5 {
+            write(cwd, &format!("f{i}.rs"), "x");
+        }
+        let mut store = CheckpointStore::new(cwd).with_caps(2, u64::MAX);
+        if !store.git_available().await {
+            return;
+        }
+        assert!(store.snapshot().await.is_none(), "oversized → no snapshot");
+        // Size skips are per-turn, not a permanent reason.
+        assert_eq!(store.permanent_disabled_reason(), None);
+        // Shrink back under the cap → the next snapshot re-enables (not latched).
+        for i in 0..5 {
+            let _ = std::fs::remove_file(cwd.join(format!("f{i}.rs")));
+        }
+        write(cwd, "small.rs", "x");
+        assert!(
+            store.snapshot().await.is_some(),
+            "re-enables once under cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_enumeration_skips_snapshot_without_latching() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        write(cwd, "a.rs", "x");
+        // A 1ns budget can't outrun spawning `git ls-files`, so the probe times
+        // out → this snapshot is skipped, but file-revert is NOT permanently off.
+        let mut store = CheckpointStore::new(cwd);
+        store.probe_budget = Duration::from_nanos(1);
+        if !store.git_available().await {
+            return;
+        }
+        assert!(
+            store.snapshot().await.is_none(),
+            "probe timeout → no snapshot"
+        );
+        assert_eq!(
+            store.permanent_disabled_reason(),
+            None,
+            "timeout doesn't latch off"
+        );
+        // With a normal budget the same tree snapshots fine.
+        store.probe_budget = PROBE_BUDGET;
+        assert!(
+            store.snapshot().await.is_some(),
+            "normal budget → snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn home_launch_disables_file_revert() {
+        let Some(home) = crate::services::system_env::home_dir() else {
+            return;
+        };
+        // HOME="/" (some minimal containers) classifies as filesystem root, not
+        // home — skip so the assertion below isn't env-fragile.
+        if home.parent().is_none() {
+            return;
+        }
+        let mut store = CheckpointStore::new(&home);
+        // The reason is known eagerly at construction (no git, no walk needed).
+        assert_eq!(store.permanent_disabled_reason(), Some("home directory"));
+        assert!(
+            store.snapshot().await.is_none(),
+            "home dir → no tree snapshot (would walk all of ~)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_root_disables_file_revert() {
+        let mut store = CheckpointStore::new(Path::new("/"));
+        assert_eq!(store.permanent_disabled_reason(), Some("filesystem root"));
+        assert!(store.snapshot().await.is_none(), "/ → no tree snapshot");
     }
 
     #[tokio::test]

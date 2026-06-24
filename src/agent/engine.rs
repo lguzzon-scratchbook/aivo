@@ -851,17 +851,15 @@ impl AgentEngine {
         // edits. The existing pre-edit tree is the right rewind target.
         let already_checkpointed = self.checkpoints.last().map(|c| c.msg_index) == Some(turn_start);
         if !already_checkpointed {
-            // Snapshot at turn start (before any edit). `None` when checkpointing
-            // is off (sub-engines), git is absent, or the tree is too large.
-            let tree = match self.checkpoint_store.as_mut() {
-                Some(store) => store.snapshot().await,
-                None => None,
-            };
+            // The tree snapshot is taken lazily — only once this turn is about to
+            // touch the workspace (see `execute_tool_batch`) — so a read-only or
+            // pure-Q&A turn pays no git cost. `tree` is filled in then; `None` here
+            // and `None` forever for a turn that never mutates.
             self.checkpoints.push(Checkpoint {
                 msg_index: turn_start,
                 // Before `push_text_turn` may merge a resend in (see `Checkpoint`).
                 prompt: user_text.clone(),
-                tree,
+                tree: None,
                 changed: None,
             });
         }
@@ -1064,6 +1062,23 @@ impl AgentEngine {
         ui: &mut dyn AgentUi,
         tool_calls: &[ToolCall],
     ) -> u64 {
+        // Lazy `/rewind` checkpoint: take the pre-edit tree snapshot now, the first
+        // time a turn runs a batch that isn't entirely read-only. Conservative —
+        // anything not on the `is_read_only` allowlist (writes, run_bash, subagent,
+        // MCP) triggers it, so we never miss a mutation; a fully read-only batch
+        // doesn't. The snapshot is the turn-start tree (reads didn't mutate it).
+        if self.checkpoints.last().is_some_and(|c| c.tree.is_none())
+            && !tool_calls.iter().all(|c| tools::is_read_only(&c.name))
+        {
+            let tree = match self.checkpoint_store.as_mut() {
+                Some(store) => store.snapshot().await,
+                None => None,
+            };
+            if let Some(cp) = self.checkpoints.last_mut() {
+                cp.tree = tree;
+            }
+        }
+
         let mut extra_tokens = 0u64;
         let mut outcomes: Vec<Option<Result<String, String>>> = vec![None; tool_calls.len()];
         let mut parallel_idx: Vec<usize> = Vec::new();
@@ -4710,5 +4725,57 @@ mod tests {
         assert!(!p.join("b.txt").exists(), "renamed file removed");
         assert!(outcome.restored >= 1);
         assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn lazy_checkpoint_snapshots_only_before_a_mutating_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("a.txt"), "v0").unwrap();
+        let mut engine = rewind_engine(p);
+        engine.enable_rewind_checkpoints(&p.display().to_string());
+        if !engine
+            .checkpoint_store
+            .as_mut()
+            .unwrap()
+            .git_available()
+            .await
+        {
+            return; // git missing → skip
+        }
+        let client = reqwest::Client::new();
+        let ctx = turn_ctx(&client, "http://127.0.0.1", p);
+        let mut ui = CapturingUi::default();
+        // Stands in for the turn-start checkpoint (tree filled lazily, if at all).
+        engine.checkpoints.push(Checkpoint {
+            msg_index: 0,
+            prompt: "go".into(),
+            tree: None,
+            changed: None,
+        });
+
+        // A read-only batch must NOT snapshot.
+        let read = vec![ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: json!({ "path": "a.txt" }),
+        }];
+        engine.execute_tool_batch(&ctx, &mut ui, &read).await;
+        assert!(
+            engine.checkpoints.last().unwrap().tree.is_none(),
+            "read-only turn pays no snapshot"
+        );
+
+        // A mutating batch snapshots the pre-edit tree first.
+        let write = vec![ToolCall {
+            id: "2".into(),
+            name: "write_file".into(),
+            arguments: json!({ "path": "a.txt", "content": "v1" }),
+        }];
+        engine.execute_tool_batch(&ctx, &mut ui, &write).await;
+        assert!(
+            engine.checkpoints.last().unwrap().tree.is_some(),
+            "snapshot taken before a mutating tool"
+        );
     }
 }
