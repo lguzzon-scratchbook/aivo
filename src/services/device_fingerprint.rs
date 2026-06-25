@@ -53,17 +53,26 @@ pub fn maybe_with_starter_headers(
     }
 }
 
-/// Attaches device identity headers to a request builder.
-pub fn with_starter_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+/// Device-identity headers as `(name, value)` pairs, for callers that build
+/// requests by hand (the `share_tunnel` WS upgrade). [`with_starter_headers`] wraps this.
+pub fn starter_header_pairs() -> [(&'static str, String); 5] {
     let did = device_id();
     let ts = current_unix_ts();
     let sig = sign_request(did, ts);
-    builder
-        .header("X-Aivo-Device", did)
-        .header("X-Aivo-Timestamp", ts.to_string())
-        .header("X-Aivo-Signature", sig)
-        .header("X-Aivo-Signature-Alg", SIGNATURE_ALG)
-        .header("X-Aivo-Version", VERSION)
+    [
+        ("X-Aivo-Device", did.to_string()),
+        ("X-Aivo-Timestamp", ts.to_string()),
+        ("X-Aivo-Signature", sig),
+        ("X-Aivo-Signature-Alg", SIGNATURE_ALG.to_string()),
+        ("X-Aivo-Version", VERSION.to_string()),
+    ]
+}
+
+/// Attaches device identity headers to a request builder.
+pub fn with_starter_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    starter_header_pairs()
+        .into_iter()
+        .fold(builder, |b, (name, value)| b.header(name, value))
 }
 
 pub(crate) fn hex_sha256(data: &[u8]) -> String {

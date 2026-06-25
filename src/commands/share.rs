@@ -10,10 +10,10 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::cli::ShareArgs;
-use crate::errors::ExitCode;
+use crate::errors::{CLIError, ErrorCategory, ExitCode};
 use crate::services::session_store::SessionStore;
 use crate::services::share_local_server::{build_state, start_local_server};
-use crate::services::share_payload::{RedactionHit, SharePayload};
+use crate::services::share_payload::SharePayload;
 use crate::services::share_picker;
 use crate::services::share_redact::{RedactCtx, redact};
 use crate::services::share_resolver::{PluginTranscript, ResolverContext, resolve_session};
@@ -64,6 +64,11 @@ impl ShareCommand {
     }
 
     async fn execute_internal(self, args: ShareArgs) -> Result<ExitCode> {
+        // Publishing needs a linked device; `--debug-local-only` (127.0.0.1) is exempt.
+        if !args.debug_local_only {
+            ensure_device_linked().await?;
+        }
+
         // Always resolve from the user's current working directory — the
         // native CLI extractors all match by canonical cwd.
         let cwd = std::env::current_dir()?;
@@ -97,16 +102,14 @@ impl ShareCommand {
         let mut payload = resolved.payload;
 
         let redact_ctx = RedactCtx::from_system();
-        let report: Vec<RedactionHit> = if args.no_redact {
+        if args.no_redact {
             payload.meta.redacted = false;
-            Vec::new()
         } else {
-            let (red, hits) = redact(payload, &redact_ctx);
+            let (red, _hits) = redact(payload, &redact_ctx);
             payload = red;
-            hits
-        };
+        }
 
-        print_preview(&payload, &report, args.live);
+        print_preview(&payload, args.live);
 
         let live = args.live;
         let session_id_owned = session_id.to_string();
@@ -148,7 +151,7 @@ impl ShareCommand {
             match share_tunnel::run_tunnel(local_base, args.open, shutdown.clone()).await {
                 Ok(()) => ExitCode::Success,
                 Err(e) => {
-                    eprintln!("{} {e}", style::red("Tunnel error:"));
+                    eprintln!("  {} {e}", style::red("✗"));
                     ExitCode::NetworkError
                 }
             }
@@ -229,32 +232,45 @@ impl ShareCommand {
     }
 }
 
-fn print_preview(payload: &SharePayload, report: &[RedactionHit], live: bool) {
-    let chars = payload.approximate_chars();
-    let kb = chars / 1024;
+/// Refuse to share from an unlinked device. Fails open when the server is
+/// unreachable so a network blip doesn't block a linked user.
+async fn ensure_device_linked() -> Result<()> {
+    use crate::commands::login::{AccountSync, sync_account_status};
+    match sync_account_status().await {
+        AccountSync::Linked(account) => {
+            println!(
+                "  {} Sharing as {}",
+                style::success_symbol(),
+                style::dim(account.display())
+            );
+            Ok(())
+        }
+        AccountSync::Unverified(Some(_)) => Ok(()),
+        AccountSync::Unlinked { .. } | AccountSync::Unverified(None) => Err(not_linked_error()),
+    }
+}
+
+fn not_linked_error() -> anyhow::Error {
+    CLIError::new(
+        "Sharing requires a linked aivo account.",
+        ErrorCategory::Auth,
+        None::<String>,
+        Some("Run `aivo login` to link this device, then try sharing again."),
+    )
+    .into()
+}
+
+fn print_preview(payload: &SharePayload, live: bool) {
+    let kb = payload.approximate_chars() / 1024;
+    let model = payload.model.as_deref().unwrap_or("(none)");
+    let mode = if live { "live" } else { "snapshot" };
     println!(
-        "{} {} messages, ~{} KB after redaction",
-        style::bold("Share preview:"),
+        "    {} messages · ~{} KB · {} · {} · {}",
         payload.messages.len(),
         kb,
-    );
-    if !report.is_empty() {
-        let summary = report
-            .iter()
-            .map(|h| format!("{} {}", h.count, h.category))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  {} {}", style::dim("redacted:"), style::dim(summary));
-    }
-    let model = payload.model.as_deref().unwrap_or("(none)");
-    println!(
-        "  {} {} · {} {} · {} {}",
-        style::dim("source:"),
         style::cyan(&payload.source_cli),
-        style::dim("model:"),
         style::cyan(model),
-        style::dim("mode:"),
-        style::cyan(if live { "live" } else { "snapshot" }),
+        style::cyan(mode),
     );
 }
 
@@ -275,11 +291,29 @@ pub(crate) fn print_share_started(url: &str) {
 
     println!();
     println!(
-        "{} {}  {}",
+        "  {} {}   {}",
         style::green("✓"),
         style::bold("Sharing"),
-        style::dim("Ctrl+C stop sharing")
+        style::dim("Ctrl+C to stop")
     );
-    println!("  {}", style::cyan(url));
+    println!("    {}", style::cyan(url));
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::{ExitCode, exit_code_for_error};
+
+    #[test]
+    fn not_linked_error_is_auth_category() {
+        let e = not_linked_error();
+        assert_eq!(exit_code_for_error(&e), ExitCode::AuthError);
+    }
+
+    #[test]
+    fn not_linked_error_points_at_login() {
+        let e = not_linked_error();
+        assert!(e.to_string().contains("aivo login"));
+    }
 }

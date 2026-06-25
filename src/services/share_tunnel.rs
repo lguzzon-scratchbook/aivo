@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
-use http::HeaderValue;
+use http::{HeaderName, HeaderValue};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -63,6 +63,16 @@ pub async fn run_tunnel(
         HeaderValue::from_static(SUBPROTOCOL),
     );
 
+    // Sign the upgrade so the server can verify the device→user binding (older servers ignore it).
+    for (name, value) in crate::services::device_fingerprint::starter_header_pairs() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            req.headers_mut().insert(name, value);
+        }
+    }
+
     // Connect + handshake takes a network roundtrip; show a spinner so the
     // user sees feedback between Enter and the success banner. The spinner
     // is killed in every exit branch (early returns and the success path);
@@ -75,12 +85,14 @@ pub async fn run_tunnel(
         Ok(Err(e)) => {
             crate::style::stop_spinner(&spinner);
             let _ = spinner_handle.await;
-            return Err(anyhow!(e)).with_context(|| format!("failed to connect to {ws_endpoint}"));
+            return Err(connect_error(e));
         }
         Err(_) => {
             crate::style::stop_spinner(&spinner);
             let _ = spinner_handle.await;
-            return Err(anyhow!("timed out connecting to {ws_endpoint}"));
+            return Err(anyhow!(
+                "Timed out reaching the aivo share service — check your connection and try again."
+            ));
         }
     };
 
@@ -363,6 +375,31 @@ where
         Message::Binary(b) => Ok(b.to_vec()),
         other => Err(anyhow!("expected binary frame, got {other:?}")),
     }
+}
+
+/// Map a WS connect failure to a user-facing error (the auth gate refuses with an HTTP status, not 101).
+fn connect_error(e: tokio_tungstenite::tungstenite::Error) -> anyhow::Error {
+    use tokio_tungstenite::tungstenite::Error as WsErr;
+    if let WsErr::Http(resp) = &e {
+        match resp.status().as_u16() {
+            403 => {
+                return anyhow!(
+                    "This device isn't linked to an aivo account, so sharing was refused.\n  \
+                     Run `aivo login` to link it, then try again."
+                );
+            }
+            503 => {
+                return anyhow!(
+                    "Share authorization is temporarily unavailable — try again in a moment."
+                );
+            }
+            _ => {}
+        }
+    }
+    anyhow!(
+        "Couldn't reach the aivo share service.\n  \
+         Check your internet connection and try again."
+    )
 }
 
 fn http_to_ws_url(base: &str) -> Result<String> {
