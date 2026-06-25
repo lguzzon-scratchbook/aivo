@@ -738,12 +738,16 @@ pub(super) fn render_pending_status(
     reduce_motion: bool,
     elapsed: Duration,
     activity: &str,
+    tail: &str,
 ) {
     let spinner = spinner_frame_indexed(frame_tick, reduce_motion);
-    let text = format!(
-        "{spinner} {activity} ({} • esc to interrupt)",
-        format_request_elapsed(elapsed)
-    );
+    let elapsed = format_request_elapsed(elapsed);
+    // Empty tail → just the clock.
+    let text = if tail.is_empty() {
+        format!("{spinner} {activity} ({elapsed})")
+    } else {
+        format!("{spinner} {activity} ({elapsed} • {tail})")
+    };
     push_styled_line(
         lines,
         text,
@@ -996,6 +1000,56 @@ pub(super) fn tool_call_target_display(name: &str, args: &serde_json::Value, cwd
     }
 }
 
+/// Present-tense label for the inline status line — `running grep "foo"`,
+/// `reading main.rs`, `delegating to reviewer`. Target capped so it can't wrap.
+pub(super) fn tool_action_label(name: &str, args: &serde_json::Value, cwd: &str) -> String {
+    if name == "subagent" {
+        let agent = args
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        return match agent {
+            Some(a) => format!("delegating to {a}"),
+            None => "delegating".to_string(),
+        };
+    }
+    if name == "update_plan" {
+        return "updating the plan".to_string();
+    }
+    if name == "skill" {
+        let s = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        return if s.is_empty() {
+            "running a skill".to_string()
+        } else {
+            format!("running skill {s}")
+        };
+    }
+    if name == "take_note" {
+        return "taking a note".to_string();
+    }
+    let verb = match name {
+        "read_file" => "reading",
+        "edit_file" | "multi_edit" => "editing",
+        "write_file" => "writing",
+        "delete_file" => "deleting",
+        "list_dir" => "listing",
+        "grep" | "glob" => "searching",
+        "run_bash" => "running",
+        "web_fetch" => "fetching",
+        // MCP and any other external tool: name it, no target to show.
+        _ => return format!("running {}", tool_display_name(name)),
+    };
+    let target = truncate_label(
+        &tool_call_target_display(name, args, cwd),
+        ACTION_TARGET_MAX_COLS,
+    );
+    if target.is_empty() {
+        format!("{verb} {}", tool_display_name(name))
+    } else {
+        format!("{verb} {target}")
+    }
+}
+
 /// Condense a shell command for a one-line label: drop a redundant `cd <cwd> &&`
 /// prefix and `2>/dev/null` / `2>&1` redirection noise, then collapse whitespace.
 fn condense_command(cmd: &str, cwd: &str) -> String {
@@ -1035,6 +1089,26 @@ fn basename(path: &str) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or(path)
         .to_string()
+}
+
+/// Max display columns for a status-line action target (room for verb + tail).
+const ACTION_TARGET_MAX_COLS: usize = 40;
+
+/// Cap `s` to `max` display columns, appending `…` on overflow.
+fn truncate_label(s: &str, max: usize) -> String {
+    if cell_width(s) <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(1); // room for the ellipsis
+    let mut out = String::new();
+    for ch in s.chars() {
+        if cell_width(&out) + cell_width(&ch.to_string()) > budget {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 /// Join target labels into one line, dropping empties, capped at `max` display

@@ -291,6 +291,10 @@ impl ChatTuiApp {
         self.incoming_buffer.clear();
         self.pending_finish = None;
         self.pending_reasoning.clear();
+        // Reset per-turn status state (label can't flash before the first tool).
+        self.last_tool_action = None;
+        self.turn_output_tokens = 0;
+        self.retrying = false;
         self.pending_submit = Some(PendingSubmission {
             content: input.clone(),
             attachments: attachments.clone(),
@@ -1937,6 +1941,10 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             .ok();
     }
 
+    fn turn_tokens(&mut self, output: u64) {
+        self.tx.send(RuntimeEvent::AgentTurnTokens(output)).ok();
+    }
+
     fn plan_updated(&mut self, items: &[crate::agent::plan::PlanItem]) {
         let value = serde_json::to_value(items).unwrap_or(serde_json::Value::Null);
         self.tx.send(RuntimeEvent::AgentPlan(value)).ok();
@@ -1963,6 +1971,12 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     fn notify(&mut self, text: &str) {
         self.tx
             .send(RuntimeEvent::AgentNotice(text.to_string()))
+            .ok();
+    }
+
+    fn notify_error(&mut self, text: &str) {
+        self.tx
+            .send(RuntimeEvent::AgentError(text.to_string()))
             .ok();
     }
 

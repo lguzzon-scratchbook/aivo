@@ -128,8 +128,23 @@ impl ChatTuiApp {
         // coalesced call line drops its target list to avoid repeating it.
         let separate_results = self.history.iter().any(|m| m.role == "tool_result");
 
+        // Hide an in-flight tool's card (trailing `tool_call`, no result yet)
+        // while sending — the status line names it instead, so it's not shown
+        // twice. It renders once its result lands (no longer at the tail).
+        let mut render_len = self.history.len();
+        if self.sending {
+            while render_len > 0 {
+                let m = &self.history[render_len - 1];
+                if m.role == "tool_call" && decode_tool_outcome(&m.content).0.is_none() {
+                    render_len -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
         let mut idx = 0;
-        while idx < self.history.len() {
+        while idx < render_len {
             let message = &self.history[idx];
             // The plan/task list is pinned in its own panel above the composer
             // (see `render_plan_panel`), not rendered inline — so it stays visible
@@ -190,6 +205,8 @@ impl ChatTuiApp {
                     } else {
                         self.tool_call_run_len(idx, &name)
                     };
+                    // Don't coalesce into the hidden in-flight tail.
+                    let run = run.min(render_len - idx);
                     if run >= 2 {
                         let targets: Vec<String> = self.history[idx..idx + run]
                             .iter()
@@ -392,19 +409,41 @@ impl ChatTuiApp {
         ))
     }
 
-    /// The live processing status line — thinking / running a tool / working —
-    /// shown while a turn runs, with the spinner glyph + elapsed clock. Returns
-    /// `None` when idle. Rebuilt every frame (it animates) and appended after the
-    /// cached body so animation never invalidates the cache.
+    /// The live status line (spinner + activity + elapsed + this turn's tokens),
+    /// or `None` when idle. Rebuilt per frame and appended after the cached body
+    /// so animation never invalidates the cache.
     pub(super) fn spinner_status_line(&self) -> Option<StyledLine> {
-        // A model turn and a `!cmd` run never overlap, so at most one drives the
-        // spinner; the local command reports its own elapsed clock and activity.
-        let (started_at, activity) = if self.sending {
-            (self.request_started_at, self.processing_activity())
+        let started_at = if self.sending {
+            self.request_started_at
         } else if let Some(run) = &self.local_command {
-            (Some(run.started_at), "running command".to_string())
+            Some(run.started_at)
         } else {
             return None;
+        };
+        // Throttled label; fall back to the live one before the first tick.
+        let activity = match &self.status_display {
+            Some((label, _)) => label.clone(),
+            None => self.desired_status(),
+        };
+        // This turn's generated tokens (measured, else a ~chars/4 estimate); 0 is
+        // omitted. A `!cmd` run has no round, so it keeps the interrupt hint.
+        let tail = if self.sending {
+            let (used, is_estimate) = if self.turn_output_tokens > 0 {
+                (self.turn_output_tokens, false)
+            } else {
+                let streamed = self.pending_response.len()
+                    + self.incoming_buffer.len()
+                    + self.pending_reasoning.len();
+                (streamed as u64 / 4, true)
+            };
+            if used == 0 {
+                String::new()
+            } else {
+                let approx = if is_estimate { "~" } else { "" };
+                format!("{approx}{} tokens", format_token_count_value(used))
+            }
+        } else {
+            "esc to interrupt".to_string()
         };
         let mut block = Vec::new();
         render_pending_status(
@@ -415,8 +454,42 @@ impl ChatTuiApp {
                 .map(|started_at| started_at.elapsed())
                 .unwrap_or_default(),
             &activity,
+            &tail,
         );
         block.into_iter().next()
+    }
+
+    /// The status label right now, pre-throttle: a tool step names itself, else
+    /// streaming reads "Working" and pre-output compute reads "Thinking".
+    pub(super) fn desired_status(&self) -> String {
+        if !self.sending {
+            return "running command".to_string();
+        }
+        if let Some(action) = self.current_action_label() {
+            return action;
+        }
+        // Streaming output or recovering from a retry → "Working", else "Thinking".
+        if self.retrying || !self.pending_response.is_empty() || !self.incoming_buffer.is_empty() {
+            return "Working".to_string();
+        }
+        "Thinking".to_string()
+    }
+
+    /// Advance the throttled status label (once per loop iteration): adopt the
+    /// new label only after the current one has shown for `STATUS_MIN_DURATION`,
+    /// so fast steps don't flicker. Called per frame.
+    pub(super) fn tick_status_throttle(&mut self) {
+        if !self.sending && self.local_command.is_none() {
+            self.status_display = None;
+            return;
+        }
+        let desired = self.desired_status();
+        match &self.status_display {
+            // Unchanged — keep the original timestamp so it can still age out.
+            Some((label, _)) if *label == desired => {}
+            Some((_, since)) if since.elapsed() < STATUS_MIN_DURATION => {}
+            _ => self.status_display = Some((desired, Instant::now())),
+        }
     }
 
     /// Appends the live spinner status line (with its leading spacing blank) to a
@@ -454,6 +527,8 @@ impl ChatTuiApp {
         // The committed history renders the folded reasoning summary only while
         // this is on, so a toggle must invalidate the memoized body.
         self.thinking_enabled.hash(&mut hasher);
+        // The in-flight card hide depends on `sending`, so a flip must rebuild.
+        self.sending.hash(&mut hasher);
         self.history.len().hash(&mut hasher);
         if let Some(first) = self.history.first() {
             first.role.hash(&mut hasher);
@@ -1879,27 +1954,26 @@ impl ChatTuiApp {
         spans
     }
 
-    /// What the turn is doing right now, derived from the live transcript so no
-    /// extra state is needed: streaming a reply, running a tool, or waiting on
-    /// the model. Drives the footer status and the in-stream spinner.
-    pub(super) fn processing_activity(&self) -> String {
+    /// Present-tense label for the in-flight tool step (e.g. `running grep`), or
+    /// `None`. Uses the same in-flight test that hides the tool's card (trailing
+    /// `tool_call`, no result yet), so the status and the card never both show.
+    pub(super) fn current_action_label(&self) -> Option<String> {
+        if !self.sending {
+            return None;
+        }
         if !self.pending_response.is_empty() || !self.incoming_buffer.is_empty() {
-            return "working".to_string();
+            return None;
         }
-        if let Some(last) = self.history.last()
-            && last.role == "tool_call"
-        {
-            let verb = serde_json::from_str::<serde_json::Value>(&last.content)
-                .ok()
-                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                .unwrap_or_else(|| "tool".to_string());
-            // "subagent" is jargon — surface the delegation as a plain verb.
-            if verb == "subagent" {
-                return "delegating".to_string();
-            }
-            return format!("running {verb}");
+        let in_flight = self
+            .history
+            .last()
+            .is_some_and(|m| m.role == "tool_call" && decode_tool_outcome(&m.content).0.is_none());
+        if !in_flight {
+            return None;
         }
-        "thinking".to_string()
+        self.last_tool_action
+            .as_ref()
+            .map(|(label, _)| label.clone())
     }
 
     /// Tokens to show in the footer fill right now, and whether the figure is a

@@ -170,6 +170,9 @@ pub trait AgentUi: Send {
     /// prompt + tool schemas + conversation), emitted before usage is known.
     /// Default no-op.
     fn context_usage(&mut self, _tokens: u64, _measured: bool) {}
+    /// The turn's cumulative generated (output) tokens so far, summed across
+    /// steps — for a live per-turn counter. Default no-op.
+    fn turn_tokens(&mut self, _output: u64) {}
     /// Prompt the user for the next turn (REPL). `None` ends the session (EOF /
     /// `/exit`). Default `None` → one-shot only (used by tests/non-interactive).
     fn read_user_input(&mut self) -> Option<String> {
@@ -187,6 +190,11 @@ pub trait AgentUi: Send {
     fn tool_start(&mut self, name: &str, args: &Value);
     fn tool_result(&mut self, name: &str, result: &Result<String, String>);
     fn notify(&mut self, text: &str);
+    /// Like [`notify`](Self::notify) but for a genuine error, so a UI can use an
+    /// error hue. Default delegates to `notify`.
+    fn notify_error(&mut self, text: &str) {
+        self.notify(text);
+    }
     /// End-of-turn line: an optional summary plus this turn's stats.
     /// `tokens` is the cumulative work across all steps (prompt re-counted each
     /// step); `context_tokens` is the *last* step's prompt+completion — the real
@@ -944,7 +952,7 @@ impl AgentEngine {
                         tokio::time::sleep(retry_delay(retries)).await;
                     }
                     Err(e) => {
-                        ui.notify(&format!("LLM error: {e}"));
+                        ui.notify_error(&format!("LLM error: {e}"));
                         break AssistantMessage {
                             content: Some(format!("[error: {e}]")),
                             tool_calls: vec![],
@@ -972,6 +980,7 @@ impl AgentEngine {
                     cache_read_tokens: split.cache_read,
                     cache_write_tokens: split.cache_creation,
                 });
+                ui.turn_tokens(self.turn_usage.completion_tokens);
             }
 
             // An empty completion (no text, no tool calls — content filters,
@@ -1176,10 +1185,11 @@ impl AgentEngine {
                     .unwrap_or("");
                 skills::load_skill_result(&self.skills, name)
             } else if call.name == "subagent" {
-                // Spawn a fresh sub-engine on the same serve/cwd (needs ctx). Its
-                // LLM calls aren't this engine's steps, so fold the total into both
-                // the footer (extra_tokens) and the turn's index usage below.
-                match self.run_subagent(ctx, &call.arguments).await {
+                // Fresh sub-engine on the same serve/cwd; fold its total into the
+                // footer + turn usage below. Pass the UI + output base so it
+                // forwards live token growth.
+                let base = self.turn_usage.completion_tokens;
+                match self.run_subagent(ctx, ui, base, &call.arguments).await {
                     Ok((msg, sub_tokens)) => {
                         extra_tokens += sub_tokens;
                         self.turn_usage.completion_tokens =
@@ -1701,7 +1711,13 @@ Re-run the full command without write confinement?",
     /// transcript, only the result comes back. Dangerous ops inside it inherit the
     /// parent's auto-approve and otherwise fail closed (no interactive prompt can
     /// nest inside a tool call).
-    async fn run_subagent(&self, ctx: &TurnCtx<'_>, args: &Value) -> Result<(String, u64), String> {
+    async fn run_subagent(
+        &self,
+        ctx: &TurnCtx<'_>,
+        parent_ui: &mut dyn AgentUi,
+        base: u64,
+        args: &Value,
+    ) -> Result<(String, u64), String> {
         let task = args
             .get("task")
             .and_then(|v| v.as_str())
@@ -1760,6 +1776,8 @@ Re-run the full command without write confinement?",
 
         let mut ui = SubagentUi {
             yes: ctx.auto_approve_enabled(),
+            parent: Some(parent_ui),
+            base,
             ..Default::default()
         };
         // Box the recursive future (run_turn → subagent → run_turn) so the async
@@ -1819,7 +1837,7 @@ use its role instead of a generic sub-agent.",
 /// inherits the parent's auto-approve, else denies (a nested tool call has no
 /// interactive prompt).
 #[derive(Default)]
-struct SubagentUi {
+struct SubagentUi<'a> {
     cur_text: String,
     last_nonempty: String,
     /// Last engine notice (LLM error / step-limit / no-progress) — surfaced when
@@ -1829,9 +1847,12 @@ struct SubagentUi {
     /// The sub-agent's cumulative token usage, folded into the parent turn's total.
     tokens: u64,
     yes: bool,
+    /// Forward live token growth (base + sub so-far) to the parent UI.
+    parent: Option<&'a mut dyn AgentUi>,
+    base: u64,
 }
 
-impl SubagentUi {
+impl SubagentUi<'_> {
     /// The sub-agent's answer: the converging step's text, or the last non-empty
     /// step's text if it converged without emitting any of its own.
     fn answer(&self) -> &str {
@@ -1863,7 +1884,7 @@ impl SubagentUi {
     }
 }
 
-impl AgentUi for SubagentUi {
+impl AgentUi for SubagentUi<'_> {
     fn turn_start(&mut self) {
         // A new step begins: the previous step's text (if any) becomes the
         // fallback, and the current buffer resets for this step.
@@ -1882,6 +1903,12 @@ impl AgentUi for SubagentUi {
     fn footer(&mut self, _summary: Option<&str>, steps: usize, tokens: u64, _c: u64, _e: u64) {
         self.steps = steps;
         self.tokens = tokens;
+    }
+    fn turn_tokens(&mut self, output: u64) {
+        let total = self.base.saturating_add(output);
+        if let Some(p) = self.parent.as_deref_mut() {
+            p.turn_tokens(total);
+        }
     }
     fn ask_permission<'a>(
         &'a mut self,
@@ -2299,6 +2326,8 @@ mod tests {
         asks: usize,
         /// The `tool` argument of each `ask_permission` call, in order.
         ask_tools: Vec<String>,
+        /// Each `turn_tokens` report, in order.
+        turn_token_reports: Vec<u64>,
     }
     impl AgentUi for CapturingUi {
         fn assistant_text(&mut self, t: &str) {
@@ -2318,6 +2347,9 @@ mod tests {
         fn footer(&mut self, _: Option<&str>, _: usize, tokens: u64, _: u64, _: u64) {
             self.footer_tokens = tokens;
         }
+        fn turn_tokens(&mut self, output: u64) {
+            self.turn_token_reports.push(output);
+        }
         fn ask_permission<'a>(
             &'a mut self,
             tool: &'a str,
@@ -2336,6 +2368,20 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[test]
+    fn subagent_forwards_live_tokens_to_parent_with_base() {
+        let mut parent = CapturingUi::default();
+        let mut sub = SubagentUi {
+            base: 100,
+            parent: Some(&mut parent),
+            ..Default::default()
+        };
+        sub.turn_tokens(20);
+        sub.turn_tokens(55);
+        drop(sub);
+        assert_eq!(parent.turn_token_reports, vec![120, 155]);
     }
 
     fn tmp() -> PathBuf {

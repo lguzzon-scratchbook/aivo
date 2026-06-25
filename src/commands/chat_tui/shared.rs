@@ -53,6 +53,9 @@ pub(super) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// cadence), but still a real yield so the streaming task keeps progressing on
 /// the current-thread runtime.
 pub(super) const INPUT_REPAINT_INTERVAL: Duration = Duration::from_millis(1);
+/// Minimum time the live status label holds before it may change, so fast steps
+/// don't flash by unreadably.
+pub(super) const STATUS_MIN_DURATION: Duration = Duration::from_millis(1500);
 /// Typewriter reveal rate. Each animation frame reveals at least
 /// `TYPEWRITER_MIN_CHARS` of the buffered stream text (a steady floor so a slow
 /// trickle still types out) plus `1/TYPEWRITER_CATCHUP_DIVISOR` of whatever
@@ -1343,6 +1346,11 @@ pub(super) enum RuntimeEvent {
         tokens: u64,
         measured: bool,
     },
+    /// The turn's cumulative generated (output) tokens so far — drives the live
+    /// per-turn counter in the status line.
+    AgentTurnTokens(u64),
+    /// An agent error (e.g. an LLM/API failure) — shown as an error-hued notice.
+    AgentError(String),
     /// The agent turn finished (engine called `footer`) — commit the turn.
     AgentFinished {
         steps: usize,
@@ -1459,6 +1467,18 @@ pub(super) struct ChatTuiApp {
     pub(super) pending_submit: Option<PendingSubmission>,
     pub(super) sending: bool,
     pub(super) request_started_at: Option<Instant>,
+    /// Current tool step, present-tense (`running grep`), + when it started.
+    /// Feeds the inline status label.
+    pub(super) last_tool_action: Option<(String, Instant)>,
+    /// The status label on screen + when first shown; throttled by
+    /// `tick_status_throttle` so it switches at most once per `STATUS_MIN_DURATION`.
+    pub(super) status_display: Option<(String, Instant)>,
+    /// This turn's cumulative generated tokens (status-line tail). Reset at turn
+    /// start; fed by `AgentTurnTokens` (agent) or `Usage` (plain chat).
+    pub(super) turn_output_tokens: u64,
+    /// A connection retry is in progress → status reads "Working", not
+    /// "Thinking". Set on the retry notice, cleared on progress.
+    pub(super) retrying: bool,
     pub(super) last_usage: Option<TokenUsage>,
     /// Provider-measured usage streamed mid-turn (Anthropic reports it from
     /// `message_start`; OpenAI/Responses/Google only at the end). Drives the

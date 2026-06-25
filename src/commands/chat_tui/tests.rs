@@ -1015,6 +1015,10 @@ fn make_test_app(
         pending_submit: None,
         sending: false,
         request_started_at: None,
+        last_tool_action: None,
+        status_display: None,
+        turn_output_tokens: 0,
+        retrying: false,
         last_usage: None,
         live_usage: None,
         context_tokens: 0,
@@ -1319,7 +1323,7 @@ fn test_build_transcript_shows_pending_status_without_visible_stream() {
     let transcript = app.build_transcript();
     let plain = transcript.plain_lines.join("\n");
 
-    assert!(plain.contains("esc to interrupt"));
+    assert!(plain.contains("Thinking"));
 }
 
 #[test]
@@ -1350,8 +1354,8 @@ fn test_build_transcript_folds_streaming_reasoning_when_enabled() {
 
 #[test]
 fn test_no_folded_summary_during_thinking_only_phase() {
-    // During the thinking-only gap the spinner already shows "thinking", so the
-    // transcript must not also render a folded summary (avoid the double-up).
+    // During the thinking-only gap the Thinking heartbeat already signals activity,
+    // so the transcript must not also render a folded summary (avoid the double-up).
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.thinking_enabled = true;
@@ -1877,22 +1881,331 @@ fn test_agent_context_drives_footer_live() {
 }
 
 #[test]
-fn test_processing_activity_reflects_phase() {
+fn test_current_action_label_reflects_phase() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // No streamed text, no tool in flight → waiting on the model.
-    assert_eq!(app.processing_activity(), "thinking");
-    // A tool call in flight → name the running tool.
+    app.sending = true;
+    // No tool in flight → pure model compute, only the Thinking heartbeat.
+    assert_eq!(app.current_action_label(), None);
+    // A tool call in flight → name the step, present-tense, with its target.
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "ls"}),
+    );
+    assert_eq!(app.current_action_label().as_deref(), Some("running ls"));
+    // Streamed tokens arriving → the step is over, heartbeat only.
+    app.pending_response = "partial".to_string();
+    assert_eq!(app.current_action_label(), None);
+}
+
+#[test]
+fn test_tool_action_label_is_present_tense_with_target() {
+    use super::render::tool_action_label;
+    assert_eq!(
+        tool_action_label("read_file", &serde_json::json!({"path": "src/main.rs"}), ""),
+        "reading main.rs"
+    );
+    assert_eq!(
+        tool_action_label("grep", &serde_json::json!({"pattern": "parse_expr"}), ""),
+        "searching parse_expr"
+    );
+    assert_eq!(
+        tool_action_label("edit_file", &serde_json::json!({"path": "a/b.rs"}), ""),
+        "editing b.rs"
+    );
+    // MCP / unknown tools: named, no target to show.
+    assert_eq!(
+        tool_action_label("mcp__linear__create_issue", &serde_json::json!({}), ""),
+        "running linear/create_issue"
+    );
+}
+
+#[test]
+fn test_tool_action_label_caps_long_command() {
+    use super::render::tool_action_label;
+    let long = "cd /private/tmp/test/markdown-preview && node server.js > /tmp/server.log & \
+                sleep 2 && curl -s http://localhost:3000/ && kill $SERVER_PID";
+    let label = tool_action_label("run_bash", &serde_json::json!({ "command": long }), "");
+    // Capped to one line: short, ellipsized, single line.
+    assert!(
+        label.starts_with("running cd /private/tmp"),
+        "label: {label:?}"
+    );
+    assert!(label.ends_with('…'), "ellipsized: {label:?}");
+    assert!(label.chars().count() <= 50, "kept short: {label:?}");
+    assert!(!label.contains('\n'), "single line: {label:?}");
+}
+
+#[test]
+fn test_current_action_shows_inline_on_status_line() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.apply_agent_tool_call(
+        None,
+        "grep".to_string(),
+        serde_json::json!({"pattern": "parse_expr"}),
+    );
+    // The action replaces "Thinking" on the SAME single status line (no extra
+    // line), so the layout never shifts as steps come and go.
+    let status = app
+        .build_transcript()
+        .plain_lines
+        .into_iter()
+        .find(|l| l.contains("searching parse_expr"))
+        .expect("action shown inline on the status line");
+    // It's the live status line (carries the elapsed clock), not a tool card.
+    assert!(status.contains('('), "on the status line: {status:?}");
+}
+
+#[test]
+fn test_done_marker_stays_above_new_input_after_plan_clear() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // A finished turn: a reply, then a completed plan pinned in its panel. The
+    // Done marker is stamped on the last VISIBLE entry (the reply, idx 1).
     app.history.push(ChatMessage {
-        role: "tool_call".to_string(),
-        content: r#"{"name":"run_bash","args":{"cmd":"ls"}}"#.to_string(),
+        role: "user".to_string(),
+        content: "first task".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
-    assert_eq!(app.processing_activity(), "running run_bash");
-    // Streamed tokens arriving → working (takes priority over the tool tail).
-    app.pending_response = "partial".to_string();
-    assert_eq!(app.processing_activity(), "working");
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "the reply".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.history.push(ChatMessage {
+        role: "plan".to_string(),
+        content: r#"[{"step":"a","status":"completed"}]"#.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.turn_durations.insert(1, 78_000);
+
+    // The next user message clears the completed plan, then appends.
+    app.clear_completed_plan();
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "second task".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    let plain = app.build_transcript().plain_lines;
+    let done = plain.iter().position(|l| l.contains("Done in"));
+    let next = plain.iter().position(|l| l.contains("second task"));
+    assert!(done.is_some(), "Done marker still shown: {plain:?}");
+    assert!(
+        done < next,
+        "Done marker must stay above the new input: {plain:?}"
+    );
+}
+
+#[test]
+fn test_clear_completed_plan_shifts_index_maps() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "a".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.history.push(ChatMessage {
+        role: "plan".to_string(),
+        content: r#"[{"step":"a","status":"completed"}]"#.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "b".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    // Markers keyed to the entry AFTER the plan (idx 2) must slide to idx 1.
+    app.turn_durations.insert(2, 5_000);
+    app.expanded_thinking.insert(2);
+
+    app.clear_completed_plan();
+
+    assert_eq!(app.turn_durations.get(&2), None, "stale key dropped");
+    assert_eq!(app.turn_durations.get(&1), Some(&5_000), "shifted down one");
+    assert!(app.expanded_thinking.contains(&1), "set key shifted too");
+}
+
+#[test]
+fn test_in_flight_tool_card_hidden_until_result() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "lsof -ti:3000"}),
+    );
+    // In flight: only the status names it — the `→ run_bash(…)` card is held back
+    // so the same action isn't shown twice (the dup the user reported).
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        !plain.contains("run_bash("),
+        "card hidden while running: {plain:?}"
+    );
+    assert!(
+        plain.contains("running lsof"),
+        "status names the step: {plain:?}"
+    );
+    // Result lands → the card (with the command) renders.
+    app.apply_agent_tool_result("ok".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("run_bash("),
+        "card shown after result: {plain:?}"
+    );
+}
+
+#[test]
+fn test_status_tail_shows_turn_output_tokens() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.pending_response = "x".repeat(4_000); // ~1k tokens streamed
+    // Before any measured turn output: a live ~-flagged estimate, never esc.
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("tokens"), "estimate shown: {plain:?}");
+    assert!(
+        !plain.contains("esc to interrupt"),
+        "no esc hint in status: {plain:?}"
+    );
+    // The engine reports the turn's cumulative generated tokens → exact (no ~),
+    // distinct from the prompt-dominated context total (which stays in the footer).
+    app.turn_output_tokens = 512;
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("512 tokens"), "turn output shown: {plain:?}");
+    assert!(!plain.contains("~512"), "measured, not estimate: {plain:?}");
+}
+
+#[tokio::test]
+async fn test_agent_error_notice_uses_error_color() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // An engine error (notify_error) lands in the error hue, not the neutral one.
+    app.tx
+        .send(RuntimeEvent::AgentError("LLM error: 429".to_string()))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(app.notice, Some((ERROR, "LLM error: 429".to_string())));
+    // An ordinary notice stays neutral.
+    app.tx
+        .send(RuntimeEvent::AgentNotice("compacting context…".to_string()))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(app.notice, Some((MUTED, "compacting context…".to_string())));
+}
+
+#[tokio::test]
+async fn test_done_marker_skipped_on_errored_turn() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "hi".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.sending = true;
+    app.request_started_at =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3));
+    // The turn errors, then finishes → no `Done in …` marker (would misrepresent).
+    app.tx
+        .send(RuntimeEvent::AgentError("LLM error: 429".to_string()))
+        .unwrap();
+    app.tx
+        .send(RuntimeEvent::AgentFinished {
+            steps: 1,
+            tokens: 0,
+            context_tokens: 0,
+        })
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(
+        app.turn_durations.is_empty(),
+        "no Done marker on error: {:?}",
+        app.turn_durations
+    );
+}
+
+#[test]
+fn test_connection_retry_status_reads_working() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    assert_eq!(app.desired_status(), "Thinking");
+    app.retrying = true;
+    assert_eq!(app.desired_status(), "Working");
+}
+
+#[tokio::test]
+async fn test_retry_notice_sets_retrying_then_progress_clears_it() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.tx
+        .send(RuntimeEvent::AgentNotice(
+            "connection issue — retrying (2/3)…".to_string(),
+        ))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(app.retrying, "retry notice sets the flag");
+    // A streamed chunk = recovery → clears it.
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
+            "hi".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(!app.retrying, "progress clears the flag");
+}
+
+#[test]
+fn test_status_label_throttled_to_min_duration() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+
+    // First tick adopts the current label.
+    app.tick_status_throttle();
+    assert_eq!(
+        app.status_display.as_ref().map(|(s, _)| s.as_str()),
+        Some("Thinking")
+    );
+
+    // A tool starts, but "Thinking" was just shown → it must hold its second.
+    app.apply_agent_tool_call(
+        None,
+        "grep".to_string(),
+        serde_json::json!({"pattern": "foo"}),
+    );
+    app.tick_status_throttle();
+    assert_eq!(
+        app.status_display.as_ref().map(|(s, _)| s.as_str()),
+        Some("Thinking"),
+        "must hold the prior label for its minimum second"
+    );
+
+    // Backdate the display past the minimum → the next tick may switch.
+    let old = std::time::Instant::now()
+        .checked_sub(STATUS_MIN_DURATION + std::time::Duration::from_millis(50))
+        .expect("instant in range");
+    app.status_display = Some(("Thinking".to_string(), old));
+    app.tick_status_throttle();
+    assert_eq!(
+        app.status_display.as_ref().map(|(s, _)| s.as_str()),
+        Some("searching foo"),
+        "switches once the prior label has had its second"
+    );
 }
 
 #[test]
@@ -2660,10 +2973,7 @@ fn test_spinner_animation_does_not_invalidate_transcript_cache() {
 
     let screen = render_screen(&mut app, &mut terminal);
     let body_ptr = app.transcript_cache.as_ref().unwrap().body.lines.as_ptr();
-    assert!(
-        screen.contains("esc to interrupt"),
-        "spinner missing:\n{screen}"
-    );
+    assert!(screen.contains("Thinking"), "spinner missing:\n{screen}");
 
     // Advancing the spinner glyph must not rebuild the body — only the appended
     // status line is volatile, so a long transcript never reparses to animate.
@@ -2674,10 +2984,7 @@ fn test_spinner_animation_does_not_invalidate_transcript_cache() {
         body_ptr,
         "spinner animation must reuse the cached body"
     );
-    assert!(
-        screen.contains("esc to interrupt"),
-        "spinner missing:\n{screen}"
-    );
+    assert!(screen.contains("Thinking"), "spinner missing:\n{screen}");
 }
 
 #[test]
@@ -3165,17 +3472,18 @@ fn test_inline_status_stays_in_transcript_across_phases() {
     let mut app = make_test_app(tx, rx);
     app.sending = true;
 
-    // Thinking: status line, no streamed text yet.
+    // Model-compute phase: the Thinking heartbeat shows, no streamed text yet —
+    // and no round tokens generated, so no "0 tokens" noise.
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("thinking"), "thinking phase: {plain:?}");
-    assert!(plain.contains("esc to interrupt"));
+    assert!(plain.contains("Thinking"), "compute phase: {plain:?}");
+    assert!(!plain.contains("tokens"), "no token tail at 0: {plain:?}");
 
-    // Working: the status line follows the streamed reply, still in-stream.
+    // Streaming the reply reads "Working"; once output flows the tail shows it.
     app.pending_response = "streaming the answer".to_string();
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("streaming the answer"));
-    assert!(plain.contains("working"), "working phase: {plain:?}");
-    assert!(plain.contains("esc to interrupt"));
+    assert!(plain.contains("Working"), "streaming phase: {plain:?}");
+    assert!(plain.contains("tokens"));
 }
 
 #[test]
@@ -3529,9 +3837,15 @@ fn test_delegating_spinner_label_drops_subagent_word() {
         "subagent".to_string(),
         serde_json::json!({"task": "Audit the auth flow"}),
     );
-    let activity = app.processing_activity();
-    assert_eq!(activity, "delegating", "spinner should read 'delegating'");
-    assert!(!activity.contains("subagent"), "spinner leaked 'subagent'");
+    let activity = app.current_action_label().unwrap_or_default();
+    assert_eq!(
+        activity, "delegating",
+        "action line should read 'delegating'"
+    );
+    assert!(
+        !activity.contains("subagent"),
+        "action line leaked 'subagent'"
+    );
 }
 
 #[test]

@@ -41,7 +41,29 @@ impl ChatTuiApp {
             .find(|m| m.role == "plan")
             .is_some_and(|m| plan_all_completed(&m.content));
         if complete {
-            self.history.retain(|m| m.role != "plan");
+            self.drop_plan_entries();
+        }
+    }
+
+    /// Remove the pinned plan card(s), re-keying the index-keyed view maps
+    /// (Done-in markers, reasoning durations, expansions, outputs) so later
+    /// markers don't slide onto the wrong row.
+    pub(super) fn drop_plan_entries(&mut self) {
+        let plan_indices: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "plan")
+            .map(|(i, _)| i)
+            .collect();
+        // Highest first, so each removal leaves the lower indices untouched.
+        for &idx in plan_indices.iter().rev() {
+            self.history.remove(idx);
+            shift_index_map_after_removal(&mut self.turn_durations, idx);
+            shift_index_map_after_removal(&mut self.reasoning_durations, idx);
+            shift_index_map_after_removal(&mut self.local_outputs, idx);
+            shift_index_set_after_removal(&mut self.expanded_thinking, idx);
+            shift_index_set_after_removal(&mut self.expanded_output, idx);
         }
     }
 
@@ -143,4 +165,29 @@ impl ChatTuiApp {
         self.sending = false;
         self.notice = None;
     }
+}
+
+/// Re-key a history-index map after the entry at `removed` is deleted: drop that
+/// key, slide higher keys down by one.
+fn shift_index_map_after_removal<V>(map: &mut std::collections::HashMap<usize, V>, removed: usize) {
+    *map = std::mem::take(map)
+        .into_iter()
+        .filter_map(|(k, v)| match k {
+            k if k == removed => None,
+            k if k > removed => Some((k - 1, v)),
+            k => Some((k, v)),
+        })
+        .collect();
+}
+
+/// Set twin of [`shift_index_map_after_removal`].
+fn shift_index_set_after_removal(set: &mut std::collections::HashSet<usize>, removed: usize) {
+    *set = std::mem::take(set)
+        .into_iter()
+        .filter_map(|k| match k {
+            k if k == removed => None,
+            k if k > removed => Some(k - 1),
+            k => Some(k),
+        })
+        .collect();
 }

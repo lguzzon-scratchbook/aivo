@@ -44,6 +44,9 @@ impl ChatTuiApp {
             RuntimeEvent::AgentContext { tokens, measured } => {
                 self.apply_agent_context(tokens, measured);
             }
+            RuntimeEvent::AgentTurnTokens(output) => {
+                self.turn_output_tokens = output;
+            }
             RuntimeEvent::AgentToolCall { id, name, args } => {
                 self.apply_agent_tool_call(id, name, args)
             }
@@ -99,7 +102,12 @@ impl ChatTuiApp {
                 }
             },
             RuntimeEvent::AgentPlan(items) => self.apply_agent_plan(items),
-            RuntimeEvent::AgentNotice(text) => self.notice = Some((MUTED, text)),
+            RuntimeEvent::AgentNotice(text) => {
+                // A connection-retry notice means we're recovering, not thinking.
+                self.retrying = text.contains("retrying");
+                self.notice = Some((MUTED, text));
+            }
+            RuntimeEvent::AgentError(text) => self.notice = Some((ERROR, text)),
             RuntimeEvent::AgentPermission {
                 tool,
                 preview,
@@ -304,6 +312,16 @@ impl ChatTuiApp {
         args: serde_json::Value,
     ) {
         self.flush_pending_assistant();
+        // Stamp the status-line action label for the in-flight step.
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        self.last_tool_action = Some((
+            super::render::tool_action_label(&name, &args, &cwd),
+            Instant::now(),
+        ));
         let mut obj = serde_json::Map::new();
         obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
         obj.insert("args".to_string(), args);
@@ -453,7 +471,8 @@ impl ChatTuiApp {
     pub(super) fn apply_agent_plan(&mut self, items: serde_json::Value) {
         self.flush_pending_assistant();
         let content = items.to_string();
-        self.history.retain(|m| m.role != "plan");
+        // Drop the prior card (with index-map fixup), re-append the latest below.
+        self.drop_plan_entries();
         self.history.push(ChatMessage {
             role: "plan".to_string(),
             content,
@@ -474,17 +493,21 @@ impl ChatTuiApp {
         context_tokens: u64,
     ) -> Result<()> {
         self.flush_pending_assistant();
-        // Stamp the turn's wall time for the `✶ Done in …` marker, before the clock
-        // is cleared below (skip sub-second turns — "0s" is noise).
+        // `✶ Done in …` marker — skipped under 1s and on an errored turn. Attach
+        // to the last VISIBLE entry: a trailing plan renders in its own panel, so
+        // stamping it there hides/misplaces the marker once the plan clears.
+        let errored = self.notice.as_ref().is_some_and(|(c, _)| *c == ERROR);
         if let Some(started) = self.request_started_at
-            && !self.history.is_empty()
+            && !errored
         {
             let elapsed = started.elapsed();
-            if elapsed.as_secs() >= 1 {
-                self.turn_durations
-                    .insert(self.history.len() - 1, elapsed.as_millis() as u64);
+            if elapsed.as_secs() >= 1
+                && let Some(idx) = self.history.iter().rposition(|m| m.role != "plan")
+            {
+                self.turn_durations.insert(idx, elapsed.as_millis() as u64);
             }
         }
+        self.retrying = false;
         self.sending = false;
         self.request_started_at = None;
         self.response_task = None;
@@ -570,6 +593,8 @@ impl ChatTuiApp {
     }
 
     fn apply_runtime_delta(&mut self, delta: ChatResponseChunk) {
+        // Any chunk is progress — a prior connection retry has recovered.
+        self.retrying = false;
         match delta {
             // Buffer the chunk; `tick_typewriter` reveals it into the displayed
             // reply over the next frames so output reads as fast typing instead
@@ -584,7 +609,11 @@ impl ChatTuiApp {
             }
             // Live provider-measured usage — the footer's context-fill reads this
             // while `sending` so the stat grows during the turn, not just at the end.
-            ChatResponseChunk::Usage(usage) => self.live_usage = Some(usage),
+            ChatResponseChunk::Usage(usage) => {
+                // Plain chat is a single round, so its completion IS the turn output.
+                self.turn_output_tokens = usage.completion_tokens;
+                self.live_usage = Some(usage);
+            }
             // Accumulate the model's reasoning unconditionally; `thinking_enabled`
             // gates only the *render* (so toggling /config reveals/hides it
             // instantly). Committed onto the assistant message at turn end. The
@@ -1030,6 +1059,8 @@ impl ChatTuiApp {
             if self.recover_dead_response_task().await? {
                 needs_redraw = true;
             }
+
+            self.tick_status_throttle();
 
             // Animations repaint without input.
             if self.is_animating() {
