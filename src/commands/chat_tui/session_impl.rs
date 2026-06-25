@@ -41,7 +41,7 @@ impl ChatTuiApp {
 
     pub(super) fn prepare_for_model_picker(&mut self) {
         if self.sending {
-            self.cancel_inflight_request();
+            self.cancel_inflight_request(true);
         }
     }
 
@@ -1452,7 +1452,7 @@ impl ChatTuiApp {
         self.discard_resume_state();
         self.overlay = Overlay::None;
         if self.sending {
-            self.cancel_inflight_request();
+            self.cancel_inflight_request(false);
         }
 
         self.resume_restore_state = Some(ResumeRestoreState::capture(self));

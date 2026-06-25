@@ -7462,7 +7462,7 @@ async fn test_cancel_keeps_user_turn_for_in_process_agent_turn() {
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     app.agent_serve = Some((handle, shutdown));
 
-    app.cancel_inflight_request();
+    app.cancel_inflight_request(false);
 
     // The engine already consumed this turn (and may have edited files), so the
     // request stays in the transcript instead of being silently un-sent — unlike
@@ -7513,6 +7513,43 @@ async fn test_interrupt_inflight_request_keeps_partial_response() {
         app.notice.as_ref().map(|(_, text)| text.as_str()),
         Some("Response interrupted")
     );
+}
+
+/// Interrupting an output-less request must not prepend the cancelled text onto
+/// a freshly typed message.
+#[tokio::test]
+async fn test_interrupt_empty_does_not_restore_draft() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "first message".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_submit = Some(PendingSubmission {
+        content: "first message".to_string(),
+        attachments: Vec::new(),
+    });
+    app.sending = true;
+    app.request_started_at = Some(Instant::now());
+
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert!(!app.sending);
+    assert!(
+        app.draft.is_empty(),
+        "the cancelled message must not be restored to the composer"
+    );
+    assert!(app.pending_submit.is_none());
+    assert!(
+        app.history.is_empty(),
+        "the unanswered user turn is un-sent so resent history stays alternating"
+    );
+
+    app.insert_char_at_cursor('h');
+    app.insert_char_at_cursor('i');
+    assert_eq!(app.draft, "hi");
 }
 
 /// Watchdog: a task that finished WITHOUT a terminal event (a `run_turn` panic
@@ -7593,7 +7630,7 @@ async fn test_stopping_a_turn_clears_goal_mode() {
     };
 
     let mut app = armed();
-    app.cancel_inflight_request();
+    app.cancel_inflight_request(false);
     assert!(app.goal_mode.is_none(), "cancel must clear goal mode");
 
     // Interrupt with NO partial response routes through cancel.

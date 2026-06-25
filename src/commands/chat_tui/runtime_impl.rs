@@ -1562,7 +1562,7 @@ impl ChatTuiApp {
 
     pub(super) fn start_new_chat(&mut self) {
         self.discard_resume_state();
-        self.cancel_inflight_request();
+        self.cancel_inflight_request(false);
         self.overlay = Overlay::None;
         self.history.clear();
         self.expanded_thinking.clear();
@@ -1599,7 +1599,10 @@ impl ChatTuiApp {
         self.stop_agent_serve();
     }
 
-    pub(super) fn cancel_inflight_request(&mut self) {
+    /// `restore_draft` puts a cancelled non-agent submission back in the composer
+    /// (model-picker, to resend after switching); `false` (ESC / resume / `/new`)
+    /// un-sends it instead, leaving the composer empty — recallable via ↑.
+    pub(super) fn cancel_inflight_request(&mut self, restore_draft: bool) {
         let was_sending = self.sending;
         // Cancelling (interrupt path 1, /new, resume, key switch) also exits any
         // autonomous /goal loop, so it can't auto-continue after the dropped turn.
@@ -1634,13 +1637,22 @@ impl ChatTuiApp {
             // Keep the user turn in the transcript; just drop the restore buffer so
             // it can't be resurrected by a later non-agent cancel.
             self.pending_submit = None;
-        } else {
+        } else if restore_draft {
             restore_cancelled_submission(
                 &mut self.history,
                 &mut self.draft,
                 &mut self.draft_attachments,
                 &mut self.pending_submit,
             );
+        } else {
+            self.pending_submit = None;
+            if self
+                .history
+                .last()
+                .is_some_and(|message| message.role == "user")
+            {
+                self.history.pop();
+            }
         }
         self.cursor = self.draft.len();
         self.sync_command_menu_state();
@@ -1664,7 +1676,7 @@ impl ChatTuiApp {
         self.drain_incoming_buffer();
         self.pending_finish = None;
         if self.pending_response.is_empty() {
-            self.cancel_inflight_request();
+            self.cancel_inflight_request(false);
             if goal_was_active {
                 self.notice = Some((MUTED, "Goal mode stopped".to_string()));
             }
