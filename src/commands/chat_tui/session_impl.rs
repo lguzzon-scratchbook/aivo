@@ -1507,6 +1507,7 @@ impl ChatTuiApp {
         self.expanded_output.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
+        self.turn_durations.clear();
         // Restore the exact agent transcript (tool calls + results with ids) into
         // the next engine build instead of the lossy text seed. `None` for
         // non-agent or pre-feature sessions → falls back to the text seed.

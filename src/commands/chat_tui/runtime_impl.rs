@@ -1169,6 +1169,7 @@ impl ChatTuiApp {
         self.expanded_output.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
+        self.turn_durations.clear();
         self.draft = removed.content;
         self.cursor = self.draft.len();
         self.draft_attachments = removed.attachments;
@@ -1569,6 +1570,7 @@ impl ChatTuiApp {
         self.expanded_output.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
+        self.turn_durations.clear();
         self.reasoning_started_at = None;
         self.reasoning_elapsed_ms = None;
         self.clear_transcript_selection();

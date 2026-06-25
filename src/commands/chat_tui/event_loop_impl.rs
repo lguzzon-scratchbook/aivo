@@ -474,6 +474,17 @@ impl ChatTuiApp {
         context_tokens: u64,
     ) -> Result<()> {
         self.flush_pending_assistant();
+        // Stamp the turn's wall time for the `✶ Done in …` marker, before the clock
+        // is cleared below (skip sub-second turns — "0s" is noise).
+        if let Some(started) = self.request_started_at
+            && !self.history.is_empty()
+        {
+            let elapsed = started.elapsed();
+            if elapsed.as_secs() >= 1 {
+                self.turn_durations
+                    .insert(self.history.len() - 1, elapsed.as_millis() as u64);
+            }
+        }
         self.sending = false;
         self.request_started_at = None;
         self.response_task = None;

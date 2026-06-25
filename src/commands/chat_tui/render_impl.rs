@@ -123,6 +123,11 @@ impl ChatTuiApp {
             self.real_cwd.as_str()
         };
 
+        // In-process emits separate `tool_result` lines (which carry per-call
+        // targets); cursor enriches the call in place. With separate results, a
+        // coalesced call line drops its target list to avoid repeating it.
+        let separate_results = self.history.iter().any(|m| m.role == "tool_result");
+
         let mut idx = 0;
         while idx < self.history.len() {
             let message = &self.history[idx];
@@ -176,14 +181,10 @@ impl ChatTuiApp {
                 }
                 "tool_call" => {
                     let (name, args) = decode_tool_call(&message.content);
-                    // Coalesce a run of consecutive same-kind calls into one line.
-                    // Cursor agents emit no interleaved results, so their calls are
-                    // adjacent; the in-process agent's calls are split by results,
-                    // so this never merges them. Subagents are the exception: each is
-                    // a heavyweight, distinct unit of work (often dispatched in
-                    // parallel, so adjacent), not the tiny exploration steps
-                    // coalescing is meant to fold — render each on its own line so
-                    // its task is visible instead of an opaque `subagent ×N`.
+                    // Coalesce a run of adjacent same-verb calls into one line (see
+                    // `tool_group_key`). Subagents are the exception — each is a
+                    // distinct unit of work, so render it on its own line with its
+                    // task visible, never an opaque `subagent ×N`.
                     let run = if name == "subagent" {
                         1
                     } else {
@@ -194,7 +195,7 @@ impl ChatTuiApp {
                             .iter()
                             .map(|m| {
                                 let (n, a) = decode_tool_call(&m.content);
-                                let target = tool_call_target(&n, &a);
+                                let target = tool_call_target_display(&n, &a, cwd);
                                 // cursor gives no path/pattern, so show the per-call
                                 // result (e.g. `18 matches`) in the detail slot.
                                 if target.is_empty() {
@@ -208,7 +209,9 @@ impl ChatTuiApp {
                             .iter()
                             .filter(|m| decode_tool_outcome(&m.content).1)
                             .count();
-                        render_tool_call_group(&mut block, &name, &targets, failed);
+                        let header_targets: &[String] =
+                            if separate_results { &[] } else { &targets };
+                        render_tool_call_group(&mut block, &name, run, header_targets, failed);
                         advance = run;
                     } else {
                         let (result, failed) = decode_tool_outcome(&message.content);
@@ -216,15 +219,22 @@ impl ChatTuiApp {
                     }
                 }
                 "tool_result" => {
-                    // The matching call is the immediately preceding entry (the
-                    // in-process agent emits call then result) — its tool name lets
-                    // the count read in the right unit (files/entries/matches).
-                    let tool = idx
-                        .checked_sub(1)
-                        .and_then(|i| self.history.get(i))
-                        .filter(|m| m.role == "tool_call")
-                        .map(|m| decode_tool_call(&m.content).0);
-                    render_tool_result(&mut block, &message.content, cwd, tool.as_deref());
+                    // `tool` fixes the unit (files/entries/matches); a detached
+                    // call's target tags the result (see `tool_result_source`).
+                    let (tool, label) = match self.tool_result_source(idx, cwd) {
+                        Some((name, target, detached)) => (
+                            Some(name),
+                            detached.then_some(target).filter(|t| !t.is_empty()),
+                        ),
+                        None => (None, None),
+                    };
+                    render_tool_result(
+                        &mut block,
+                        &message.content,
+                        cwd,
+                        tool.as_deref(),
+                        label.as_deref(),
+                    );
                 }
                 "local_command" => {
                     // Expanded renders the in-memory output (persisted preview after a
@@ -243,6 +253,21 @@ impl ChatTuiApp {
             }
             let bar = role_bar_color(message.role.as_str());
             push_block(&mut lines, &mut bars, block, Some(bar));
+            // The `✶ Done in …` marker for a turn stamped on its last entry (which
+            // may sit inside a coalesced block, so scan the block's index range).
+            if let Some(&ms) = (idx..idx + advance).find_map(|i| self.turn_durations.get(&i)) {
+                push_styled_line(&mut lines, String::new(), Style::default());
+                bars.push(None);
+                push_styled_line(
+                    &mut lines,
+                    format!(
+                        "✶ Done in {}",
+                        format_request_elapsed(std::time::Duration::from_millis(ms))
+                    ),
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                );
+                bars.push(None);
+            }
             previous_role = Some(message.role.as_str());
             idx += advance;
         }
@@ -275,8 +300,9 @@ impl ChatTuiApp {
         // folded `▸ thought` line here would double it. The summary is frozen at
         // the answer's start so it matches the committed form (no jump on commit).
         if !self.pending_response.is_empty() {
-            let live_reasoning = (self.thinking_enabled && !self.pending_reasoning.is_empty())
-                .then_some(self.pending_reasoning.as_str());
+            let live_reasoning = (self.thinking_enabled
+                && reasoning_is_substantive(&self.pending_reasoning))
+            .then_some(self.pending_reasoning.as_str());
             lines.push(blank_line());
             bars.push(None);
             push_assistant_blocks(
@@ -325,12 +351,45 @@ impl ChatTuiApp {
     }
 
     /// Length of the run of consecutive `tool_call` entries starting at `start`
-    /// that share the tool name `name` (≥1; used to coalesce cursor's tool runs).
+    /// that share `name`'s coalescing verb (≥1; see `tool_group_key`).
     fn tool_call_run_len(&self, start: usize, name: &str) -> usize {
+        let key = tool_group_key(name);
         self.history[start..]
             .iter()
-            .take_while(|m| m.role == "tool_call" && decode_tool_call(&m.content).0 == name)
+            .take_while(|m| {
+                m.role == "tool_call" && tool_group_key(&decode_tool_call(&m.content).0) == key
+            })
             .count()
+    }
+
+    /// The `(tool name, target, detached)` for the `tool_result` at `idx`. Results
+    /// are emitted after the whole batch in call order, so the j-th result pairs
+    /// with the j-th call in the preceding call run (not `idx-1`). `detached` —
+    /// the call isn't immediately before the result — means the result carries its
+    /// own target, since no adjacent call line shows it.
+    fn tool_result_source(&self, idx: usize, cwd: &str) -> Option<(String, String, bool)> {
+        // Offset of this result within its contiguous run of results.
+        let mut res_start = idx;
+        while res_start > 0 && self.history[res_start - 1].role == "tool_result" {
+            res_start -= 1;
+        }
+        let j = idx - res_start;
+        // The matching calls are the contiguous tool_call run just before them.
+        let mut call_start = res_start;
+        while call_start > 0 && self.history[call_start - 1].role == "tool_call" {
+            call_start -= 1;
+        }
+        let call_idx = call_start + j;
+        if call_idx >= res_start {
+            return None;
+        }
+        let (name, args) = decode_tool_call(&self.history[call_idx].content);
+        let detached = call_idx + 1 != idx;
+        Some((
+            name.clone(),
+            tool_call_target_display(&name, &args, cwd),
+            detached,
+        ))
     }
 
     /// The live processing status line — thinking / running a tool / working —

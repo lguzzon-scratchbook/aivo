@@ -215,6 +215,7 @@ impl ChatTuiApp {
             expanded_output: std::collections::HashSet::new(),
             expanded_thinking: std::collections::HashSet::new(),
             reasoning_durations: std::collections::HashMap::new(),
+            turn_durations: std::collections::HashMap::new(),
             reasoning_started_at: None,
             reasoning_elapsed_ms: None,
         })

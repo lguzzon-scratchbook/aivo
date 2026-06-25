@@ -124,6 +124,7 @@ impl ChatTuiApp {
         self.expanded_output.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
+        self.turn_durations.clear();
         self.clear_transcript_selection();
         self.reset_composer();
         self.pending_response.clear();

@@ -1086,6 +1086,7 @@ fn make_test_app(
         expanded_output: std::collections::HashSet::new(),
         expanded_thinking: std::collections::HashSet::new(),
         reasoning_durations: std::collections::HashMap::new(),
+        turn_durations: std::collections::HashMap::new(),
         reasoning_started_at: None,
         reasoning_elapsed_ms: None,
     }
@@ -1327,15 +1328,23 @@ fn test_build_transcript_folds_streaming_reasoning_when_enabled() {
     let mut app = make_test_app(tx, rx);
     app.thinking_enabled = true;
     app.sending = true;
-    app.pending_reasoning = "Inspecting the request".to_string();
+    app.pending_reasoning = "Inspecting the request\nThen the second detail".to_string();
     app.pending_response = "Working on it".to_string();
 
     let transcript = app.build_transcript();
     let plain = transcript.plain_lines.join("\n");
 
-    // Live reasoning renders folded so it doesn't expand then collapse as the answer streams.
+    // Live reasoning renders folded so it doesn't expand then collapse as the
+    // answer streams: the ▸ summary previews the first line, the rest stays folded.
     assert!(plain.contains("▸ thought"));
-    assert!(!plain.contains("Inspecting the request"));
+    assert!(
+        plain.contains("Inspecting the request"),
+        "first-line gist in fold"
+    );
+    assert!(
+        !plain.contains("Then the second detail"),
+        "later lines stay folded"
+    );
     assert!(plain.contains("Working on it"));
 }
 
@@ -1555,18 +1564,23 @@ fn test_history_reasoning_folds_when_thinking_enabled() {
     app.history.push(ChatMessage {
         role: "assistant".to_string(),
         content: "the answer".to_string(),
-        reasoning_content: Some("the private chain of thought".to_string()),
+        reasoning_content: Some("the gist line\nthe private chain of thought".to_string()),
         attachments: vec![],
     });
 
-    // On: history shows the folded summary, not the full reasoning (click to expand).
+    // On: the folded summary previews the first line; later lines stay folded
+    // (click to expand the full reasoning).
     app.thinking_enabled = true;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let shown = app.build_transcript().plain_lines.join("\n");
     assert!(shown.contains("▸ thought"), "folded summary present");
     assert!(
+        shown.contains("the gist line"),
+        "first line previews in the fold"
+    );
+    assert!(
         !shown.contains("the private chain of thought"),
-        "full reasoning stays folded"
+        "later reasoning lines stay folded"
     );
     assert!(shown.contains("the answer"));
 
@@ -1574,6 +1588,7 @@ fn test_history_reasoning_folds_when_thinking_enabled() {
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let hidden = app.build_transcript().plain_lines.join("\n");
     assert!(!hidden.contains("▸ thought"));
+    assert!(!hidden.contains("the gist line"));
     assert!(!hidden.contains("the private chain of thought"));
     assert!(hidden.contains("the answer"));
 }
@@ -1665,6 +1680,35 @@ fn test_thinking_summary_shows_duration_else_line_count() {
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("▸ thought for 2s"), "{plain}");
+}
+
+#[test]
+fn test_finished_turn_renders_done_marker() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "fix it".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "done".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.turn_durations.insert(1, 404_000); // stamped on the last entry; 6m 44s
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("✶ Done in 6m 44s"), "{plain}");
+
+    // No recorded duration → no marker.
+    app.turn_durations.clear();
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(!plain.contains("Done in"), "{plain}");
 }
 
 #[test]
@@ -3257,6 +3301,170 @@ fn test_tool_result_count_units_by_tool() {
             "{tool}: expected {expected:?} in {plain}"
         );
     }
+}
+
+#[test]
+fn test_batched_tool_results_resolve_unit_and_target_by_position() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Batch of [grep×3] then [r0, r1, r2]: each result must resolve its own call
+    // by position, not idx-1 (which left the 2nd/3rd mislabelled "lines").
+    for pat in ["alpha", "beta", "gamma"] {
+        app.apply_agent_tool_call(
+            None,
+            "grep".to_string(),
+            serde_json::json!({"pattern": pat}),
+        );
+    }
+    app.apply_agent_tool_result("1: x\n2: y".to_string()); // 2 matches
+    app.apply_agent_tool_result("1: x\n2: y\n3: z".to_string()); // 3 matches
+    app.apply_agent_tool_result("1: x\n2: y\n3: z\n4: w".to_string()); // 4 matches
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("2 matches"), "{plain}");
+    assert!(plain.contains("3 matches"), "{plain}");
+    assert!(plain.contains("4 matches"), "{plain}");
+    assert!(plain.contains("alpha · "), "{plain}");
+    assert!(plain.contains("beta · "), "{plain}");
+    assert!(plain.contains("gamma · "), "{plain}");
+    assert!(plain.contains("searched ×3"), "{plain}");
+    assert!(!plain.contains("searched ×3: alpha"), "{plain}");
+}
+
+#[test]
+fn test_adjacent_search_tools_merge_into_one_group() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // 2 globs + 2 greps both read as "searched" → one `searched ×4` header, not
+    // two indistinguishable `searched ×2`, with results keeping their own units.
+    for (tool, pat) in [
+        ("glob", "**/*canary*"),
+        ("glob", "**/*gemini*"),
+        ("grep", "gemini"),
+        ("grep", "canary"),
+    ] {
+        app.apply_agent_tool_call(None, tool.to_string(), serde_json::json!({"pattern": pat}));
+    }
+    app.apply_agent_tool_result("a.rs\nb.rs\nc.rs".to_string()); // glob -> 3 files
+    app.apply_agent_tool_result("x.rs".to_string());
+    app.apply_agent_tool_result("1:a\n2:b".to_string()); // grep -> 2 matches
+    app.apply_agent_tool_result("1:a\n2:b\n3:c\n4:d".to_string()); // grep -> 4 matches
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("searched ×4"), "{plain}");
+    assert_eq!(plain.matches("searched ×").count(), 1, "{plain}");
+    assert!(plain.contains("3 files"), "{plain}");
+    assert!(plain.contains("2 matches"), "{plain}");
+    assert!(plain.contains("4 matches"), "{plain}");
+    assert!(plain.contains("**/*canary* · "), "{plain}");
+    assert!(plain.contains("gemini · "), "{plain}");
+}
+
+#[test]
+fn test_run_bash_label_strips_redundant_cd_prefix() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.real_cwd = "/Users/yc/project/work/aivo".to_string();
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "cd /Users/yc/project/work/aivo && git show f391ffd"}),
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("run_bash(git show f391ffd)"), "{plain}");
+    assert!(!plain.contains("cd /Users/yc/project/work/aivo"), "{plain}");
+}
+
+#[test]
+fn test_detached_results_in_batch_carry_their_target() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // read_file + grep in one batch: both results land after both calls, so each
+    // must name its own target to stay distinguishable.
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "src/gemini_router.rs"}),
+    );
+    app.apply_agent_tool_call(
+        None,
+        "grep".to_string(),
+        serde_json::json!({"pattern": "400|sanitize"}),
+    );
+    app.apply_agent_tool_result("a\nb\nc".to_string()); // read -> 3 lines
+    app.apply_agent_tool_result("1:x\n2:y".to_string()); // grep -> 2 matches
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("gemini_router.rs · 3 lines"), "{plain}");
+    assert!(plain.contains("400|sanitize · 2 matches"), "{plain}");
+}
+
+#[test]
+fn test_failed_tool_result_renders_in_error_hue() {
+    // An in-process failure arrives as a single-line `error: …`; the result reads
+    // in the error hue, not dim, so a timeout/denial is legible as a failure.
+    let mut lines = Vec::new();
+    render_tool_result(
+        &mut lines,
+        "error: command timed out after 120s",
+        "",
+        Some("run_bash"),
+        None,
+    );
+    assert!(
+        lines[0]
+            .line
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(ERROR))
+    );
+    assert!(
+        lines[0]
+            .line
+            .spans
+            .iter()
+            .all(|s| s.style.fg != Some(FAINT))
+    );
+
+    // A normal multi-line result stays neutral even when a line says "error:".
+    let mut ok = Vec::new();
+    render_tool_result(&mut ok, "error: x\nmore\nlines", "", Some("grep"), None);
+    assert!(ok[0].line.spans.iter().any(|s| s.style.fg == Some(FAINT)));
+    assert!(ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR)));
+}
+
+#[test]
+fn test_run_bash_label_drops_redirection_noise() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "which aivo 2>/dev/null && aivo --help 2>&1"}),
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("which aivo && aivo --help"), "{plain}");
+    assert!(!plain.contains("2>/dev/null"), "{plain}");
+    assert!(!plain.contains("2>&1"), "{plain}");
+}
+
+#[test]
+fn test_punctuation_only_reasoning_renders_no_thought_row() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.thinking_enabled = true;
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "the answer".to_string(),
+        reasoning_content: Some("...".to_string()),
+        attachments: vec![],
+    });
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(!plain.contains("▸ thought"), "{plain}");
+    assert!(plain.contains("the answer"));
 }
 
 #[test]

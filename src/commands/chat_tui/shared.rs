@@ -1662,6 +1662,9 @@ pub(super) struct ChatTuiApp {
     /// drives the folded `▸ thought for Ns` summary. In-memory only, cleared
     /// alongside `expanded_thinking`.
     pub(super) reasoning_durations: std::collections::HashMap<usize, u64>,
+    /// Wall time (ms) a finished turn took, by the history index of its last entry;
+    /// drives the `✶ Done in …` marker. In-memory only, cleared with `expanded_thinking`.
+    pub(super) turn_durations: std::collections::HashMap<usize, u64>,
     /// When the current segment's reasoning started streaming (first reasoning
     /// chunk), for the live `▸ thought for Ns` timer. `None` between segments.
     pub(super) reasoning_started_at: Option<Instant>,

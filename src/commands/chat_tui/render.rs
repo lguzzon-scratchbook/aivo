@@ -580,18 +580,43 @@ fn reasoning_header(prefix: &str, reasoning: &str, duration_ms: Option<u64>) -> 
     )])
 }
 
-/// One-line folded stand-in for a reasoning block. Live and committed thinking
-/// both render this way, so the block keeps constant height across the handoff.
+/// One-line folded stand-in for a reasoning block, with a gist of the first line
+/// so the fold is scannable. Live and committed thinking both render this way.
 pub(super) fn render_reasoning_summary(
     lines: &mut Vec<StyledLine>,
     reasoning: &str,
     duration_ms: Option<u64>,
 ) {
-    lines.push(reasoning_header(
-        THINKING_SUMMARY_PREFIX,
-        reasoning,
-        duration_ms,
-    ));
+    let mut spans = vec![Span::styled(
+        format!(
+            "{THINKING_SUMMARY_PREFIX} {}",
+            thinking_suffix(reasoning, duration_ms)
+        ),
+        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+    )];
+    if let Some(preview) = reasoning_preview(reasoning) {
+        spans.push(Span::styled(
+            format!(" · {preview}"),
+            Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    lines.push(line_with_plain(spans));
+}
+
+/// First reasoning line for the folded summary, emphasis stripped and truncated.
+fn reasoning_preview(reasoning: &str) -> Option<String> {
+    let first = normalized_reasoning_lines(reasoning).into_iter().next()?;
+    let clean: String = first
+        .trim_start_matches(['#', '>', '-', '*', ' '])
+        .replace(['*', '`'], "");
+    let preview = truncate_chars(clean.trim(), 56);
+    (!preview.is_empty()).then_some(preview)
+}
+
+/// Whether a reasoning string earns a `▸ thought` row — has real content, not
+/// just whitespace/punctuation (some models emit a bare "..." segment).
+pub(super) fn reasoning_is_substantive(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
 }
 
 /// Expanded form: the `▾ thought` header above the full reasoning, indented so
@@ -651,7 +676,7 @@ pub(super) fn render_assistant_message(
     content: &str,
     width: u16,
 ) {
-    if let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) {
+    if let Some(reasoning) = reasoning.filter(|text| reasoning_is_substantive(text)) {
         render_reasoning_block(lines, reasoning, None);
         if !content.is_empty() {
             push_styled_line(lines, "", Style::default());
@@ -683,7 +708,7 @@ pub(super) fn push_assistant_blocks(
     width: u16,
     content_bar: Color,
 ) {
-    if let Some(view) = reasoning.filter(|v| !v.text.trim().is_empty()) {
+    if let Some(view) = reasoning.filter(|v| reasoning_is_substantive(v.text)) {
         let mut block = Vec::new();
         // The live tail is always collapsed so it doesn't expand-then-fold mid-turn.
         if view.collapsed {
@@ -877,17 +902,28 @@ pub(super) fn decode_tool_call(content: &str) -> (String, serde_json::Value) {
     (name, args)
 }
 
-/// Render a coalesced run of same-kind tool calls as one `→ verb N: a, b…` line.
+/// Coalescing key: tools sharing a display verb (grep+glob, edit_file+multi_edit)
+/// fold into one group, so a mixed batch reads as one `searched ×N` line.
+pub(super) fn tool_group_key(name: &str) -> &str {
+    match name {
+        "grep" | "glob" => "search",
+        "edit_file" | "multi_edit" => "edit",
+        other => other,
+    }
+}
+
+/// Render a coalesced run of same-verb tool calls as one `→ verb N: a, b…` line.
 /// cursor agents explore in many small steps, so a card per call is noise — the
 /// run collapses to its count and the distinguishing targets (file basenames,
 /// patterns, commands).
 pub(super) fn render_tool_call_group(
     lines: &mut Vec<StyledLine>,
     name: &str,
+    count: usize,
     targets: &[String],
     failed: usize,
 ) {
-    let n = targets.len();
+    let n = count;
     let head = match name {
         "read_file" => format!("read {n} files"),
         "edit_file" | "multi_edit" => format!("edited {n} files"),
@@ -934,9 +970,8 @@ fn tool_display_name(name: &str) -> String {
     name.to_string()
 }
 
-/// The compact target shown for a tool inside a coalesced run: a file's
-/// basename, a search pattern, or a command — the bit that differs between
-/// sibling calls.
+/// The raw target a tool acted on (basename / pattern / command). Verbatim for
+/// model-facing seed notes; the transcript uses [`tool_call_target_display`].
 pub(super) fn tool_call_target(name: &str, args: &serde_json::Value) -> String {
     let pick = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
     match name {
@@ -948,6 +983,50 @@ pub(super) fn tool_call_target(name: &str, args: &serde_json::Value) -> String {
         "web_fetch" => pick("url").to_string(),
         _ => String::new(),
     }
+}
+
+/// Transcript form of [`tool_call_target`]: a `run_bash` command is condensed for
+/// display; everything else is identical.
+pub(super) fn tool_call_target_display(name: &str, args: &serde_json::Value, cwd: &str) -> String {
+    if name == "run_bash" {
+        let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        condense_command(command, cwd)
+    } else {
+        tool_call_target(name, args)
+    }
+}
+
+/// Condense a shell command for a one-line label: drop a redundant `cd <cwd> &&`
+/// prefix and `2>/dev/null` / `2>&1` redirection noise, then collapse whitespace.
+fn condense_command(cmd: &str, cwd: &str) -> String {
+    let mut out = strip_leading_cd(cmd.trim(), cwd).to_string();
+    for noise in [
+        " 2>/dev/null",
+        " 2> /dev/null",
+        " 1>/dev/null",
+        " >/dev/null",
+        " > /dev/null",
+        " 2>&1",
+    ] {
+        out = out.replace(noise, "");
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Strip a leading `cd <cwd> && ` (cwd optionally quoted) — redundant, run_bash
+/// already runs there. A `cd` into a different dir is kept.
+fn strip_leading_cd<'a>(cmd: &'a str, cwd: &str) -> &'a str {
+    let cwd = cwd.trim_end_matches(['/', '\\']);
+    if cwd.is_empty() {
+        return cmd;
+    }
+    for (open, close) in [("", ""), ("\"", "\""), ("'", "'")] {
+        let prefix = format!("cd {open}{cwd}{close} &&");
+        if let Some(rest) = cmd.strip_prefix(prefix.as_str()) {
+            return rest.trim_start();
+        }
+    }
+    cmd
 }
 
 /// Final path segment (handles both `/` and `\` separators).
@@ -1218,14 +1297,27 @@ pub(super) fn render_tool_result(
     result: &str,
     cwd: &str,
     tool: Option<&str>,
+    label: Option<&str>,
 ) {
-    lines.push(line_with_plain(vec![
-        Span::styled("  ⎿ ".to_string(), Style::default().fg(FAINT)),
-        Span::styled(
-            tool_result_summary(result, cwd, tool),
-            Style::default().fg(FAINT),
-        ),
-    ]));
+    // A failure arrives as a single-line `error: …` (see `ChatAgentUi`); show it
+    // in the error hue. Multi-line output containing "error:" stays neutral.
+    let failed = result.lines().count() <= 1 && result.trim_start().starts_with("error:");
+    let summary_color = if failed { ERROR } else { FAINT };
+    let mut spans = vec![Span::styled(
+        "  ⎿ ".to_string(),
+        Style::default().fg(summary_color),
+    )];
+    if let Some(label) = label.filter(|l| !l.is_empty()) {
+        spans.push(Span::styled(
+            format!("{} · ", truncate_chars(label, 40)),
+            Style::default().fg(MUTED),
+        ));
+    }
+    spans.push(Span::styled(
+        tool_result_summary(result, cwd, tool),
+        Style::default().fg(summary_color),
+    ));
+    lines.push(line_with_plain(spans));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1642,7 +1734,7 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
             display_path(pick("path"), cwd)
         }
         "glob" | "grep" => truncate_chars(pick("pattern"), 60),
-        "run_bash" => truncate_chars(pick("command"), 60),
+        "run_bash" => truncate_chars(&condense_command(pick("command"), cwd), 60),
         "web_fetch" => truncate_chars(pick("url"), 60),
         "skill" => truncate_chars(pick("name"), 60),
         // "subagent" is jargon — the delegated task is the salient detail and
