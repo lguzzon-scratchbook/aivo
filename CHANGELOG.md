@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.32.0
+
+`aivo login`/`logout` link this device to your account, and sharing now requires
+a linked device. The chat TUI gets a warm-night brand recolor, a reworked live
+status line with a token counter, and a more legible agent timeline.
+
+- feat(login): add `aivo login`/`logout` (60e3525)
+- feat(share): gate sharing on a linked device (569ff58)
+- feat(logs): list resumable chat sessions with no logged turn (4c5c274)
+- feat(chat): recolor TUI to warm-night brand palette (7c46bac)
+- feat(chat): rework live status line + token counter (ba680a4)
+- feat(chat): improve agent timeline legibility (15943b6)
+- fix(chat): don't restore cancelled message into composer on ESC (a13bad4)
+
 ## v0.31.5
 
 `/rewind` no longer stalls when chat is launched from your home directory, and
