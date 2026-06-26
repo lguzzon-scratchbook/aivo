@@ -89,6 +89,10 @@ pub enum Commands {
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
+
+    /// Manage fallback definitions (virtual models with ordered provider:model pairs).
+    #[command(aliases = ["fb"])]
+    Fallback(FallbackArgs),
 }
 
 /// Arguments for `aivo login`.
@@ -135,6 +139,28 @@ pub struct ShareArgs {
     /// Bind only on 127.0.0.1 — local debugging without the public tunnel.
     #[arg(long, hide = true)]
     pub debug_local_only: bool,
+}
+
+/// Arguments for `aivo fallback`
+#[derive(Args, Debug, Clone)]
+pub struct FallbackArgs {
+    /// Action to perform: create, list, get, update, delete, status, clear-exclusions, reorder
+    #[arg(value_name = "ACTION")]
+    pub action: Option<String>,
+
+    /// Name of the fallback (for actions that target one).
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Trailing tokens. For `create`/`update`: provider:model pairs. For `reorder`:
+    /// the desired order of full provider:model strings (all entries, in order).
+    /// For `clear-exclusions`: optional provider:model to clear (clear all if absent).
+    #[arg(
+        value_name = "ENTRIES",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub entries: Vec<String>,
 }
 
 /// Arguments for `aivo hf`. No subcommand → defaults to `list`. Real clap

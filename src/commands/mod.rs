@@ -69,6 +69,7 @@ pub mod chat;
 pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
 pub(crate) mod chat_tui_format;
+pub(crate) mod fallback;
 pub mod hf;
 pub mod info;
 pub mod keys;
@@ -86,6 +87,7 @@ pub mod update;
 
 pub use alias::AliasCommand;
 pub use chat::ChatCommand;
+pub use fallback::FallbackCommand;
 pub use info::InfoCommand;
 pub use keys::KeysCommand;
 pub use login::{LoginCommand, LogoutCommand};

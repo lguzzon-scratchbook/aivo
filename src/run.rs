@@ -14,9 +14,9 @@ use crate::cli_args::{
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LoginCommand, LogoutCommand,
-    LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand, ServeParams,
-    ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    self, AliasCommand, ChatCommand, FallbackCommand, InfoCommand, KeysCommand, LoginCommand,
+    LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand,
+    ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
@@ -189,6 +189,7 @@ pub async fn run() -> ! {
             Commands::Hf(_) => crate::commands::hf::HfCommand::print_help(),
             Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
+            Commands::Fallback(_) => FallbackCommand::print_help(),
         }
         process::exit(0);
     }
@@ -791,6 +792,16 @@ pub async fn run() -> ! {
         Commands::Share(share_args) => {
             let command = ShareCommand::new(session_store);
             command.execute(share_args).await
+        }
+
+        Commands::Fallback(fallback_args) => {
+            let command = FallbackCommand::new(session_store);
+            let code = command.execute(fallback_args).await;
+            if code != 0 {
+                ExitCode::UserError
+            } else {
+                ExitCode::Success
+            }
         }
 
         Commands::Update(update_args) if update_args.rollback => {

@@ -1,5 +1,6 @@
 //! RunCommand handler for unified AI tool launching.
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use reqwest::Client;
@@ -16,7 +17,7 @@ use crate::services::http_utils;
 use crate::services::huggingface;
 use crate::services::models_cache::ModelsCache;
 use crate::services::project_id::Thread;
-use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::session_store::{ApiKey, FallbackConfig, FallbackExclusion, SessionStore};
 use crate::services::system_env;
 use crate::style;
 
@@ -407,6 +408,26 @@ impl RunCommand {
             crate::services::transform_mode::set_active(false);
         }
 
+        // Fallback routing: if the resolved model matches a fallback name,
+        // iterate through its `provider:model` entries in order.
+        if let Some(ref fb_model) = launch_model {
+            let fallbacks = self.session_store.get_fallbacks().await?;
+            if let Some(fb_cfg) = fallbacks.get(fb_model) {
+                return self
+                    .try_fallback(
+                        fb_cfg,
+                        fb_model,
+                        ai_tool,
+                        args,
+                        claude_overrides,
+                        env,
+                        key_override.as_ref(),
+                        dry_run,
+                    )
+                    .await;
+            }
+        }
+
         // Launch the AI tool
         let options = LaunchOptions {
             tool: ai_tool,
@@ -428,6 +449,174 @@ impl RunCommand {
             0 => ExitCode::Success,
             n => ExitCode::ToolExit(n),
         })
+    }
+
+    /// Try each fallback entry in order until one succeeds.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_fallback(
+        &self,
+        fb_cfg: &FallbackConfig,
+        fb_name: &str,
+        tool: AIToolType,
+        args: Vec<String>,
+        claude_overrides: ClaudeModelOverrides,
+        env: Option<HashMap<String, String>>,
+        effective_key: Option<&ApiKey>,
+        dry_run: bool,
+    ) -> anyhow::Result<ExitCode> {
+        let now = now_secs();
+
+        // Promote expired exclusions back to active.
+        let exclusions: Vec<FallbackExclusion> = fb_cfg
+            .exclusions
+            .iter()
+            .filter(|e| !e.is_expired(now))
+            .cloned()
+            .collect();
+
+        let mut last_error = None;
+        for (i, entry) in fb_cfg.entries.iter().enumerate() {
+            // Skip excluded entries (unless exclusion expired).
+            if exclusions
+                .iter()
+                .any(|e| e.provider == entry.provider && e.model == entry.model)
+            {
+                eprintln!(
+                    "  {} {} (excluded — skipping)",
+                    style::dim("↻"),
+                    entry.to_provider_model(),
+                );
+                continue;
+            }
+
+            eprintln!(
+                "  {} Trying {}/{}: {}",
+                style::arrow_symbol(),
+                i + 1,
+                fb_cfg.entries.len(),
+                style::cyan(entry.to_provider_model()),
+            );
+
+            let options = LaunchOptions {
+                tool,
+                args: args.clone(),
+                model: Some(entry.model.clone()),
+                claude_overrides: claude_overrides.clone(),
+                env: env.clone(),
+                key_override: effective_key.cloned(),
+            };
+
+            if dry_run {
+                let plan = self.ai_launcher.prepare_launch(&options).await?;
+                print_launch_preview(&plan);
+                return Ok(ExitCode::Success);
+            }
+
+            match self.ai_launcher.launch(&options).await {
+                Ok(0) => {
+                    // Success!
+                    self.session_store
+                        .update_fallback_last_used(
+                            fb_name,
+                            Some(entry.to_provider_model()),
+                        )
+                        .await
+                        .ok();
+                    // Clear exclusions on success (successful entry is healthy).
+                    let mut keep_ex: Vec<FallbackExclusion> = exclusions
+                        .iter()
+                        .filter(|e| e.provider != entry.provider || e.model != entry.model)
+                        .cloned()
+                        .collect();
+                    // Also re-add any non-expired exclusions that aren't resolved yet
+                    // (e.g. other entries still in exclusion).
+                    for ex in &fb_cfg.exclusions {
+                        if !ex.is_expired(now)
+                            && !keep_ex.iter().any(|k| {
+                                k.provider == ex.provider && k.model == ex.model
+                            })
+                        {
+                            keep_ex.push(ex.clone());
+                        }
+                    }
+                    self.session_store
+                        .update_fallback_exclusions(fb_name, keep_ex)
+                        .await
+                        .ok();
+                    eprintln!(
+                        "  {} Succeeded with {}",
+                        style::green("✓"),
+                        entry.to_provider_model(),
+                    );
+                    return Ok(ExitCode::Success);
+                }
+                Ok(nonzero) => {
+                    eprintln!(
+                        "  {} {} failed with exit code {}",
+                        style::yellow("!"),
+                        entry.to_provider_model(),
+                        nonzero,
+                    );
+                    // Add exclusion: transient (5xx-like) → short backoff;
+                    // otherwise skip to next.
+                    let reason = format!("exit code {}", nonzero);
+                    // For non-zero exits, treat as transient with a 30s backoff.
+                    let expires_at = Some(now + 30);
+                    if !exclusions.iter().any(|e| {
+                        e.provider == entry.provider && e.model == entry.model
+                    }) {
+                        let mut new_exclusions = exclusions.clone();
+                        new_exclusions.push(FallbackExclusion {
+                            provider: entry.provider.clone(),
+                            model: entry.model.clone(),
+                            reason: reason.clone(),
+                            excluded_at: now,
+                            expires_at,
+                        });
+                        self.session_store
+                            .update_fallback_exclusions(fb_name, new_exclusions)
+                            .await
+                            .ok();
+                    }
+                    last_error = Some(nonzero);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  {} {} error: {}",
+                        style::yellow("!"),
+                        entry.to_provider_model(),
+                        e,
+                    );
+                    let expires_at = Some(now + 60);
+                    if !exclusions.iter().any(|ex| {
+                        ex.provider == entry.provider && ex.model == entry.model
+                    }) {
+                        let mut new_exclusions = exclusions.clone();
+                        new_exclusions.push(FallbackExclusion {
+                            provider: entry.provider.clone(),
+                            model: entry.model.clone(),
+                            reason: format!("{e:#}"),
+                            excluded_at: now,
+                            expires_at,
+                        });
+                        self.session_store
+                            .update_fallback_exclusions(fb_name, new_exclusions)
+                            .await
+                            .ok();
+                    }
+                    last_error = Some(1);
+                }
+            }
+        }
+
+        // All entries exhausted.
+        let code = last_error.unwrap_or(1);
+        eprintln!(
+            "  {} All fallback entries exhausted (last exit: {})",
+            style::red("✗"),
+            code,
+        );
+        Ok(ExitCode::ToolExit(code))
     }
 
     /// Shows usage information. When `tool` names a specific CLI, only the
@@ -902,6 +1091,14 @@ async fn resolve_max_context(
         Some(c) if c >= 1_000_000 => Some("1m".to_string()),
         _ => None,
     }
+}
+
+/// Returns current Unix timestamp in seconds.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[cfg(test)]

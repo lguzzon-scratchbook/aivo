@@ -973,6 +973,86 @@ impl std::fmt::Display for AliasValue {
     }
 }
 
+// ── Fallback types ──────────────────────────────────────────────────────────
+
+/// A single entry in a fallback list: `<provider>:<model>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FallbackEntry {
+    pub provider: String,
+    pub model: String,
+}
+
+impl FallbackEntry {
+    pub fn new(provider: String, model: String) -> Self {
+        Self { provider, model }
+    }
+
+    /// Parse `provider:model` string. Returns None if format is invalid.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (provider, model) = s.split_once(':')?;
+        let provider = provider.trim().to_string();
+        let model = model.trim().to_string();
+        if provider.is_empty() || model.is_empty() {
+            return None;
+        }
+        // No colons or spaces allowed in provider or model names
+        if provider.contains(':') || provider.contains(' ')
+            || model.contains(':') || model.contains(' ')
+        {
+            return None;
+        }
+        Some(Self { provider, model })
+    }
+
+    pub fn to_provider_model(&self) -> String {
+        format!("{}:{}", self.provider, self.model)
+    }
+}
+
+/// Runtime exclusion state for a failed fallback entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FallbackExclusion {
+    pub provider: String,
+    pub model: String,
+    pub reason: String,
+    /// Unix timestamp (seconds) when this entry was excluded.
+    pub excluded_at: i64,
+    /// Unix timestamp (seconds) when this exclusion expires. None = indefinite.
+    pub expires_at: Option<i64>,
+}
+
+impl FallbackExclusion {
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|exp| now >= exp)
+    }
+
+    pub fn provider_model(&self) -> String {
+        format!("{}:{}", self.provider, self.model)
+    }
+}
+
+/// A fallback definition: a virtual model that tries provider:model pairs in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FallbackConfig {
+    /// Ordered list of provider:model pairs to try.
+    pub entries: Vec<FallbackEntry>,
+    /// The last successfully used provider:model (if any).
+    pub last_used: Option<String>,
+    /// Runtime exclusion state (persisted so it survives restarts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclusions: Vec<FallbackExclusion>,
+}
+
+impl FallbackConfig {
+    pub fn new(entries: Vec<FallbackEntry>) -> Self {
+        Self {
+            entries,
+            last_used: None,
+            exclusions: Vec::new(),
+        }
+    }
+}
+
 /// Stored configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredConfig {
@@ -1042,6 +1122,10 @@ pub struct StoredConfig {
     /// wipe a newer one's settings. Flattened so unknown keys round-trip verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+
+    /// Fallback definitions: virtual models backed by ordered provider:model pairs.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fallbacks: HashMap<String, FallbackConfig>,
 }
 
 /// Deserialize directory_starts supporting both legacy flat format and new nested format.
@@ -1143,6 +1227,7 @@ impl StoredConfig {
             starter_key_dismissed: false,
             disabled_skills: Vec::new(),
             disabled_mcp_servers: Vec::new(),
+            fallbacks: HashMap::new(),
             extra: BTreeMap::new(),
         }
     }
@@ -2207,6 +2292,64 @@ impl SessionStore {
             current = target.clone();
         }
         Ok(current)
+    }
+
+    // ── Fallback CRUD ───────────────────────────────────────────────────────────
+
+    /// Get all fallback definitions.
+    pub async fn get_fallbacks(&self) -> Result<HashMap<String, FallbackConfig>> {
+        let config = self.ctx.load().await?;
+        Ok(config.fallbacks)
+    }
+
+    /// Set a fallback definition (create or overwrite).
+    pub async fn set_fallback(&self, name: String, config: FallbackConfig) -> Result<()> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut cfg = self.ctx.load().await?;
+        cfg.fallbacks.insert(name, config);
+        self.ctx.save_raw(&cfg).await?;
+        Ok(())
+    }
+
+    /// Remove a fallback definition by name. Returns true if it existed.
+    pub async fn remove_fallback(&self, name: &str) -> Result<bool> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut cfg = self.ctx.load().await?;
+        let existed = cfg.fallbacks.remove(name).is_some();
+        if existed {
+            self.ctx.save_raw(&cfg).await?;
+        }
+        Ok(existed)
+    }
+
+    /// Update a fallback's exclusion list (e.g. after an attempt).
+    pub async fn update_fallback_exclusions(
+        &self,
+        name: &str,
+        exclusions: Vec<FallbackExclusion>,
+    ) -> Result<()> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut cfg = self.ctx.load().await?;
+        if let Some(fb) = cfg.fallbacks.get_mut(name) {
+            fb.exclusions = exclusions;
+            self.ctx.save_raw(&cfg).await?;
+        }
+        Ok(())
+    }
+
+    /// Update a fallback's last-used entry.
+    pub async fn update_fallback_last_used(
+        &self,
+        name: &str,
+        last_used: Option<String>,
+    ) -> Result<()> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut cfg = self.ctx.load().await?;
+        if let Some(fb) = cfg.fallbacks.get_mut(name) {
+            fb.last_used = last_used;
+            self.ctx.save_raw(&cfg).await?;
+        }
+        Ok(())
     }
 }
 
