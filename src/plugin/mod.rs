@@ -353,6 +353,11 @@ async fn exec_plugin(
     config_dir: &Path,
     extra_env: &[(String, String)],
 ) -> i32 {
+    if let Err(msg) = check_plugin_binary(bin) {
+        eprintln!("{} {msg}", style::red("Error:"));
+        return ExitCode::UserError.code();
+    }
+
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args);
     cmd.env("AIVO_CONFIG_DIR", config_dir);
@@ -366,14 +371,76 @@ async fn exec_plugin(
     match cmd.status().await {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
-            eprintln!(
-                "{} failed to launch plugin {}: {e}",
-                style::red("Error:"),
-                bin.display(),
-            );
+            let hint = match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    format!(
+                        "plugin binary or its runtime interpreter not found: `{}`.\n  \
+                         The binary exists at {} but failed to launch — a required \
+                         runtime (Node, Python, etc.) may be missing.",
+                        bin.display(),
+                        bin.display(),
+                    )
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    format!(
+                        "cannot execute plugin `{}`: permission denied.\n  \
+                         Check that the file is executable: `chmod +x {}`",
+                        bin.display(),
+                        bin.display(),
+                    )
+                }
+                std::io::ErrorKind::InvalidData => {
+                    format!(
+                        "cannot execute plugin `{}`: the binary format is not recognized.\n  \
+                         The file may be corrupted or its interpreter is not installed.",
+                        bin.display(),
+                    )
+                }
+                _ => {
+                    format!("failed to launch plugin `{}`: {e}", bin.display())
+                }
+            };
+            eprintln!("{} {hint}", style::red("Error:"));
             ExitCode::UserError.code()
         }
     }
+}
+
+/// Validates that a plugin binary exists and is runnable before spawning.
+/// Returns `Ok(())` if the binary looks good, or an error message string on failure.
+fn check_plugin_binary(bin: &Path) -> Result<(), String> {
+    if !bin.exists() {
+        return Err(format!(
+            "plugin binary `{}` does not exist.\n  \
+             It may have been moved or deleted after installation.",
+            bin.display()
+        ));
+    }
+    if !bin.is_file() {
+        return Err(format!("plugin path `{}` is not a file.", bin.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match bin.metadata() {
+            Ok(meta) if meta.permissions().mode() & 0o111 == 0 => {
+                return Err(format!(
+                    "plugin binary `{}` is not executable.\n  \
+                     Fix with: chmod +x {}",
+                    bin.display(),
+                    bin.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot access plugin binary `{}`: {e}",
+                    bin.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Shared y/N consent prompt for a plugin's grantable capabilities. Callers
@@ -778,6 +845,57 @@ mod tests {
         assert!(f.debug_log.is_none());
         assert!(!f.dry_run);
         assert_eq!(f.rest, args(&["-p", "hello", "--thinking"]));
+    }
+
+    #[test]
+    fn check_plugin_binary_rejects_missing_path() {
+        let nowhere = Path::new("/tmp/does-not-exist-aivo-999");
+        assert!(check_plugin_binary(nowhere).is_err());
+        let err = check_plugin_binary(nowhere).unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn check_plugin_binary_rejects_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = check_plugin_binary(dir.path()).unwrap_err();
+        assert!(err.contains("not a file"), "got: {err}");
+    }
+
+    #[test]
+    fn check_plugin_binary_rejects_non_executable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("aivo-plugin");
+        std::fs::write(&f, "#!/bin/sh\necho hello\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&f).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&f, perms).unwrap();
+            let err = check_plugin_binary(&f).unwrap_err();
+            assert!(err.contains("not executable"), "got: {err}");
+        }
+        #[cfg(not(unix))]
+        {
+            // On Windows, non-executable file passes (is_file check only)
+            assert!(check_plugin_binary(&f).is_ok());
+        }
+    }
+
+    #[test]
+    fn check_plugin_binary_passes_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("aivo-plugin");
+        std::fs::write(&f, "#!/bin/sh\necho hello\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&f).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&f, perms).unwrap();
+        }
+        assert!(check_plugin_binary(&f).is_ok());
     }
 
     #[test]
