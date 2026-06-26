@@ -520,7 +520,27 @@ async fn materialize_github(
     if !quiet {
         eprintln!("  {} {picked}", style::dim("·"));
     }
-    let body = download(asset_url, quiet).await?;
+    let tag_name = manifest
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(tag.unwrap_or("latest"));
+    let body = match download(asset_url, quiet).await {
+        Ok(body) => body,
+        Err(primary_err) => {
+            let mirror_base = env_base("AIVO_GH_MIRROR", AIVO_GH_MIRROR_DEFAULT);
+            if !quiet {
+                eprintln!(
+                    "  {} GitHub download failed; falling back to mirror…",
+                    style::dim("↻")
+                );
+            }
+            let fallback_url = gh_mirror_url(&mirror_base, owner, repo, tag_name, picked);
+            match download(&fallback_url, quiet).await {
+                Ok(body) => body,
+                Err(_) => return Err(primary_err),
+            }
+        }
+    };
     let checksum = sha(&body.bytes);
     let primary = install_payload(&body.bytes, Some(picked), name, dir)?;
     Ok(Materialized {
@@ -774,6 +794,24 @@ impl Drop for CleanupDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// The default GitHub release asset mirror. Override via `AIVO_GH_MIRROR`.
+const AIVO_GH_MIRROR_DEFAULT: &str = "https://getaivo.dev/gh-mirror";
+
+/// Constructs a mirror URL for a GitHub release asset. The `<mirror_base>`
+/// comes from `AIVO_GH_MIRROR` (or its default); the remaining path mirrors
+/// the GitHub release asset URL structure so a CDN / R2 bucket can serve
+/// the same payload when the primary GitHub download fails.
+fn gh_mirror_url(mirror_base: &str, owner: &str, repo: &str, tag: &str, asset: &str) -> String {
+    format!(
+        "{}/{}/{}/{}/{}",
+        mirror_base.trim_end_matches('/'),
+        owner,
+        repo,
+        tag,
+        asset
+    )
 }
 
 async fn download(url: &str, quiet: bool) -> Result<Body> {
@@ -1074,5 +1112,26 @@ mod tests {
         assert!(looks_like_html(b"  \n<html>"));
         assert!(!looks_like_html(b"\x7fELF\x02\x01"));
         assert!(!looks_like_html(b"#!/bin/sh"));
+    }
+
+    #[test]
+    fn gh_mirror_url_constructs_correct_url() {
+        let url = gh_mirror_url(
+            "https://getaivo.dev/gh-mirror",
+            "owner",
+            "repo",
+            "v1.2.3",
+            "binary-linux-x64.tar.gz",
+        );
+        assert_eq!(
+            url,
+            "https://getaivo.dev/gh-mirror/owner/repo/v1.2.3/binary-linux-x64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn gh_mirror_url_strips_trailing_slash() {
+        let url = gh_mirror_url("https://mirror.example.com/", "o", "r", "latest", "asset");
+        assert_eq!(url, "https://mirror.example.com/o/r/latest/asset");
     }
 }
