@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::commands::models::fetch_models;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::copilot_auth::CopilotTokenManager;
+use crate::services::http_debug;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::model_list_response;
@@ -950,6 +951,15 @@ macro_rules! impl_with_failover {
                 return Ok(response);
             }
 
+            http_debug::log_route_event(
+                &format!(
+                    "failover_trigger: {} returned status={}; trying failover keys",
+                    stringify!($handler),
+                    status,
+                ),
+                None,
+            );
+
             if !state.quiet {
                 eprintln!(
                     "  \u{21bb} Primary key returned {}; trying failover keys...",
@@ -964,6 +974,14 @@ macro_rules! impl_with_failover {
                         RouterResponse::Streaming { .. } => 200,
                     };
                     if !is_failover_status(s) {
+                        http_debug::log_route_event(
+                            &format!(
+                                "failover_success: {} succeeded with key {}",
+                                stringify!($handler),
+                                entry.key.display_name()
+                            ),
+                            None,
+                        );
                         if !state.quiet {
                             eprintln!(
                                 "  \u{2713} Failover to {} succeeded",
@@ -1081,6 +1099,15 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
             if attempt > 0 && !state.quiet {
                 eprintln!("  \u{2022} Protocol auto-switched to {}", protocol.as_str());
             }
+            http_debug::log_route_event(
+                &format!(
+                    "protocol_auto_switch: route={:x} status={}; switched to {}",
+                    slot.route_atom().load(std::sync::atomic::Ordering::Relaxed),
+                    status,
+                    protocol.as_str()
+                ),
+                None,
+            );
             success = Some(response);
             break;
         }

@@ -258,6 +258,11 @@ pub(crate) enum Phase {
     /// because notifications have no reply and shouldn't be paired up by id
     /// when post-processing the log.
     Notification,
+    /// Routing-level event: protocol auto-switch, key failover, or similar
+    /// provider-routing decision. Standalone entry (not paired with a request
+    /// id) — carries a human-readable label in `url` and the triggering
+    /// status code in `status` when applicable.
+    RouteEvent,
 }
 
 #[derive(Debug, Serialize)]
@@ -385,6 +390,30 @@ pub async fn init(path: PathBuf) -> std::io::Result<PathBuf> {
 
 pub(crate) fn global() -> Option<&'static HttpDebugLogger> {
     GLOBAL.get()
+}
+
+/// Emit a routing-level event (protocol auto-switch, failover) to the debug
+/// log. No-op when the global debug logger is uninitialized.
+pub(crate) fn log_route_event(event: &str, trigger: Option<u16>) {
+    use chrono::Utc;
+    let Some(logger) = global() else {
+        return;
+    };
+    let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    logger.log_blocking(&DebugEntry {
+        ts,
+        id: "route".to_string(),
+        phase: Phase::RouteEvent,
+        method: String::new(),
+        url: event.to_string(),
+        status: trigger,
+        duration_ms: None,
+        request_headers: BTreeMap::new(),
+        request_body: None,
+        response_headers: BTreeMap::new(),
+        response_body: None,
+        error: None,
+    });
 }
 
 #[cfg(test)]
@@ -1118,6 +1147,48 @@ mod tests {
         // Behavior is exercised by integration tests under tests/.
         fn _assert<T: LoggedSend>() {}
         _assert::<reqwest::RequestBuilder>();
+    }
+
+    #[tokio::test]
+    async fn route_event_writes_jsonl_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log_path = dir.path().join("debug.jsonl");
+        let logger = HttpDebugLogger::open(&log_path).await.unwrap();
+
+        logger
+            .log(DebugEntry {
+                ts: "2026-06-26T12:00:00.000Z".into(),
+                id: "route".into(),
+                phase: Phase::RouteEvent,
+                method: String::new(),
+                url: "failover_trigger: handle_chat returned status=429".into(),
+                status: Some(429),
+                duration_ms: None,
+                request_headers: BTreeMap::new(),
+                request_body: None,
+                response_headers: BTreeMap::new(),
+                response_body: None,
+                error: None,
+            })
+            .await;
+
+        drop(logger);
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let line = content.lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["phase"], "route_event");
+        assert!(
+            v["url"].as_str().unwrap().contains("failover_trigger"),
+            "url field missing event info: {}",
+            v["url"]
+        );
+        assert_eq!(v["status"], 429);
+    }
+
+    #[test]
+    fn route_event_is_noop_when_global_unset() {
+        // Should not panic when no global logger is initialized
+        log_route_event("test_event", None);
     }
 
     #[test]
