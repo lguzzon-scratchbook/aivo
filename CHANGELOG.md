@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.32.2
+
+New `aivo account` command surfaces your linked-device info and usage with a
+shared bar meter, and folds in `login`/`logout`/`open`. The `aivo login` flow
+gets two reliability fixes: the verification URL now shows on screen with the
+code pre-filled, and Ctrl+C during the device poll restores terminal echo.
+
+- feat(account): add `aivo account` (info/usage/open/login/logout) + shared bar meter (9df19f5)
+- fix(login): show the code-prefilled verification URL on screen (43d0f20)
+- fix(login): catch Ctrl+C during device poll to restore terminal echo (bbb0b91)
+- fix(login): scope echo guard to avoid Windows-only drop_non_drop clippy lint (03059f7)
+
 ## v0.32.1
 
 Polish for the new `aivo login` flow: the device-link screen is redesigned, the
