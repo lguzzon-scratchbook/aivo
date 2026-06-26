@@ -33,3 +33,11 @@ memory/
 
 # Python cache (canary fake provider)
 __pycache__/
+
+# AgentOps session artifacts (auto-added by ao init)
+/.agents/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
