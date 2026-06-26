@@ -284,7 +284,7 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
         && let Some(id) = app.resumable_session_id()
     {
         println!(
-            "\n{}  {}",
+            "{}  {}",
             crate::style::dim("Resume this chat:"),
             crate::style::cyan(format!("aivo chat --resume {id}")),
         );
