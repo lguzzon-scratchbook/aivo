@@ -124,11 +124,27 @@ impl StartCommand {
                 _ => None, // will trigger picker below
             }
         };
-        let model_arg = if model_explicit || key_explicit {
+        let mut model_arg = if model_explicit || key_explicit {
             model_arg
         } else {
             self.refresh_starter_model_arg(&key.value, model_arg).await
         };
+
+        // First-run fallback: when only the auto-created aivo-starter key
+        // exists and no model has been selected yet, skip the model picker
+        // and use the seeded chat model. Once any user adds their own API
+        // key this no longer applies. Matches run.rs lines 517-541.
+        if !model_explicit
+            && !key_explicit
+            && model_arg.as_deref().map_or(true, |m| m.is_empty())
+            && crate::services::provider_profile::is_aivo_starter_base(&key.value.base_url)
+            && is_first_run_with_starter(
+                &self.session_store.get_keys().await.unwrap_or_default(),
+                &key.value,
+            )
+        {
+            model_arg = Some(crate::constants::AIVO_STARTER_MODEL.to_owned());
+        }
 
         let model = self
             .resolve_model(model_arg, last_sel.as_ref(), &key, args.refresh, tool.value)
@@ -589,6 +605,16 @@ impl StartCommand {
     }
 }
 
+/// Returns true when only the auto-created aivo-starter key exists and no
+/// user keys have been added. In this state the model picker should be skipped
+/// and the seeded chat model (`aivo/starter`) used directly. Once any user adds
+/// their own API key, this returns false permanently.
+///
+/// Matches the first-run detection in `run.rs` (lines 527-534).
+pub(crate) fn is_first_run_with_starter(keys: &[ApiKey], key: &ApiKey) -> bool {
+    keys.len() == 1 && crate::services::provider_profile::is_aivo_starter_base(&key.base_url)
+}
+
 /// The built-in picker rows as `(name, detail)` pairs: aivo's own in-process
 /// chat agent first (no install, shares the same keys as the tools below), then
 /// every native tool supported on this platform. Plugins are appended by the
@@ -657,8 +683,9 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_tool_rows;
+    use super::{is_first_run_with_starter, render_tool_rows};
     use crate::services::ai_launcher::AIToolType;
+    use crate::services::session_store::ApiKey;
 
     fn plain(rows: Vec<String>) -> Vec<String> {
         rows.iter()
@@ -706,5 +733,57 @@ mod tests {
         // The native tools still follow it.
         assert!(entries.iter().any(|(name, _)| name == "claude"));
         assert!(entries.iter().any(|(name, _)| name == "codex"));
+    }
+
+    fn starter_key() -> ApiKey {
+        ApiKey::new_with_protocol(
+            "starter-id".into(),
+            crate::constants::AIVO_STARTER_KEY_NAME.into(),
+            crate::constants::AIVO_STARTER_SENTINEL.into(),
+            None,
+            crate::constants::AIVO_STARTER_EMPTY_SECRET.into(),
+        )
+    }
+
+    fn user_key() -> ApiKey {
+        ApiKey::new_with_protocol(
+            "user-id".into(),
+            "mykey".into(),
+            "https://api.openai.com/v1".into(),
+            None,
+            "sk-test".into(),
+        )
+    }
+
+    #[test]
+    fn first_run_detected_when_only_starter_key() {
+        let starter = starter_key();
+        let keys = vec![starter.clone()];
+        assert!(is_first_run_with_starter(&keys, &starter));
+    }
+
+    #[test]
+    fn first_run_disabled_when_user_key_added() {
+        let starter = starter_key();
+        let user = user_key();
+        let keys = vec![starter, user];
+        // Pass the starter key as the resolved key — first-run is off because
+        // a user key exists alongside the starter.
+        assert!(!is_first_run_with_starter(&keys, &starter_key()));
+    }
+
+    #[test]
+    fn first_run_disabled_when_only_user_key() {
+        let user = user_key();
+        let keys = vec![user.clone()];
+        // Single key, but it's not the starter — not first-run.
+        assert!(!is_first_run_with_starter(&keys, &user));
+    }
+
+    #[test]
+    fn is_first_run_with_starter_rejects_empty_keys() {
+        let starter = starter_key();
+        let keys: Vec<ApiKey> = vec![];
+        assert!(!is_first_run_with_starter(&keys, &starter));
     }
 }
