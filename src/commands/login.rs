@@ -39,7 +39,7 @@ impl LoginCommand {
     async fn execute_internal(&self, args: LoginArgs) -> Result<ExitCode> {
         // Re-verify against the server before deciding we're already logged in:
         // the device may have been unlinked from the dashboard since last time.
-        match sync_account_status().await {
+        let relink = match sync_account_status().await {
             AccountSync::Linked(account) => {
                 println!(
                     "  {} Already logged in as {}.",
@@ -59,56 +59,63 @@ impl LoginCommand {
                 );
                 return Ok(ExitCode::Success);
             }
-            AccountSync::Unlinked { had_local: true } => {
-                println!(
-                    "  {}",
-                    style::dim("This device's previous link was removed; signing in again.")
-                );
-                // fall through to a fresh login
-            }
-            AccountSync::Unlinked { had_local: false } | AccountSync::Unverified(None) => {
-                // Nothing linked locally or server-side → just log in.
-            }
-        }
+            // Previous link removed: note it in the header, then re-link.
+            AccountSync::Unlinked { had_local: true } => true,
+            AccountSync::Unlinked { had_local: false } | AccountSync::Unverified(None) => false,
+        };
 
         let label = args.label.unwrap_or_else(default_label);
 
-        // Start the device-authorization request (Ed25519-signed).
         let device = device_auth::start_device_auth(Some(&label)).await?;
 
-        // Show the code + URL. Polling starts immediately, so approval is
-        // detected even if the user never presses Enter (e.g. opens the URL on
-        // their phone); Enter just opens a browser here — optional, not a gate.
-        let verify_url = device
+        // Show the bare URL (clean for hand-typing); Enter opens the
+        // code-prefilled one. Polling below starts regardless, so Enter is a
+        // convenience (e.g. approve on a phone), never a gate.
+        let bare_url = device.verification_uri.clone();
+        let open_url = device
             .verification_uri_complete
             .filter(|s| !s.is_empty())
-            .unwrap_or(device.verification_uri);
-        println!();
-        println!(
-            "  {} To link this device, sign in and confirm this code:",
-            style::arrow_symbol()
-        );
-        println!("    {}", style::bold(&device.user_code));
-        println!("    {} {}", style::dim("at"), style::blue(&verify_url));
-        println!();
-        println!(
-            "  {}",
-            style::dim("Press Enter to open your browser (optional)…")
-        );
+            .unwrap_or_else(|| bare_url.clone());
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
-        // Open the browser if/when the user presses Enter, concurrently with —
-        // never blocking — the poll below. Aborted once polling finishes.
-        let opener = spawn_browser_opener_on_enter(verify_url.clone());
+        println!();
+        println!("  {}", style::bold("Sign in to aivo"));
+        if relink {
+            println!(
+                "  {}",
+                style::dim("This device's previous link was removed — signing in again.")
+            );
+        }
+        println!(
+            "  Confirm this code in your browser:  {}",
+            style::cyan(style::bold(&device.user_code))
+        );
+        if interactive {
+            println!(
+                "  Press {} to open your browser, or visit {}",
+                style::keycap(" Enter "),
+                style::blue(&bare_url)
+            );
+        } else {
+            println!("  Visit {} to confirm.", style::blue(&bare_url));
+        }
+        println!();
 
-        // Poll until the user approves in the browser.
-        let (spinning, spinner_handle) =
-            style::start_spinner(Some(" Waiting for approval in the browser..."));
+        // Without this, the newline echoed on Enter scrolls the in-place
+        // spinner, duplicating the "Waiting…" line. Restored on drop.
+        let echo_guard = EchoGuard::disable();
+
+        // Opens the browser on Enter, concurrently with (never blocking) the poll.
+        let opener = spawn_browser_opener_on_enter(open_url);
+
+        let (spinning, spinner_handle) = style::start_spinner(Some(" Waiting for approval…"));
         let result =
             device_auth::poll_device_token(&device.device_code, device.interval, device.expires_in)
                 .await;
         style::stop_spinner(&spinning);
         let _ = spinner_handle.await;
         opener.abort();
+        drop(echo_guard);
         let user = result?;
 
         // Record the account locally for display (no secret stored).
@@ -255,6 +262,53 @@ fn spawn_browser_opener_on_enter(verify_url: String) -> tokio::task::JoinHandle<
             );
         }
     })
+}
+
+/// Suppresses terminal echo for its lifetime (restored on drop), leaving
+/// canonical mode and signals on so line reads and Ctrl+C still work. `disable`
+/// returns `None` (a no-op) off a TTY or on non-Unix.
+#[cfg(unix)]
+struct EchoGuard {
+    fd: std::os::fd::RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl EchoGuard {
+    fn disable() -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        let mut original = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let original = unsafe { original.assume_init() };
+        let mut quiet = original;
+        quiet.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            return None;
+        }
+        Some(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)] // Never constructed here; `disable` is always a no-op.
+struct EchoGuard;
+
+#[cfg(not(unix))]
+impl EchoGuard {
+    // The echo trail is Unix-only; nothing to suppress here.
+    fn disable() -> Option<Self> {
+        None
+    }
 }
 
 /// Default device label: `aivo <version> on <hostname>` when a hostname is

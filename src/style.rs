@@ -96,6 +96,11 @@ pub fn magenta(text: impl AsRef<str>) -> String {
     style_text(StyleName::Magenta, text)
 }
 
+/// Renders text as a reverse-video "keycap" so a key to press stands out.
+pub fn keycap(text: impl AsRef<str>) -> String {
+    style(text.as_ref()).reverse().bold().to_string()
+}
+
 /// Convenience function for the "✓" success symbol.
 pub fn success_symbol() -> String {
     green("✓")
