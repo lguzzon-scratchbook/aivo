@@ -103,25 +103,36 @@ impl LoginCommand {
 
         // Scoped so echo is restored — and the Enter→browser opener cancelled —
         // the moment polling ends, before any later output.
-        let result = {
+        let outcome = {
             // Without this, the newline echoed on Enter scrolls the in-place
             // spinner, duplicating the "Waiting…" line.
             let _echo_guard = EchoGuard::disable();
             // Opens the browser on Enter, concurrently with (never blocking) the poll.
             let opener = spawn_browser_opener_on_enter(open_url);
             let (spinning, spinner_handle) = style::start_spinner(Some(" Waiting for approval…"));
-            let result = device_auth::poll_device_token(
-                &device.device_code,
-                device.interval,
-                device.expires_in,
-            )
-            .await;
+            // Catch Ctrl+C here rather than let the default SIGINT kill the
+            // process mid-poll: that skips `EchoGuard`'s drop, leaving the
+            // terminal with echo off and a half-drawn spinner line.
+            let outcome = tokio::select! {
+                r = device_auth::poll_device_token(
+                    &device.device_code,
+                    device.interval,
+                    device.expires_in,
+                ) => Some(r),
+                _ = tokio::signal::ctrl_c() => None,
+            };
             style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
             opener.abort();
-            result
+            outcome
         };
-        let user = result?;
+        let user = match outcome {
+            Some(result) => result?,
+            None => {
+                println!("  {}", style::dim("Cancelled."));
+                return Ok(ExitCode::ToolExit(130));
+            }
+        };
 
         // Record the account locally for display (no secret stored).
         let account = account_store::Account {
