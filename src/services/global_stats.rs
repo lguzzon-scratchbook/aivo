@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::services::context_ingest::{is_gemini_session_file, normalize_gemini_session};
 use crate::services::model_names::normalize_claude_version;
 use crate::services::system_env;
 
@@ -346,7 +347,7 @@ fn cache_path(tool: &str) -> PathBuf {
 fn tool_file_filter(tool: &str) -> fn(&str) -> bool {
     match tool {
         "claude" | "codex" => |name: &str| name.ends_with(".jsonl"),
-        "gemini" => |name: &str| name.starts_with("session-") && name.ends_with(".json"),
+        "gemini" => is_gemini_session_file,
         _ => |_: &str| true,
     }
 }
@@ -757,14 +758,19 @@ async fn parse_codex_file(
     Some(entry)
 }
 
-/// Parse a single Gemini session JSON file.
+/// Parse a single Gemini session file. Token usage lives on `type:"gemini"`
+/// records under `tokens.{input,output,cached}`.
+///
+/// `normalize_gemini_session` absorbs the format difference (legacy
+/// single-object `session-*.json` vs. current per-line `chats/session-*.jsonl`),
+/// handing back a uniform `{messages:[…]}` either way.
 async fn parse_gemini_file(
     path: &Path,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<FileEntry> {
     let content = fs::read_to_string(path).await.ok()?;
-    let v: Value = serde_json::from_str(&content).ok()?;
-    let messages = v.get("messages")?.as_array()?;
+    let session = normalize_gemini_session(&content)?;
+    let messages = session.get("messages").and_then(|m| m.as_array())?;
 
     let mut entry = FileEntry::default();
 
@@ -1181,12 +1187,13 @@ mod tests {
         // Gemini's `tokens.input` is the total turn input INCLUDING the
         // `tokens.cached` portion. Normalize to fresh-only.
         let dir = tempfile::tempdir().unwrap();
-        let body = r#"{"sessionId":"s1","messages":[
-            {"type":"user","content":"hi"},
-            {"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":7613,"output":11,"cached":7036,"thoughts":29,"tool":0,"total":7653}}
-        ]}"#;
-        let path = dir.path().join("session-x.json");
-        fs::write(&path, body).await.unwrap();
+        let lines = [
+            r#"{"sessionId":"s1","kind":"main"}"#,
+            r#"{"type":"user","content":[{"text":"hi"}]}"#,
+            r#"{"$set":{"lastUpdated":"2026-06-19T13:37:21.014Z"}}"#,
+            r#"{"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":7613,"output":11,"cached":7036,"thoughts":29,"tool":0,"total":7653}}"#,
+        ];
+        let path = write_jsonl(&dir, "session-x.jsonl", &lines).await;
         let entry = parse_gemini_file(&path, None).await.unwrap();
         assert_eq!(
             entry.input_tokens,
@@ -1202,14 +1209,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_gemini_file_accepts_legacy_json_object() {
+        // Pre-migration layout: a single `{messages:[…]}` object. Must still
+        // parse so a user's old `session-*.json` history isn't dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"sessionId":"s1","messages":[
+            {"type":"user","content":"hi"},
+            {"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":7613,"output":11,"cached":7036}}
+        ]}"#;
+        let path = dir.path().join("session-legacy.json");
+        fs::write(&path, body).await.unwrap();
+        let entry = parse_gemini_file(&path, None).await.unwrap();
+        assert_eq!(entry.input_tokens, 7613 - 7036);
+        assert_eq!(entry.output_tokens, 11);
+        assert_eq!(entry.cache_read_tokens, 7036);
+    }
+
+    #[tokio::test]
     async fn parse_gemini_file_sums_multiple_messages_with_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let body = r#"{"messages":[
-            {"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":1000,"output":50,"cached":800}},
-            {"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":2000,"output":100,"cached":1500}}
-        ]}"#;
-        let path = dir.path().join("session-y.json");
-        fs::write(&path, body).await.unwrap();
+        let lines = [
+            r#"{"sessionId":"s1","kind":"main"}"#,
+            r#"{"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":1000,"output":50,"cached":800}}"#,
+            r#"{"type":"gemini","model":"gemini-2.5-flash","tokens":{"input":2000,"output":100,"cached":1500}}"#,
+        ];
+        let path = write_jsonl(&dir, "session-y.jsonl", &lines).await;
         let entry = parse_gemini_file(&path, None).await.unwrap();
         assert_eq!(entry.input_tokens, (1000 - 800) + (2000 - 1500));
         assert_eq!(entry.output_tokens, 150);
@@ -1219,12 +1243,12 @@ mod tests {
     #[tokio::test]
     async fn parse_gemini_file_filters_messages_by_timestamp_cutoff() {
         let dir = tempfile::tempdir().unwrap();
-        let body = r#"{"messages":[
-            {"type":"gemini","timestamp":"2025-05-31T23:59:59Z","model":"gemini-2.5-flash","tokens":{"input":1000,"output":50,"cached":800}},
-            {"type":"gemini","timestamp":"2025-06-01T00:00:00Z","model":"gemini-2.5-flash","tokens":{"input":2000,"output":100,"cached":1500}}
-        ]}"#;
-        let path = dir.path().join("session-z.json");
-        fs::write(&path, body).await.unwrap();
+        let lines = [
+            r#"{"sessionId":"s1","kind":"main"}"#,
+            r#"{"type":"gemini","timestamp":"2025-05-31T23:59:59Z","model":"gemini-2.5-flash","tokens":{"input":1000,"output":50,"cached":800}}"#,
+            r#"{"type":"gemini","timestamp":"2025-06-01T00:00:00Z","model":"gemini-2.5-flash","tokens":{"input":2000,"output":100,"cached":1500}}"#,
+        ];
+        let path = write_jsonl(&dir, "session-z.jsonl", &lines).await;
         let cutoff = chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);

@@ -34,7 +34,8 @@ use tokio::fs;
 
 use crate::services::ai_launcher::AIToolType;
 use crate::services::context_ingest::{
-    encode_claude_dir, gemini_matching_session_files_in, normalize_gemini_session, pi_session_dir,
+    encode_claude_dir, gemini_matching_session_files_in, is_gemini_session_file,
+    normalize_gemini_session, pi_session_dir,
 };
 use crate::services::system_env;
 
@@ -277,8 +278,7 @@ async fn gemini_all_session_files(tmp_root: &Path) -> Vec<PathBuf> {
         while let Ok(Some(f)) = sub.next_entry().await {
             let p = f.path();
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.starts_with("session-") && (name.ends_with(".json") || name.ends_with(".jsonl"))
-            {
+            if is_gemini_session_file(name) {
                 out.push(p);
             }
         }
