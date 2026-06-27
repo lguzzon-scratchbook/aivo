@@ -79,11 +79,22 @@ impl FallbackCommand {
             anyhow::bail!("Fallback '{name}' already exists. Use `fallback update` to modify, or `fallback delete` first.");
         }
 
-        let config = FallbackConfig::new(parsed);
+        // Filter out entries whose provider has no matching key
+        let (filtered, removed) = self.filter_entries_by_provider(parsed).await?;
+        if filtered.is_empty() {
+            anyhow::bail!("None of the specified provider:model entries have a matching API key.");
+        }
+        for pm in &removed {
+            eprintln!(
+                "  {} Skipped {} — no API key found for provider '{}'",
+                style::yellow("!"),
+                pm,
+                pm.split(':').next().unwrap_or(""),
+            );
+        }
+        let config = FallbackConfig::new(filtered);
         self.session_store.set_fallback(name.clone(), config).await?;
         println!("  {} Created fallback '{name}'", style::green("✓"));
-        // Warn about providers with no matching key
-        self.warn_missing_providers(&name).await?;
         Ok(())
     }
 
@@ -184,7 +195,20 @@ impl FallbackCommand {
             .get_mut(&name)
             .ok_or_else(|| anyhow::anyhow!("Fallback '{name}' not found"))?;
 
-        config.entries = parsed;
+        // Filter out entries whose provider has no matching key
+        let (filtered, removed) = self.filter_entries_by_provider(parsed).await?;
+        if filtered.is_empty() {
+            anyhow::bail!("None of the specified provider:model entries have a matching API key.");
+        }
+        for pm in &removed {
+            eprintln!(
+                "  {} Skipped {} — no API key found for provider '{}'",
+                style::yellow("!"),
+                pm,
+                pm.split(':').next().unwrap_or(""),
+            );
+        }
+        config.entries = filtered;
         // Reset last_used if entries changed (it no longer points to a valid entry)
         config.last_used = None;
         // Clear exclusions on update — they may not be relevant with new entries
@@ -192,7 +216,6 @@ impl FallbackCommand {
 
         self.session_store.set_fallback(name.clone(), config.clone()).await?;
         println!("  {} Updated fallback '{name}'", style::green("✓"));
-        self.warn_missing_providers(&name).await?;
         Ok(())
     }
 
@@ -346,23 +369,22 @@ fn active_entries(config: &FallbackConfig, now: i64) -> Vec<&FallbackEntry> {
 }
 
 impl FallbackCommand {
-    /// Warn about providers in the named fallback that have no matching API key.
-    async fn warn_missing_providers(&self, fb_name: &str) -> Result<()> {
-        let fallbacks = self.session_store.get_fallbacks().await?;
-        let Some(config) = fallbacks.get(fb_name) else {
-            return Ok(());
-        };
-        for entry in &config.entries {
-            if !self.session_store.provider_has_key(&entry.provider).await? {
-                eprintln!(
-                    "  {} No API key found for provider '{}' (entry {}). This entry will fail at runtime.",
-                    style::yellow("!"),
-                    entry.provider,
-                    entry.to_provider_model(),
-                );
+    /// Filter parsed entries, keeping only those whose provider has a matching key.
+    /// Returns `(kept, removed_as_provider_model_strings)`.
+    async fn filter_entries_by_provider(
+        &self,
+        entries: Vec<FallbackEntry>,
+    ) -> Result<(Vec<FallbackEntry>, Vec<String>)> {
+        let mut kept = Vec::with_capacity(entries.len());
+        let mut removed = Vec::new();
+        for entry in entries {
+            if self.session_store.provider_has_key(&entry.provider).await? {
+                kept.push(entry);
+            } else {
+                removed.push(entry.to_provider_model());
             }
         }
-        Ok(())
+        Ok((kept, removed))
     }
 
     pub fn print_help() {
