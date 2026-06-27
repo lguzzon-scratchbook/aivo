@@ -13,6 +13,7 @@ use crate::services::system_env;
 use crate::services::api_key_store::ApiKeyStore;
 use crate::services::atomic_write::atomic_write_secure;
 use crate::services::chat_session_store::ChatSessionStore;
+use crate::services::known_providers;
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::route_cache::PersistedRoute;
@@ -2351,6 +2352,89 @@ impl SessionStore {
         }
         Ok(())
     }
+
+    /// Check whether at least one stored API key matches the given provider string.
+    /// Uses the same matching logic as `purge_orphan_fallback_entries`.
+    pub async fn provider_has_key(&self, provider: &str) -> Result<bool> {
+        let cfg = self.ctx.load().await?;
+        Ok(provider_has_matching_key(provider, &cfg.api_keys))
+    }
+
+    /// Scan all fallback definitions and remove entries whose `provider` string
+    /// no longer matches any remaining API key. Returns a list of removed entries
+    /// as `(fallback_name, provider:model)` tuples.
+    ///
+    /// Matching rules:
+    /// 1. If the provider string matches a known provider (via
+    ///    `known_providers::find_by_name_substring`), a key must exist whose
+    ///    `base_url` contains the known provider's `base_url` hostname.
+    /// 2. Otherwise, a key must exist whose `name` or `base_url` contains the
+    ///    provider string as a case-insensitive substring.
+    pub async fn purge_orphan_fallback_entries(&self) -> Result<Vec<(String, String)>> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut cfg = self.ctx.load().await?;
+        // Build a set of all current base_urls for matching.
+        let keys: Vec<ApiKey> = cfg.api_keys.clone();
+        let mut removed = Vec::new();
+
+        for (fb_name, fb_cfg) in &mut cfg.fallbacks {
+            let before = fb_cfg.entries.len();
+            fb_cfg.entries.retain(|entry| {
+                let has_match = provider_has_matching_key(&entry.provider, &keys);
+                if !has_match {
+                    removed.push((fb_name.clone(), entry.to_provider_model()));
+                }
+                has_match
+            });
+            // Also clean up exclusions referencing removed entries.
+            if fb_cfg.entries.len() != before {
+                let active_entries = &fb_cfg.entries;
+                fb_cfg.exclusions.retain(|ex| {
+                    active_entries
+                        .iter()
+                        .any(|e| e.provider == ex.provider && e.model == ex.model)
+                });
+            }
+        }
+        // Remove fallbacks that became empty.
+        cfg.fallbacks.retain(|_, fb_cfg| !fb_cfg.entries.is_empty());
+
+        self.ctx.save_raw(&cfg).await?;
+        Ok(removed)
+    }
+}
+
+/// Check whether at least one API key matches the given provider string.
+fn provider_has_matching_key(provider: &str, keys: &[ApiKey]) -> bool {
+    // Fast path: empty provider string never matches.
+    if provider.is_empty() {
+        return false;
+    }
+
+    // Try matching against known providers first.
+    if let Some(kp) = known_providers::find_by_name_substring(provider) {
+        // The known provider's base_url is something like
+        // "https://api.openai.com/v1". Check if any key's base_url
+        // contains the known provider's hostname fragment.
+        let kp_host = kp
+            .base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1")
+            .trim_end_matches('/');
+        for key in keys {
+            if key.base_url.contains(kp_host) {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: substring match against key name and base_url.
+    let provider_lower = provider.to_ascii_lowercase();
+    keys.iter().any(|key| {
+        key.name.to_ascii_lowercase().contains(&provider_lower)
+            || key.base_url.to_ascii_lowercase().contains(&provider_lower)
+    })
 }
 
 impl Default for SessionStore {

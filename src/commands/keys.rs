@@ -3044,6 +3044,26 @@ impl KeysCommand {
             if key_to_remove.base_url == crate::constants::AIVO_STARTER_SENTINEL {
                 let _ = self.session_store.set_starter_key_dismissed(true).await;
             }
+            // Purge orphan fallback entries referencing the deleted key's provider
+            if let Ok(orphaned) = self.session_store.purge_orphan_fallback_entries().await {
+                if !orphaned.is_empty() {
+                    // Group by fallback name for display
+                    let mut by_fb: std::collections::BTreeMap<&str, Vec<&str>> =
+                        std::collections::BTreeMap::new();
+                    for (fb_name, entry_str) in &orphaned {
+                        by_fb.entry(fb_name).or_default().push(entry_str);
+                    }
+                    for (fb_name, entries) in &by_fb {
+                        eprintln!(
+                            "  {} Removed {} orphaned entry(ies) from fallback '{}': {}",
+                            style::yellow("!"),
+                            entries.len(),
+                            fb_name,
+                            entries.join(", "),
+                        );
+                    }
+                }
+            }
             println!(
                 "{} Removed key: {}",
                 style::success_symbol(),

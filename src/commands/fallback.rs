@@ -82,6 +82,8 @@ impl FallbackCommand {
         let config = FallbackConfig::new(parsed);
         self.session_store.set_fallback(name.clone(), config).await?;
         println!("  {} Created fallback '{name}'", style::green("✓"));
+        // Warn about providers with no matching key
+        self.warn_missing_providers(&name).await?;
         Ok(())
     }
 
@@ -190,6 +192,7 @@ impl FallbackCommand {
 
         self.session_store.set_fallback(name.clone(), config.clone()).await?;
         println!("  {} Updated fallback '{name}'", style::green("✓"));
+        self.warn_missing_providers(&name).await?;
         Ok(())
     }
 
@@ -343,6 +346,25 @@ fn active_entries(config: &FallbackConfig, now: i64) -> Vec<&FallbackEntry> {
 }
 
 impl FallbackCommand {
+    /// Warn about providers in the named fallback that have no matching API key.
+    async fn warn_missing_providers(&self, fb_name: &str) -> Result<()> {
+        let fallbacks = self.session_store.get_fallbacks().await?;
+        let Some(config) = fallbacks.get(fb_name) else {
+            return Ok(());
+        };
+        for entry in &config.entries {
+            if !self.session_store.provider_has_key(&entry.provider).await? {
+                eprintln!(
+                    "  {} No API key found for provider '{}' (entry {}). This entry will fail at runtime.",
+                    style::yellow("!"),
+                    entry.provider,
+                    entry.to_provider_model(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn print_help() {
         println!("{} aivo fallback <action> [name] [entries...]", crate::style::bold("Usage:"));
         println!();
