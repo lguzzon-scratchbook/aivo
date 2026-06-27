@@ -30,9 +30,9 @@
     "semantic_hash": "7a04bc1780a259fbe18403922959af03"
   },
   "npm/package.json": {
-    "mtime": 1782576577.0494993,
-    "ast_hash": "08e883ecaedc73dffcbd1791adb16118",
-    "semantic_hash": "08e883ecaedc73dffcbd1791adb16118"
+    "mtime": 1782579373.4905035,
+    "ast_hash": "03307195900884d943d737851c06037a",
+    "semantic_hash": ""
   },
   "npm/scripts/postinstall.js": {
     "mtime": 1782508646.3317473,
@@ -370,9 +370,9 @@
     "semantic_hash": "7c8a0fa1c586898365c0ea3c4a939e68"
   },
   "src/run.rs": {
-    "mtime": 1782576600.168675,
-    "ast_hash": "801e971fa0afffb42f04876126f98954",
-    "semantic_hash": "801e971fa0afffb42f04876126f98954"
+    "mtime": 1782580001.0493038,
+    "ast_hash": "bd76d17ffd62d0660cce5b3a65f2d3cc",
+    "semantic_hash": ""
   },
   "src/services/account_store.rs": {
     "mtime": 1782508646.3477473,
@@ -990,9 +990,9 @@
     "semantic_hash": ""
   },
   "README.md": {
-    "mtime": 1782576577.0456471,
-    "ast_hash": "0671d72ed86076471d93a9e35be7cb8b",
-    "semantic_hash": "0671d72ed86076471d93a9e35be7cb8b"
+    "mtime": 1782580925.235105,
+    "ast_hash": "97d2517ed3e85216cb93c8c676a60413",
+    "semantic_hash": ""
   },
   "docs/PLUGIN-PROTOCOL.md": {
     "mtime": 1782508646.3317473,
