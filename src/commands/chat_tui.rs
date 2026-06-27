@@ -227,6 +227,7 @@ impl ChatTuiApp {
             turn_durations: std::collections::HashMap::new(),
             reasoning_started_at: None,
             reasoning_elapsed_ms: None,
+            installing_skill: None,
         })
     }
 }

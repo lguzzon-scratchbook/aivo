@@ -555,8 +555,37 @@ impl ChatTuiApp {
         source: String,
         only: Option<String>,
     ) -> Result<()> {
+        if self.installing_skill.is_some() {
+            self.notice = Some((WARNING, "A skill install is already running".to_string()));
+            return Ok(());
+        }
+        // Download + extract on a background task so the TUI doesn't freeze; the
+        // outcome arrives as `RuntimeEvent::SkillInstalled`.
+        self.installing_skill = Some((source.clone(), Instant::now()));
+        self.notice = None;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::agent::skills::install_from_source(&source, only.as_deref()).await;
+            tx.send(RuntimeEvent::SkillInstalled { source, result })
+                .ok();
+        });
+        // Close the add field so the in-overlay spinner row shows.
+        if matches!(self.overlay, Overlay::Skills(_)) {
+            self.open_skills_overlay().await?;
+        }
+        Ok(())
+    }
+
+    /// Apply a background install's outcome: enable the skills, drop the engine,
+    /// and reopen the `/skills` overlay unless another overlay is open.
+    pub(super) async fn apply_skill_installed(
+        &mut self,
+        source: String,
+        result: std::result::Result<crate::agent::skills::InstallOutcome, String>,
+    ) -> Result<()> {
         use crate::agent::skills::InstallOutcome;
-        match crate::agent::skills::install_from_source(&source, only.as_deref()).await {
+        self.installing_skill = None;
+        match result {
             Ok(InstallOutcome::Installed(names)) if names.is_empty() => {
                 self.notice = Some((WARNING, format!("No skills found in `{source}`")));
             }
@@ -580,7 +609,10 @@ impl ChatTuiApp {
             }
             Err(e) => self.notice = Some((ERROR, format!("Failed to install skill: {e}"))),
         }
-        self.open_skills_overlay().await
+        if matches!(self.overlay, Overlay::None | Overlay::Skills(_)) {
+            self.open_skills_overlay().await?;
+        }
+        Ok(())
     }
 
     /// Delete the skill at `index` (the overlay's confirmed `d`); resolves its

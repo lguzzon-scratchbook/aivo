@@ -525,6 +525,19 @@ impl ChatTuiApp {
             )));
         }
 
+        // Animated install row at the top while a background install runs.
+        if let Some((source, _)) = &self.installing_skill {
+            let spinner = spinner_frame_indexed(self.frame_tick, self.reduce_motion);
+            rows.insert(
+                0,
+                Line::from(Span::styled(
+                    format!("{spinner} Installing from {source}…"),
+                    Style::default().fg(ACCENT),
+                )),
+            );
+            selected_pos += 1; // the inserted row shifts the scroll anchor down one
+        }
+
         let detail = state
             .items
             .get(state.selected)

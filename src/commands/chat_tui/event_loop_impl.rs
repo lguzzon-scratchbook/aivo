@@ -147,6 +147,9 @@ impl ChatTuiApp {
                 exit_code,
                 truncated,
             } => self.finish_local_command(exit_code, truncated).await?,
+            RuntimeEvent::SkillInstalled { source, result } => {
+                self.apply_skill_installed(source, result).await?
+            }
         }
         Ok(())
     }

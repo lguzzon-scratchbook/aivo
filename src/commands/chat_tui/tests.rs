@@ -1097,6 +1097,7 @@ fn make_test_app(
         turn_durations: std::collections::HashMap::new(),
         reasoning_started_at: None,
         reasoning_elapsed_ms: None,
+        installing_skill: None,
     }
 }
 
@@ -6455,6 +6456,14 @@ async fn test_skills_add_routes_source_not_scaffold() {
     app.submit_skill_add("./aivo_no_such_skill_dir_zzz".to_string())
         .await
         .unwrap();
+    // Install runs on a background task now; drain its `SkillInstalled` outcome.
+    for _ in 0..1000 {
+        app.handle_runtime_events().await.unwrap();
+        if app.installing_skill.is_none() && app.notice.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     let notice = &app.notice.as_ref().unwrap().1;
     assert!(
         notice.contains("Failed to install") || notice.contains("not a directory"),

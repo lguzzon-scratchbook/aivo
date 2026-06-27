@@ -1392,6 +1392,11 @@ pub(super) enum RuntimeEvent {
         exit_code: i64,
         truncated: bool,
     },
+    /// A background `/skills add <source>` install finished, off the event loop.
+    SkillInstalled {
+        source: String,
+        result: std::result::Result<crate::agent::skills::InstallOutcome, String>,
+    },
 }
 
 /// A live in-process agent for the current chat, keyed by the (key, model) it
@@ -1723,4 +1728,6 @@ pub(super) struct ChatTuiApp {
     /// streaming so the displayed time excludes answer-streaming. `None` until the
     /// answer starts (the live timer runs from `reasoning_started_at` until then).
     pub(super) reasoning_elapsed_ms: Option<u64>,
+    /// In-flight `/skills add` install `(source, started)`; drives the spinner.
+    pub(super) installing_skill: Option<(String, Instant)>,
 }

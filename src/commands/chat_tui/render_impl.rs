@@ -419,6 +419,23 @@ impl ChatTuiApp {
     /// or `None` when idle. Rebuilt per frame and appended after the cached body
     /// so animation never invalidates the cache.
     pub(super) fn spinner_status_line(&self) -> Option<StyledLine> {
+        // A background skill install drives the status spinner when no turn or
+        // `!cmd` run owns it.
+        if !self.sending
+            && self.local_command.is_none()
+            && let Some((source, started)) = &self.installing_skill
+        {
+            let mut block = Vec::new();
+            render_pending_status(
+                &mut block,
+                self.frame_tick,
+                self.reduce_motion,
+                started.elapsed(),
+                &format!("Installing skill from {source}"),
+                "",
+            );
+            return block.into_iter().next();
+        }
         let started_at = if self.sending {
             self.request_started_at
         } else if let Some(run) = &self.local_command {

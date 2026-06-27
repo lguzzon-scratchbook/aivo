@@ -23,6 +23,7 @@ impl ChatTuiApp {
     pub(super) fn is_animating(&self) -> bool {
         self.sending
             || self.local_command.is_some()
+            || self.installing_skill.is_some()
             || !self.incoming_buffer.is_empty()
             || self.toast.is_some()
             || self.drag_autoscroll.is_some()
