@@ -1081,6 +1081,7 @@ fn make_test_app(
         agent_auto_approve: false,
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         thinking_enabled: true,
+        web_search_enabled: true,
         model_supports_thinking: true,
         model_image_input: None,
         reasoning_effort: None,

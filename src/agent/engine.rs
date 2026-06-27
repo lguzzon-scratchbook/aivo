@@ -367,6 +367,8 @@ pub struct AgentEngine {
     /// [`Self::thinking_request`] emit a disable signal instead of the level.
     /// Set per turn from the chat `/config` toggle.
     thinking_enabled: bool,
+    /// `/config` toggle for aivo's hosted web_search (the local tool); native search untouched.
+    use_web_search_enabled: bool,
     /// Whether this model can reason at all (from the model-limits snapshot).
     /// Cached at construction (the engine is rebuilt on model switch) so the
     /// disable path doesn't send an effort field to a model that would 400 on it.
@@ -426,7 +428,13 @@ impl AgentEngine {
         specs.push(plan::plan_tool_spec());
         specs.push(notes::note_tool_spec());
         specs.push(subagent_tool_spec(&[]));
-        let tools_openai = specs.into_iter().map(tool_to_openai).collect();
+        let mut tools_openai: Vec<Value> = specs.into_iter().map(tool_to_openai).collect();
+        // Layer A: providers with native search get the server tool (bridge-translated)
+        // instead of the local one — mutually exclusive.
+        if tools::native_web_search_enabled(model) {
+            tools_openai.retain(|t| t["function"]["name"].as_str() != Some("web_search"));
+            tools_openai.push(json!({ "type": "web_search" }));
+        }
         let messages = vec![json!({
             "role": "system",
             "content": system_prompt(cwd, date, guides, skills),
@@ -453,6 +461,7 @@ impl AgentEngine {
             reasoning_effort: default_reasoning_effort(model),
             reasoning_efforts: Vec::new(),
             thinking_enabled: true,
+            use_web_search_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
         }
@@ -480,6 +489,27 @@ impl AgentEngine {
     /// instead of the chosen level.
     pub fn set_thinking_enabled(&mut self, on: bool) {
         self.thinking_enabled = on;
+    }
+
+    /// `/config` toggle: add/remove the local hosted `web_search` tool. Idempotent;
+    /// a native-search model (which carries the server tool instead) is untouched.
+    pub fn set_web_search_enabled(&mut self, on: bool) {
+        self.use_web_search_enabled = on;
+        if tools::native_web_search_enabled(&self.model) {
+            return; // native models don't carry the local tool
+        }
+        let is_web_search = |t: &Value| t["function"]["name"].as_str() == Some("web_search");
+        let has = self.tools_openai.iter().any(is_web_search);
+        if on && !has {
+            if let Some(s) = tools::tool_specs()
+                .into_iter()
+                .find(|s| s.name == "web_search")
+            {
+                self.tools_openai.push(tool_to_openai(s));
+            }
+        } else if !on && has {
+            self.tools_openai.retain(|t| !is_web_search(t));
+        }
     }
 
     /// Set the catalog-advertised effort levels for this turn. See `reasoning_efforts`.
@@ -1805,6 +1835,8 @@ Re-run the full command without write confinement?",
             SUBAGENT_MAX_STEPS,
         );
         sub.drop_subagent_tool();
+        // Honor the parent's hosted-web-search opt-in/out in delegated work.
+        sub.set_web_search_enabled(self.use_web_search_enabled);
         // Carry the parent's reasoning effort into delegated work, but only when
         // it's a valid level for the sub's model (they may differ) — otherwise
         // keep the sub model's own default rather than risk sending a level the
@@ -2110,7 +2142,8 @@ and shell tools.\n\n\
 Match your effort to the request: answer simple questions or greetings directly, and only \
 reach for tools and project context when the task actually needs them — don't investigate or \
 read guide files just to say hello.\n\n\
-Bias toward doing. Your `run_bash` is a real shell with network access — fetch live data \
+Bias toward doing. To look things up on the web, use `web_search` to find pages and `web_fetch` \
+to read one. Your `run_bash` is a real shell with network access — fetch live data \
 (e.g. `curl wttr.in/<city>` for weather, web/HTTP APIs for other lookups), inspect the system, \
 run any command. If a command answers the request, run it instead of claiming you can't access \
 the internet or external services, explaining how the user could do it themselves, telling them it \
@@ -2357,6 +2390,23 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
+
+    #[test]
+    fn web_search_toggle_adds_and_removes_local_tool() {
+        let mut e = AgentEngine::new("/tmp", "deepseek-v4", "", &[], &[], 0, 0);
+        let has = |e: &AgentEngine| {
+            e.tools_openai
+                .iter()
+                .any(|t| t["function"]["name"].as_str() == Some("web_search"))
+        };
+        assert!(has(&e), "non-native model starts with web_search");
+        e.set_web_search_enabled(false);
+        assert!(!has(&e), "toggle off removes it");
+        e.set_web_search_enabled(false); // idempotent
+        assert!(!has(&e));
+        e.set_web_search_enabled(true);
+        assert!(has(&e), "toggle on re-adds it");
+    }
 
     #[test]
     fn test_resolve_max_steps() {

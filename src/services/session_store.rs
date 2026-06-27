@@ -731,6 +731,8 @@ pub struct ChatToggles {
     /// Whether the model is asked to think (and its reasoning shown, folded) — the
     /// single thinking on/off concept. Defaults on.
     pub thinking_enabled: bool,
+    /// aivo's hosted web_search (`/config`). Defaults off (opt-in).
+    pub web_search_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1831,6 +1833,19 @@ impl SessionStore {
         self.write_chat_prefs(&prefs).await
     }
 
+    /// "use aivo's hosted web_search" toggle (`/config`). Defaults OFF (opt-in) —
+    /// enabling routes searches through aivo's gateway and uses the daily quota.
+    pub async fn get_chat_web_search_enabled(&self) -> bool {
+        self.get_chat_pref_bool("useWebSearch", false).await
+    }
+
+    /// Persist the web_search toggle, preserving sibling prefs (atomic write).
+    pub async fn set_chat_web_search_enabled(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_chat_prefs().await;
+        prefs.insert("useWebSearch".into(), serde_json::Value::Bool(on));
+        self.write_chat_prefs(&prefs).await
+    }
+
     /// The persisted `/effort` reasoning level for `model` (remembered across
     /// `aivo chat` sessions). Effort levels are model-specific, so they're stored
     /// per-model under `reasoningEffort: {<model>: <level>}` in chat-prefs.json.
@@ -1888,6 +1903,7 @@ impl SessionStore {
         ChatToggles {
             auto_approve: bool_or("autoApprove", false),
             thinking_enabled,
+            web_search_enabled: bool_or("useWebSearch", false),
         }
     }
 

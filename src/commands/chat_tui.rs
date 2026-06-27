@@ -94,6 +94,7 @@ impl ChatTuiApp {
         let crate::services::session_store::ChatToggles {
             auto_approve,
             thinking_enabled,
+            web_search_enabled,
         } = params.session_store.get_chat_toggles().await;
         // Move any pre-existing `/skills` + `/mcp` opt-outs out of config.json (where
         // a routine key/route/selection write — or an older aivo binary — can drop
@@ -207,6 +208,7 @@ impl ChatTuiApp {
                 auto_approve,
             )),
             thinking_enabled,
+            web_search_enabled,
             // Set by `refresh_context_window` (called right after construction and
             // on every model switch); false until the first resolve.
             model_supports_thinking: false,

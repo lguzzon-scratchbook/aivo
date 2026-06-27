@@ -710,6 +710,8 @@ impl ChatTuiApp {
         // Thinking on/off, carried in per turn like the effort; off makes the engine
         // emit the provider-correct disable signal.
         let thinking_enabled = self.thinking_enabled;
+        // `/config` "use aivo web search" toggle, applied like thinking each turn.
+        let web_search_enabled = self.web_search_enabled;
         // The model's catalog effort levels, so the engine's disable path only sends
         // a level the provider accepts (e.g. `aivo/starter` has no `none`).
         let reasoning_efforts = self.model_reasoning_efforts.clone();
@@ -727,6 +729,7 @@ impl ChatTuiApp {
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
             engine.set_thinking_enabled(thinking_enabled);
+            engine.set_web_search_enabled(web_search_enabled);
             engine.set_reasoning_efforts(reasoning_efforts);
             if let Some(effort) = reasoning_effort {
                 engine.set_reasoning_effort(effort);

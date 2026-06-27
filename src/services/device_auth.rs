@@ -90,6 +90,9 @@ pub struct UsageLimits {
     pub rpd: Option<u64>,
     #[serde(default)]
     pub tpd: Option<u64>,
+    /// Hosted web searches/day cap.
+    #[serde(default)]
+    pub spd: Option<u64>,
 }
 
 /// One row of the per-model usage breakdown (current 24h window).
@@ -132,6 +135,11 @@ pub struct UsageSummary {
     pub by_model: Vec<UsageModelRow>,
     #[serde(default)]
     pub window_resets_at: Option<String>,
+    /// Hosted web search: today's count + lifetime total.
+    #[serde(default)]
+    pub searches: u64,
+    #[serde(default)]
+    pub searches_total: u64,
 }
 
 /// Body of `/api/device/usage`: a `linked` discriminator over a `UsageSummary`.
@@ -464,9 +472,10 @@ mod tests {
         let json = r#"{
             "linked":true,"plan":"aivo-pro","billing_mode":"subscription","is_pro":true,
             "subscription":{"status":"active","current_period_end":"2026-07-26T00:00:00Z"},
-            "limits":{"rpm":30,"rpd":1000,"tpd":100000},
+            "limits":{"rpm":30,"rpd":1000,"tpd":100000,"spd":10},
             "rpd":120,"tpd":45000,"rpm":3,
             "requests_total":8490,"tokens_total":2100000,"linked_devices":2,
+            "searches":4,"searches_total":37,
             "by_model":[{"model":"claude","tokens":1500000,"requests":4200}],
             "window_resets_at":"2026-06-27T14:32:00Z"
         }"#;
@@ -476,9 +485,12 @@ mod tests {
         assert_eq!(u.plan.as_deref(), Some("aivo-pro"));
         assert!(u.is_pro);
         assert_eq!(u.limits.rpd, Some(1000));
+        assert_eq!(u.limits.spd, Some(10));
         assert_eq!(u.rpd, 120);
         assert_eq!(u.tokens_total, 2_100_000);
         assert_eq!(u.linked_devices, 2);
+        assert_eq!(u.searches, 4);
+        assert_eq!(u.searches_total, 37);
         assert_eq!(u.by_model.len(), 1);
         assert_eq!(u.by_model[0].model, "claude");
         assert_eq!(u.window_resets_at.as_deref(), Some("2026-06-27T14:32:00Z"));

@@ -290,6 +290,12 @@ fn print_usage(s: &UsageSummary) {
             colorize_unit(&format_human(s.tokens_total))
         ));
     }
+    if s.searches_total > 0 {
+        parts.push(format!(
+            "{} searches",
+            colorize_unit(&format_human(s.searches_total))
+        ));
+    }
     if let Some(ts) = &s.window_resets_at {
         parts.push(format!("resets {}", humanize_reset(ts)));
     }
@@ -300,6 +306,7 @@ fn print_usage(s: &UsageSummary) {
     let meters = [
         ("Requests", s.rpd, s.limits.rpd),
         ("Tokens", s.tpd, s.limits.tpd),
+        ("Searches", s.searches, s.limits.spd),
         ("RPM", s.rpm, s.limits.rpm),
     ];
     let name_w = meters

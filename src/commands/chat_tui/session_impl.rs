@@ -338,6 +338,11 @@ impl ChatTuiApp {
                 label: "Auto-approve tools",
                 description: "run write/edit/bash without asking (Shift+Tab)",
             },
+            ConfigToggle {
+                setting: ConfigSetting::UseWebSearch,
+                label: "aivo web search",
+                description: "let the agent search the web via aivo (daily quota)",
+            },
         ];
         self.overlay = Overlay::Config(ConfigOverlay { items, selected: 0 });
     }
@@ -348,6 +353,7 @@ impl ChatTuiApp {
         match setting {
             ConfigSetting::Thinking => self.thinking_enabled,
             ConfigSetting::AutoApprove => self.agent_auto_approve,
+            ConfigSetting::UseWebSearch => self.web_search_enabled,
         }
     }
 
@@ -365,6 +371,9 @@ impl ChatTuiApp {
             ConfigSetting::Thinking => self.set_thinking_enabled(!self.thinking_enabled).await,
             // Reuse the shared setter so the live atomic + toast stay in lockstep.
             ConfigSetting::AutoApprove => self.set_auto_approve(!self.agent_auto_approve),
+            ConfigSetting::UseWebSearch => {
+                self.set_web_search_enabled(!self.web_search_enabled).await
+            }
         }
     }
 
@@ -380,6 +389,20 @@ impl ChatTuiApp {
         self.thinking_enabled = on;
         self.show_toast(if on { "Thinking on" } else { "Thinking off" });
         let _ = self.session_store.set_chat_thinking_enabled(on).await;
+    }
+
+    /// Set the aivo-web-search flag and persist it; the engine applies it next turn.
+    pub(super) async fn set_web_search_enabled(&mut self, on: bool) {
+        if self.web_search_enabled == on {
+            return;
+        }
+        self.web_search_enabled = on;
+        self.show_toast(if on {
+            "aivo web search on"
+        } else {
+            "aivo web search off — the agent won't search via aivo"
+        });
+        let _ = self.session_store.set_chat_web_search_enabled(on).await;
     }
 
     /// `/skills`: discover the agent skills available for the working dir and show

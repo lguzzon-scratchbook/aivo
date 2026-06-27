@@ -543,6 +543,8 @@ pub(super) enum ConfigSetting {
     Thinking,
     /// Run the agent's tools without asking (mirrors the Shift+Tab toggle).
     AutoApprove,
+    /// Whether the agent may use aivo's hosted web_search (`/v1/search`).
+    UseWebSearch,
 }
 
 /// One row in the `/config` overlay: a boolean preference with a label and a
@@ -1669,6 +1671,8 @@ pub(super) struct ChatTuiApp {
     /// Anthropic upstreams (so off truly stops reasoning, not just hides it).
     /// Toggled in `/config`, remembered across sessions.
     pub(super) thinking_enabled: bool,
+    /// aivo's hosted web_search; `/config` toggle, applied to the engine each turn.
+    pub(super) web_search_enabled: bool,
     /// Whether the current model is known to support reasoning/thinking (from the
     /// model-limits snapshot). Cached on each model resolve (see
     /// `refresh_context_window`); gates the footer effort badge so it only shows
