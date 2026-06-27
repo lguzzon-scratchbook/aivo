@@ -409,3 +409,39 @@ impl FallbackCommand {
         println!("  Entries are tried in order until one succeeds.");
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::session_store::{FallbackEntry, FallbackConfig};
+
+    #[tokio::test]
+    async fn filter_entries_by_provider_keeps_only_matching() {
+        let store = crate::services::SessionStore::with_path(
+            std::env::temp_dir().join("test-fallback-filter.json"),
+        );
+        let cmd = super::FallbackCommand::new(store);
+
+        let entries = vec![
+            FallbackEntry::new("nonexistent-provider".into(), "m1".into()),
+            FallbackEntry::new("another-missing".into(), "m2".into()),
+        ];
+        let (kept, removed) = cmd.filter_entries_by_provider(entries).await.unwrap();
+        assert!(kept.is_empty(), "no keys exist, so all entries should be filtered out");
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&"nonexistent-provider:m1".to_string()));
+        assert!(removed.contains(&"another-missing:m2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn filter_entries_by_provider_handles_empty() {
+        let store = crate::services::SessionStore::with_path(
+            std::env::temp_dir().join("test-fallback-filter2.json"),
+        );
+        let cmd = super::FallbackCommand::new(store);
+        let (kept, removed) = cmd.filter_entries_by_provider(vec![]).await.unwrap();
+        assert!(kept.is_empty());
+        assert!(removed.is_empty());
+    }
+}

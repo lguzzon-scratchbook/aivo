@@ -3872,4 +3872,155 @@ mod tests {
         assert_eq!(decoded.key.as_str(), "sk-roundtrip-secret");
         assert_eq!(decoded, key);
     }
+
+
+    // ── Fallback entry parsing ──────────────────────────────────────────
+
+    #[test]
+    fn fallback_entry_parse_valid() {
+        let e = FallbackEntry::parse("openai:gpt-4o").unwrap();
+        assert_eq!(e.provider, "openai");
+        assert_eq!(e.model, "gpt-4o");
+
+        let e = FallbackEntry::parse("  anthropic  :  claude-sonnet-4-5  ").unwrap();
+        assert_eq!(e.provider, "anthropic");
+        assert_eq!(e.model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn fallback_entry_parse_no_colon() {
+        assert!(FallbackEntry::parse("justamodel").is_none());
+    }
+
+    #[test]
+    fn fallback_entry_parse_colon_in_provider() {
+        assert!(FallbackEntry::parse("bad:provider:model-x").is_none());
+    }
+
+    #[test]
+    fn fallback_entry_parse_space_in_model() {
+        assert!(FallbackEntry::parse("openai:bad model").is_none());
+    }
+
+    #[test]
+    fn fallback_entry_parse_empty() {
+        assert!(FallbackEntry::parse(":").is_none());
+        assert!(FallbackEntry::parse("provider:").is_none());
+        assert!(FallbackEntry::parse(":model").is_none());
+    }
+
+    #[test]
+    fn fallback_entry_to_provider_model_roundtrip() {
+        let e = FallbackEntry::new("openai".into(), "gpt-4o".into());
+        assert_eq!(e.to_provider_model(), "openai:gpt-4o");
+    }
+
+    // ── Fallback exclusion expiry ───────────────────────────────────────
+
+    #[test]
+    fn fallback_exclusion_is_expired() {
+        let ex = FallbackExclusion {
+            provider: "o".into(), model: "m".into(),
+            reason: "fail".into(), excluded_at: 100,
+            expires_at: Some(200),
+        };
+        assert!(ex.is_expired(250));   // past expiry
+        assert!(!ex.is_expired(150));  // before expiry
+        assert!(ex.is_expired(200));   // exactly at expiry (code uses >=)
+    }
+
+    #[test]
+    fn fallback_exclusion_indefinite_never_expires() {
+        let ex = FallbackExclusion {
+            provider: "o".into(), model: "m".into(),
+            reason: "fail".into(), excluded_at: 100,
+            expires_at: None,
+        };
+        assert!(!ex.is_expired(0));
+        assert!(!ex.is_expired(i64::MAX));
+    }
+
+    #[test]
+    fn fallback_exclusion_provider_model() {
+        let ex = FallbackExclusion {
+            provider: "openai".into(), model: "gpt-4o".into(),
+            reason: "exit 1".into(), excluded_at: 100,
+            expires_at: None,
+        };
+        assert_eq!(ex.provider_model(), "openai:gpt-4o");
+    }
+
+    // ── Provider matching ───────────────────────────────────────────────
+
+    fn test_key(name: &str, base_url: &str) -> ApiKey {
+        ApiKey::new_with_protocol(
+            "id".into(), name.into(), base_url.into(), None, "sk-test".into(),
+        )
+    }
+
+    #[test]
+    fn provider_has_matching_key_known_provider_match() {
+        // "openai" is a known provider; key base_url contains api.openai.com
+        let keys = vec![test_key("my-openai-key", "https://api.openai.com/v1")];
+        assert!(provider_has_matching_key("openai", &keys));
+    }
+
+    #[test]
+    fn provider_has_matching_key_known_provider_via_substring_input() {
+        // "my-openrouter-key" → known_providers sees "openrouter" 
+        // key base_url matches openrouter's domain
+        let keys = vec![test_key("work", "https://openrouter.ai/api/v1")];
+        // The provider name IS the key name's substring
+        assert!(provider_has_matching_key("openrouter", &keys));
+    }
+
+    #[test]
+    fn provider_has_matching_key_name_substring_fallback() {
+        // No known provider match → fallback to key name substring
+        let keys = vec![test_key("my-custom-llm", "https://custom.example.com")];
+        assert!(provider_has_matching_key("custom-llm", &keys));
+    }
+
+    #[test]
+    fn provider_has_matching_key_base_url_substring_fallback() {
+        // No known provider match → fallback to base_url substring
+        let keys = vec![test_key("my-key", "https://custom.example.com/v1")];
+        assert!(provider_has_matching_key("custom.example", &keys));
+    }
+
+    #[test]
+    fn provider_has_matching_key_no_match() {
+        let keys = vec![test_key("my-key", "https://api.openai.com/v1")];
+        assert!(!provider_has_matching_key("nonexistent-provider", &keys));
+    }
+
+    #[test]
+    fn provider_has_matching_key_empty_provider() {
+        let keys = vec![test_key("my-key", "https://api.openai.com/v1")];
+        assert!(!provider_has_matching_key("", &keys));
+    }
+
+    #[test]
+    fn provider_has_matching_key_empty_keys() {
+        assert!(!provider_has_matching_key("openai", &[]));
+    }
+
+    #[test]
+    fn provider_has_matching_key_case_insensitive() {
+        let keys = vec![test_key("My-OpenAI-Key", "https://api.openai.com/v1")];
+        assert!(provider_has_matching_key("OPENAI", &keys));
+    }
+
+    #[test]
+    fn fallback_config_new() {
+        let entries = vec![
+            FallbackEntry::new("a".into(), "m1".into()),
+            FallbackEntry::new("b".into(), "m2".into()),
+        ];
+        let cfg = FallbackConfig::new(entries.clone());
+        assert_eq!(cfg.entries, entries);
+        assert_eq!(cfg.last_used, None);
+        assert!(cfg.exclusions.is_empty());
+    }
+
 }
