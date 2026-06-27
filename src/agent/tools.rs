@@ -284,6 +284,17 @@ pub fn is_dangerous(name: &str, args: &Value, cwd: &Path) -> bool {
     }
 }
 
+/// A hard floor under [`is_dangerous`]: an unrecoverable `run_bash` command (see
+/// [`bash_is_catastrophic`]) the engine confirms even under auto-approve.
+pub fn is_catastrophic(name: &str, args: &Value) -> bool {
+    name == "run_bash"
+        && args
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(bash_is_catastrophic)
+            .unwrap_or(false)
+}
+
 /// True when a path resolves outside the working directory (absolute elsewhere,
 /// `..` traversal, or **through a symlink** that points out of the project) —
 /// editing outside the project is worth confirming.
@@ -349,6 +360,11 @@ const INTERPRETERS: &[&str] = &[
     "ruby", "perl", "php", "pwsh",
 ];
 
+/// `/dev/` entries harmless to write to; anything else is a real device.
+const SAFE_DEVICES: &[&str] = &[
+    "null", "zero", "stdin", "stdout", "stderr", "tty", "fd", "full", "random", "urandom",
+];
+
 /// Detects destructive shell commands that should be confirmed before running
 /// (and highlighted ⚠ in the card). Best-effort and advisory — a heuristic, not
 /// a sandbox: it tokenizes per simple-command (so flag order / extra spaces
@@ -411,13 +427,190 @@ pub fn bash_looks_destructive(cmd: &str) -> bool {
     redirects_to_real_device(&lower)
 }
 
+/// The un-waivable core under [`bash_looks_destructive`]: commands that are
+/// unrecoverable or system-wide. Deliberately FAR narrower — a workspace-local
+/// `rm -rf ./build` must stay out, or unattended (`/goal`, `-y`) runs break.
+fn bash_is_catastrophic(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+
+    // Fork bomb, in either canonical spacing.
+    if lower
+        .split_whitespace()
+        .collect::<String>()
+        .contains(":(){:|:&};:")
+    {
+        return true;
+    }
+
+    for seg in lower.split(['\n', ';', '|', '&']) {
+        let all: Vec<&str> = seg.split_whitespace().collect();
+        let tokens = effective_command(&all); // see-through `sudo`/`env`/`nice`
+        let Some(&cmd0) = tokens.first() else {
+            continue;
+        };
+        let base = cmd0.rsplit('/').next().unwrap_or(cmd0);
+        // `sh -c 'rm -rf /'` hides the real command in a quoted arg — rescan it.
+        if INTERPRETERS.contains(&base)
+            && interpreter_inline_code(seg).is_some_and(|inner| bash_is_catastrophic(&inner))
+        {
+            return true;
+        }
+        let hit = match base {
+            "rm" => {
+                has_short_or_long(tokens, &['r'], &["recursive"])
+                    && tokens.iter().skip(1).any(|t| is_root_or_home_target(t))
+            }
+            b if b == "mkfs" || b.starts_with("mkfs.") => true,
+            "dd" => tokens
+                .iter()
+                .any(|t| t.strip_prefix("of=").is_some_and(is_raw_device_path)),
+            "chmod" | "chown" | "chgrp" => {
+                has_short_or_long(tokens, &['r'], &["recursive"])
+                    && tokens.iter().skip(1).any(|t| *t == "/")
+            }
+            "shutdown" | "reboot" | "halt" | "poweroff" => true,
+            "init" => matches!(tokens.get(1), Some(&"0") | Some(&"6")),
+            _ => false,
+        };
+        if hit || windows_seg_is_catastrophic(tokens) {
+            return true;
+        }
+    }
+
+    redirects_to_real_device(&lower) // `cat img > /dev/sda`
+}
+
+/// Windows half of [`bash_is_catastrophic`]: `run_bash` shells through PowerShell,
+/// which the POSIX walk misses. Tokens are lowercased (cmd/PowerShell are
+/// case-insensitive).
+fn windows_seg_is_catastrophic(tokens: &[&str]) -> bool {
+    let Some(&cmd0) = tokens.first() else {
+        return false;
+    };
+    let base = cmd0.rsplit(['\\', '/']).next().unwrap_or(cmd0);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".com"))
+        .unwrap_or(base);
+    let args = &tokens[1..];
+    match base {
+        "format-volume" | "clear-disk" | "stop-computer" | "restart-computer" => true,
+        "format" => args.iter().any(|a| is_windows_root_target(a)),
+        "cipher" => args.iter().any(|a| a.starts_with("/w")), // wipe free space
+        // Recursive delete of a root — aliases ri/rm/del/erase/rd/rmdir all map to
+        // Remove-Item; recurse is `/s` (cmd) or `-recurse`/`-r` (PowerShell).
+        "remove-item" | "ri" | "rm" | "del" | "erase" | "rd" | "rmdir" => {
+            let recursive = args
+                .iter()
+                .any(|a| *a == "/s" || *a == "-r" || a.starts_with("-rec"));
+            recursive && args.iter().any(|a| is_windows_root_target(a))
+        }
+        _ => false,
+    }
+}
+
+/// A Windows drive/home/system root (`C:\`, `\`, `~`, `$env:`/`%…%`) whose
+/// recursive deletion is unrecoverable. A subpath is not matched.
+fn is_windows_root_target(arg: &str) -> bool {
+    let trimmed = arg.trim_end_matches(['*', '\\', '/']);
+    // "<letter>:" drive root.
+    if let [letter, b':'] = trimmed.as_bytes()
+        && letter.is_ascii_alphabetic()
+    {
+        return true;
+    }
+    // Root of the current drive (`\`, `/`) — but not a bare `*`.
+    if trimmed.is_empty() && (arg.starts_with('\\') || arg.starts_with('/')) {
+        return true;
+    }
+    matches!(
+        trimmed,
+        "~" | "$home"
+            | "${home}"
+            | "$env:systemdrive"
+            | "$env:userprofile"
+            | "$env:homedrive"
+            | "$env:systemroot"
+            | "$env:windir"
+            | "%systemdrive%"
+            | "%userprofile%"
+            | "%homedrive%"
+            | "%systemroot%"
+            | "%windir%"
+    )
+}
+
+/// Strip a leading privilege/env/scheduling wrapper so `sudo rm -rf /` and
+/// `env X=1 rm -rf /` classify as `rm -rf /`. Best-effort.
+fn effective_command<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut rest = tokens;
+    loop {
+        let Some((&head, tail)) = rest.split_first() else {
+            return rest;
+        };
+        match head.rsplit('/').next().unwrap_or(head) {
+            "sudo" | "doas" => {
+                rest = tail;
+                while let Some((&t, tl)) = rest.split_first() {
+                    let Some(flag) = t.strip_prefix('-').filter(|s| !s.is_empty()) else {
+                        break; // first non-option token is the wrapped command
+                    };
+                    rest = tl;
+                    if t == "--" {
+                        break;
+                    }
+                    // -u/-g/-p/-C/-h/-r/-t (and --long forms) take an argument.
+                    if matches!(
+                        flag.chars().last(),
+                        Some('u' | 'g' | 'p' | 'c' | 'h' | 'r' | 't')
+                    ) {
+                        rest = rest.split_first().map_or(rest, |(_, tl)| tl);
+                    }
+                }
+            }
+            "env" => {
+                rest = tail;
+                while let Some((&t, tl)) = rest.split_first() {
+                    if !t.starts_with('-') && t.contains('=') {
+                        rest = tl;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" | "nohup" | "stdbuf" | "ionice" | "time" => rest = tail,
+            _ => return rest,
+        }
+    }
+}
+
+/// An `rm` target whose recursive deletion is unrecoverable — `/`, `~`, `$HOME`,
+/// or the whole cwd (`.`), with or without a trailing `/` or `/*`. A workspace
+/// subpath (`./build`, `~/Documents`) is not matched. `arg` arrives lowercased.
+fn is_root_or_home_target(arg: &str) -> bool {
+    let base = arg.strip_suffix("/*").unwrap_or(arg).trim_end_matches('/');
+    if arg.starts_with('/') && base.is_empty() {
+        return true; // "/", "//", "/*"
+    }
+    matches!(base, "~" | "$home" | "${home}" | ".")
+}
+
+/// A real `/dev/` block device (`/dev/sda`) vs. a harmless pseudo-device.
+fn is_raw_device_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/dev/") else {
+        return false;
+    };
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    !name.is_empty() && !SAFE_DEVICES.contains(&name.as_str())
+}
+
 /// True when the command redirects output (`>`/`>>`, optionally with a leading fd
 /// like `2>`) onto a `/dev/` entry that is NOT a harmless pseudo-device. Writing
 /// to `/dev/sda` overwrites a disk; `2>/dev/null` is everyday noise-suppression.
 fn redirects_to_real_device(cmd: &str) -> bool {
-    const SAFE_DEVICES: &[&str] = &[
-        "null", "zero", "stdin", "stdout", "stderr", "tty", "fd", "full", "random", "urandom",
-    ];
     let mut search = cmd;
     while let Some(pos) = search.find("/dev/") {
         // Only a write redirection counts: the bytes just before `/dev/` must end
@@ -2056,6 +2249,90 @@ mod tests {
         assert!(bash_looks_destructive("dd if=/dev/zero of=/dev/sda")); // dd already gated
         assert!(bash_looks_destructive("cat img.iso > /dev/sda"));
         assert!(bash_looks_destructive("echo x >/dev/nvme0n1"));
+    }
+
+    #[test]
+    fn catastrophic_hard_floor() {
+        assert!(bash_is_catastrophic("rm -rf /"));
+        assert!(bash_is_catastrophic("rm -rf /*"));
+        assert!(bash_is_catastrophic("rm -rf ~"));
+        assert!(bash_is_catastrophic("rm -rf ~/*"));
+        assert!(bash_is_catastrophic("rm -fr ~/"));
+        assert!(bash_is_catastrophic("rm -rf $HOME"));
+        assert!(bash_is_catastrophic("rm -rf ${HOME}/*"));
+        assert!(bash_is_catastrophic("rm -rf .")); // the whole workspace
+        assert!(bash_is_catastrophic("rm --recursive --force /"));
+        assert!(bash_is_catastrophic("sudo rm -rf --no-preserve-root /"));
+        // Hidden inside an interpreter wrapper.
+        assert!(bash_is_catastrophic("sh -c 'rm -rf /'"));
+        // Format / overwrite a disk, fork bomb, recursive perms on `/`, power off.
+        assert!(bash_is_catastrophic("mkfs.ext4 /dev/sda1"));
+        assert!(bash_is_catastrophic("mkfs /dev/sdb"));
+        assert!(bash_is_catastrophic("dd if=/dev/zero of=/dev/sda"));
+        assert!(bash_is_catastrophic("cat img.iso > /dev/nvme0n1"));
+        assert!(bash_is_catastrophic(":(){ :|: & };:"));
+        assert!(bash_is_catastrophic(":() { :|:& };:"));
+        assert!(bash_is_catastrophic("chmod -R 777 /"));
+        assert!(bash_is_catastrophic("chown -R root /"));
+        assert!(bash_is_catastrophic("shutdown -h now"));
+        assert!(bash_is_catastrophic("sudo reboot"));
+        assert!(bash_is_catastrophic("init 0"));
+
+        // The whole point: workspace-local destruction stays WAIVABLE (must NOT
+        // be in the floor, or `/goal` / `-y` runs break). These are still caught
+        // by the confirm-tier `bash_looks_destructive`.
+        assert!(!bash_is_catastrophic("rm -rf ./build"));
+        assert!(!bash_is_catastrophic("rm -rf target"));
+        assert!(!bash_is_catastrophic("rm -rf ~/Documents")); // specific subdir
+        assert!(!bash_is_catastrophic("rm -rf /tmp/scratch"));
+        assert!(!bash_is_catastrophic("rm -f /etc/hosts")); // not recursive
+        assert!(!bash_is_catastrophic("chmod -R 755 ./src")); // not the fs root
+        assert!(!bash_is_catastrophic("chown -R me:me .")); // not the fs root
+        assert!(!bash_is_catastrophic("dd if=disk.img of=./out.img")); // file copy
+        assert!(!bash_is_catastrophic("cat /dev/urandom | head -c 16")); // read
+        assert!(!bash_is_catastrophic("echo done > /dev/null"));
+        assert!(!bash_is_catastrophic("init_db.sh")); // not the `init` command
+        assert!(!bash_is_catastrophic("cargo build"));
+
+        // The public wrapper only fires for run_bash.
+        assert!(is_catastrophic(
+            "run_bash",
+            &json!({ "command": "rm -rf /" })
+        ));
+        assert!(!is_catastrophic("run_bash", &json!({ "command": "ls" })));
+        assert!(!is_catastrophic(
+            "write_file",
+            &json!({ "path": "/", "content": "" })
+        ));
+    }
+
+    #[test]
+    fn catastrophic_floor_windows() {
+        assert!(bash_is_catastrophic("Format-Volume -DriveLetter C"));
+        assert!(bash_is_catastrophic("Clear-Disk -Number 0"));
+        assert!(bash_is_catastrophic("format.com C:"));
+        assert!(bash_is_catastrophic("format C: /q"));
+        assert!(bash_is_catastrophic("cipher /w:C"));
+        assert!(bash_is_catastrophic("Stop-Computer"));
+        assert!(bash_is_catastrophic("Restart-Computer -Force"));
+        // Recursive delete of a drive / home / system root, every alias + style.
+        assert!(bash_is_catastrophic("Remove-Item -Recurse -Force C:\\"));
+        assert!(bash_is_catastrophic("rm -r -fo C:\\"));
+        assert!(bash_is_catastrophic("ri -Recurse $env:SystemDrive"));
+        assert!(bash_is_catastrophic("del /f /s /q C:\\*"));
+        assert!(bash_is_catastrophic("rd /s /q D:\\"));
+        assert!(bash_is_catastrophic("rmdir /s /q %SystemDrive%"));
+        assert!(bash_is_catastrophic("Remove-Item -Recurse ~"));
+
+        // Workspace-local / read-only work stays waivable.
+        assert!(!bash_is_catastrophic(
+            "Remove-Item -Recurse -Force .\\build"
+        ));
+        assert!(!bash_is_catastrophic("del /q out.txt")); // not recursive
+        assert!(!bash_is_catastrophic("rd /s /q .\\node_modules")); // subpath
+        assert!(!bash_is_catastrophic("format-hex file.bin")); // not Format-Volume
+        assert!(!bash_is_catastrophic("Get-ChildItem C:\\")); // read-only
+        assert!(!bash_is_catastrophic("cipher /e .\\secret")); // encrypt, not /w
     }
 
     #[test]

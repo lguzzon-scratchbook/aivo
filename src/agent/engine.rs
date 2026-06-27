@@ -1155,21 +1155,31 @@ Investigate with read-only tools and write the implementation plan instead."
                     .external
                     .as_ref()
                     .is_some_and(|e| e.requires_approval(&call.name));
+            // A hard floor: an unrecoverable command (wipe `/`, format a disk, …) is
+            // confirmed even under auto-approve, and never remembered. Off a TTY
+            // `ask_permission` fails closed. See tools::is_catastrophic.
+            let catastrophic = tools::is_catastrophic(&call.name, &call.arguments);
             let pkey = permission_key(&call.name, &call.arguments);
-            let allowed =
-                if !needs_confirm || ctx.auto_approve_enabled() || self.always.contains(&pkey) {
-                    true
-                } else {
-                    let preview = tools::preview(&call.name, &call.arguments);
-                    match ui.ask_permission(&call.name, preview.as_deref()).await {
-                        Decision::Allow => true,
-                        Decision::AlwaysAllow => {
-                            self.always.insert(pkey);
-                            true
-                        }
-                        Decision::Deny => false,
+            let allowed = if catastrophic {
+                let preview = tools::preview(&call.name, &call.arguments);
+                // Allow and AlwaysAllow both run it once only — never persisted.
+                !matches!(
+                    ui.ask_permission(&call.name, preview.as_deref()).await,
+                    Decision::Deny
+                )
+            } else if !needs_confirm || ctx.auto_approve_enabled() || self.always.contains(&pkey) {
+                true
+            } else {
+                let preview = tools::preview(&call.name, &call.arguments);
+                match ui.ask_permission(&call.name, preview.as_deref()).await {
+                    Decision::Allow => true,
+                    Decision::AlwaysAllow => {
+                        self.always.insert(pkey);
+                        true
                     }
-                };
+                    Decision::Deny => false,
+                }
+            };
             if !allowed {
                 outcomes[i] = Some(Err("denied by user".to_string()));
                 continue;
@@ -2715,6 +2725,57 @@ mod tests {
         assert_eq!(ui.text, "done");
         assert!(dir.join("out.txt").exists());
         assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "hi");
+    }
+
+    /// `rm -rf /` prompts even with auto-approve on (`turn_ctx` sets `yes: true`).
+    /// The mock denies, so it never runs.
+    #[tokio::test]
+    async fn catastrophic_command_prompts_even_under_auto_approve() {
+        let dir = tmp();
+        let bash = tool_call_sse("run_bash", json!({ "command": "rm -rf /" }));
+        let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi {
+            deny: true, // never let a real `rm -rf /` execute
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir), // yes: true → auto-approve on
+            Some("clean up".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(ui.ask_tools, vec!["run_bash"]); // asked despite auto-approve
+    }
+
+    /// Contrast: a workspace-local `rm -rf ./build` is not in the floor, so
+    /// auto-approve waives it. The path doesn't exist, so running it is a no-op.
+    #[tokio::test]
+    async fn auto_approve_waives_workspace_local_destructive() {
+        let dir = tmp();
+        let bash = tool_call_sse(
+            "run_bash",
+            json!({ "command": "rm -rf ./build_does_not_exist" }),
+        );
+        let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir), // yes: true → auto-approve on
+            Some("clean build dir".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(ui.asks, 0); // waived — no prompt
+        assert!(ui.tools.contains(&"run_bash".to_string())); // and it ran
     }
 
     /// A `run_bash` call the sandbox blocks (a write outside the workspace)
