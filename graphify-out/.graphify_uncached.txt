@@ -1,0 +1,5 @@
+/home/lguzzon/DEVs/GITs/GITHUBs/aivo/.beads/README.md
+/home/lguzzon/DEVs/GITs/GITHUBs/aivo/.beads/config.yaml
+/home/lguzzon/DEVs/GITs/GITHUBs/aivo/AGENTS.md
+/home/lguzzon/DEVs/GITs/GITHUBs/aivo/CLAUDE.md
+/home/lguzzon/DEVs/GITs/GITHUBs/aivo/GOALS.md

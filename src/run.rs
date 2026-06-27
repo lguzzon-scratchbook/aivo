@@ -894,6 +894,7 @@ fn print_help() {
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
+    print_cmd("fallback", "Manage fallback provider:model definitions");
     print_cmd("hf", "Manage cached HuggingFace GGUF files");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");

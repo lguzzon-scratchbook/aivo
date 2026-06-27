@@ -71,7 +71,21 @@ aivo opencode --debug                        # JSONL log of upstream HTTP traffi
 ```
 
 
-Without a tool name, `aivo run` opens the tool picker — native agents and installed coding-agent plugins.
+## run
+
+Launch a coding agent. Tool name is optional — aivo picks the last-used tool when given none.
+
+```bash
+aivo run claude                          # launch claude
+aivo run                                 # tool picker
+aivo run codex -m o4-mini                # pin a model
+aivo run gemini --dry-run                # preview, don't launch
+aivo run pi -k openrouter                # use a specific key
+aivo run opencode -c                     # inject cross-CLI context
+aivo run claude --debug                  # log HTTP traffic to JSONL
+aivo run claude --max-context=1m         # larger context window (--1m / --2m)
+aivo run claude --env KEY=VALUE          # inject env vars
+```
 
 ## keys
 
@@ -213,6 +227,28 @@ aivo alias rm fast                           # remove (works for both kinds)
 ```
 
 Names that collide with built-in subcommands or tool names are rejected.
+
+## fallback
+
+Virtual models backed by ordered `provider:model` pairs. Tried in sequence until one succeeds — useful for routing requests through a preferred provider with a backup.
+
+```bash
+aivo fallback                                    # list
+aivo fallback create my-fallback claude:sonnet openrouter:gpt-4o
+aivo fallback get my-fallback
+aivo fallback update my-fallback claude:haiku openai:o4-mini
+aivo fallback status my-fallback                # active/excluded entry counts
+aivo fallback clear-exclusions my-fallback      # reset failures
+aivo fallback reorder my-fallback ...            # reorder entries
+aivo fallback delete my-fallback
+```
+
+A fallback name can be used anywhere a model is accepted:
+
+```bash
+aivo claude -m my-fallback
+aivo chat -m my-fallback
+```
 
 ## logs
 
