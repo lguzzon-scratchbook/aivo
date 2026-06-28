@@ -57,6 +57,17 @@ impl ChatTuiApp {
         .await;
         // A `--max-context` override wins over the resolved window.
         self.context_window = self.context_window_override.or(limits.context).unwrap_or(0);
+        // Cursor bakes the effort tier into bare ids; resolve the window from the
+        // underlying model + surface the tier. Unknown → footer token-count.
+        self.cursor_effort_label = if self.key.is_cursor_acp() {
+            let parts = crate::services::cursor_acp::parse_cursor_model(&self.model);
+            if self.context_window_override.is_none() {
+                self.context_window = parts.context_window().unwrap_or(0);
+            }
+            parts.effort_label()
+        } else {
+            None
+        };
         // Valid `/effort` levels: live catalog (e.g. aivo/starter) or snapshot.
         self.model_reasoning_efforts = limits.reasoning_efforts.clone();
         // Reasoning-capable per the snapshot, or implied by advertised levels.
@@ -80,10 +91,16 @@ impl ChatTuiApp {
     /// no levels.
     pub(super) async fn run_effort_command(&mut self, arg: Option<String>) {
         if self.model_reasoning_efforts.is_empty() {
-            self.notice = Some((
-                MUTED,
-                format!("{} has no reasoning-effort levels", self.model),
-            ));
+            // Cursor has no effort param — the tier is part of the model id.
+            let msg = if self.key.is_cursor_acp() {
+                format!(
+                    "{} bakes effort into the name — use /model to pick a tier (…-high, …-max)",
+                    self.model
+                )
+            } else {
+                format!("{} has no reasoning-effort levels", self.model)
+            };
+            self.notice = Some((MUTED, msg));
             return;
         }
         match arg.map(|s| s.trim().to_ascii_lowercase()) {
@@ -338,6 +355,11 @@ impl ChatTuiApp {
                 label: "Auto-approve tools",
                 description: "run write/edit/bash without asking (Shift+Tab)",
             },
+            ConfigToggle {
+                setting: ConfigSetting::UseWebSearch,
+                label: "aivo web search",
+                description: "let the agent search the web via aivo (daily quota)",
+            },
         ];
         self.overlay = Overlay::Config(ConfigOverlay { items, selected: 0 });
     }
@@ -348,6 +370,7 @@ impl ChatTuiApp {
         match setting {
             ConfigSetting::Thinking => self.thinking_enabled,
             ConfigSetting::AutoApprove => self.agent_auto_approve,
+            ConfigSetting::UseWebSearch => self.web_search_enabled,
         }
     }
 
@@ -365,6 +388,9 @@ impl ChatTuiApp {
             ConfigSetting::Thinking => self.set_thinking_enabled(!self.thinking_enabled).await,
             // Reuse the shared setter so the live atomic + toast stay in lockstep.
             ConfigSetting::AutoApprove => self.set_auto_approve(!self.agent_auto_approve),
+            ConfigSetting::UseWebSearch => {
+                self.set_web_search_enabled(!self.web_search_enabled).await
+            }
         }
     }
 
@@ -380,6 +406,20 @@ impl ChatTuiApp {
         self.thinking_enabled = on;
         self.show_toast(if on { "Thinking on" } else { "Thinking off" });
         let _ = self.session_store.set_chat_thinking_enabled(on).await;
+    }
+
+    /// Set the aivo-web-search flag and persist it; the engine applies it next turn.
+    pub(super) async fn set_web_search_enabled(&mut self, on: bool) {
+        if self.web_search_enabled == on {
+            return;
+        }
+        self.web_search_enabled = on;
+        self.show_toast(if on {
+            "aivo web search on"
+        } else {
+            "aivo web search off — the agent won't search via aivo"
+        });
+        let _ = self.session_store.set_chat_web_search_enabled(on).await;
     }
 
     /// `/skills`: discover the agent skills available for the working dir and show
@@ -532,8 +572,37 @@ impl ChatTuiApp {
         source: String,
         only: Option<String>,
     ) -> Result<()> {
+        if self.installing_skill.is_some() {
+            self.notice = Some((WARNING, "A skill install is already running".to_string()));
+            return Ok(());
+        }
+        // Download + extract on a background task so the TUI doesn't freeze; the
+        // outcome arrives as `RuntimeEvent::SkillInstalled`.
+        self.installing_skill = Some((source.clone(), Instant::now()));
+        self.notice = None;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::agent::skills::install_from_source(&source, only.as_deref()).await;
+            tx.send(RuntimeEvent::SkillInstalled { source, result })
+                .ok();
+        });
+        // Close the add field so the in-overlay spinner row shows.
+        if matches!(self.overlay, Overlay::Skills(_)) {
+            self.open_skills_overlay().await?;
+        }
+        Ok(())
+    }
+
+    /// Apply a background install's outcome: enable the skills, drop the engine,
+    /// and reopen the `/skills` overlay unless another overlay is open.
+    pub(super) async fn apply_skill_installed(
+        &mut self,
+        source: String,
+        result: std::result::Result<crate::agent::skills::InstallOutcome, String>,
+    ) -> Result<()> {
         use crate::agent::skills::InstallOutcome;
-        match crate::agent::skills::install_from_source(&source, only.as_deref()).await {
+        self.installing_skill = None;
+        match result {
             Ok(InstallOutcome::Installed(names)) if names.is_empty() => {
                 self.notice = Some((WARNING, format!("No skills found in `{source}`")));
             }
@@ -557,7 +626,10 @@ impl ChatTuiApp {
             }
             Err(e) => self.notice = Some((ERROR, format!("Failed to install skill: {e}"))),
         }
-        self.open_skills_overlay().await
+        if matches!(self.overlay, Overlay::None | Overlay::Skills(_)) {
+            self.open_skills_overlay().await?;
+        }
+        Ok(())
     }
 
     /// Delete the skill at `index` (the overlay's confirmed `d`); resolves its

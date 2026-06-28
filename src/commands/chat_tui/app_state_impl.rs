@@ -23,6 +23,7 @@ impl ChatTuiApp {
     pub(super) fn is_animating(&self) -> bool {
         self.sending
             || self.local_command.is_some()
+            || self.installing_skill.is_some()
             || !self.incoming_buffer.is_empty()
             || self.toast.is_some()
             || self.drag_autoscroll.is_some()
@@ -64,6 +65,7 @@ impl ChatTuiApp {
             shift_index_map_after_removal(&mut self.local_outputs, idx);
             shift_index_set_after_removal(&mut self.expanded_thinking, idx);
             shift_index_set_after_removal(&mut self.expanded_output, idx);
+            shift_index_opt_after_removal(&mut self.plan_card_idx, idx);
         }
     }
 
@@ -178,6 +180,15 @@ fn shift_index_map_after_removal<V>(map: &mut std::collections::HashMap<usize, V
             k => Some((k, v)),
         })
         .collect();
+}
+
+/// Optional-scalar twin of [`shift_index_map_after_removal`].
+fn shift_index_opt_after_removal(opt: &mut Option<usize>, removed: usize) {
+    match *opt {
+        Some(i) if i == removed => *opt = None,
+        Some(i) if i > removed => *opt = Some(i - 1),
+        _ => {}
+    }
 }
 
 /// Set twin of [`shift_index_map_after_removal`].

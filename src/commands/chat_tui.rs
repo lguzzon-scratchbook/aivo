@@ -94,6 +94,7 @@ impl ChatTuiApp {
         let crate::services::session_store::ChatToggles {
             auto_approve,
             thinking_enabled,
+            web_search_enabled,
         } = params.session_store.get_chat_toggles().await;
         // Move any pre-existing `/skills` + `/mcp` opt-outs out of config.json (where
         // a routine key/route/selection write — or an older aivo binary — can drop
@@ -189,6 +190,9 @@ impl ChatTuiApp {
             active_agent: params.initial_agent,
             pending_agent_messages: None,
             goal_mode: None,
+            capturing_plan: false,
+            pending_plan: None,
+            plan_card_idx: None,
             agent_engine: None,
             agent_route_cache: None,
             mcp_client: None,
@@ -204,10 +208,12 @@ impl ChatTuiApp {
                 auto_approve,
             )),
             thinking_enabled,
+            web_search_enabled,
             // Set by `refresh_context_window` (called right after construction and
             // on every model switch); false until the first resolve.
             model_supports_thinking: false,
             model_image_input: None,
+            cursor_effort_label: None,
             // Loaded per-model by `refresh_context_window` (called right after).
             reasoning_effort: None,
             model_reasoning_efforts: Vec::new(),
@@ -222,6 +228,7 @@ impl ChatTuiApp {
             turn_durations: std::collections::HashMap::new(),
             reasoning_started_at: None,
             reasoning_elapsed_ms: None,
+            installing_skill: None,
         })
     }
 }

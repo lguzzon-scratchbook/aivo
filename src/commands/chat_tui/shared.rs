@@ -193,6 +193,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "plan",
+        help_label: "/plan <objective>",
+        description: "investigate read-only, draft a plan, then /plan go [guidance] to execute it",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "rewind",
         help_label: "/rewind",
         description: "rewind to an earlier turn (reverts file edits)",
@@ -231,6 +237,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "create-skill" => Some("[what the skill should do]"),
         "agent" => Some("[name|default]"),
         "goal" => Some("<objective> | stop"),
+        "plan" => Some("<objective> | go [guidance] | stop"),
         "model" => Some("[name]"),
         "key" => Some("[id|name]"),
         "resume" => Some("[query]"),
@@ -536,6 +543,8 @@ pub(super) enum ConfigSetting {
     Thinking,
     /// Run the agent's tools without asking (mirrors the Shift+Tab toggle).
     AutoApprove,
+    /// Whether the agent may use aivo's hosted web_search (`/v1/search`).
+    UseWebSearch,
 }
 
 /// One row in the `/config` overlay: a boolean preference with a label and a
@@ -1227,6 +1236,10 @@ pub(super) enum SlashCommand {
     /// Goal mode: `<objective>` works autonomously until done; bare shows status,
     /// `stop` ends it.
     Goal(Option<String>),
+    /// Plan mode: `<objective>` investigates read-only and drafts an
+    /// implementation plan; `go` executes it in a fresh context; bare shows
+    /// status, `stop` discards the pending plan.
+    Plan(Option<String>),
     /// Reasoning effort: bare opens a picker of the model's levels, `<level>`
     /// sets it directly.
     Effort(Option<String>),
@@ -1378,6 +1391,11 @@ pub(super) enum RuntimeEvent {
     LocalCommandDone {
         exit_code: i64,
         truncated: bool,
+    },
+    /// A background `/skills add <source>` install finished, off the event loop.
+    SkillInstalled {
+        source: String,
+        result: std::result::Result<crate::agent::skills::InstallOutcome, String>,
     },
 }
 
@@ -1589,6 +1607,15 @@ pub(super) struct ChatTuiApp {
     /// agent turns; cleared on completion, the iteration cap, `/goal stop`, an
     /// interrupt, `/new`, resume, or a key/model switch.
     pub(super) goal_mode: Option<GoalState>,
+    /// The in-flight turn is a `/plan` investigation: capture its reply as the
+    /// pending plan when it finishes. Reset on interrupt/cancel/`/new`.
+    pub(super) capturing_plan: bool,
+    /// A drafted plan from `/plan`, awaiting `/plan go` to execute it in a fresh
+    /// context. Cleared on execute, `/plan stop`, or `/new`.
+    pub(super) pending_plan: Option<String>,
+    /// History index of the plan reply, framed as the plan card; shifted on
+    /// history removal (like `turn_durations`), cleared on execute/discard/`/new`.
+    pub(super) plan_card_idx: Option<usize>,
     /// In-process agent for API-key chats (the agent path); `None` until the
     /// first agent turn, rebuilt on key/model switch, cleared on `/new`.
     pub(super) agent_engine: Option<AgentSession>,
@@ -1649,6 +1676,8 @@ pub(super) struct ChatTuiApp {
     /// Anthropic upstreams (so off truly stops reasoning, not just hides it).
     /// Toggled in `/config`, remembered across sessions.
     pub(super) thinking_enabled: bool,
+    /// aivo's hosted web_search; `/config` toggle, applied to the engine each turn.
+    pub(super) web_search_enabled: bool,
     /// Whether the current model is known to support reasoning/thinking (from the
     /// model-limits snapshot). Cached on each model resolve (see
     /// `refresh_context_window`); gates the footer effort badge so it only shows
@@ -1657,6 +1686,9 @@ pub(super) struct ChatTuiApp {
     /// Snapshot vision support, cached on each model resolve. `Some(false)` =
     /// text-only (image sends refused pre-flight); `None` = unknown (let through).
     pub(super) model_image_input: Option<bool>,
+    /// Parsed Cursor effort tier for the footer badge (`None` for non-cursor or
+    /// bare ids); set in `refresh_context_window`.
+    pub(super) cursor_effort_label: Option<String>,
     /// `/effort` reasoning level chosen by the user (None = model default);
     /// applied to the engine on build/change and persisted in chat-prefs.
     pub(super) reasoning_effort: Option<String>,
@@ -1699,4 +1731,6 @@ pub(super) struct ChatTuiApp {
     /// streaming so the displayed time excludes answer-streaming. `None` until the
     /// answer starts (the live timer runs from `reasoning_started_at` until then).
     pub(super) reasoning_elapsed_ms: Option<u64>,
+    /// In-flight `/skills add` install `(source, started)`; drives the spinner.
+    pub(super) installing_skill: Option<(String, Instant)>,
 }

@@ -1065,6 +1065,9 @@ fn make_test_app(
         active_agent: None,
         pending_agent_messages: None,
         goal_mode: None,
+        capturing_plan: false,
+        pending_plan: None,
+        plan_card_idx: None,
         agent_engine: None,
         agent_route_cache: None,
         mcp_client: None,
@@ -1078,8 +1081,10 @@ fn make_test_app(
         agent_auto_approve: false,
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         thinking_enabled: true,
+        web_search_enabled: true,
         model_supports_thinking: true,
         model_image_input: None,
+        cursor_effort_label: None,
         reasoning_effort: None,
         model_reasoning_efforts: Vec::new(),
         queued_messages: Vec::new(),
@@ -1093,6 +1098,7 @@ fn make_test_app(
         turn_durations: std::collections::HashMap::new(),
         reasoning_started_at: None,
         reasoning_elapsed_ms: None,
+        installing_skill: None,
     }
 }
 
@@ -3516,6 +3522,36 @@ fn test_display_cwd_shows_real_dir_for_cursor_keys() {
     assert_eq!(app.display_cwd(), "/home/me/project");
 }
 
+#[tokio::test]
+async fn test_cursor_model_refresh_sets_window_and_effort_badge() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.key = ApiKey::new_with_protocol(
+        "cursor".to_string(),
+        String::new(),
+        "cursor".to_string(),
+        None,
+        String::new(),
+    );
+
+    // Claude tier → underlying-model window + tier badge.
+    app.model = "claude-opus-4-8-max".to_string();
+    app.refresh_context_window().await;
+    assert_eq!(app.context_window, 1_000_000);
+    assert_eq!(app.cursor_effort_label.as_deref(), Some("max"));
+
+    // Cursor-native windows (not in models.dev): composer 200k, auto 2M.
+    app.model = "composer-2.5".to_string();
+    app.refresh_context_window().await;
+    assert_eq!(app.context_window, 200_000);
+    assert_eq!(app.cursor_effort_label, None);
+
+    app.model = "auto".to_string();
+    app.refresh_context_window().await;
+    assert_eq!(app.context_window, 2_000_000);
+    assert_eq!(app.cursor_effort_label, None);
+}
+
 #[test]
 fn test_agent_events_build_display_history() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3555,36 +3591,34 @@ fn test_agent_events_build_display_history() {
 fn test_native_tool_paths_render_relative_to_cwd() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.real_cwd = "/Users/yc/project/work/llm-server".to_string();
+    app.real_cwd = "/Users/alice/proj".to_string();
 
-    // A path under the cwd renders relative — the absolute prefix is noise the
-    // footer already shows, and it pushed the distinguishing basename off-screen.
+    // Paths under cwd render relative (the absolute prefix is footer noise).
     app.apply_agent_tool_call(
         None,
         "read_file".to_string(),
-        serde_json::json!({"path": "/Users/yc/project/work/llm-server/apps/web/src/routes/chat/+page.svelte"}),
+        serde_json::json!({"path": "/Users/alice/proj/src/ui/views/panel.rs"}),
     );
     app.apply_agent_tool_result("128 lines".to_string());
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(
-        plain.contains("read_file(apps/web/src/routes/chat/+page.svelte)"),
+        plain.contains("read_file(src/ui/views/panel.rs)"),
         "{plain}"
     );
     assert!(
-        !plain.contains("/Users/yc/project"),
+        !plain.contains("/Users/alice/proj"),
         "absolute path leaked: {plain}"
     );
 
-    // A relative path too long to fit is left-truncated on a segment boundary so
-    // the basename survives (vs. the old tail-truncation that cut it off).
+    // Over-long paths left-truncate on a segment boundary to keep the basename.
     app.apply_agent_tool_call(
         None,
         "read_file".to_string(),
-        serde_json::json!({"path": "/Users/yc/project/work/llm-server/apps/web/src/routes/dashboard/settings/billing/invoices/detail/+page.svelte"}),
+        serde_json::json!({"path": "/Users/alice/proj/src/module/feature/component/section/detail/view/inner/widget.rs"}),
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("…/"), "expected left-truncation: {plain}");
-    assert!(plain.contains("+page.svelte"), "basename lost: {plain}");
+    assert!(plain.contains("widget.rs"), "basename lost: {plain}");
 }
 
 #[test]
@@ -3673,15 +3707,18 @@ fn test_adjacent_search_tools_merge_into_one_group() {
 fn test_run_bash_label_strips_redundant_cd_prefix() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.real_cwd = "/Users/yc/project/work/aivo".to_string();
+    app.real_cwd = "/Users/alice/project/work/aivo".to_string();
     app.apply_agent_tool_call(
         None,
         "run_bash".to_string(),
-        serde_json::json!({"command": "cd /Users/yc/project/work/aivo && git show f391ffd"}),
+        serde_json::json!({"command": "cd /Users/alice/project/work/aivo && git show f391ffd"}),
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("run_bash(git show f391ffd)"), "{plain}");
-    assert!(!plain.contains("cd /Users/yc/project/work/aivo"), "{plain}");
+    assert!(
+        !plain.contains("cd /Users/alice/project/work/aivo"),
+        "{plain}"
+    );
 }
 
 #[test]
@@ -6091,6 +6128,113 @@ fn test_parse_goal_command() {
     );
 }
 
+#[test]
+fn test_parse_plan_command() {
+    assert_eq!(
+        parse_slash_command("plan").unwrap(),
+        SlashCommand::Plan(None)
+    );
+    assert_eq!(
+        parse_slash_command("plan add a cache layer").unwrap(),
+        SlashCommand::Plan(Some("add a cache layer".to_string()))
+    );
+    assert_eq!(
+        parse_slash_command("plan go").unwrap(),
+        SlashCommand::Plan(Some("go".to_string()))
+    );
+}
+
+#[test]
+fn test_plan_exec_seed_appends_guidance() {
+    use super::runtime_impl::plan_exec_seed;
+    let bare = plan_exec_seed("1. do X", "");
+    assert!(bare.ends_with("1. do X"));
+    assert!(!bare.contains("Additional guidance"));
+    let steered = plan_exec_seed("1. do X", "use the existing retry helper");
+    assert!(steered.starts_with(&bare));
+    assert!(steered.contains("Additional guidance for this execution:"));
+    assert!(steered.ends_with("use the existing retry helper"));
+}
+
+/// The plan-card anchor slides down when an earlier history entry is removed
+/// (e.g. an `update_plan` checklist card dropped by `drop_plan_entries`).
+#[tokio::test]
+async fn test_plan_card_idx_shifts_on_removal() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let msg = |role: &str, c: &str| ChatMessage {
+        role: role.to_string(),
+        content: c.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    };
+    app.history.clear();
+    app.history.push(msg("user", "hi")); // 0
+    app.history.push(msg("plan", "[]")); // 1 (checklist card — dropped below)
+    app.history.push(msg("assistant", "plan body")); // 2
+    app.plan_card_idx = Some(2);
+    app.drop_plan_entries();
+    assert_eq!(
+        app.plan_card_idx,
+        Some(1),
+        "anchor follows the assistant down"
+    );
+    assert_eq!(app.history[1].role, "assistant");
+}
+
+/// `/plan` state machine without the dispatch paths (which need a serve): a
+/// finished investigation turn captures its reply as the pending plan; `stop`
+/// discards it; bare reports status; `go` with nothing pending just guides.
+#[tokio::test]
+async fn test_plan_capture_discard_and_status() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let assistant = |content: &str| ChatMessage {
+        role: "assistant".to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    };
+
+    // A finished planning turn stashes the reply and prompts for `/plan go`.
+    app.capturing_plan = true;
+    app.history.push(assistant("1. do X\n2. do Y"));
+    app.maybe_capture_plan();
+    assert!(!app.capturing_plan, "capture flag clears");
+    assert_eq!(app.pending_plan.as_deref(), Some("1. do X\n2. do Y"));
+    assert!(app.notice.as_ref().unwrap().1.contains("/plan go"));
+    // The captured reply is anchored as the plan card.
+    assert_eq!(
+        app.plan_card_idx,
+        app.history.iter().rposition(|m| m.role == "assistant")
+    );
+
+    // Bare `/plan` with a plan pending reports it's ready.
+    app.run_plan_command(None).await;
+    assert!(app.notice.as_ref().unwrap().1.contains("review"));
+
+    // `/plan stop` discards the pending plan and unframes the card.
+    app.run_plan_command(Some("stop".to_string())).await;
+    assert!(app.pending_plan.is_none());
+    assert!(app.plan_card_idx.is_none());
+    assert!(app.notice.as_ref().unwrap().1.contains("discarded"));
+
+    // `/plan go` with nothing pending guides instead of dispatching.
+    app.run_plan_command(Some("go".to_string())).await;
+    assert!(app.notice.as_ref().unwrap().1.contains("No plan yet"));
+
+    // `/plan go <guidance>` routes to execute (first word), not a new objective.
+    app.run_plan_command(Some("go also add tests".to_string()))
+        .await;
+    assert!(app.notice.as_ref().unwrap().1.contains("No plan yet"));
+
+    // An empty investigation reply is not captured as a plan.
+    app.capturing_plan = true;
+    app.history.push(assistant("   "));
+    app.maybe_capture_plan();
+    assert!(app.pending_plan.is_none(), "blank reply isn't a plan");
+}
+
 /// `/create-skill` is a first-class built-in command (in `SLASH_COMMANDS` and
 /// `/help`), parses with an optional intent argument, and dispatches the embedded
 /// create-skill instructions as a turn — shown compactly in the transcript.
@@ -6344,6 +6488,14 @@ async fn test_skills_add_routes_source_not_scaffold() {
     app.submit_skill_add("./aivo_no_such_skill_dir_zzz".to_string())
         .await
         .unwrap();
+    // Install runs on a background task now; drain its `SkillInstalled` outcome.
+    for _ in 0..1000 {
+        app.handle_runtime_events().await.unwrap();
+        if app.installing_skill.is_none() && app.notice.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     let notice = &app.notice.as_ref().unwrap().1;
     assert!(
         notice.contains("Failed to install") || notice.contains("not a directory"),

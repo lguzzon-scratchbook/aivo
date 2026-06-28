@@ -182,18 +182,23 @@ impl ChatTuiApp {
                     // below no-ops.
                     let collapsed = !self.expanded_thinking.contains(&idx);
                     let duration_ms = self.reasoning_durations.get(&idx).copied();
-                    push_assistant_blocks(
-                        &mut lines,
-                        &mut bars,
-                        reasoning.map(|text| ReasoningView {
-                            text,
-                            collapsed,
-                            duration_ms,
-                        }),
-                        &message.content,
-                        text_width,
-                        role_bar_color("assistant"),
-                    );
+                    let view = reasoning.map(|text| ReasoningView {
+                        text,
+                        collapsed,
+                        duration_ms,
+                    });
+                    if self.plan_card_idx == Some(idx) {
+                        push_plan_card(&mut lines, &mut bars, view, &message.content, text_width);
+                    } else {
+                        push_assistant_blocks(
+                            &mut lines,
+                            &mut bars,
+                            view,
+                            &message.content,
+                            text_width,
+                            role_bar_color("assistant"),
+                        );
+                    }
                 }
                 "tool_call" => {
                     let (name, args) = decode_tool_call(&message.content);
@@ -414,6 +419,23 @@ impl ChatTuiApp {
     /// or `None` when idle. Rebuilt per frame and appended after the cached body
     /// so animation never invalidates the cache.
     pub(super) fn spinner_status_line(&self) -> Option<StyledLine> {
+        // A background skill install drives the status spinner when no turn or
+        // `!cmd` run owns it.
+        if !self.sending
+            && self.local_command.is_none()
+            && let Some((source, started)) = &self.installing_skill
+        {
+            let mut block = Vec::new();
+            render_pending_status(
+                &mut block,
+                self.frame_tick,
+                self.reduce_motion,
+                started.elapsed(),
+                &format!("Installing skill from {source}"),
+                "",
+            );
+            return block.into_iter().next();
+        }
         let started_at = if self.sending {
             self.request_started_at
         } else if let Some(run) = &self.local_command {
@@ -1943,10 +1965,14 @@ impl ChatTuiApp {
     /// when a narrow terminal squeezes this bar.
     fn hint_indicator_spans(&self) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        // Reasoning effort — the same effective level the engine sends, so they
-        // can't disagree. Shown only when thinking is on for a thinking-capable
-        // model; hidden when thinking is off (the engine isn't reasoning then).
-        if self.thinking_enabled
+        // Effort: Cursor's tier comes from the model id; otherwise the effective
+        // level the engine sends (only while thinking is on, so they can't disagree).
+        if let Some(label) = self.cursor_effort_label.as_deref() {
+            spans.push(Span::styled(
+                format!("effort: {label}"),
+                Style::default().fg(TOOL),
+            ));
+        } else if self.thinking_enabled
             && self.model_supports_thinking
             && let Some(level) = self.effective_reasoning_effort()
         {

@@ -895,7 +895,7 @@ pub(crate) async fn gemini_matching_session_files_in(
 /// Accept both the legacy `.json` and the newer `.jsonl` gemini session
 /// files. gemini-cli switched the per-message storage format around early
 /// 2026; ignoring `.jsonl` silently hides every recent session.
-fn is_gemini_session_file(name: &str) -> bool {
+pub(crate) fn is_gemini_session_file(name: &str) -> bool {
     name.starts_with("session-") && (name.ends_with(".json") || name.ends_with(".jsonl"))
 }
 

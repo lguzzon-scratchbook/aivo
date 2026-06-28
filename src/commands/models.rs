@@ -724,15 +724,6 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
         .map(|v| v.into_iter().map(|m| m.id).collect())
 }
 
-/// Like `fetch_models`, but keeps image/audio models in the list. Used by
-/// `aivo image`, where providers like xai advertise `grok-2-image` /
-/// `grok-imagine-image` that `is_text_chat_model` would otherwise strip.
-pub(crate) async fn fetch_all_models(client: &Client, key: &ApiKey) -> Result<Vec<String>> {
-    fetch_models_detailed_filtered(client, key, false)
-        .await
-        .map(|v| v.into_iter().map(|m| m.id).collect())
-}
-
 /// Fills missing context/max-output columns from the embedded models.dev
 /// snapshot. Provider-reported values always win; never feed the result back
 /// into the models cache.
@@ -844,7 +835,8 @@ pub(crate) async fn warm_full_catalog_metadata(client: &Client, key: &ApiKey, ca
         .await;
 }
 
-/// Cached variant of `fetch_all_models`.
+/// Cache-first full catalog fetch; stores metadata so `resolve_limits` finds the
+/// context window (else Pi/opencode fall back to a 128k default).
 pub(crate) async fn fetch_all_models_cached(
     client: &Client,
     key: &ApiKey,
@@ -854,10 +846,15 @@ pub(crate) async fn fetch_all_models_cached(
     if !bypass_cache && let Some(cached) = full_catalog_cached(key, cache).await {
         return Ok(cached);
     }
-    let models = fetch_all_models(client, key).await?;
+    let detailed = fetch_models_detailed_filtered(client, key, false).await?;
+    let models: Vec<String> = detailed.iter().map(|m| m.id.clone()).collect();
     if !crate::services::provider_profile::is_ollama_base(&key.base_url) {
         cache
-            .set(&full_catalog_cache_key_for_key(key), models.clone())
+            .set_with_metadata(
+                &full_catalog_cache_key_for_key(key),
+                models.clone(),
+                build_metadata_map(&detailed),
+            )
             .await;
     }
     Ok(models)
@@ -962,7 +959,7 @@ pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Resu
     fetch_models_detailed_filtered(client, key, true).await
 }
 
-/// Implementation behind `fetch_models_detailed` / `fetch_all_models`. When
+/// Implementation behind `fetch_models_detailed` / `fetch_all_models_cached`. When
 /// `chat_only` is true (the default), applies `is_text_chat_model` to the
 /// OpenAI-compatible / Anthropic / CloudflareSearch branches so chat pickers
 /// don't surface image, audio, or embedding models. Set to false for the

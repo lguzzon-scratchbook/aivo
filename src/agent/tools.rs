@@ -32,6 +32,9 @@ const WEB_FETCH_MAX_BYTES: usize = 5 * 1024 * 1024;
 const WEB_FETCH_CHAR_CEIL: usize = 100_000;
 /// Redirects are followed manually so each hop is SSRF-checked; cap the chain.
 const WEB_FETCH_MAX_REDIRECTS: usize = 5;
+/// `web_search`: default and ceiling result count requested from the gateway.
+const WEB_SEARCH_DEFAULT_RESULTS: usize = 8;
+const WEB_SEARCH_MAX_RESULTS: usize = 20;
 
 /// Directories never descended into by glob/grep walks.
 const IGNORED_DIRS: &[&str] = &[
@@ -159,6 +162,18 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         ),
         spec(
+            "web_search",
+            "Search the web and return ranked results (title, URL, snippet). Use it to find current or external information, then call web_fetch on a result URL to read that page.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for"},
+                    "max_results": {"type": "integer", "description": "Max results to return (default 8, max 20)"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        spec(
             "run_bash",
             "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist).",
             json!({
@@ -173,6 +188,68 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Built-in specs for `model`: GPT-5/Codex get `apply_patch` instead of
+/// `edit_file`/`multi_edit` (never both — they'd mix edit formats).
+pub fn tool_specs_for(model: &str) -> Vec<ToolSpec> {
+    let mut specs = tool_specs();
+    if uses_apply_patch(model) {
+        specs.retain(|s| s.name != "edit_file" && s.name != "multi_edit");
+        specs.push(apply_patch_spec());
+    }
+    specs
+}
+
+/// Models that emit V4A `apply_patch` fluently (and botch exact-string edits).
+pub fn uses_apply_patch(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    name.contains("codex") || name.starts_with("gpt-5") || name.starts_with("gpt-4.1")
+}
+
+/// Models the serve bridge can give a native `{type:"web_search"}` server tool
+/// (Anthropic + Gemini). Name-based — no `/v1/models` flag advertises this.
+fn native_search_supported(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    name.starts_with("claude") || name.starts_with("gemini") || lower.contains("anthropic")
+}
+
+/// Layer A: hand search to the provider instead of the local tool. Conservative —
+/// the bridge drops an untranslatable server tool, so unknown models keep
+/// `web_search`. `AIVO_AGENT_NATIVE_SEARCH=0` forces the hosted path.
+pub fn native_web_search_enabled(model: &str) -> bool {
+    !matches!(
+        std::env::var("AIVO_AGENT_NATIVE_SEARCH").as_deref(),
+        Ok("0") | Ok("false")
+    ) && native_search_supported(model)
+}
+
+fn apply_patch_spec() -> ToolSpec {
+    spec(
+        "apply_patch",
+        "Create, edit, rename, or delete files with a V4A patch (pass the whole patch as `input`). \
+Format:\n\
+*** Begin Patch\n\
+*** Update File: path/to/file\n\
+@@ optional_anchor_line\n\
+ unchanged context line\n\
+-removed line\n\
++added line\n\
+*** Add File: path/to/new\n\
++every line of the new file, each prefixed with +\n\
+*** Delete File: path/to/old\n\
+*** End Patch\n\
+Update hunks use NO line numbers: include a few unchanged context lines (each prefixed with a single space) around every change so the hunk can be located, and prefix removed lines with `-` and added lines with `+`. Add `*** Move to: path` on the line after an `*** Update File:` header to rename. One patch may touch several files.",
+        json!({
+            "type": "object",
+            "properties": {
+                "input": {"type": "string", "description": "The full V4A patch, from '*** Begin Patch' to '*** End Patch'."}
+            },
+            "required": ["input"]
+        }),
+    )
+}
+
 fn spec(name: &str, description: &str, parameters: Value) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
@@ -183,7 +260,10 @@ fn spec(name: &str, description: &str, parameters: Value) -> ToolSpec {
 
 /// Side-effecting tools the client must permission-gate before `execute`.
 pub fn is_mutating(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "multi_edit" | "run_bash")
+    matches!(
+        name,
+        "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "run_bash"
+    )
 }
 
 /// Built-in tools that only read (filesystem or network) and share no mutable
@@ -192,7 +272,10 @@ pub fn is_mutating(name: &str) -> bool {
 /// skill / subagent and external (MCP) tools mutate the engine or need ordered
 /// permission handling, so they stay sequential even though they aren't here.
 pub fn is_parallel_safe(name: &str) -> bool {
-    matches!(name, "read_file" | "glob" | "grep" | "web_fetch")
+    matches!(
+        name,
+        "read_file" | "glob" | "grep" | "web_fetch" | "web_search"
+    )
 }
 
 /// Whether a tool only reads — never touches the workspace. A conservative
@@ -203,7 +286,7 @@ pub fn is_parallel_safe(name: &str) -> bool {
 pub fn is_read_only(name: &str) -> bool {
     matches!(
         name,
-        "read_file" | "list_dir" | "glob" | "grep" | "web_fetch"
+        "read_file" | "list_dir" | "glob" | "grep" | "web_fetch" | "web_search"
     )
 }
 
@@ -223,8 +306,29 @@ pub fn is_dangerous(name: &str, args: &Value, cwd: &Path) -> bool {
             .and_then(|p| p.as_str())
             .map(|p| path_escapes_cwd(p, cwd))
             .unwrap_or(false),
+        // A patch may touch many files; gate it if *any* target leaves the cwd.
+        "apply_patch" => args
+            .get("input")
+            .and_then(|p| p.as_str())
+            .map(|p| {
+                crate::agent::apply_patch::target_paths(p)
+                    .iter()
+                    .any(|t| path_escapes_cwd(t, cwd))
+            })
+            .unwrap_or(false),
         _ => false,
     }
+}
+
+/// A hard floor under [`is_dangerous`]: an unrecoverable `run_bash` command (see
+/// [`bash_is_catastrophic`]) the engine confirms even under auto-approve.
+pub fn is_catastrophic(name: &str, args: &Value) -> bool {
+    name == "run_bash"
+        && args
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(bash_is_catastrophic)
+            .unwrap_or(false)
 }
 
 /// True when a path resolves outside the working directory (absolute elsewhere,
@@ -292,6 +396,11 @@ const INTERPRETERS: &[&str] = &[
     "ruby", "perl", "php", "pwsh",
 ];
 
+/// `/dev/` entries harmless to write to; anything else is a real device.
+const SAFE_DEVICES: &[&str] = &[
+    "null", "zero", "stdin", "stdout", "stderr", "tty", "fd", "full", "random", "urandom",
+];
+
 /// Detects destructive shell commands that should be confirmed before running
 /// (and highlighted ⚠ in the card). Best-effort and advisory — a heuristic, not
 /// a sandbox: it tokenizes per simple-command (so flag order / extra spaces
@@ -354,13 +463,190 @@ pub fn bash_looks_destructive(cmd: &str) -> bool {
     redirects_to_real_device(&lower)
 }
 
+/// The un-waivable core under [`bash_looks_destructive`]: commands that are
+/// unrecoverable or system-wide. Deliberately FAR narrower — a workspace-local
+/// `rm -rf ./build` must stay out, or unattended (`/goal`, `-y`) runs break.
+fn bash_is_catastrophic(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+
+    // Fork bomb, in either canonical spacing.
+    if lower
+        .split_whitespace()
+        .collect::<String>()
+        .contains(":(){:|:&};:")
+    {
+        return true;
+    }
+
+    for seg in lower.split(['\n', ';', '|', '&']) {
+        let all: Vec<&str> = seg.split_whitespace().collect();
+        let tokens = effective_command(&all); // see-through `sudo`/`env`/`nice`
+        let Some(&cmd0) = tokens.first() else {
+            continue;
+        };
+        let base = cmd0.rsplit('/').next().unwrap_or(cmd0);
+        // `sh -c 'rm -rf /'` hides the real command in a quoted arg — rescan it.
+        if INTERPRETERS.contains(&base)
+            && interpreter_inline_code(seg).is_some_and(|inner| bash_is_catastrophic(&inner))
+        {
+            return true;
+        }
+        let hit = match base {
+            "rm" => {
+                has_short_or_long(tokens, &['r'], &["recursive"])
+                    && tokens.iter().skip(1).any(|t| is_root_or_home_target(t))
+            }
+            b if b == "mkfs" || b.starts_with("mkfs.") => true,
+            "dd" => tokens
+                .iter()
+                .any(|t| t.strip_prefix("of=").is_some_and(is_raw_device_path)),
+            "chmod" | "chown" | "chgrp" => {
+                has_short_or_long(tokens, &['r'], &["recursive"])
+                    && tokens.iter().skip(1).any(|t| *t == "/")
+            }
+            "shutdown" | "reboot" | "halt" | "poweroff" => true,
+            "init" => matches!(tokens.get(1), Some(&"0") | Some(&"6")),
+            _ => false,
+        };
+        if hit || windows_seg_is_catastrophic(tokens) {
+            return true;
+        }
+    }
+
+    redirects_to_real_device(&lower) // `cat img > /dev/sda`
+}
+
+/// Windows half of [`bash_is_catastrophic`]: `run_bash` shells through PowerShell,
+/// which the POSIX walk misses. Tokens are lowercased (cmd/PowerShell are
+/// case-insensitive).
+fn windows_seg_is_catastrophic(tokens: &[&str]) -> bool {
+    let Some(&cmd0) = tokens.first() else {
+        return false;
+    };
+    let base = cmd0.rsplit(['\\', '/']).next().unwrap_or(cmd0);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".com"))
+        .unwrap_or(base);
+    let args = &tokens[1..];
+    match base {
+        "format-volume" | "clear-disk" | "stop-computer" | "restart-computer" => true,
+        "format" => args.iter().any(|a| is_windows_root_target(a)),
+        "cipher" => args.iter().any(|a| a.starts_with("/w")), // wipe free space
+        // Recursive delete of a root — aliases ri/rm/del/erase/rd/rmdir all map to
+        // Remove-Item; recurse is `/s` (cmd) or `-recurse`/`-r` (PowerShell).
+        "remove-item" | "ri" | "rm" | "del" | "erase" | "rd" | "rmdir" => {
+            let recursive = args
+                .iter()
+                .any(|a| *a == "/s" || *a == "-r" || a.starts_with("-rec"));
+            recursive && args.iter().any(|a| is_windows_root_target(a))
+        }
+        _ => false,
+    }
+}
+
+/// A Windows drive/home/system root (`C:\`, `\`, `~`, `$env:`/`%…%`) whose
+/// recursive deletion is unrecoverable. A subpath is not matched.
+fn is_windows_root_target(arg: &str) -> bool {
+    let trimmed = arg.trim_end_matches(['*', '\\', '/']);
+    // "<letter>:" drive root.
+    if let [letter, b':'] = trimmed.as_bytes()
+        && letter.is_ascii_alphabetic()
+    {
+        return true;
+    }
+    // Root of the current drive (`\`, `/`) — but not a bare `*`.
+    if trimmed.is_empty() && (arg.starts_with('\\') || arg.starts_with('/')) {
+        return true;
+    }
+    matches!(
+        trimmed,
+        "~" | "$home"
+            | "${home}"
+            | "$env:systemdrive"
+            | "$env:userprofile"
+            | "$env:homedrive"
+            | "$env:systemroot"
+            | "$env:windir"
+            | "%systemdrive%"
+            | "%userprofile%"
+            | "%homedrive%"
+            | "%systemroot%"
+            | "%windir%"
+    )
+}
+
+/// Strip a leading privilege/env/scheduling wrapper so `sudo rm -rf /` and
+/// `env X=1 rm -rf /` classify as `rm -rf /`. Best-effort.
+fn effective_command<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut rest = tokens;
+    loop {
+        let Some((&head, tail)) = rest.split_first() else {
+            return rest;
+        };
+        match head.rsplit('/').next().unwrap_or(head) {
+            "sudo" | "doas" => {
+                rest = tail;
+                while let Some((&t, tl)) = rest.split_first() {
+                    let Some(flag) = t.strip_prefix('-').filter(|s| !s.is_empty()) else {
+                        break; // first non-option token is the wrapped command
+                    };
+                    rest = tl;
+                    if t == "--" {
+                        break;
+                    }
+                    // -u/-g/-p/-C/-h/-r/-t (and --long forms) take an argument.
+                    if matches!(
+                        flag.chars().last(),
+                        Some('u' | 'g' | 'p' | 'c' | 'h' | 'r' | 't')
+                    ) {
+                        rest = rest.split_first().map_or(rest, |(_, tl)| tl);
+                    }
+                }
+            }
+            "env" => {
+                rest = tail;
+                while let Some((&t, tl)) = rest.split_first() {
+                    if !t.starts_with('-') && t.contains('=') {
+                        rest = tl;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" | "nohup" | "stdbuf" | "ionice" | "time" => rest = tail,
+            _ => return rest,
+        }
+    }
+}
+
+/// An `rm` target whose recursive deletion is unrecoverable — `/`, `~`, `$HOME`,
+/// or the whole cwd (`.`), with or without a trailing `/` or `/*`. A workspace
+/// subpath (`./build`, `~/Documents`) is not matched. `arg` arrives lowercased.
+fn is_root_or_home_target(arg: &str) -> bool {
+    let base = arg.strip_suffix("/*").unwrap_or(arg).trim_end_matches('/');
+    if arg.starts_with('/') && base.is_empty() {
+        return true; // "/", "//", "/*"
+    }
+    matches!(base, "~" | "$home" | "${home}" | ".")
+}
+
+/// A real `/dev/` block device (`/dev/sda`) vs. a harmless pseudo-device.
+fn is_raw_device_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/dev/") else {
+        return false;
+    };
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    !name.is_empty() && !SAFE_DEVICES.contains(&name.as_str())
+}
+
 /// True when the command redirects output (`>`/`>>`, optionally with a leading fd
 /// like `2>`) onto a `/dev/` entry that is NOT a harmless pseudo-device. Writing
 /// to `/dev/sda` overwrites a disk; `2>/dev/null` is everyday noise-suppression.
 fn redirects_to_real_device(cmd: &str) -> bool {
-    const SAFE_DEVICES: &[&str] = &[
-        "null", "zero", "stdin", "stdout", "stderr", "tty", "fd", "full", "random", "urandom",
-    ];
     let mut search = cmd;
     while let Some(pos) = search.find("/dev/") {
         // Only a write redirection counts: the bytes just before `/dev/` must end
@@ -563,6 +849,14 @@ pub fn preview(name: &str, args: &Value) -> Option<String> {
             let plural = if n == 1 { "edit" } else { "edits" };
             Some(format!("{path}  ({n} {plural})"))
         }
+        "apply_patch" => {
+            let paths = crate::agent::apply_patch::target_paths(args.get("input")?.as_str()?);
+            if paths.is_empty() {
+                Some("apply_patch".to_string())
+            } else {
+                Some(format!("patch: {}", paths.join(", ")))
+            }
+        }
         "run_bash" => Some(args.get("command")?.as_str()?.to_string()),
         _ => None,
     }
@@ -579,10 +873,12 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         "write_file" => write_file(args, cwd),
         "edit_file" => edit_file(args, cwd),
         "multi_edit" => multi_edit(args, cwd),
+        "apply_patch" => crate::agent::apply_patch::apply(arg_str(args, "input")?, cwd),
         "web_fetch" => web_fetch(args).await,
+        "web_search" => web_search(args).await,
         "run_bash" => run_bash(args, cwd).await,
         other => Err(format!(
-            "unknown tool `{other}` (available: read_file, list_dir, glob, grep, write_file, edit_file, multi_edit, run_bash)"
+            "unknown tool `{other}` (available: read_file, list_dir, glob, grep, write_file, edit_file, multi_edit, web_fetch, web_search, run_bash)"
         )),
     }
 }
@@ -603,7 +899,7 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
     args.get(key).and_then(|v| v.as_u64())
 }
 
-fn resolve(cwd: &Path, p: &str) -> PathBuf {
+pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
     let pb = Path::new(p);
     if pb.is_absolute() {
         pb.to_path_buf()
@@ -1008,7 +1304,7 @@ fn to_crlf(s: &str) -> String {
 /// rename over the target. A crash or error mid-write leaves the original file
 /// intact rather than a truncated/partial one. The temp shares the target's
 /// parent directory so the rename stays on one filesystem (and is atomic).
-fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = full.parent().filter(|p| !p.as_os_str().is_empty());
@@ -1224,7 +1520,7 @@ async fn web_fetch(args: &Value) -> Result<String, String> {
                 .get(current.clone())
                 .send()
                 .await
-                .map_err(|e| format!("fetch {current}: {e}"))?;
+                .map_err(|e| fetch_failed(current.as_str(), &e.to_string()))?;
             if !resp.status().is_redirection() {
                 break resp;
             }
@@ -1270,13 +1566,168 @@ async fn web_fetch(args: &Value) -> Result<String, String> {
     };
     let text: String = text.chars().take(max_chars).collect();
     if !status.is_success() {
-        let snippet: String = text.chars().take(500).collect();
-        return Err(format!("fetch {current}: HTTP {status}\n{snippet}"));
+        return Err(fetch_failed(current.as_str(), &format!("HTTP {status}")));
     }
     if text.trim().is_empty() {
         return Ok("(empty response)".to_string());
     }
     Ok(text)
+}
+
+// --- web_search: hosted /v1/search (layer B) ---
+
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// `AIVO_SEARCH_ENDPOINT` overrides the gateway default (local wrangler in dev).
+fn search_endpoint() -> String {
+    std::env::var("AIVO_SEARCH_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{}/v1/search", crate::constants::AIVO_STARTER_REAL_URL))
+}
+
+/// Latched once search is known-exhausted this session (quota/auth/config), so
+/// later web_search calls short-circuit instead of re-hitting the gateway.
+static SEARCH_EXHAUSTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn web_search(args: &Value) -> Result<String, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let query = arg_str(args, "query")?.trim();
+    if query.is_empty() {
+        return Err("web_search: empty query".to_string());
+    }
+    if SEARCH_EXHAUSTED.load(Relaxed) {
+        return Err(search_exhausted(
+            "Web search is unavailable for the rest of this session",
+        ));
+    }
+    let max_results = arg_u64(args, "max_results")
+        .map(|n| n as usize)
+        .unwrap_or(WEB_SEARCH_DEFAULT_RESULTS)
+        .clamp(1, WEB_SEARCH_MAX_RESULTS);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(WEB_FETCH_TIMEOUT))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+    // Device-signed (same auth as chat); the gateway holds the keys + quota.
+    let builder = client
+        .post(search_endpoint())
+        .json(&json!({ "query": query, "max_results": max_results }));
+    let resp = crate::services::device_fingerprint::with_starter_headers(builder)
+        .send()
+        .await
+        .map_err(|e| search_unavailable(&format!("couldn't reach web search ({e})")))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let hits = parse_search_results(&text, max_results);
+        if hits.is_empty() {
+            return Ok(format!("No web results for {query:?}."));
+        }
+        return Ok(render_search_results(query, &hits));
+    }
+    let (message, latch) = classify_search_error(status.as_u16());
+    if latch {
+        // Persistent (quota/auth/config) — don't keep hammering the gateway.
+        SEARCH_EXHAUSTED.store(true, Relaxed);
+    }
+    Err(message)
+}
+
+fn parse_search_results(body: &str, max: usize) -> Vec<SearchHit> {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let Some(arr) = v.get("results").and_then(|r| r.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .take(max)
+        .filter_map(|it| {
+            let title = it.get("title")?.as_str()?.trim().to_string();
+            let url = it.get("url")?.as_str()?.trim().to_string();
+            if title.is_empty() || url.is_empty() {
+                return None;
+            }
+            Some(SearchHit {
+                title,
+                url,
+                snippet: it
+                    .get("snippet")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Non-200 → (actionable layer-C message, whether to latch the session
+/// exhausted). 401/429/503 are persistent (latch + tell the model to stop); 502
+/// and network errors are transient (no latch). Leads with the human-readable
+/// status so the truncated tool-card line stays meaningful.
+fn classify_search_error(status: u16) -> (String, bool) {
+    match status {
+        401 => (
+            search_exhausted("Web search needs sign-in — run `aivo login`"),
+            true,
+        ),
+        429 => (
+            search_exhausted("Today's web-search quota is used up"),
+            true,
+        ),
+        503 => (search_exhausted("Web search isn't configured"), true),
+        502 => (search_unavailable("Web search is temporarily down"), false),
+        _ => (
+            search_unavailable(&format!("Web search failed (HTTP {status})")),
+            false,
+        ),
+    }
+}
+
+/// Persistent unavailability — tell the model to STOP retrying (the engine also
+/// short-circuits later calls via `SEARCH_EXHAUSTED`).
+fn search_exhausted(reason: &str) -> String {
+    format!(
+        "{reason}. Don't call web_search again this session — answer from what you already \
+know (say plainly you couldn't search) or web_fetch a known URL; don't invent results."
+    )
+}
+
+/// Transient unavailability — the model may proceed without search, but a later
+/// call could succeed, so no "stop" steer.
+fn search_unavailable(reason: &str) -> String {
+    format!(
+        "{reason}. Answer from what you already know or web_fetch a known URL — don't \
+invent search results, URLs, or facts."
+    )
+}
+
+/// web_fetch failure → steer the model to its search content, not fabrication.
+fn fetch_failed(url: &str, reason: &str) -> String {
+    format!(
+        "Couldn't fetch {url} ({reason}) — the page may be unreachable from here or down. \
+Answer from the web_search results you already have, or try a different result URL — do \
+NOT invent this page's contents."
+    )
+}
+
+fn render_search_results(query: &str, hits: &[SearchHit]) -> String {
+    let mut out = format!("Web search results for {query:?}:\n");
+    for (i, h) in hits.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}\n   {}\n", i + 1, h.title, h.url));
+        if !h.snippet.is_empty() {
+            out.push_str("   ");
+            out.push_str(&h.snippet);
+            out.push('\n');
+        }
+    }
+    out.push_str("\nUse web_fetch on a result URL to read the full page.");
+    out
 }
 
 /// `AIVO_WEB_FETCH_ALLOW_LOCAL=1` opts back into fetching loopback/private hosts
@@ -1479,6 +1930,13 @@ fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let at = &rest[amp..];
+        // Numeric character references (`&#39;` / `&#x27;`) — common in real pages
+        // and search snippets — before the small named table.
+        if let Some((decoded, len)) = decode_numeric_entity(at) {
+            out.push(decoded);
+            rest = &at[len..];
+            continue;
+        }
         match ENTITIES.iter().find(|(ent, _)| at.starts_with(ent)) {
             Some((ent, rep)) => {
                 out.push_str(rep);
@@ -1493,6 +1951,26 @@ fn decode_entities(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Decode a numeric character reference (`&#39;` decimal or `&#x27;` hex) at the
+/// start of `s`, returning the char and bytes consumed (incl. the trailing `;`).
+/// None if `s` isn't a well-formed numeric reference.
+fn decode_numeric_entity(s: &str) -> Option<(char, usize)> {
+    let body = s.strip_prefix("&#")?;
+    let (radix, digits) = match body.strip_prefix(['x', 'X']) {
+        Some(rest) => (16, rest),
+        None => (10, body),
+    };
+    let end = digits.find(';')?;
+    let num = &digits[..end];
+    if num.is_empty() {
+        return None;
+    }
+    let ch = char::from_u32(u32::from_str_radix(num, radix).ok()?)?;
+    // "&#" + optional "x" + digits + ";"
+    let consumed = 2 + usize::from(radix == 16) + num.len() + 1;
+    Some((ch, consumed))
 }
 
 /// Collapse intra-line whitespace runs and limit blank lines to one, so a tag
@@ -1530,6 +2008,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn decode_entities_handles_numeric_references() {
+        assert_eq!(
+            decode_entities("Rust&#x27;s &#39;async&#39;"),
+            "Rust's 'async'"
+        );
+        assert_eq!(decode_entities("a&#38;b &#x26; c"), "a&b & c");
+        // Malformed references are left untouched.
+        assert_eq!(decode_entities("&#;"), "&#;");
+        assert_eq!(decode_entities("&#xZZ;"), "&#xZZ;");
+        assert_eq!(decode_entities("3 &lt; 5"), "3 < 5"); // named still works
+    }
+
+    #[test]
+    fn web_search_parses_gateway_results() {
+        let body = r#"{"results":[
+            {"title":"The Rust Book","url":"https://doc.rust-lang.org/book/","snippet":"Learn Rust.","source":"brave"},
+            {"title":"Tokio","url":"https://tokio.rs/","snippet":"Async runtime.","source":"tavily"},
+            {"title":"","url":"https://drop.me/","snippet":"no title"}
+        ]}"#;
+        let hits = parse_search_results(body, 8);
+        assert_eq!(hits.len(), 2); // the title-less row is dropped
+        assert_eq!(hits[0].url, "https://doc.rust-lang.org/book/");
+        assert_eq!(hits[0].title, "The Rust Book");
+        assert_eq!(hits[1].url, "https://tokio.rs/");
+        // max caps the count; a malformed/empty body yields no hits.
+        assert_eq!(parse_search_results(body, 1).len(), 1);
+        assert!(parse_search_results("not json", 8).is_empty());
+        assert!(parse_search_results(r#"{"results":[]}"#, 8).is_empty());
+    }
+
+    #[test]
+    fn web_search_error_messages_are_actionable() {
+        // Every layer-C message must steer the model away from fabricating.
+        let antifab = |s: &str| {
+            assert!(
+                s.to_lowercase().contains("invent"),
+                "no anti-fab steer: {s}"
+            );
+            assert!(s.contains("web_fetch"), "no next step: {s}");
+        };
+        // Persistent failures latch the session and tell the model to stop.
+        let (login, login_latch) = classify_search_error(401);
+        assert!(login.contains("aivo login") && login.contains("Don't call web_search"));
+        assert!(login_latch);
+        antifab(&login);
+
+        let (quota, quota_latch) = classify_search_error(429);
+        assert!(quota.contains("quota is used up") && quota.contains("Don't call web_search"));
+        assert!(quota_latch);
+        antifab(&quota);
+
+        assert!(classify_search_error(503).1, "503 latches");
+
+        // Transient failures don't latch — a later call might succeed.
+        let (down, down_latch) = classify_search_error(502);
+        assert!(!down_latch);
+        antifab(&down);
+        assert!(
+            !classify_search_error(500).1,
+            "unknown status doesn't latch"
+        );
+
+        // web_fetch failures get the same anti-fabrication steer.
+        let f = fetch_failed("https://blocked.example/page", "HTTP 403");
+        assert!(f.contains("https://blocked.example/page") && f.contains("HTTP 403"));
+        assert!(f.contains("do NOT") && f.contains("web_search"));
+    }
+
+    #[test]
+    fn native_search_supported_is_conservative() {
+        // Bridge-translatable native search → layer A.
+        assert!(native_search_supported("claude-opus-4"));
+        assert!(native_search_supported("anthropic/claude-3.5-sonnet"));
+        assert!(native_search_supported("gemini-2.5-pro"));
+        assert!(native_search_supported("google/gemini-2.5-flash"));
+        // Everything else keeps the hosted web_search tool (B/C).
+        assert!(!native_search_supported("deepseek-v4-flash"));
+        assert!(!native_search_supported("gpt-5"));
+        assert!(!native_search_supported("qwen3-max"));
+        assert!(!native_search_supported("llama-3.3-70b"));
     }
 
     #[test]
@@ -1993,9 +2554,93 @@ mod tests {
     }
 
     #[test]
+    fn catastrophic_hard_floor() {
+        assert!(bash_is_catastrophic("rm -rf /"));
+        assert!(bash_is_catastrophic("rm -rf /*"));
+        assert!(bash_is_catastrophic("rm -rf ~"));
+        assert!(bash_is_catastrophic("rm -rf ~/*"));
+        assert!(bash_is_catastrophic("rm -fr ~/"));
+        assert!(bash_is_catastrophic("rm -rf $HOME"));
+        assert!(bash_is_catastrophic("rm -rf ${HOME}/*"));
+        assert!(bash_is_catastrophic("rm -rf .")); // the whole workspace
+        assert!(bash_is_catastrophic("rm --recursive --force /"));
+        assert!(bash_is_catastrophic("sudo rm -rf --no-preserve-root /"));
+        // Hidden inside an interpreter wrapper.
+        assert!(bash_is_catastrophic("sh -c 'rm -rf /'"));
+        // Format / overwrite a disk, fork bomb, recursive perms on `/`, power off.
+        assert!(bash_is_catastrophic("mkfs.ext4 /dev/sda1"));
+        assert!(bash_is_catastrophic("mkfs /dev/sdb"));
+        assert!(bash_is_catastrophic("dd if=/dev/zero of=/dev/sda"));
+        assert!(bash_is_catastrophic("cat img.iso > /dev/nvme0n1"));
+        assert!(bash_is_catastrophic(":(){ :|: & };:"));
+        assert!(bash_is_catastrophic(":() { :|:& };:"));
+        assert!(bash_is_catastrophic("chmod -R 777 /"));
+        assert!(bash_is_catastrophic("chown -R root /"));
+        assert!(bash_is_catastrophic("shutdown -h now"));
+        assert!(bash_is_catastrophic("sudo reboot"));
+        assert!(bash_is_catastrophic("init 0"));
+
+        // The whole point: workspace-local destruction stays WAIVABLE (must NOT
+        // be in the floor, or `/goal` / `-y` runs break). These are still caught
+        // by the confirm-tier `bash_looks_destructive`.
+        assert!(!bash_is_catastrophic("rm -rf ./build"));
+        assert!(!bash_is_catastrophic("rm -rf target"));
+        assert!(!bash_is_catastrophic("rm -rf ~/Documents")); // specific subdir
+        assert!(!bash_is_catastrophic("rm -rf /tmp/scratch"));
+        assert!(!bash_is_catastrophic("rm -f /etc/hosts")); // not recursive
+        assert!(!bash_is_catastrophic("chmod -R 755 ./src")); // not the fs root
+        assert!(!bash_is_catastrophic("chown -R me:me .")); // not the fs root
+        assert!(!bash_is_catastrophic("dd if=disk.img of=./out.img")); // file copy
+        assert!(!bash_is_catastrophic("cat /dev/urandom | head -c 16")); // read
+        assert!(!bash_is_catastrophic("echo done > /dev/null"));
+        assert!(!bash_is_catastrophic("init_db.sh")); // not the `init` command
+        assert!(!bash_is_catastrophic("cargo build"));
+
+        // The public wrapper only fires for run_bash.
+        assert!(is_catastrophic(
+            "run_bash",
+            &json!({ "command": "rm -rf /" })
+        ));
+        assert!(!is_catastrophic("run_bash", &json!({ "command": "ls" })));
+        assert!(!is_catastrophic(
+            "write_file",
+            &json!({ "path": "/", "content": "" })
+        ));
+    }
+
+    #[test]
+    fn catastrophic_floor_windows() {
+        assert!(bash_is_catastrophic("Format-Volume -DriveLetter C"));
+        assert!(bash_is_catastrophic("Clear-Disk -Number 0"));
+        assert!(bash_is_catastrophic("format.com C:"));
+        assert!(bash_is_catastrophic("format C: /q"));
+        assert!(bash_is_catastrophic("cipher /w:C"));
+        assert!(bash_is_catastrophic("Stop-Computer"));
+        assert!(bash_is_catastrophic("Restart-Computer -Force"));
+        // Recursive delete of a drive / home / system root, every alias + style.
+        assert!(bash_is_catastrophic("Remove-Item -Recurse -Force C:\\"));
+        assert!(bash_is_catastrophic("rm -r -fo C:\\"));
+        assert!(bash_is_catastrophic("ri -Recurse $env:SystemDrive"));
+        assert!(bash_is_catastrophic("del /f /s /q C:\\*"));
+        assert!(bash_is_catastrophic("rd /s /q D:\\"));
+        assert!(bash_is_catastrophic("rmdir /s /q %SystemDrive%"));
+        assert!(bash_is_catastrophic("Remove-Item -Recurse ~"));
+
+        // Workspace-local / read-only work stays waivable.
+        assert!(!bash_is_catastrophic(
+            "Remove-Item -Recurse -Force .\\build"
+        ));
+        assert!(!bash_is_catastrophic("del /q out.txt")); // not recursive
+        assert!(!bash_is_catastrophic("rd /s /q .\\node_modules")); // subpath
+        assert!(!bash_is_catastrophic("format-hex file.bin")); // not Format-Volume
+        assert!(!bash_is_catastrophic("Get-ChildItem C:\\")); // read-only
+        assert!(!bash_is_catastrophic("cipher /e .\\secret")); // encrypt, not /w
+    }
+
+    #[test]
     fn specs_cover_all_tools() {
         let names: Vec<String> = tool_specs().into_iter().map(|s| s.name).collect();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
         for n in [
             "read_file",
             "list_dir",
@@ -2005,9 +2650,44 @@ mod tests {
             "edit_file",
             "multi_edit",
             "web_fetch",
+            "web_search",
             "run_bash",
         ] {
             assert!(names.iter().any(|x| x == n), "missing {n}");
+        }
+    }
+
+    #[test]
+    fn apply_patch_routing_by_model() {
+        for m in ["gpt-5", "openai/gpt-5-codex", "codex-mini", "gpt-4.1-mini"] {
+            assert!(uses_apply_patch(m), "{m} should use apply_patch");
+            let names: Vec<String> = tool_specs_for(m).into_iter().map(|s| s.name).collect();
+            assert!(
+                names.iter().any(|n| n == "apply_patch"),
+                "{m} missing apply_patch"
+            );
+            assert!(
+                !names.iter().any(|n| n == "edit_file"),
+                "{m} kept edit_file"
+            );
+            assert!(
+                !names.iter().any(|n| n == "multi_edit"),
+                "{m} kept multi_edit"
+            );
+        }
+        for m in [
+            "claude-sonnet-4-6",
+            "gpt-4o",
+            "anthropic/claude-opus-4-8",
+            "gemini-2.5-pro",
+        ] {
+            assert!(!uses_apply_patch(m), "{m} should not use apply_patch");
+            let names: Vec<String> = tool_specs_for(m).into_iter().map(|s| s.name).collect();
+            assert!(names.iter().any(|n| n == "edit_file"));
+            assert!(
+                !names.iter().any(|n| n == "apply_patch"),
+                "{m} got apply_patch"
+            );
         }
     }
 

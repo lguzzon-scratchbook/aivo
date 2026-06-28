@@ -125,6 +125,13 @@ const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
 /// is intact — only the now-stale bytes go.
 const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
 
+/// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1` (off keeps it out of the TUI).
+fn agent_debug(msg: &str) {
+    if matches!(std::env::var("AIVO_DEBUG").as_deref(), Ok("1")) {
+        eprintln!("aivo[agent]: {msg}");
+    }
+}
+
 const SUMMARY_SYSTEM_PROMPT: &str = "You are compressing a coding-agent conversation to free up \
 context. Write a concise but complete summary under these exact headings:\n\
 ## Goal\n## Constraints & Preferences\n## Progress (Done / In Progress / Blocked)\n\
@@ -367,10 +374,15 @@ pub struct AgentEngine {
     /// [`Self::thinking_request`] emit a disable signal instead of the level.
     /// Set per turn from the chat `/config` toggle.
     thinking_enabled: bool,
+    /// `/config` toggle for aivo's hosted web_search (the local tool); native search untouched.
+    use_web_search_enabled: bool,
     /// Whether this model can reason at all (from the model-limits snapshot).
     /// Cached at construction (the engine is rebuilt on model switch) so the
     /// disable path doesn't send an effort field to a model that would 400 on it.
     reasoning_capable: bool,
+    /// Plan mode: mutating tools (writes, edits, `run_bash`, subagent) are refused
+    /// so a `/plan` investigation can't modify the workspace. See `restrict_read_only`.
+    read_only: bool,
 }
 
 /// The reasoning-effort level to default to: `AIVO_AGENT_REASONING_EFFORT` if
@@ -416,14 +428,20 @@ impl AgentEngine {
             .and_then(|s| s.parse().ok())
             .unwrap_or(context_window);
         let max_steps = resolve_max_steps(max_steps);
-        let mut specs = tools::tool_specs();
+        let mut specs = tools::tool_specs_for(model);
         if !skills.is_empty() {
             specs.push(skills::skill_tool_spec(skills));
         }
         specs.push(plan::plan_tool_spec());
         specs.push(notes::note_tool_spec());
         specs.push(subagent_tool_spec(&[]));
-        let tools_openai = specs.into_iter().map(tool_to_openai).collect();
+        let mut tools_openai: Vec<Value> = specs.into_iter().map(tool_to_openai).collect();
+        // Layer A: providers with native search get the server tool (bridge-translated)
+        // instead of the local one — mutually exclusive.
+        if tools::native_web_search_enabled(model) {
+            tools_openai.retain(|t| t["function"]["name"].as_str() != Some("web_search"));
+            tools_openai.push(json!({ "type": "web_search" }));
+        }
         let messages = vec![json!({
             "role": "system",
             "content": system_prompt(cwd, date, guides, skills),
@@ -450,8 +468,21 @@ impl AgentEngine {
             reasoning_effort: default_reasoning_effort(model),
             reasoning_efforts: Vec::new(),
             thinking_enabled: true,
+            use_web_search_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
+            read_only: false,
         }
+    }
+
+    /// Make this engine read-only for `/plan`: hide the mutating tools (and
+    /// `subagent`, which could spawn an editing sub-engine) from the model. The
+    /// execution guard refuses them too, in case one is hallucinated. One-way.
+    pub fn restrict_read_only(&mut self) {
+        self.read_only = true;
+        self.tools_openai.retain(|t| {
+            let name = t["function"]["name"].as_str().unwrap_or("");
+            !tools::is_mutating(name) && name != "subagent"
+        });
     }
 
     /// Set the `reasoning_effort` level (the `/effort` command). Only meaningful
@@ -465,6 +496,27 @@ impl AgentEngine {
     /// instead of the chosen level.
     pub fn set_thinking_enabled(&mut self, on: bool) {
         self.thinking_enabled = on;
+    }
+
+    /// `/config` toggle: add/remove the local hosted `web_search` tool. Idempotent;
+    /// a native-search model (which carries the server tool instead) is untouched.
+    pub fn set_web_search_enabled(&mut self, on: bool) {
+        self.use_web_search_enabled = on;
+        if tools::native_web_search_enabled(&self.model) {
+            return; // native models don't carry the local tool
+        }
+        let is_web_search = |t: &Value| t["function"]["name"].as_str() == Some("web_search");
+        let has = self.tools_openai.iter().any(is_web_search);
+        if on && !has {
+            if let Some(s) = tools::tool_specs()
+                .into_iter()
+                .find(|s| s.name == "web_search")
+            {
+                self.tools_openai.push(tool_to_openai(s));
+            }
+        } else if !on && has {
+            self.tools_openai.retain(|t| !is_web_search(t));
+        }
     }
 
     /// Set the catalog-advertised effort levels for this turn. See `reasoning_efforts`.
@@ -549,7 +601,17 @@ impl AgentEngine {
     /// overrides a known one (incl. the test env override).
     pub fn set_context_window(&mut self, window: u32) {
         if self.context_window == 0 && window > 0 {
+            agent_debug(&format!(
+                "context window resolved at model lookup: {window} (was unknown)"
+            ));
             self.context_window = window;
+        } else if window > 0 && window != self.context_window {
+            // Keep the known window, but surface drift so a wrong one can't
+            // silently mis-size compaction.
+            agent_debug(&format!(
+                "context window drift: budgeting {} (assumed) but model lookup reports {window} (served)",
+                self.context_window
+            ));
         }
     }
 
@@ -601,11 +663,16 @@ impl AgentEngine {
             sys["content"] = json!(format!("{cur}\n\n## Your role: {}\n{}", sa.name, sa.body));
         }
         if let Some(allowed) = sa.resolved_tools() {
+            // An authored `Edit`/`MultiEdit` scope grants `apply_patch` (its stand-in).
+            let editor_allowed = allowed.contains(&"edit_file") || allowed.contains(&"multi_edit");
             self.tools_openai.retain(|t| {
                 let name = t["function"]["name"].as_str().unwrap_or("");
                 // `update_plan`/`take_note` have no side effects outside the engine,
                 // so a scoped specialist keeps planning + note-taking regardless.
-                name == "update_plan" || name == "take_note" || allowed.contains(&name)
+                name == "update_plan"
+                    || name == "take_note"
+                    || allowed.contains(&name)
+                    || (name == "apply_patch" && editor_allowed)
             });
         }
     }
@@ -992,6 +1059,8 @@ impl AgentEngine {
             let no_output = message.tool_calls.is_empty()
                 && message.content.as_deref().is_none_or(str::is_empty);
             if no_output {
+                // Silent convergence reads as success ("Done" with no answer); say so.
+                ui.notify("the model returned an empty response — no answer produced");
                 converged = true;
                 break;
             }
@@ -1116,6 +1185,15 @@ impl AgentEngine {
                 continue;
             }
             ui.tool_start(&call.name, &call.arguments);
+            // Plan mode backstop (the tool is also hidden); the error steers the model.
+            if self.read_only && tools::is_mutating(&call.name) {
+                outcomes[i] = Some(Err(
+                    "Plan mode is read-only — do not modify files or run commands. \
+Investigate with read-only tools and write the implementation plan instead."
+                        .to_string(),
+                ));
+                continue;
+            }
             // Confirm only genuinely risky actions: a destructive command, an
             // out-of-cwd write, a blind overwrite of an existing file the model
             // never read, or an external (MCP) tool whose server the user
@@ -1126,21 +1204,31 @@ impl AgentEngine {
                     .external
                     .as_ref()
                     .is_some_and(|e| e.requires_approval(&call.name));
+            // A hard floor: an unrecoverable command (wipe `/`, format a disk, …) is
+            // confirmed even under auto-approve, and never remembered. Off a TTY
+            // `ask_permission` fails closed. See tools::is_catastrophic.
+            let catastrophic = tools::is_catastrophic(&call.name, &call.arguments);
             let pkey = permission_key(&call.name, &call.arguments);
-            let allowed =
-                if !needs_confirm || ctx.auto_approve_enabled() || self.always.contains(&pkey) {
-                    true
-                } else {
-                    let preview = tools::preview(&call.name, &call.arguments);
-                    match ui.ask_permission(&call.name, preview.as_deref()).await {
-                        Decision::Allow => true,
-                        Decision::AlwaysAllow => {
-                            self.always.insert(pkey);
-                            true
-                        }
-                        Decision::Deny => false,
+            let allowed = if catastrophic {
+                let preview = tools::preview(&call.name, &call.arguments);
+                // Allow and AlwaysAllow both run it once only — never persisted.
+                !matches!(
+                    ui.ask_permission(&call.name, preview.as_deref()).await,
+                    Decision::Deny
+                )
+            } else if !needs_confirm || ctx.auto_approve_enabled() || self.always.contains(&pkey) {
+                true
+            } else {
+                let preview = tools::preview(&call.name, &call.arguments);
+                match ui.ask_permission(&call.name, preview.as_deref()).await {
+                    Decision::Allow => true,
+                    Decision::AlwaysAllow => {
+                        self.always.insert(pkey);
+                        true
                     }
-                };
+                    Decision::Deny => false,
+                }
+            };
             if !allowed {
                 outcomes[i] = Some(Err("denied by user".to_string()));
                 continue;
@@ -1184,6 +1272,12 @@ impl AgentEngine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 skills::load_skill_result(&self.skills, name)
+            } else if call.name == "subagent" && self.read_only {
+                // A sub-engine isn't read-only; refuse delegation in plan mode.
+                Err(
+                    "Plan mode is read-only — cannot delegate to a subagent while planning."
+                        .to_string(),
+                )
             } else if call.name == "subagent" {
                 // Fresh sub-engine on the same serve/cwd; fold its total into the
                 // footer + turn usage below. Pass the UI + output base so it
@@ -1546,22 +1640,30 @@ Re-run the full command without write confinement?",
     }
 
     fn record_touched_file(&mut self, name: &str, args: &Value) {
-        if !matches!(
-            name,
-            "read_file" | "write_file" | "edit_file" | "multi_edit"
-        ) {
-            return;
-        }
-        let Some(path) = args.get("path").and_then(|v| v.as_str()).map(str::trim) else {
-            return;
+        // `apply_patch` carries many paths in its V4A body; the rest carry one.
+        let paths: Vec<String> = match name {
+            "read_file" | "write_file" | "edit_file" | "multi_edit" => args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|p| vec![p.to_string()])
+                .unwrap_or_default(),
+            "apply_patch" => args
+                .get("input")
+                .and_then(|v| v.as_str())
+                .map(crate::agent::apply_patch::target_paths)
+                .unwrap_or_default(),
+            _ => return,
         };
-        if path.is_empty() || self.touched_files.iter().any(|p| p == path) {
-            return;
+        for path in paths {
+            let path = path.trim();
+            if path.is_empty() || self.touched_files.iter().any(|p| p == path) {
+                continue;
+            }
+            if self.touched_files.len() >= MAX_TOUCHED_FILES {
+                self.touched_files.remove(0);
+            }
+            self.touched_files.push(path.to_string());
         }
-        if self.touched_files.len() >= MAX_TOUCHED_FILES {
-            self.touched_files.remove(0);
-        }
-        self.touched_files.push(path.to_string());
     }
 
     // --- /rewind: tree checkpoints ---
@@ -1752,6 +1854,8 @@ Re-run the full command without write confinement?",
             SUBAGENT_MAX_STEPS,
         );
         sub.drop_subagent_tool();
+        // Honor the parent's hosted-web-search opt-in/out in delegated work.
+        sub.set_web_search_enabled(self.use_web_search_enabled);
         // Carry the parent's reasoning effort into delegated work, but only when
         // it's a valid level for the sub's model (they may differ) — otherwise
         // keep the sub model's own default rather than risk sending a level the
@@ -2057,7 +2161,8 @@ and shell tools.\n\n\
 Match your effort to the request: answer simple questions or greetings directly, and only \
 reach for tools and project context when the task actually needs them — don't investigate or \
 read guide files just to say hello.\n\n\
-Bias toward doing. Your `run_bash` is a real shell with network access — fetch live data \
+Bias toward doing. To look things up on the web, use `web_search` to find pages and `web_fetch` \
+to read one. Your `run_bash` is a real shell with network access — fetch live data \
 (e.g. `curl wttr.in/<city>` for weather, web/HTTP APIs for other lookups), inspect the system, \
 run any command. If a command answers the request, run it instead of claiming you can't access \
 the internet or external services, explaining how the user could do it themselves, telling them it \
@@ -2218,6 +2323,11 @@ fn permission_key(name: &str, args: &Value) -> String {
     match name {
         "run_bash" => format!("run_bash\u{0}{}", arg("command")),
         "write_file" | "edit_file" | "multi_edit" => format!("{name}\u{0}{}", arg("path")),
+        // Scope to the exact set of files the patch touches, not all patches.
+        "apply_patch" => format!(
+            "apply_patch\u{0}{}",
+            crate::agent::apply_patch::target_paths(arg("input")).join("\u{1}")
+        ),
         _ => name.to_string(),
     }
 }
@@ -2299,6 +2409,23 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
+
+    #[test]
+    fn web_search_toggle_adds_and_removes_local_tool() {
+        let mut e = AgentEngine::new("/tmp", "deepseek-v4", "", &[], &[], 0, 0);
+        let has = |e: &AgentEngine| {
+            e.tools_openai
+                .iter()
+                .any(|t| t["function"]["name"].as_str() == Some("web_search"))
+        };
+        assert!(has(&e), "non-native model starts with web_search");
+        e.set_web_search_enabled(false);
+        assert!(!has(&e), "toggle off removes it");
+        e.set_web_search_enabled(false); // idempotent
+        assert!(!has(&e));
+        e.set_web_search_enabled(true);
+        assert!(has(&e), "toggle on re-adds it");
+    }
 
     #[test]
     fn test_resolve_max_steps() {
@@ -2524,6 +2651,34 @@ mod tests {
     }
 
     #[test]
+    fn restrict_read_only_hides_mutating_tools() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.restrict_read_only();
+        assert!(engine.read_only);
+        let names: Vec<&str> = engine
+            .tools_openai
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        // Mutating built-ins + subagent are stripped; read-only ones + plan/notes remain.
+        for gone in [
+            "write_file",
+            "edit_file",
+            "multi_edit",
+            "run_bash",
+            "subagent",
+        ] {
+            assert!(
+                !names.contains(&gone),
+                "{gone} should be hidden in plan mode"
+            );
+        }
+        for kept in ["read_file", "grep", "glob", "list_dir", "update_plan"] {
+            assert!(names.contains(&kept), "{kept} should remain in plan mode");
+        }
+    }
+
+    #[test]
     fn default_reasoning_effort_gates_on_model_capability() {
         // Reasoning-capable models (snapshot `r` flag) get an effort to send…
         for model in ["o3", "gpt-5", "claude-sonnet-4-5", "gemini-2.5-pro"] {
@@ -2639,6 +2794,57 @@ mod tests {
         assert_eq!(ui.text, "done");
         assert!(dir.join("out.txt").exists());
         assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "hi");
+    }
+
+    /// `rm -rf /` prompts even with auto-approve on (`turn_ctx` sets `yes: true`).
+    /// The mock denies, so it never runs.
+    #[tokio::test]
+    async fn catastrophic_command_prompts_even_under_auto_approve() {
+        let dir = tmp();
+        let bash = tool_call_sse("run_bash", json!({ "command": "rm -rf /" }));
+        let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi {
+            deny: true, // never let a real `rm -rf /` execute
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir), // yes: true → auto-approve on
+            Some("clean up".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(ui.ask_tools, vec!["run_bash"]); // asked despite auto-approve
+    }
+
+    /// Contrast: a workspace-local `rm -rf ./build` is not in the floor, so
+    /// auto-approve waives it. The path doesn't exist, so running it is a no-op.
+    #[tokio::test]
+    async fn auto_approve_waives_workspace_local_destructive() {
+        let dir = tmp();
+        let bash = tool_call_sse(
+            "run_bash",
+            json!({ "command": "rm -rf ./build_does_not_exist" }),
+        );
+        let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir), // yes: true → auto-approve on
+            Some("clean build dir".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(ui.asks, 0); // waived — no prompt
+        assert!(ui.tools.contains(&"run_bash".to_string())); // and it ran
     }
 
     /// A `run_bash` call the sandbox blocks (a write outside the workspace)
@@ -3669,6 +3875,66 @@ mod tests {
         );
     }
 
+    /// Forcing a tiny window + zero keep-recent makes an over-budget transcript
+    /// compact at the boundary; with only stale OLD tool output overflowing,
+    /// `maybe_compact` takes the no-model cheap path (clears them, returns 0).
+    #[tokio::test]
+    async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
+        // SAFETY: scoped mutation of an env var no other test reads.
+        unsafe { std::env::set_var("AIVO_AGENT_KEEP_RECENT", "0") };
+
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+        let huge = "x".repeat(200_000);
+        engine.messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": huge.clone()}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "b", "content": huge}),
+            json!({"role": "user", "content": "now"}),
+        ];
+        let budget = engine.compaction_window() - COMPACT_RESERVE;
+        assert!(
+            estimate_tokens(&engine.messages) > budget,
+            "transcript must start over budget so the boundary is actually crossed"
+        );
+
+        let client = reqwest::Client::new();
+        let cwd = std::path::Path::new(".");
+        let ctx = turn_ctx(&client, "", cwd);
+        let mut ui = CapturingUi::default();
+        let tokens = engine.maybe_compact(&ctx, &mut ui).await;
+
+        unsafe { std::env::remove_var("AIVO_AGENT_KEEP_RECENT") };
+
+        assert_eq!(tokens, 0, "cheap path must not call the model");
+        assert!(
+            estimate_tokens(&engine.messages) <= budget,
+            "compaction must bring the transcript under budget"
+        );
+        let cleared = engine
+            .messages
+            .iter()
+            .filter(|m| role(m) == "tool")
+            .filter(|m| m.get("content").and_then(|c| c.as_str()) == Some(TOOL_RESULT_CLEARED))
+            .count();
+        assert_eq!(
+            cleared, 2,
+            "stale OLD tool output cleared without a model call"
+        );
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("cleared older tool output")),
+            "the user is told the cheap path ran"
+        );
+    }
+
     #[test]
     fn seed_history_carries_user_and_assistant_only() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4527,6 +4793,26 @@ mod tests {
         assert!(after.contains(&"grep".to_string()));
         assert!(after.contains(&"update_plan".to_string()));
         assert!(!after.contains(&"write_file".to_string()));
+        assert!(!after.contains(&"run_bash".to_string()));
+    }
+
+    /// On a gpt-5 engine, an authored `Edit` scope grants `apply_patch`.
+    #[test]
+    fn apply_profile_edit_scope_grants_apply_patch_on_gpt5() {
+        let mut e = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
+        e.drop_subagent_tool();
+        assert!(tool_names(&e).contains(&"apply_patch".to_string()));
+        e.apply_profile(&subagent(
+            "editor",
+            None,
+            Some(vec!["read_file", "edit_file"]),
+        ));
+        let after = tool_names(&e);
+        assert!(
+            after.contains(&"apply_patch".to_string()),
+            "lost editor on gpt-5"
+        );
+        assert!(after.contains(&"read_file".to_string()));
         assert!(!after.contains(&"run_bash".to_string()));
     }
 
