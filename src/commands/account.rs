@@ -376,30 +376,22 @@ fn print_usage(s: &UsageSummary) {
         .max()
         .unwrap_or(0)
         .max("tokens".len());
-    let req_w = rows
-        .iter()
-        .map(|m| format_human(m.requests).len())
-        .max()
-        .unwrap_or(0)
-        .max("reqs".len());
     println!(
-        "{} {} {}",
+        "{} {}",
         style::bold(format!("{:<name_w$}", "By model")),
         style::dim(format!("{:>tok_w$}", "tokens")),
-        style::dim(format!("{:>req_w$}", "reqs")),
     );
     let show_bar = rows.len() > 1;
     for (m, name) in rows.iter().zip(&names) {
         let pn = style::cyan(format!("{name:<name_w$}"));
         let pt = colorize_unit(&format!("{:>tok_w$}", format_human(m.tokens)));
-        let pr = colorize_unit(&format!("{:>req_w$}", format_human(m.requests)));
         if show_bar {
             println!(
-                "{pn} {pt} {pr}  {}",
+                "{pn} {pt}  {}",
                 style::meter(m.tokens, max_tok, style::METER_WIDTH)
             );
         } else {
-            println!("{pn} {pt} {pr}");
+            println!("{pn} {pt}");
         }
     }
 }
