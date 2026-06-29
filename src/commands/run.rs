@@ -516,10 +516,7 @@ impl RunCommand {
                 Ok(0) => {
                     // Success!
                     self.session_store
-                        .update_fallback_last_used(
-                            fb_name,
-                            Some(entry.to_provider_model()),
-                        )
+                        .update_fallback_last_used(fb_name, Some(entry.to_provider_model()))
                         .await
                         .ok();
                     // Clear exclusions on success (successful entry is healthy).
@@ -532,9 +529,9 @@ impl RunCommand {
                     // (e.g. other entries still in exclusion).
                     for ex in &fb_cfg.exclusions {
                         if !ex.is_expired(now)
-                            && !keep_ex.iter().any(|k| {
-                                k.provider == ex.provider && k.model == ex.model
-                            })
+                            && !keep_ex
+                                .iter()
+                                .any(|k| k.provider == ex.provider && k.model == ex.model)
                         {
                             keep_ex.push(ex.clone());
                         }
@@ -562,9 +559,10 @@ impl RunCommand {
                     let reason = format!("exit code {}", nonzero);
                     // For non-zero exits, treat as transient with a 30s backoff.
                     let expires_at = Some(now + 30);
-                    if !exclusions.iter().any(|e| {
-                        e.provider == entry.provider && e.model == entry.model
-                    }) {
+                    if !exclusions
+                        .iter()
+                        .any(|e| e.provider == entry.provider && e.model == entry.model)
+                    {
                         let mut new_exclusions = exclusions.clone();
                         new_exclusions.push(FallbackExclusion {
                             provider: entry.provider.clone(),
@@ -588,9 +586,10 @@ impl RunCommand {
                         e,
                     );
                     let expires_at = Some(now + 60);
-                    if !exclusions.iter().any(|ex| {
-                        ex.provider == entry.provider && ex.model == entry.model
-                    }) {
+                    if !exclusions
+                        .iter()
+                        .any(|ex| ex.provider == entry.provider && ex.model == entry.model)
+                    {
                         let mut new_exclusions = exclusions.clone();
                         new_exclusions.push(FallbackExclusion {
                             provider: entry.provider.clone(),

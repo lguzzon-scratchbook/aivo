@@ -998,9 +998,10 @@ impl FallbackEntry {
         if provider.is_empty() || model.is_empty() {
             return None;
         }
-        // No colons or spaces allowed in provider or model names
-        if provider.contains(':') || provider.contains(' ')
-            || model.contains(':') || model.contains(' ')
+        // No colons or spaces allowed in provider names
+        if provider.contains(':')
+            || provider.contains(' ')
+            || model.contains(' ')
         {
             return None;
         }
@@ -3877,7 +3878,6 @@ mod tests {
         assert_eq!(decoded, key);
     }
 
-
     // ── Fallback entry parsing ──────────────────────────────────────────
 
     #[test]
@@ -3897,8 +3897,10 @@ mod tests {
     }
 
     #[test]
-    fn fallback_entry_parse_colon_in_provider() {
-        assert!(FallbackEntry::parse("bad:provider:model-x").is_none());
+    fn fallback_entry_parse_colon_in_model() {
+        let e = FallbackEntry::parse("kiloGateway:deepseek/deepseek-v4-flash:discounted").unwrap();
+        assert_eq!(e.provider, "kiloGateway");
+        assert_eq!(e.model, "deepseek/deepseek-v4-flash:discounted");
     }
 
     #[test]
@@ -3924,20 +3926,24 @@ mod tests {
     #[test]
     fn fallback_exclusion_is_expired() {
         let ex = FallbackExclusion {
-            provider: "o".into(), model: "m".into(),
-            reason: "fail".into(), excluded_at: 100,
+            provider: "o".into(),
+            model: "m".into(),
+            reason: "fail".into(),
+            excluded_at: 100,
             expires_at: Some(200),
         };
-        assert!(ex.is_expired(250));   // past expiry
-        assert!(!ex.is_expired(150));  // before expiry
-        assert!(ex.is_expired(200));   // exactly at expiry (code uses >=)
+        assert!(ex.is_expired(250)); // past expiry
+        assert!(!ex.is_expired(150)); // before expiry
+        assert!(ex.is_expired(200)); // exactly at expiry (code uses >=)
     }
 
     #[test]
     fn fallback_exclusion_indefinite_never_expires() {
         let ex = FallbackExclusion {
-            provider: "o".into(), model: "m".into(),
-            reason: "fail".into(), excluded_at: 100,
+            provider: "o".into(),
+            model: "m".into(),
+            reason: "fail".into(),
+            excluded_at: 100,
             expires_at: None,
         };
         assert!(!ex.is_expired(0));
@@ -3947,8 +3953,10 @@ mod tests {
     #[test]
     fn fallback_exclusion_provider_model() {
         let ex = FallbackExclusion {
-            provider: "openai".into(), model: "gpt-4o".into(),
-            reason: "exit 1".into(), excluded_at: 100,
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            reason: "exit 1".into(),
+            excluded_at: 100,
             expires_at: None,
         };
         assert_eq!(ex.provider_model(), "openai:gpt-4o");
@@ -3958,7 +3966,11 @@ mod tests {
 
     fn test_key(name: &str, base_url: &str) -> ApiKey {
         ApiKey::new_with_protocol(
-            "id".into(), name.into(), base_url.into(), None, "sk-test".into(),
+            "id".into(),
+            name.into(),
+            base_url.into(),
+            None,
+            "sk-test".into(),
         )
     }
 
@@ -3971,7 +3983,7 @@ mod tests {
 
     #[test]
     fn provider_has_matching_key_known_provider_via_substring_input() {
-        // "my-openrouter-key" → known_providers sees "openrouter" 
+        // "my-openrouter-key" → known_providers sees "openrouter"
         // key base_url matches openrouter's domain
         let keys = vec![test_key("work", "https://openrouter.ai/api/v1")];
         // The provider name IS the key name's substring
@@ -4026,5 +4038,4 @@ mod tests {
         assert_eq!(cfg.last_used, None);
         assert!(cfg.exclusions.is_empty());
     }
-
 }

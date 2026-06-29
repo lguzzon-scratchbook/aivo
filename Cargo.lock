@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "aivo"
-version = "0.33.0-dev"
+version = "0.33.1-dev"
 dependencies = [
  "aes",
  "aes-gcm",
