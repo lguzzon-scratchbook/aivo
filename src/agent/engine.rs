@@ -125,6 +125,10 @@ const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
 /// is intact — only the now-stale bytes go.
 const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
 
+/// Ack when a sandbox-blocked `run_bash` is approved to re-run unconfined; the
+/// chat TUI clears it on the next agent output so it isn't pinned all turn.
+pub const SANDBOX_ESCALATION_NOTICE: &str = "re-running outside the workspace sandbox (approved)";
+
 /// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1` (off keeps it out of the TUI).
 fn agent_debug(msg: &str) {
     if matches!(std::env::var("AIVO_DEBUG").as_deref(), Ok("1")) {
@@ -529,22 +533,14 @@ impl AgentEngine {
         self.reasoning_efforts.iter().any(|e| e == level)
     }
 
-    /// How to express thinking control on this step's request: `(reasoning_effort,
+    /// How to express thinking control on this step: `(reasoning_effort,
     /// emit_thinking_disabled)`.
     ///
-    /// Enabled → the resolved level (or `None` for a non-reasoning model), no
-    /// disable field. Disabled, for a reasoning-capable model:
-    /// - **gpt-5 / codex**: `"minimal"` — they reject `"none"` alongside tools and
-    ///   reject the `thinking` field.
-    /// - **o-series**: `"low"` — the floor they accept (no none/minimal).
-    /// - **catalog lists `none`/`minimal`**: send it — a real effort-level off.
-    /// - **otherwise** (effort is depth-only, e.g. `aivo/starter`, Anthropic): emit
-    ///   `thinking:{type:"disabled"}` and NO effort — `"none"` isn't in their effort
-    ///   scale (400s), so the separate `thinking` field is the toggle; the
-    ///   OpenAI→Anthropic bridge carries it through.
-    ///
-    /// Capability also accepts a chat-set level/catalog, since alias models (e.g.
-    /// `aivo/starter`) are absent from the snapshot.
+    /// Enabled → the resolved level (`None` for a non-reasoning model). Disabled →
+    /// the lowest "off" the model's catalog advertises, since the gpt-5 family
+    /// diverged (5.0 → `minimal`, 5.1+/5.4 → `none`, codex → `low`) and a name
+    /// guess 400s. A depth-only scale with no off level (`aivo/starter`, Anthropic)
+    /// → emit `thinking:{type:"disabled"}` instead, carried by the bridge.
     fn thinking_request(&self) -> (Option<&str>, bool) {
         if self.thinking_enabled {
             return (self.reasoning_effort.as_deref(), false);
@@ -557,14 +553,19 @@ impl AgentEngine {
         }
         let lower = self.model.to_ascii_lowercase();
         let name = lower.rsplit('/').next().unwrap_or(&lower);
-        if name.starts_with("gpt-5") || name.contains("codex") {
-            (Some("minimal"), false)
-        } else if name.starts_with("o1") || name.starts_with("o3") || name.starts_with("o4") {
-            (Some("low"), false)
-        } else if self.effort_is_valid("none") {
+        if self.effort_is_valid("none") {
             (Some("none"), false)
         } else if self.effort_is_valid("minimal") {
             (Some("minimal"), false)
+        } else if name.starts_with("o1") || name.starts_with("o3") || name.starts_with("o4") {
+            (Some("low"), false)
+        } else if name.starts_with("gpt-5") || name.contains("codex") {
+            // codex floor is low (no off); snapshot-absent gpt-5.0 → minimal.
+            if self.effort_is_valid("low") {
+                (Some("low"), false)
+            } else {
+                (Some("minimal"), false)
+            }
         } else {
             (None, true)
         }
@@ -1395,7 +1396,7 @@ Re-run the full command without write confinement?",
             // declined (rather than a silent success).
             return outcome.result;
         }
-        ui.notify("re-running outside the workspace sandbox (approved)");
+        ui.notify(SANDBOX_ESCALATION_NOTICE);
         tools::run_bash_unconfined(args, ctx.cwd).await
     }
 
@@ -2732,6 +2733,22 @@ mod tests {
         has_none.set_reasoning_efforts(vec!["none".into(), "low".into(), "high".into()]);
         has_none.set_thinking_enabled(false);
         assert_eq!(has_none.thinking_request(), (Some("none"), false));
+
+        // gpt-5.4 lists `none` but not `minimal` → catalog wins (c5d6b17 regression).
+        let mut g54 = AgentEngine::new("/tmp", "gpt-5.4", "", &[], &[], 0, 0);
+        g54.set_reasoning_efforts(
+            ["none", "low", "medium", "high", "xhigh"]
+                .map(String::from)
+                .to_vec(),
+        );
+        g54.set_thinking_enabled(false);
+        assert_eq!(g54.thinking_request(), (Some("none"), false));
+
+        // codex advertises only low/medium/high → its `low` floor, not `minimal`.
+        let mut codex = AgentEngine::new("/tmp", "gpt-5-codex", "", &[], &[], 0, 0);
+        codex.set_reasoning_efforts(["low", "medium", "high"].map(String::from).to_vec());
+        codex.set_thinking_enabled(false);
+        assert_eq!(codex.thinking_request(), (Some("low"), false));
 
         // Effort scale with no off (e.g. `aivo/starter` → deepseek: low..max, and
         // absent from the snapshot): emit the `thinking` disable field, NOT an
