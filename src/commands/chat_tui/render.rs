@@ -2285,6 +2285,89 @@ pub(super) fn strip_ansi_and_controls(s: &str) -> String {
     out
 }
 
+/// Clean one captured `!cmd` line with single-line cursor semantics, so a
+/// carriage-return overwrite collapses to its final visible state. The PTY merges
+/// stdout+stderr and splits only on `\n`, so a spinner/progress bar (`\r{frame}`
+/// repeated) arrives as one newline-less run; stripping each `\r` as a control byte
+/// (as `strip_ansi_and_controls` does) would keep every frame — one garbled line.
+pub(super) fn render_output_line(raw: &str) -> String {
+    let mut line: Vec<char> = Vec::new();
+    let mut cursor = 0usize;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                // CSI: ESC [ … final byte in 0x40..=0x7e. Only `K` (erase-in-line) alters text.
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut final_byte = '\0';
+                    for d in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&d) {
+                            final_byte = d;
+                            break;
+                        }
+                        params.push(d);
+                    }
+                    if final_byte == 'K' {
+                        match params.as_str() {
+                            "" | "0" => line.truncate(cursor.min(line.len())),
+                            "1" => line.iter_mut().take(cursor).for_each(|slot| *slot = ' '),
+                            "2" => line.clear(),
+                            _ => {}
+                        }
+                    }
+                }
+                // OSC: ESC ] … terminated by BEL or ST (ESC \).
+                Some(']') => {
+                    chars.next();
+                    while let Some(d) = chars.next() {
+                        if d == '\x07' {
+                            break;
+                        }
+                        if d == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Lone ESC or a 2-byte escape — drop the following byte.
+                _ => {
+                    chars.next();
+                }
+            },
+            '\r' => cursor = 0,
+            // Match `strip_ansi_and_controls`: one space per tab, advancing one column.
+            '\t' => {
+                while line.len() < cursor {
+                    line.push(' ');
+                }
+                if cursor < line.len() {
+                    line[cursor] = ' ';
+                } else {
+                    line.push(' ');
+                }
+                cursor += 1;
+            }
+            c if c.is_control() => {}
+            c => {
+                while line.len() < cursor {
+                    line.push(' ');
+                }
+                if cursor < line.len() {
+                    line[cursor] = c;
+                } else {
+                    line.push(c);
+                }
+                cursor += 1;
+            }
+        }
+    }
+    line.into_iter().collect()
+}
+
 fn tool_result_summary(s: &str, cwd: &str, tool: Option<&str>) -> String {
     // Multi-line output (read_file's numbered lines, dir listings, command
     // output) collapses to a clean count — the `→ verb(args)` line above already

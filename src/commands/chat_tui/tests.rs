@@ -10192,3 +10192,70 @@ async fn output_expand_caps_huge_capture_and_notes_remainder() {
         "the tail is not rendered inline"
     );
 }
+
+#[test]
+fn test_render_output_line_collapses_spinner_frames() {
+    // The spinner writes "\r{dim frame} Fetching models..." per frame (no newline
+    // between frames), then "\r\x1b[2K" + the result; the PTY hands it over as one line.
+    let frame = |glyph: &str| format!("\r\u{1b}[2m{glyph}\u{1b}[0m Fetching models...");
+    let mut raw = String::new();
+    for glyph in ["⠋", "⠙", "⠹", "⠸", "⠼"] {
+        raw.push_str(&frame(glyph));
+    }
+    raw.push_str("\r\u{1b}[2K✓ 2 models via aivo-starter\r"); // trailing \r = PTY's \r\n
+    assert_eq!(render_output_line(&raw), "✓ 2 models via aivo-starter");
+}
+
+#[test]
+fn test_render_output_line_plain_line_unchanged() {
+    // Normal lines pass through; the trailing \r (PTY's \r\n) and colour SGR drop out.
+    assert_eq!(render_output_line("hello world\r"), "hello world");
+    assert_eq!(render_output_line("  \u{1b}[32mOK\u{1b}[0m"), "  OK");
+    assert_eq!(render_output_line("plain"), "plain");
+}
+
+#[test]
+fn test_render_output_line_progress_bar_keeps_final_state() {
+    // A progress bar redraws in place with bare \r; only the last state should show.
+    let raw = "[#   ] 25%\r[##  ] 50%\r[####] 100%";
+    assert_eq!(render_output_line(raw), "[####] 100%");
+}
+
+#[test]
+fn test_render_output_line_erase_in_line_drops_stale_tail() {
+    // Erase-to-end (`\x1b[K`) must drop the stale tail when a shorter string overwrites.
+    assert_eq!(render_output_line("longlabel\rhi\u{1b}[K"), "hi");
+    // `\x1b[2K` clears the whole line.
+    assert_eq!(render_output_line("spam\r\u{1b}[2Kdone"), "done");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_pty_run_collapses_carriage_return_overwrites() {
+    // End-to-end through the real PTY reader: a command that redraws one line with
+    // bare \r (like the spinner) must commit only its final state, not every frame.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let shell =
+        spawn_local_shell("printf '111\\r222\\r333\\n'", &std::env::temp_dir()).expect("spawn pty");
+    run_local_to_completion(shell, tx);
+
+    let mut lines = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            RuntimeEvent::LocalCommandLine { line, .. } => lines.push(line),
+            RuntimeEvent::LocalCommandDone {
+                exit_code,
+                truncated,
+            } => {
+                assert_eq!(exit_code, 0, "printf should exit 0");
+                assert!(!truncated, "a tiny run is not truncated");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        lines,
+        vec!["333".to_string()],
+        "carriage-return overwrites collapse to the final state"
+    );
+}

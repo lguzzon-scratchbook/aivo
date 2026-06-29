@@ -333,11 +333,11 @@ pub(super) fn run_pty_to_completion(shell: PtyShell, tx: UnboundedSender<Runtime
     });
 }
 
-/// Strip one raw output line's ANSI/color escapes and control bytes, and cap an
-/// over-long (newline-less) line so a binary stream can't become one giant line.
-/// Shared by the Unix PTY reader and the Windows pipe readers.
+/// Clean one raw output line for display: collapse cursor overwrites and strip
+/// escapes (`render_output_line`), then cap an over-long (newline-less) line so a
+/// binary stream can't become one giant line. Shared by the PTY and pipe readers.
 fn clean_output_line(raw: &[u8]) -> String {
-    let mut line = strip_ansi_and_controls(&String::from_utf8_lossy(raw));
+    let mut line = render_output_line(&String::from_utf8_lossy(raw));
     if line.chars().count() > MAX_LINE_CHARS {
         line = line.chars().take(MAX_LINE_CHARS).collect();
         line.push('…');
