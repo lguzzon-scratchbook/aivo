@@ -39,11 +39,15 @@ impl FallbackCommand {
             "update" => self.cmd_update(args.name, args.entries).await,
             "delete" | "rm" | "remove" => self.cmd_delete(args.name).await,
             "status" => self.cmd_status(args.name).await,
-            "clear-exclusions" | "clear" => self.cmd_clear_exclusions(args.name, args.entries).await,
+            "clear-exclusions" | "clear" => {
+                self.cmd_clear_exclusions(args.name, args.entries).await
+            }
             "reorder" => self.cmd_reorder(args.name, args.entries).await,
             other => {
                 eprintln!("{} Unknown fallback action: {other}", style::red("Error:"));
-                eprintln!("  Valid actions: create, list, get, update, delete, status, clear-exclusions, reorder");
+                eprintln!(
+                    "  Valid actions: create, list, get, update, delete, status, clear-exclusions, reorder"
+                );
                 Ok(())
             }
         }
@@ -62,7 +66,9 @@ impl FallbackCommand {
 
     /// `fallback create <name> <provider:model> [<provider:model> ...]`
     async fn cmd_create(&self, name: Option<String>, entries: Vec<String>) -> Result<()> {
-        let name = name.ok_or_else(|| anyhow::anyhow!("Usage: fallback create <name> <provider:model> [...]"))?;
+        let name = name.ok_or_else(|| {
+            anyhow::anyhow!("Usage: fallback create <name> <provider:model> [...]")
+        })?;
         Self::validate_name(&name)?;
         if entries.is_empty() {
             anyhow::bail!("At least one <provider:model> entry is required");
@@ -70,13 +76,19 @@ impl FallbackCommand {
 
         let parsed: Vec<FallbackEntry> = entries
             .iter()
-            .map(|e| FallbackEntry::parse(e).ok_or_else(|| anyhow::anyhow!("Invalid entry {e:?}. Expected format: <provider>:<model>")))
+            .map(|e| {
+                FallbackEntry::parse(e).ok_or_else(|| {
+                    anyhow::anyhow!("Invalid entry {e:?}. Expected format: <provider>:<model>")
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Check not already existing
         let existing = self.session_store.get_fallbacks().await?;
         if existing.contains_key(&name) {
-            anyhow::bail!("Fallback '{name}' already exists. Use `fallback update` to modify, or `fallback delete` first.");
+            anyhow::bail!(
+                "Fallback '{name}' already exists. Use `fallback update` to modify, or `fallback delete` first."
+            );
         }
 
         // Filter out entries whose provider has no matching key
@@ -93,7 +105,9 @@ impl FallbackCommand {
             );
         }
         let config = FallbackConfig::new(filtered);
-        self.session_store.set_fallback(name.clone(), config).await?;
+        self.session_store
+            .set_fallback(name.clone(), config)
+            .await?;
         println!("  {} Created fallback '{name}'", style::green("✓"));
         Ok(())
     }
@@ -102,13 +116,19 @@ impl FallbackCommand {
     async fn cmd_list(&self) -> Result<()> {
         let fallbacks = self.session_store.get_fallbacks().await?;
         if fallbacks.is_empty() {
-            println!("  No fallbacks defined. Use `aivo fallback create <name> <provider:model> [...]`.");
+            println!(
+                "  No fallbacks defined. Use `aivo fallback create <name> <provider:model> [...]`."
+            );
             return Ok(());
         }
 
         println!("{}", style::bold("Fallbacks:"));
         for (name, config) in &fallbacks {
-            let entries: Vec<String> = config.entries.iter().map(|e| e.to_provider_model()).collect();
+            let entries: Vec<String> = config
+                .entries
+                .iter()
+                .map(|e| e.to_provider_model())
+                .collect();
             let active = active_entries(config, now());
             let excluded = config.entries.len() - active.len();
             let excl_str = if excluded > 0 {
@@ -148,7 +168,13 @@ impl FallbackCommand {
                 .iter()
                 .find(|e| e.provider == entry.provider && e.model == entry.model);
             let excl = match excluded {
-                Some(ex) => format!("  {}", style::dim(format!("(excluded: {}, expires: {:?})", ex.reason, ex.expires_at))),
+                Some(ex) => format!(
+                    "  {}",
+                    style::dim(format!(
+                        "(excluded: {}, expires: {:?})",
+                        ex.reason, ex.expires_at
+                    ))
+                ),
                 None => String::new(),
             };
             println!("    {}. {}{}", i + 1, entry.to_provider_model(), excl);
@@ -165,7 +191,10 @@ impl FallbackCommand {
                 let exp_str = if expired {
                     " (expired)".to_string()
                 } else {
-                    format!(" (expires: {})", ex.expires_at.map_or("never".into(), |t| t.to_string()))
+                    format!(
+                        " (expires: {})",
+                        ex.expires_at.map_or("never".into(), |t| t.to_string())
+                    )
                 };
                 println!(
                     "    {}{}: {}",
@@ -180,14 +209,20 @@ impl FallbackCommand {
 
     /// `fallback update <name> <provider:model> [<provider:model> ...]`
     async fn cmd_update(&self, name: Option<String>, entries: Vec<String>) -> Result<()> {
-        let name = name.ok_or_else(|| anyhow::anyhow!("Usage: fallback update <name> <provider:model> [...]"))?;
+        let name = name.ok_or_else(|| {
+            anyhow::anyhow!("Usage: fallback update <name> <provider:model> [...]")
+        })?;
         if entries.is_empty() {
             anyhow::bail!("At least one <provider:model> entry is required");
         }
 
         let parsed: Vec<FallbackEntry> = entries
             .iter()
-            .map(|e| FallbackEntry::parse(e).ok_or_else(|| anyhow::anyhow!("Invalid entry {e:?}. Expected format: <provider>:<model>")))
+            .map(|e| {
+                FallbackEntry::parse(e).ok_or_else(|| {
+                    anyhow::anyhow!("Invalid entry {e:?}. Expected format: <provider>:<model>")
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let mut fallbacks = self.session_store.get_fallbacks().await?;
@@ -214,7 +249,9 @@ impl FallbackCommand {
         // Clear exclusions on update — they may not be relevant with new entries
         config.exclusions.clear();
 
-        self.session_store.set_fallback(name.clone(), config.clone()).await?;
+        self.session_store
+            .set_fallback(name.clone(), config.clone())
+            .await?;
         println!("  {} Updated fallback '{name}'", style::green("✓"));
         Ok(())
     }
@@ -243,20 +280,28 @@ impl FallbackCommand {
         let active: Vec<&FallbackEntry> = config
             .entries
             .iter()
-            .filter(|e| !config.exclusions.iter().any(|ex| {
-                ex.provider == e.provider && ex.model == e.model && !ex.is_expired(now)
-            }))
+            .filter(|e| {
+                !config.exclusions.iter().any(|ex| {
+                    ex.provider == e.provider && ex.model == e.model && !ex.is_expired(now)
+                })
+            })
             .collect();
         let excluded_entries: Vec<&FallbackEntry> = config
             .entries
             .iter()
-            .filter(|e| config.exclusions.iter().any(|ex| {
-                ex.provider == e.provider && ex.model == e.model && !ex.is_expired(now)
-            }))
+            .filter(|e| {
+                config.exclusions.iter().any(|ex| {
+                    ex.provider == e.provider && ex.model == e.model && !ex.is_expired(now)
+                })
+            })
             .collect();
 
         println!("{} {}:", style::bold("Fallback"), style::cyan(&name));
-        println!("  {}: {} total", style::bold("Entries"), config.entries.len());
+        println!(
+            "  {}: {} total",
+            style::bold("Entries"),
+            config.entries.len()
+        );
         println!("  {}: {}", style::bold("Active"), active.len());
         println!("  {}: {}", style::bold("Excluded"), excluded_entries.len());
         if let Some(ref last) = config.last_used {
@@ -274,7 +319,9 @@ impl FallbackCommand {
 
     /// `fallback clear-exclusions <name> [provider:model]`
     async fn cmd_clear_exclusions(&self, name: Option<String>, targets: Vec<String>) -> Result<()> {
-        let name = name.ok_or_else(|| anyhow::anyhow!("Usage: fallback clear-exclusions <name> [provider:model]"))?;
+        let name = name.ok_or_else(|| {
+            anyhow::anyhow!("Usage: fallback clear-exclusions <name> [provider:model]")
+        })?;
         let mut fallbacks = self.session_store.get_fallbacks().await?;
         let config = fallbacks
             .get_mut(&name)
@@ -283,15 +330,23 @@ impl FallbackCommand {
         if targets.is_empty() {
             // Clear all exclusions
             config.exclusions.clear();
-            println!("  {} Cleared all exclusions for '{name}'", style::green("✓"));
+            println!(
+                "  {} Cleared all exclusions for '{name}'",
+                style::green("✓")
+            );
         } else {
             // Clear specific entries
             for target in &targets {
                 if let Some(entry) = FallbackEntry::parse(target) {
-                    config.exclusions.retain(|e| !(e.provider == entry.provider && e.model == entry.model));
+                    config
+                        .exclusions
+                        .retain(|e| !(e.provider == entry.provider && e.model == entry.model));
                 }
             }
-            println!("  {} Cleared exclusions for {targets:?} in '{name}'", style::green("✓"));
+            println!(
+                "  {} Cleared exclusions for {targets:?} in '{name}'",
+                style::green("✓")
+            );
         }
 
         self.session_store
@@ -302,7 +357,9 @@ impl FallbackCommand {
 
     /// `fallback reorder <name> <provider:model> [<provider:model> ...]`
     async fn cmd_reorder(&self, name: Option<String>, entries: Vec<String>) -> Result<()> {
-        let name = name.ok_or_else(|| anyhow::anyhow!("Usage: fallback reorder <name> <provider:model> [...]"))?;
+        let name = name.ok_or_else(|| {
+            anyhow::anyhow!("Usage: fallback reorder <name> <provider:model> [...]")
+        })?;
         if entries.is_empty() {
             anyhow::bail!("Must provide all entries in the desired order");
         }
@@ -341,7 +398,9 @@ impl FallbackCommand {
         }
 
         config.entries = reordered;
-        self.session_store.set_fallback(name.clone(), config.clone()).await?;
+        self.session_store
+            .set_fallback(name.clone(), config.clone())
+            .await?;
         println!("  {} Reordered fallback '{name}'", style::green("✓"));
         Ok(())
     }
@@ -388,33 +447,57 @@ impl FallbackCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo fallback <action> [name] [entries...]", crate::style::bold("Usage:"));
+        println!(
+            "{} aivo fallback <action> [name] [entries...]",
+            crate::style::bold("Usage:")
+        );
         println!();
-        println!("{}", crate::style::bold("Manage fallback definitions — virtual models that try provider:model pairs in sequence."));
+        println!(
+            "{}",
+            crate::style::bold(
+                "Manage fallback definitions — virtual models that try provider:model pairs in sequence."
+            )
+        );
         println!();
         println!("{}", crate::style::bold("Actions:"));
         let print_opt = |act: &str, desc: &str| {
-            println!("  {}  {}", crate::style::cyan(format!("{:<20}", act)), crate::style::dim(desc));
+            println!(
+                "  {}  {}",
+                crate::style::cyan(format!("{:<20}", act)),
+                crate::style::dim(desc)
+            );
         };
         print_opt("create <name> <p:m>...", "Create a new fallback");
         print_opt("list", "List all fallbacks");
         print_opt("get <name>", "Show fallback details");
-        print_opt("update <name> <p:m>...", "Replace entries in an existing fallback");
+        print_opt(
+            "update <name> <p:m>...",
+            "Replace entries in an existing fallback",
+        );
         print_opt("delete <name>", "Remove a fallback");
         print_opt("status <name>", "Show active/excluded entry counts");
-        print_opt("clear-exclusions <name> [p:m]", "Clear exclusions (all or for one entry)");
-        print_opt("reorder <name> <p:m>...", "Reorder entries (provide all in new order)");
+        print_opt(
+            "clear-exclusions <name> [p:m]",
+            "Clear exclusions (all or for one entry)",
+        );
+        print_opt(
+            "reorder <name> <p:m>...",
+            "Reorder entries (provide all in new order)",
+        );
         println!();
-        println!("{}", crate::style::bold("A fallback name can be used anywhere a model is accepted (e.g. --model)."));
+        println!(
+            "{}",
+            crate::style::bold(
+                "A fallback name can be used anywhere a model is accepted (e.g. --model)."
+            )
+        );
         println!("  Entries are tried in order until one succeeds.");
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::services::session_store::{FallbackEntry, FallbackConfig};
+    use crate::services::session_store::FallbackEntry;
 
     #[tokio::test]
     async fn filter_entries_by_provider_keeps_only_matching() {
@@ -428,7 +511,10 @@ mod tests {
             FallbackEntry::new("another-missing".into(), "m2".into()),
         ];
         let (kept, removed) = cmd.filter_entries_by_provider(entries).await.unwrap();
-        assert!(kept.is_empty(), "no keys exist, so all entries should be filtered out");
+        assert!(
+            kept.is_empty(),
+            "no keys exist, so all entries should be filtered out"
+        );
         assert_eq!(removed.len(), 2);
         assert!(removed.contains(&"nonexistent-provider:m1".to_string()));
         assert!(removed.contains(&"another-missing:m2".to_string()));
