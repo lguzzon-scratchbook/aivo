@@ -141,7 +141,7 @@ pub async fn complete(
         .enumerate()
         .filter(|(_, a)| !a.name.is_empty())
         .map(|(i, a)| {
-            let arguments = serde_json::from_str::<Value>(&a.args).unwrap_or_else(|_| json!({}));
+            let arguments = repair_tool_arguments(&a.name, &a.args);
             ToolCall {
                 id: if a.id.is_empty() {
                     format!("call_{i}")
@@ -159,6 +159,65 @@ pub async fn complete(
         tool_calls,
         usage,
     })
+}
+
+/// Parse tool-call args; repair a truncated/malformed JSON string before falling
+/// back to `{}`. Read-only only — a repaired mutating call could run a wrong command.
+fn repair_tool_arguments(name: &str, raw: &str) -> Value {
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        return v;
+    }
+    if crate::agent::tools::is_read_only(name)
+        && let Some(fixed) = close_truncated_json(raw)
+        && let Ok(v) = serde_json::from_str::<Value>(&fixed)
+    {
+        return v;
+    }
+    json!({})
+}
+
+/// Close a truncated JSON value; `None` if nothing is open (structural, not truncation).
+fn close_truncated_json(raw: &str) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if !in_string && stack.is_empty() {
+        return None;
+    }
+    let mut out = raw.to_string();
+    if in_string {
+        out.push('"');
+    }
+    let trimmed = out.trim_end();
+    if trimmed.ends_with(',') {
+        out.truncate(trimmed.len() - 1);
+    } else if trimmed.ends_with(':') {
+        out.push_str("null");
+    }
+    while let Some(close) = stack.pop() {
+        out.push(close);
+    }
+    Some(out)
 }
 
 #[derive(Default)]
@@ -369,6 +428,47 @@ data: [DONE]\n\n";
         .unwrap();
         assert_eq!(msg.content.as_deref(), Some("中文"));
         assert_eq!(seen, "中文");
+    }
+
+    #[test]
+    fn repairs_truncated_tool_arguments() {
+        let ro = "read_file";
+        assert_eq!(
+            repair_tool_arguments(ro, r#"{"path":"a.txt"}"#)["path"],
+            "a.txt"
+        );
+        assert_eq!(
+            repair_tool_arguments(ro, r#"{"path":"a.tx"#)["path"],
+            "a.tx"
+        );
+        assert_eq!(repair_tool_arguments(ro, r#"{"n":12"#)["n"], 12);
+        assert_eq!(repair_tool_arguments(ro, r#"{"a":1,"#)["a"], 1);
+        let v = repair_tool_arguments(ro, r#"{"a":"x","b":"#);
+        assert_eq!(v["a"], "x");
+        assert!(v["b"].is_null());
+        assert_eq!(repair_tool_arguments(ro, r#"{"xs":[1,2"#)["xs"][1], 2);
+        assert_eq!(
+            repair_tool_arguments(ro, r#"{"q":"a\"b"#)["q"],
+            "a\"b".to_string()
+        );
+        assert_eq!(repair_tool_arguments(ro, "not json at all"), json!({}));
+        assert_eq!(repair_tool_arguments(ro, ""), json!({}));
+    }
+
+    #[test]
+    fn does_not_repair_truncated_args_for_mutating_tools() {
+        assert_eq!(
+            repair_tool_arguments("run_bash", r#"{"command":"rm -rf /home/u"#),
+            json!({})
+        );
+        assert_eq!(
+            repair_tool_arguments("write_file", r#"{"path":"a.tx"#),
+            json!({})
+        );
+        assert_eq!(
+            repair_tool_arguments("run_bash", r#"{"command":"echo hi"}"#)["command"],
+            "echo hi"
+        );
     }
 
     #[tokio::test]

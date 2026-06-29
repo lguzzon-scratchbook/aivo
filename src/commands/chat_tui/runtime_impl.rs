@@ -577,6 +577,12 @@ impl ChatTuiApp {
                 context_window,
                 0,
             );
+            // The bundled aivo-starter provider is first-party: brand the agent so it
+            // presents as aivo's assistant instead of disclosing the upstream model.
+            // BYOK keys stay honest (no branding).
+            if crate::services::provider_profile::is_aivo_starter_base(&self.key.base_url) {
+                engine.set_first_party();
+            }
             // Enable `/rewind` tree-checkpointing (top-level chat only — sub-engines
             // never call this, so they don't pay the git cost).
             engine.enable_rewind_checkpoints(&real_cwd);

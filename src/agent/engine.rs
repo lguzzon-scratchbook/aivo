@@ -18,7 +18,7 @@ use crate::agent::plan::{self, PlanItem};
 use crate::agent::protocol::{AssistantMessage, ChatRequest, Decision, ToolCall, ToolSpec};
 use crate::agent::skills::{self, Skill};
 use crate::agent::subagents::{self, Subagent};
-use crate::agent::{serve_client, tools};
+use crate::agent::{serve_client, tool_repair, tools};
 use crate::services::serve_router::extract_usage_from_value;
 use crate::services::session_store::SessionTokens;
 
@@ -40,6 +40,12 @@ fn resolve_max_steps(max_steps: u32) -> usize {
 /// Stop a turn when the model emits the identical tool-call batch this many
 /// times in a row — a weak-model loop that would otherwise burn the step budget.
 const REPEAT_LIMIT: usize = 3;
+/// Per-turn cap on plain-text-markup nudges; after this the turn converges.
+const MAX_LEAKED_NUDGES: usize = 2;
+const LEAKED_TOOL_CALL_NUDGE: &str = "Your last reply wrote tool calls as plain text, so nothing ran. To call a tool, emit it through the structured tool-call API — not as message text.";
+/// Stands in for an all-markup assistant turn (non-empty, keeps alternation).
+const LEAKED_TOOL_CALL_PLACEHOLDER: &str =
+    "(I wrote a tool call as text by mistake; reissuing it properly.)";
 /// Auto-retry budget for transient LLM/network failures (matches pi's default).
 const MAX_RETRIES: usize = 3;
 /// Step cap for a `subagent` run — bounded below the top-level budget so a
@@ -387,6 +393,10 @@ pub struct AgentEngine {
     /// Plan mode: mutating tools (writes, edits, `run_bash`, subagent) are refused
     /// so a `/plan` investigation can't modify the workspace. See `restrict_read_only`.
     read_only: bool,
+    /// First-party branding (aivo-starter): present as aivo, not the upstream model.
+    first_party: bool,
+    /// `(system, tools)` prefix fingerprint from the last turn; checked under `AIVO_DEBUG`.
+    prefix_fp: Option<(u64, u64)>,
 }
 
 /// The reasoning-effort level to default to: `AIVO_AGENT_REASONING_EFFORT` if
@@ -475,6 +485,23 @@ impl AgentEngine {
             use_web_search_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
+            first_party: false,
+            prefix_fp: None,
+        }
+    }
+
+    /// Append [`FIRST_PARTY_IDENTITY`] to the system prompt in place — keeps the
+    /// single-system-message invariant `restore_conversation` relies on. Idempotent.
+    pub fn set_first_party(&mut self) {
+        if self.first_party {
+            return;
+        }
+        self.first_party = true;
+        let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content")) else {
+            return;
+        };
+        if let Some(s) = content.as_str() {
+            *content = Value::String(format!("{s}\n\n{FIRST_PARTY_IDENTITY}"));
         }
     }
 
@@ -910,8 +937,30 @@ impl AgentEngine {
         ((msg_chars + tool_chars) / 4) as u64
     }
 
+    /// Under `AIVO_DEBUG`, warn when the cached prefix (system prompt + tools) drifts.
+    fn check_prefix_drift(&mut self) {
+        if std::env::var("AIVO_DEBUG").as_deref() != Ok("1") {
+            return;
+        }
+        let fp = tool_repair::prefix_fingerprint(&self.messages[0], &self.tools_openai);
+        if let Some(prev) = self.prefix_fp
+            && prev != fp
+        {
+            let what = match (prev.0 != fp.0, prev.1 != fp.1) {
+                (true, true) => "system prompt and tool schema",
+                (true, false) => "system prompt",
+                _ => "tool schema",
+            };
+            agent_debug(&format!(
+                "prefix drift: {what} changed — prompt cache will miss"
+            ));
+        }
+        self.prefix_fp = Some(fp);
+    }
+
     pub async fn run_turn(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi, user_text: String) {
         self.repair_interrupted_tail();
+        self.check_prefix_drift();
         // Record a `/rewind` checkpoint at the user message that opens this turn.
         // `push_text_turn` merges into a trailing `user` message rather than
         // appending, so when the tail is already `user` the turn starts there;
@@ -946,6 +995,7 @@ impl AgentEngine {
         self.push_text_turn("user", user_text);
 
         let mut steps = 0usize;
+        let mut leaked_nudges = 0usize;
         let mut tokens = 0u64;
         // Real provider-measured split, summed across this turn's steps (drained
         // by the TUI into the chat index for stats). Reset per turn.
@@ -1064,6 +1114,31 @@ impl AgentEngine {
                 ui.notify("the model returned an empty response — no answer produced");
                 converged = true;
                 break;
+            }
+            // Tool calls emitted as text ran nothing: strip, nudge, and retry.
+            if message.tool_calls.is_empty()
+                && leaked_nudges < MAX_LEAKED_NUDGES
+                && let Some(cleaned) = message
+                    .content
+                    .as_deref()
+                    .and_then(tool_repair::strip_if_leaked)
+            {
+                leaked_nudges += 1;
+                // Assistant turn before the nudge keeps roles alternating: a user
+                // nudge right after `tool` results 400s the Anthropic bridge.
+                let recorded = if cleaned.trim().is_empty() {
+                    LEAKED_TOOL_CALL_PLACEHOLDER.to_string()
+                } else {
+                    cleaned
+                };
+                let recorded_msg = AssistantMessage {
+                    content: Some(recorded),
+                    tool_calls: Vec::new(),
+                    usage: message.usage.clone(),
+                };
+                self.messages.push(assistant_to_openai(&recorded_msg));
+                self.push_text_turn("user", LEAKED_TOOL_CALL_NUDGE.to_string());
+                continue;
             }
             self.messages.push(assistant_to_openai(&message));
 
@@ -1855,6 +1930,11 @@ Re-run the full command without write confinement?",
             SUBAGENT_MAX_STEPS,
         );
         sub.drop_subagent_tool();
+        // A first-party (aivo-starter) parent keeps its delegates first-party too, so
+        // a sub-agent's output won't disclose the upstream provider either.
+        if self.first_party {
+            sub.set_first_party();
+        }
         // Honor the parent's hosted-web-search opt-in/out in delegated work.
         sub.set_web_search_enabled(self.use_web_search_enabled);
         // Carry the parent's reasoning effort into delegated work, but only when
@@ -2154,6 +2234,11 @@ pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
         .map(|name| name.to_string())
         .collect()
 }
+
+const FIRST_PARTY_IDENTITY: &str = "You are aivo's own assistant. If the user asks what model you \
+are, who built you, or which provider or company is behind you, present yourself as aivo's \
+assistant and don't name, confirm, or guess at the underlying model or provider — that's an \
+implementation detail. Point them to `aivo models` for their configured setup instead.";
 
 fn system_prompt(cwd: &str, date: &str, guides: &[String], skills: &[Skill]) -> String {
     let mut p = format!(
@@ -2522,6 +2607,16 @@ mod tests {
         dir
     }
 
+    /// No two adjacent `user` messages (the sequence the Anthropic bridge 400s on).
+    fn assert_no_consecutive_user(messages: &[Value]) {
+        for w in messages.windows(2) {
+            assert!(
+                !(role(&w[0]) == "user" && role(&w[1]) == "user"),
+                "two consecutive user messages: {w:?}"
+            );
+        }
+    }
+
     /// Raw-HTTP server that answers each connection with the next SSE body in
     /// `bodies` (one connection per `complete()` call), then closes.
     /// Build a one-tool-call SSE body for the fake serve.
@@ -2811,6 +2906,120 @@ mod tests {
         assert_eq!(ui.text, "done");
         assert!(dir.join("out.txt").exists());
         assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn leaked_tool_call_markup_is_stripped_and_nudged() {
+        let dir = tmp();
+        let leaked = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"<tool_calls>{\"name\":\"read_file\"}</tool_calls>"}}]})
+        );
+        let port = spawn_sse_sequence(vec![leaked, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("read the file".into()),
+            &mut ui,
+        )
+        .await;
+
+        // Nudge is its own `user` message, preceded by an `assistant` turn.
+        let nudge_idx = engine
+            .messages
+            .iter()
+            .position(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("wrote tool calls as plain text"))
+            })
+            .expect("expected a leaked-tool-call nudge in history");
+        assert_eq!(engine.messages[nudge_idx]["role"], "user");
+        assert_eq!(engine.messages[nudge_idx - 1]["role"], "assistant");
+        assert_no_consecutive_user(&engine.messages);
+        assert!(
+            !engine.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("<tool_calls>"))),
+            "leaked markup should be stripped from history"
+        );
+        let last = engine.messages.last().unwrap();
+        assert_eq!(last["role"], "assistant");
+        assert_eq!(last["content"], "done");
+    }
+
+    /// Regression: a leak after a tool step must not produce a user-after-tool 400.
+    #[tokio::test]
+    async fn leaked_tool_call_after_tool_step_keeps_roles_alternating() {
+        let dir = tmp();
+        let bash = tool_call_sse("run_bash", json!({ "command": "echo hi" }));
+        let leaked = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"<tool_calls>{\"name\":\"read_file\"}</tool_calls>"}}]})
+        );
+        let port = spawn_sse_sequence(vec![bash, leaked, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("run it".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_no_consecutive_user(&engine.messages);
+        for i in 1..engine.messages.len() {
+            if role(&engine.messages[i]) == "user" {
+                assert_ne!(
+                    role(&engine.messages[i - 1]),
+                    "tool",
+                    "a user message directly after tool results bricks the Anthropic bridge"
+                );
+            }
+        }
+        assert_eq!(engine.messages.last().unwrap()["content"], "done");
+    }
+
+    #[tokio::test]
+    async fn leaked_tool_call_nudges_are_capped() {
+        let dir = tmp();
+        let leaked = || {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content":"<tool_calls>{\"name\":\"read_file\"}</tool_calls>"}}]})
+            )
+        };
+        let port = spawn_sse_sequence(vec![leaked(), leaked(), leaked(), leaked()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("read it".into()),
+            &mut ui,
+        )
+        .await;
+
+        let nudges = engine
+            .messages
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("wrote tool calls as plain text"))
+            })
+            .count();
+        assert_eq!(nudges, MAX_LEAKED_NUDGES, "nudges must be capped");
+        assert_no_consecutive_user(&engine.messages);
     }
 
     /// `rm -rf /` prompts even with auto-approve on (`turn_ctx` sets `yes: true`).
@@ -4096,6 +4305,33 @@ mod tests {
         assert!(p.contains("never invent file contents")); // don't fabricate
         assert!(p.contains("never print, log, hard-code, or commit secrets")); // secrets hygiene
         assert!(p.contains("change tactics rather than repeating it")); // loop-breaking
+    }
+
+    #[test]
+    fn first_party_branding_is_opt_in_idempotent_and_durable() {
+        let mut e = AgentEngine::new("/tmp", "aivo/starter", "", &[], &[], 0, 0);
+        // Off by default: the base prompt never names the model/provider, so BYOK
+        // (and anything not explicitly branded) stays honest.
+        assert!(!system_content(&e).contains("aivo's own assistant"));
+
+        e.set_first_party();
+        let branded = system_content(&e);
+        assert!(branded.contains("aivo's own assistant"));
+        assert!(branded.contains("aivo models"));
+        // Must mutate the system message in place, not push one — `restore_conversation`
+        // no-ops unless `messages.len() == 1`.
+        assert_eq!(e.messages.len(), 1);
+
+        // Idempotent: a rebuild/resume re-runs it; a double call doesn't duplicate.
+        e.set_first_party();
+        assert_eq!(
+            system_content(&e).matches("aivo's own assistant").count(),
+            1
+        );
+
+        // Survives `reset()` (which keeps only the system message).
+        e.reset();
+        assert!(system_content(&e).contains("aivo's own assistant"));
     }
 
     #[test]

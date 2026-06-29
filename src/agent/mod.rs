@@ -15,4 +15,5 @@ pub mod sandbox;
 pub mod serve_client;
 pub mod skills;
 pub mod subagents;
+pub mod tool_repair;
 pub mod tools;
