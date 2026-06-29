@@ -30,9 +30,9 @@
     "semantic_hash": "7a04bc1780a259fbe18403922959af03"
   },
   "npm/package.json": {
-    "mtime": 1782714975.5550184,
-    "ast_hash": "f82f2f2eb09f7d0a30e8d76ab0b26304",
-    "semantic_hash": "f82f2f2eb09f7d0a30e8d76ab0b26304"
+    "mtime": 1782716903.328944,
+    "ast_hash": "031f999320a15d815a35861e185ce3f2",
+    "semantic_hash": "031f999320a15d815a35861e185ce3f2"
   },
   "npm/scripts/postinstall.js": {
     "mtime": 1782508646.3317473,
@@ -65,9 +65,9 @@
     "semantic_hash": "0f671ba67e3bde5a9e7b37040383bf35"
   },
   "src/agent/engine.rs": {
-    "mtime": 1782714975.5550184,
-    "ast_hash": "d324b54c0e5e87f23d943d7e2db99241",
-    "semantic_hash": "d324b54c0e5e87f23d943d7e2db99241"
+    "mtime": 1782716796.2106693,
+    "ast_hash": "259b96992e8bcd75ca1f44136bb32087",
+    "semantic_hash": "259b96992e8bcd75ca1f44136bb32087"
   },
   "src/agent/mcp.rs": {
     "mtime": 1782714975.5591686,
@@ -140,9 +140,9 @@
     "semantic_hash": "e51fd891fedc082bfc683381d1c6a5d2"
   },
   "src/commands/chat_request_builder.rs": {
-    "mtime": 1782714975.5591686,
-    "ast_hash": "3126b1c7d80e34a4f83a05c9cb710d11",
-    "semantic_hash": "3126b1c7d80e34a4f83a05c9cb710d11"
+    "mtime": 1782716796.2106693,
+    "ast_hash": "afe5dc9cd0f532793a110304ad0e38f3",
+    "semantic_hash": "afe5dc9cd0f532793a110304ad0e38f3"
   },
   "src/commands/chat_response_parser.rs": {
     "mtime": 1782508646.3357472,
@@ -160,9 +160,9 @@
     "semantic_hash": "ff01d1001652fb9e2ccaa51af163fe7f"
   },
   "src/commands/chat_tui/event_loop_impl.rs": {
-    "mtime": 1782714975.5591686,
-    "ast_hash": "fd2cfe6f1230a81c04e29cc67d7fd3fb",
-    "semantic_hash": "fd2cfe6f1230a81c04e29cc67d7fd3fb"
+    "mtime": 1782716796.2106693,
+    "ast_hash": "85a99b0880b544691a124676a1871219",
+    "semantic_hash": "85a99b0880b544691a124676a1871219"
   },
   "src/commands/chat_tui/input_impl.rs": {
     "mtime": 1782508646.3357472,
@@ -220,9 +220,9 @@
     "semantic_hash": "02fc52d33ce78f089500aadc1706601a"
   },
   "src/commands/chat_tui/tests.rs": {
-    "mtime": 1782714975.5633187,
-    "ast_hash": "1c1c077842df3eaa8e543c3659e5e831",
-    "semantic_hash": "1c1c077842df3eaa8e543c3659e5e831"
+    "mtime": 1782716796.2148478,
+    "ast_hash": "ed2fc91a08aaccd69b9e32adc37f23f8",
+    "semantic_hash": "ed2fc91a08aaccd69b9e32adc37f23f8"
   },
   "src/commands/chat_tui_format.rs": {
     "mtime": 1782508646.3397472,
@@ -385,9 +385,9 @@
     "semantic_hash": "cc540fdc467156833da18ffa8ed08137"
   },
   "src/services/ai_launcher.rs": {
-    "mtime": 1782714961.6642694,
-    "ast_hash": "c253159a1f8e197dcc3c7575b54a9ecd",
-    "semantic_hash": "c253159a1f8e197dcc3c7575b54a9ecd"
+    "mtime": 1782716796.2148478,
+    "ast_hash": "763a3a7d1c6ec9c6f3d6f09579357122",
+    "semantic_hash": "763a3a7d1c6ec9c6f3d6f09579357122"
   },
   "src/services/ansi.rs": {
     "mtime": 1782508646.3477473,
@@ -980,9 +980,9 @@
     "semantic_hash": "42555112176b2d4cbcdaf82a4aeee045"
   },
   "CHANGELOG.md": {
-    "mtime": 1782714975.5550184,
-    "ast_hash": "31332ffdbd94c98cd62a3ba822b10870",
-    "semantic_hash": "31332ffdbd94c98cd62a3ba822b10870"
+    "mtime": 1782716796.206491,
+    "ast_hash": "031d7d94c3d9b397206f021053117243",
+    "semantic_hash": "031d7d94c3d9b397206f021053117243"
   },
   "CLAUDE.md": {
     "mtime": 1782714961.5812497,
