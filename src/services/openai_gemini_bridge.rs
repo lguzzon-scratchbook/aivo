@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use crate::services::bridge_defaults::BRIDGE_FALLBACK_OPENAI_RESPONSE_ID;
-use crate::services::effort::{extract_openai_effort, gemini_thinking_config};
+use crate::services::effort::{
+    extract_openai_effort, gemini_thinking_config, gemini_uses_thinking_level,
+};
 use crate::services::http_utils::current_unix_ts;
 use crate::services::model_names::google_native_model_name;
 
@@ -510,13 +512,12 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
     if let Some(v) = body.get("stop") {
         generation.insert("stopSequences".to_string(), v.clone());
     }
-    // OpenAI `reasoning_effort` → Gemini 3 `thinkingConfig.thinking_level`.
-    // Without this, callers asking for "high" reasoning silently get Gemini's
-    // dynamic-thinking default. `thinking_level` is Gemini-3-only; older
-    // models ignore it (current code has no Gemini-2.5 thinkingBudget path).
+    // OpenAI `reasoning_effort` → Gemini `thinkingConfig`; the surface differs
+    // by version (see `gemini_uses_thinking_level`).
     if !generation.contains_key("thinkingConfig")
         && let Some(effort) = extract_openai_effort(body)
-        && let Some(cfg) = gemini_thinking_config(effort)
+        && let Some(cfg) =
+            gemini_thinking_config(effort, gemini_uses_thinking_level(&request_model))
     {
         generation.insert("thinkingConfig".to_string(), cfg);
     }
@@ -2031,6 +2032,24 @@ mod tests {
             req["generationConfig"]["thinkingConfig"]["thinking_level"],
             "high"
         );
+    }
+
+    #[test]
+    fn openai_reasoning_effort_on_gemini_2_5_uses_numeric_budget() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium"
+        });
+        let req = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-flash",
+            },
+        );
+        let cfg = &req["generationConfig"]["thinkingConfig"];
+        assert_eq!(cfg["thinkingBudget"], 8192);
+        assert!(cfg.get("thinking_level").is_none());
     }
 
     #[test]

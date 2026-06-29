@@ -206,12 +206,13 @@ pub fn uses_apply_patch(model: &str) -> bool {
     name.contains("codex") || name.starts_with("gpt-5") || name.starts_with("gpt-4.1")
 }
 
-/// Models the serve bridge can give a native `{type:"web_search"}` server tool
-/// (Anthropic + Gemini). Name-based — no `/v1/models` flag advertises this.
+/// Providers whose native `{type:"web_search"}` server tool can coexist with
+/// the agent's function tools. Anthropic can; Gemini 400s on the mix, so it
+/// uses the hosted tool. Name-based — no `/v1/models` flag advertises this.
 fn native_search_supported(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
-    name.starts_with("claude") || name.starts_with("gemini") || lower.contains("anthropic")
+    name.starts_with("claude") || lower.contains("anthropic")
 }
 
 /// Layer A: hand search to the provider instead of the local tool. Conservative —
@@ -2081,11 +2082,12 @@ mod tests {
 
     #[test]
     fn native_search_supported_is_conservative() {
-        // Bridge-translatable native search → layer A.
         assert!(native_search_supported("claude-opus-4"));
         assert!(native_search_supported("anthropic/claude-3.5-sonnet"));
-        assert!(native_search_supported("gemini-2.5-pro"));
-        assert!(native_search_supported("google/gemini-2.5-flash"));
+        // Gemini 400s on native-search + function-calling and the agent always
+        // sends function tools, so it keeps the hosted tool (B/C).
+        assert!(!native_search_supported("gemini-2.5-pro"));
+        assert!(!native_search_supported("google/gemini-2.5-flash"));
         // Everything else keeps the hosted web_search tool (B/C).
         assert!(!native_search_supported("deepseek-v4-flash"));
         assert!(!native_search_supported("gpt-5"));

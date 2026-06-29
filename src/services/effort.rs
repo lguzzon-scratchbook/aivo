@@ -126,6 +126,37 @@ impl CanonicalEffort {
             Self::High | Self::Max => Some("high"),
         }
     }
+
+    /// Map to a Gemini 2.5 `thinkingBudget`. Stays inside every 2.5 variant's
+    /// accepted band (flash cap 24576, pro 128–32768). `None`/`Minimal` omit it,
+    /// mirroring [`Self::to_gemini_thinking_level`].
+    pub(crate) fn to_gemini_thinking_budget(self) -> Option<u64> {
+        match self {
+            Self::None | Self::Minimal => None,
+            Self::Low => Some(4096),
+            Self::Medium => Some(8192),
+            Self::High => Some(16384),
+            Self::Max => Some(24576),
+        }
+    }
+}
+
+/// True for Gemini 3+, which takes `thinkingConfig.thinking_level`; 2.5 and
+/// earlier take numeric `thinkingBudget` and 400 on `thinking_level`. Unknown
+/// ids → false (the wider-supported budget surface).
+pub(crate) fn gemini_uses_thinking_level(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let Some(rest) = name.strip_prefix("gemini-") else {
+        return false;
+    };
+    let major: u32 = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    major >= 3
 }
 
 /// Extract a canonical effort from an OpenAI request body. Looks at:
@@ -211,10 +242,16 @@ pub(crate) fn anthropic_thinking_config(effort: CanonicalEffort) -> Option<Value
     }))
 }
 
-/// Build a Gemini `thinkingConfig` from a canonical effort.
-pub(crate) fn gemini_thinking_config(effort: CanonicalEffort) -> Option<Value> {
-    let level = effort.to_gemini_thinking_level()?;
-    Some(json!({ "thinking_level": level }))
+/// Build a Gemini `thinkingConfig` from a canonical effort. `uses_level` picks
+/// the surface (see [`gemini_uses_thinking_level`]).
+pub(crate) fn gemini_thinking_config(effort: CanonicalEffort, uses_level: bool) -> Option<Value> {
+    if uses_level {
+        let level = effort.to_gemini_thinking_level()?;
+        Some(json!({ "thinking_level": level }))
+    } else {
+        let budget = effort.to_gemini_thinking_budget()?;
+        Some(json!({ "thinkingBudget": budget }))
+    }
 }
 
 #[cfg(test)]
@@ -404,12 +441,32 @@ mod tests {
     #[test]
     fn gemini_thinking_level_for_minimal_returns_none() {
         // Below "low" Gemini has no equivalent; omit the field to get default.
-        assert!(gemini_thinking_config(CanonicalEffort::Minimal).is_none());
+        assert!(gemini_thinking_config(CanonicalEffort::Minimal, true).is_none());
+        assert!(gemini_thinking_config(CanonicalEffort::Minimal, false).is_none());
     }
 
     #[test]
     fn gemini_thinking_level_collapses_max_to_high() {
-        let cfg = gemini_thinking_config(CanonicalEffort::Max).expect("max maps");
+        let cfg = gemini_thinking_config(CanonicalEffort::Max, true).expect("max maps");
         assert_eq!(cfg["thinking_level"], "high");
+    }
+
+    #[test]
+    fn gemini_2_5_gets_numeric_budget_not_level() {
+        let cfg = gemini_thinking_config(CanonicalEffort::Medium, false).expect("medium maps");
+        assert_eq!(cfg["thinkingBudget"], 8192);
+        assert!(cfg.get("thinking_level").is_none());
+        let max = gemini_thinking_config(CanonicalEffort::Max, false).expect("max maps");
+        assert_eq!(max["thinkingBudget"], 24576);
+    }
+
+    #[test]
+    fn gemini_version_picks_thinking_surface() {
+        assert!(gemini_uses_thinking_level("gemini-3-pro-preview"));
+        assert!(gemini_uses_thinking_level("google/gemini-3-flash"));
+        assert!(!gemini_uses_thinking_level("gemini-2.5-flash"));
+        assert!(!gemini_uses_thinking_level("gemini-2.5-pro"));
+        assert!(!gemini_uses_thinking_level("models/gemini-2.0-flash"));
+        assert!(!gemini_uses_thinking_level("gpt-5"));
     }
 }

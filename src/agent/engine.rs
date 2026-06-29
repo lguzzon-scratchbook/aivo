@@ -2522,6 +2522,25 @@ mod tests {
     }
 
     #[test]
+    fn gemini_keeps_local_web_search_not_native_server_tool() {
+        // Gemini 400s on google_search + function tools, and the agent always
+        // has function tools — so it keeps the local web_search, not the server tool.
+        let e = AgentEngine::new("/tmp", "gemini-2.5-flash", "", &[], &[], 0, 0);
+        assert!(
+            e.tools_openai
+                .iter()
+                .any(|t| t["function"]["name"].as_str() == Some("web_search")),
+            "gemini keeps the local web_search function tool"
+        );
+        assert!(
+            !e.tools_openai
+                .iter()
+                .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("web_search")),
+            "gemini must not carry the native web_search server tool"
+        );
+    }
+
+    #[test]
     fn test_resolve_max_steps() {
         // 0 → no cap (the interactive default).
         assert_eq!(resolve_max_steps(0), usize::MAX);
