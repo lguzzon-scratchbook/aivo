@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.33.2
+
+More chat-agent hardening. The agent now repairs malformed tool calls (with
+prefix-drift telemetry) and detects leaked tool-call markup more tightly,
+keeping it out of the scrollback. Edit cards gain word-level diff highlighting
+and line numbers, the composer wraps input at word boundaries, and `!cmd`
+output collapses carriage-return overwrites. Rounding it out: Gemini
+`web_search` config and thinking-budget fixes, aligned adaptive-thinking gating
+across the bridge and native paths, id-less share tool-call pairing, and an
+`anyhow` bump for RUSTSEC-2026-0190.
+
+- feat(agent): repair malformed tool calls + prefix-drift telemetry (e8b6120)
+- feat(chat): word-level diff highlighting + line numbers in edit cards (8420e55)
+- fix(agent): tighten leaked-call detection + drop leaked markup from scrollback (1acb555)
+- fix(agent): Gemini web_search config and thinking budget (94ffabf)
+- fix(thinking): align adaptive-thinking gating across bridge and native paths (d8664b4)
+- fix(chat): wrap composer input at word boundaries (1cb30de)
+- fix(chat): collapse carriage-return overwrites in !cmd output (c089272)
+- fix(share): pair id-less chat tool calls with their results (0d6f933)
+- chore: bump anyhow to 1.0.103 (RUSTSEC-2026-0190) (9115e88)
+
 ## v0.33.1
 
 A trio of fixes for the chat agent and Pi. No-thinking turns now read their
