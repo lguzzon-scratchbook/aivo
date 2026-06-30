@@ -923,16 +923,18 @@ fn model_present_in_catalog(catalog: &[String], model: &str) -> bool {
     catalog.is_empty() || catalog.iter().any(|m| m == model)
 }
 
-/// Returns whether `model` is still listed for the aivo-starter server.
-/// Returns `true` (skip validation) for non-starter keys, the stable sentinel
-/// `aivo/starter`, `MODEL_DEFAULT_PLACEHOLDER`, and when the catalog can't be
-/// fetched — we never block the user on a network hiccup.
+/// Whether `model` is still listed for the aivo-starter server. `true` (skip)
+/// for non-starter keys, the `aivo/starter` sentinel, `MODEL_DEFAULT_PLACEHOLDER`,
+/// and an un-cached catalog.
 ///
-/// Bypasses the cache: the whole point is to detect server-side removals,
-/// and the cache may hold the pre-removal catalog. The fresh fetch's result
-/// is written back to the cache as a side benefit.
+/// Non-blocking by design: reads only the last-known catalog and never fetches,
+/// so the chat/run/start launch never waits on `/v1/models` (that cost ~1s every
+/// launch). Reads both starter cache spellings — the picker/`aivo models` key by
+/// the sentinel, chat's background warm by the post-swap real URL — which are
+/// never unified (the routers depend on the real-URL entry). The warm keeps it
+/// fresh; a removal shows up a launch late, with the first request's error
+/// bridging the gap.
 pub(crate) async fn starter_model_still_available(
-    client: &Client,
     key: &ApiKey,
     cache: &ModelsCache,
     model: &str,
@@ -945,10 +947,17 @@ pub(crate) async fn starter_model_still_available(
     {
         return true;
     }
-    match fetch_all_models_cached(client, key, cache, true).await {
-        Ok(catalog) => model_present_in_catalog(&catalog, model),
-        Err(_) => true,
+    let mut catalog = cache
+        .model_ids(crate::constants::AIVO_STARTER_SENTINEL)
+        .await
+        .unwrap_or_default();
+    if let Some(more) = cache
+        .model_ids(crate::constants::AIVO_STARTER_REAL_URL)
+        .await
+    {
+        catalog.extend(more);
     }
+    model_present_in_catalog(&catalog, model)
 }
 
 /// Fetch models with full metadata from the API where available.
@@ -1668,8 +1677,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
         let key = make_key("https://api.example.com");
-        let client = reqwest::Client::new();
-        assert!(starter_model_still_available(&client, &key, &cache, "any-model").await);
+        assert!(starter_model_still_available(&key, &cache, "any-model").await);
+    }
+
+    #[tokio::test]
+    async fn starter_validation_reads_cached_catalog_without_network() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
+
+        // Empty cache → can't judge → passes (never blocks a fresh install).
+        assert!(starter_model_still_available(&key, &cache, "model-a").await);
+
+        // The chat warm keys the catalog by the post-swap real URL; validation
+        // must read it even though the key's base_url is the sentinel.
+        cache
+            .set(
+                &full_catalog_key(crate::constants::AIVO_STARTER_REAL_URL),
+                vec!["model-a".to_string()],
+            )
+            .await;
+        assert!(starter_model_still_available(&key, &cache, "model-a").await);
+        assert!(!starter_model_still_available(&key, &cache, "model-gone").await);
     }
 
     #[tokio::test]
@@ -1677,17 +1706,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
         let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
-        let client = reqwest::Client::new();
-        // `aivo/starter` is the stable sentinel — the helper must short-circuit
-        // before fetching.
+        // `aivo/starter` is the stable sentinel — the helper must short-circuit.
         assert!(
-            starter_model_still_available(
-                &client,
-                &key,
-                &cache,
-                crate::constants::AIVO_STARTER_MODEL,
-            )
-            .await
+            starter_model_still_available(&key, &cache, crate::constants::AIVO_STARTER_MODEL,)
+                .await
         );
     }
 
@@ -1696,10 +1718,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
         let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
-        let client = reqwest::Client::new();
         assert!(
             starter_model_still_available(
-                &client,
                 &key,
                 &cache,
                 crate::constants::MODEL_DEFAULT_PLACEHOLDER,

@@ -223,7 +223,6 @@ impl ChatCommand {
     /// --model flag > persisted per-key > last_selection > None (show picker)
     async fn resolve_model(
         &self,
-        client: &Client,
         key: &ApiKey,
         flag_model: Option<String>,
     ) -> Result<Option<String>> {
@@ -240,7 +239,7 @@ impl ChatCommand {
             }
             None => {
                 if let Some(m) = self.session_store.get_chat_model(&key.id).await? {
-                    if self.starter_model_valid(client, key, &m).await {
+                    if self.starter_model_valid(key, &m).await {
                         return Ok(Some(m));
                     }
                     return Ok(None);
@@ -250,7 +249,7 @@ impl ChatCommand {
                     && let Some(ref m) = sel.model
                     && m != crate::constants::MODEL_DEFAULT_PLACEHOLDER
                 {
-                    if self.starter_model_valid(client, key, m).await {
+                    if self.starter_model_valid(key, m).await {
                         return Ok(Some(m.clone()));
                     }
                     return Ok(None);
@@ -263,10 +262,8 @@ impl ChatCommand {
     /// Wraps `starter_model_still_available`, printing a notice when the
     /// persisted model has been removed from the aivo-starter catalog so the
     /// caller knows why the picker is about to open.
-    async fn starter_model_valid(&self, client: &Client, key: &ApiKey, model: &str) -> bool {
-        if crate::commands::models::starter_model_still_available(client, key, &self.cache, model)
-            .await
-        {
+    async fn starter_model_valid(&self, key: &ApiKey, model: &str) -> bool {
+        if crate::commands::models::starter_model_still_available(key, &self.cache, model).await {
             return true;
         }
         eprintln!(
@@ -595,7 +592,7 @@ impl ChatCommand {
             // Precedence: explicit `--model` > the `--agent` profile's `model:` >
             // the per-key persisted model > last selection > picker.
             let effective = model_flag.clone().or(agent_model);
-            self.resolve_model(&client, &key, effective).await?
+            self.resolve_model(&key, effective).await?
         };
         let raw_model = match resolved {
             Some(m) => m,

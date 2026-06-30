@@ -514,10 +514,7 @@ impl StartCommand {
             return Some(model);
         }
 
-        let client = http_utils::router_http_client();
-        if crate::commands::models::starter_model_still_available(&client, key, &self.cache, &model)
-            .await
-        {
+        if crate::commands::models::starter_model_still_available(key, &self.cache, &model).await {
             return Some(model);
         }
 
