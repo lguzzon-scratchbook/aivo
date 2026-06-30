@@ -425,6 +425,7 @@ impl ChatCommand {
         agent: Option<String>,
         max_context: Option<String>,
         dry_run: bool,
+        live: bool,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -438,6 +439,7 @@ impl ChatCommand {
                 agent,
                 max_context,
                 dry_run,
+                live,
             )
             .await
         {
@@ -462,6 +464,7 @@ impl ChatCommand {
         agent: Option<String>,
         max_context: Option<String>,
         dry_run: bool,
+        live: bool,
     ) -> Result<ExitCode> {
         // Validate `--max-context` up front so a malformed value fails fast.
         let max_context: Option<u64> = match max_context.as_deref() {
@@ -861,6 +864,11 @@ impl ChatCommand {
             );
         }
 
+        // `--live` needs a linked account; fail fast rather than launch unshared.
+        if live && !crate::commands::share::device_linked().await {
+            return Err(crate::commands::share::not_linked_error());
+        }
+
         let initial_session = new_chat_session_id();
         let initial_history = Vec::new();
 
@@ -892,6 +900,7 @@ impl ChatCommand {
             initial_resume: resume,
             initial_agent,
             max_context,
+            live,
         })
         .await?;
 
@@ -946,6 +955,10 @@ impl ChatCommand {
         print_opt(
             "--resume [last|id]",
             "Resume a saved chat: picker (bare), most recent (last), or by session id",
+        );
+        print_opt(
+            "--live",
+            "Share this chat live to a viewer URL (needs `aivo login`; toggle in-chat with /live)",
         );
         print_opt(
             "--attach <path>",

@@ -154,6 +154,7 @@ impl ChatTuiApp {
             RuntimeEvent::SkillInstalled { source, result } => {
                 self.apply_skill_installed(source, result).await?
             }
+            RuntimeEvent::LiveShareReady(result) => self.apply_live_share_ready(result),
         }
         Ok(())
     }
@@ -1078,6 +1079,11 @@ impl ChatTuiApp {
                 Err(err) => break Err(err),
             }
 
+            // Deferred `--live` start, once the session has settled.
+            if self.maybe_start_live_share().await {
+                needs_redraw = true;
+            }
+
             // Keep the selection growing while a drag rests on the top/bottom edge.
             if self.tick_drag_autoscroll() {
                 needs_redraw = true;
@@ -1538,12 +1544,18 @@ impl ChatTuiApp {
     /// Picks the surface + mapped point for a press/drag: the transcript when the
     /// pointer is over it with no overlay, else the flat screen. `clamp` pins an
     /// off-surface drag to the edge instead of returning `None`.
-    fn selection_target(
+    pub(super) fn selection_target(
         &self,
         mouse: MouseEvent,
         clamp: bool,
     ) -> Option<(SelectionSurface, TranscriptPoint)> {
-        if !self.overlay.blocks_input() && self.mouse_over_transcript(mouse) {
+        // The empty state is drawn by `render_empty_state`, not the transcript row
+        // model, so its hitbox rows don't match the screen — select from the flat
+        // screen surface instead (which snapshots the rendered cells).
+        if !self.overlay.blocks_input()
+            && self.mouse_over_transcript(mouse)
+            && !self.is_transcript_empty()
+        {
             return self
                 .transcript_point_for_mouse(mouse, clamp)
                 .map(|point| (SelectionSurface::Transcript, point));

@@ -24,7 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
 use http::{HeaderName, HeaderValue};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -36,6 +36,27 @@ const DEFAULT_BASE_URL: &str = "https://s.getaivo.dev";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_BUFFER: usize = 64;
 
+/// How `run_tunnel` surfaces the public URL. `Cli` prints it (spinner + banner +
+/// optional browser open); `Headless` stays silent and sends it over a channel
+/// for the chat TUI to render itself.
+pub enum TunnelUi {
+    Cli { open_in_browser: bool },
+    Headless { url_tx: oneshot::Sender<String> },
+}
+
+/// Stop + join the connect spinner if one is running (CLI mode only).
+async fn finish_spinner(
+    spinner: &mut Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    )>,
+) {
+    if let Some((flag, handle)) = spinner.take() {
+        crate::style::stop_spinner(&flag);
+        let _ = handle.await;
+    }
+}
+
 /// Connect, register, and run the tunnel until either the server drops it
 /// or `shutdown` fires (Ctrl+C). Returns Ok on clean shutdown; Err on connect
 /// / register failure or on a server-side reject.
@@ -45,11 +66,12 @@ const OUTBOUND_BUFFER: usize = 64;
 /// the local share returns immediately. Without that wiring, Ctrl+C would
 /// wait on in-flight `reqwest` calls into the local share's wait window,
 /// adding up to 30 seconds before the WS Close reached the public host.
-pub async fn run_tunnel(
-    local_base: String,
-    open_in_browser: bool,
-    shutdown: ShutdownSignal,
-) -> Result<()> {
+pub async fn run_tunnel(local_base: String, ui: TunnelUi, shutdown: ShutdownSignal) -> Result<()> {
+    // `is_cli` gates every terminal write below; `url_tx` is the headless sink.
+    let (is_cli, open_in_browser, mut url_tx) = match ui {
+        TunnelUi::Cli { open_in_browser } => (true, open_in_browser, None),
+        TunnelUi::Headless { url_tx } => (false, false, Some(url_tx)),
+    };
     let api_base =
         std::env::var("AIVO_SHARE_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let ws_endpoint = format!("{}/_tunnel", http_to_ws_url(&api_base)?);
@@ -73,23 +95,19 @@ pub async fn run_tunnel(
         }
     }
 
-    // Connect + handshake takes a network roundtrip; show a spinner so the
-    // user sees feedback between Enter and the success banner. The spinner
-    // is killed in every exit branch (early returns and the success path);
-    // `print_share_started` does the final line-clear.
-    let (spinner, spinner_handle) = crate::style::start_spinner(Some(" preparing share…"));
+    // Connect feedback (CLI only; the headless path stays silent), killed in
+    // every exit branch below.
+    let mut spinner = is_cli.then(|| crate::style::start_spinner(Some(" preparing share…")));
 
     let connect = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_async(req)).await;
     let (mut ws, _resp) = match connect {
         Ok(Ok(ok)) => ok,
         Ok(Err(e)) => {
-            crate::style::stop_spinner(&spinner);
-            let _ = spinner_handle.await;
+            finish_spinner(&mut spinner).await;
             return Err(connect_error(e));
         }
         Err(_) => {
-            crate::style::stop_spinner(&spinner);
-            let _ = spinner_handle.await;
+            finish_spinner(&mut spinner).await;
             return Err(anyhow!(
                 "Timed out reaching the aivo share service — check your connection and try again."
             ));
@@ -109,8 +127,7 @@ pub async fn run_tunnel(
     }
     .encode();
     if let Err(e) = ws.send(Message::Binary(register.into())).await {
-        crate::style::stop_spinner(&spinner);
-        let _ = spinner_handle.await;
+        finish_spinner(&mut spinner).await;
         return Err(e.into());
     }
 
@@ -118,34 +135,37 @@ pub async fn run_tunnel(
     let first = match recv_binary(&mut ws, HANDSHAKE_TIMEOUT).await {
         Ok(b) => b,
         Err(e) => {
-            crate::style::stop_spinner(&spinner);
-            let _ = spinner_handle.await;
+            finish_spinner(&mut spinner).await;
             return Err(e);
         }
     };
     let public_url = match ServerFrame::decode(&first) {
         Ok(ServerFrame::Registered { url, .. }) => url,
         Ok(ServerFrame::Reject { reason, .. }) => {
-            crate::style::stop_spinner(&spinner);
-            let _ = spinner_handle.await;
+            finish_spinner(&mut spinner).await;
             return Err(anyhow!("server rejected tunnel: {reason}"));
         }
         Ok(other) => {
-            crate::style::stop_spinner(&spinner);
-            let _ = spinner_handle.await;
+            finish_spinner(&mut spinner).await;
             return Err(anyhow!("unexpected first frame: {other:?}"));
         }
         Err(e) => {
-            crate::style::stop_spinner(&spinner);
-            let _ = spinner_handle.await;
+            finish_spinner(&mut spinner).await;
             return Err(e).context("decode REGISTERED");
         }
     };
-    crate::style::stop_spinner(&spinner);
-    let _ = spinner_handle.await;
-    crate::commands::share::print_share_started(&public_url);
-    if open_in_browser {
-        let _ = crate::services::browser_open::open_url(&public_url);
+    finish_spinner(&mut spinner).await;
+    // Headless: hand the URL to the caller. CLI: print the banner (+ browser).
+    match url_tx.take() {
+        Some(tx) => {
+            let _ = tx.send(public_url.clone());
+        }
+        None => {
+            crate::commands::share::print_share_started(&public_url);
+            if open_in_browser {
+                let _ = crate::services::browser_open::open_url(&public_url);
+            }
+        }
     }
 
     // 3. Split the socket; spawn a writer task so the read loop and the
@@ -176,7 +196,9 @@ pub async fn run_tunnel(
     loop {
         tokio::select! {
             _ = shutdown.wait() => {
-                println!();
+                if is_cli {
+                    println!();
+                }
                 break;
             }
             msg = stream_rx.next() => {

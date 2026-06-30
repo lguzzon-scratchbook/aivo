@@ -148,7 +148,15 @@ impl ShareCommand {
             println!();
             ExitCode::Success
         } else {
-            match share_tunnel::run_tunnel(local_base, args.open, shutdown.clone()).await {
+            match share_tunnel::run_tunnel(
+                local_base,
+                share_tunnel::TunnelUi::Cli {
+                    open_in_browser: args.open,
+                },
+                shutdown.clone(),
+            )
+            .await
+            {
                 Ok(()) => ExitCode::Success,
                 Err(e) => {
                     eprintln!("  {} {e}", style::red("✗"));
@@ -250,7 +258,17 @@ async fn ensure_device_linked() -> Result<()> {
     }
 }
 
-fn not_linked_error() -> anyhow::Error {
+/// Non-printing device-link check for the chat TUI's `--live` / `/live`. Fails
+/// open on a server hiccup, like `ensure_device_linked`.
+pub(crate) async fn device_linked() -> bool {
+    use crate::commands::login::{AccountSync, sync_account_status};
+    matches!(
+        sync_account_status().await,
+        AccountSync::Linked(_) | AccountSync::Unverified(Some(_))
+    )
+}
+
+pub(crate) fn not_linked_error() -> anyhow::Error {
     CLIError::new(
         "Sharing requires a linked aivo account.",
         ErrorCategory::Auth,

@@ -372,11 +372,13 @@ impl ChatTuiApp {
             render_local_command(&mut block, &content, OutputView::Live);
             push_block(&mut lines, &mut bars, block, Some(TOOL));
         }
-        if let Some((color, text)) = notice_display(self.notice.as_ref()) {
+        if let Some((color, _)) = notice_display(self.notice.as_ref()) {
             lines.push(blank_line());
             bars.push(None);
             let mut block = Vec::new();
-            render_notice_line(&mut block, color, text.as_ref());
+            if let Some(spans) = notice_spans(self.notice.as_ref()) {
+                block.push(line_with_plain(spans));
+            }
             push_block(&mut lines, &mut bars, block, Some(color));
         }
         (lines, bars)
@@ -1758,12 +1760,9 @@ impl ChatTuiApp {
         };
 
         let mut lines = lines;
-        if let Some((color, text)) = notice_display(self.notice.as_ref()) {
+        if let Some(spans) = notice_spans(self.notice.as_ref()) {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                text.into_owned(),
-                Style::default().fg(color),
-            )));
+            lines.push(Line::from(spans));
         }
 
         frame.render_widget(
@@ -1888,16 +1887,21 @@ impl ChatTuiApp {
         } else {
             area.width.saturating_sub(right_label_width + 1)
         };
+        // Reserve columns for the `● live` badge so the text truncates to fit it.
+        let live = self.live_share.is_some();
+        let badge_w = if live {
+            display_width(LIVE_BADGE) as u16 + 3 // + " · " glue
+        } else {
+            0
+        };
         let left_text = build_footer_text(
             &self.raw_model,
             &self.key.base_url,
             self.display_cwd(),
             self.git_branch.as_deref(),
             self.active_agent.as_deref(),
-            left_width,
+            left_width.saturating_sub(badge_w),
         );
-        let left_len = display_width(&left_text) as u16;
-        let pad = left_width.saturating_sub(left_len);
         // Status-line hierarchy instead of one flat gray: the model name (first
         // segment) carries the brand accent as the identity anchor, the ` · `
         // glue recedes to FAINT, and the host/cwd context stays MUTED.
@@ -1911,7 +1915,14 @@ impl ChatTuiApp {
                 segment.to_string(),
                 Style::default().fg(color),
             ));
+            // Badge sits right after the model (first segment).
+            if index == 0 && live {
+                spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+                spans.push(Span::styled(LIVE_BADGE, Style::default().fg(LIVE)));
+            }
         }
+        let left_len = display_width(&left_text) as u16 + badge_w;
+        let pad = left_width.saturating_sub(left_len);
         if right_label_width > 0 {
             spans.push(Span::raw(" ".repeat(usize::from(pad) + 1)));
             spans.push(Span::styled(right_label, Style::default().fg(right_color)));

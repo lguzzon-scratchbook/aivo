@@ -784,16 +784,29 @@ pub(super) fn notice_display(notice: Option<&(Color, String)>) -> Option<(Color,
     })
 }
 
+/// Styled spans for the active notice. The live-share notice splits into a red
+/// `● Live:` indicator + a link-colored URL (an all-red line reads as an error);
+/// everything else is one color.
+pub(super) fn notice_spans(notice: Option<&(Color, String)>) -> Option<Vec<Span<'static>>> {
+    let (color, text) = notice_display(notice)?;
+    if let Some(url) = text.strip_prefix(LIVE_NOTICE_PREFIX) {
+        return Some(vec![
+            Span::styled(LIVE_NOTICE_PREFIX, Style::default().fg(LIVE)),
+            Span::styled(url.to_string(), Style::default().fg(LINK)),
+        ]);
+    }
+    Some(vec![Span::styled(
+        text.into_owned(),
+        Style::default().fg(color),
+    )])
+}
+
 pub(super) fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
     let (x, y) = point;
     x >= area.x
         && x < area.x.saturating_add(area.width)
         && y >= area.y
         && y < area.y.saturating_add(area.height)
-}
-
-pub(super) fn render_notice_line(lines: &mut Vec<StyledLine>, color: Color, text: &str) {
-    push_styled_line(lines, text.to_string(), Style::default().fg(color));
 }
 
 pub(super) fn render_system_message(

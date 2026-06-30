@@ -319,6 +319,7 @@ pub async fn run() -> ! {
                         .or_else(|| chat_args.one_m.then(|| "1m".to_string()))
                         .or_else(|| chat_args.two_m.then(|| "2m".to_string())),
                     chat_args.dry_run,
+                    chat_args.live,
                 )
                 .await
         }

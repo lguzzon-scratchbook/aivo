@@ -974,6 +974,10 @@ impl ChatTuiApp {
                 self.open_config_overlay();
                 Ok(false)
             }
+            SlashCommand::Live(arg) => {
+                self.run_live_command(arg).await;
+                Ok(false)
+            }
             SlashCommand::Help => {
                 self.open_help_overlay();
                 Ok(false)
@@ -1724,6 +1728,8 @@ impl ChatTuiApp {
 
     pub(super) fn start_new_chat(&mut self) {
         self.discard_resume_state();
+        // The share is pinned to the current session; a new chat swaps it out.
+        self.stop_live_share();
         self.cancel_inflight_request(false);
         self.overlay = Overlay::None;
         self.history.clear();

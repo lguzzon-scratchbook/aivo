@@ -1522,6 +1522,8 @@ impl ChatTuiApp {
 
     pub(super) fn begin_resume_load(&mut self, preview: SessionPreview) {
         self.discard_resume_state();
+        // The share is pinned to the current session; resume swaps it out.
+        self.stop_live_share();
         self.overlay = Overlay::None;
         if self.sending {
             self.cancel_inflight_request(false);

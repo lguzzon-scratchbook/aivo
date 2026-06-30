@@ -1114,6 +1114,9 @@ fn make_test_app(
         reasoning_started_at: None,
         reasoning_elapsed_ms: None,
         installing_skill: None,
+        live_share: None,
+        live_share_starting: false,
+        live_requested: false,
     }
 }
 
@@ -5031,6 +5034,14 @@ async fn test_auto_approve_toggle_shows_toast_not_notice() {
 async fn test_mouse_drag_coordinates_map_to_transcript_rows() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
+    // A populated transcript hitbox only exists with real content; an empty
+    // transcript routes selection to the screen surface (see `selection_target`).
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "x".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
     app.transcript_hitbox = Some(TranscriptHitbox {
         area: Rect::new(4, 2, 20, 4),
         first_row: 10,
@@ -5650,6 +5661,219 @@ fn test_parse_slash_command_with_argument() {
         SlashCommand::Mcp(Some("add fs npx -y srv".to_string()))
     );
     assert_eq!(parse_slash_command("mcp").unwrap(), SlashCommand::Mcp(None));
+}
+
+#[test]
+fn test_parse_slash_live() {
+    assert_eq!(
+        parse_slash_command("live").unwrap(),
+        SlashCommand::Live(None)
+    );
+    assert_eq!(
+        parse_slash_command("live stop").unwrap(),
+        SlashCommand::Live(Some("stop".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn test_live_command_stop_and_usage_notices() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // `/live stop` with no active share → informative notice, nothing started.
+    app.run_live_command(Some("stop".to_string())).await;
+    assert!(
+        app.notice.as_ref().unwrap().1.contains("Not currently"),
+        "notice: {:?}",
+        app.notice
+    );
+    assert!(app.live_share.is_none());
+
+    // Unknown argument → usage notice (no background start).
+    app.run_live_command(Some("frobnicate".to_string())).await;
+    assert!(
+        app.notice.as_ref().unwrap().1.contains("Usage"),
+        "notice: {:?}",
+        app.notice
+    );
+    assert!(!app.live_share_starting);
+}
+
+#[tokio::test]
+async fn test_live_command_reshows_url_then_stops() {
+    use crate::services::share_live::LiveShareHandle;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.live_share = Some(LiveShareHandle::for_test(
+        "https://s.getaivo.dev/v.html?t=zz",
+    ));
+
+    // Bare `/live` while already sharing just re-shows the URL — no new start.
+    app.run_live_command(None).await;
+    assert!(
+        app.notice.as_ref().unwrap().1.contains("t=zz"),
+        "notice: {:?}",
+        app.notice
+    );
+    assert!(app.live_share.is_some());
+    assert!(!app.live_share_starting);
+
+    // `/live stop` tears it down.
+    app.run_live_command(Some("stop".to_string())).await;
+    assert!(app.live_share.is_none());
+    assert!(app.notice.as_ref().unwrap().1.contains("stopped"));
+}
+
+#[test]
+fn test_apply_live_share_ready_ok_and_err() {
+    use crate::services::share_live::LiveShareHandle;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.live_share_starting = true;
+    app.apply_live_share_ready(Ok(LiveShareHandle::for_test(
+        "https://s.getaivo.dev/v.html?t=ok",
+    )));
+    assert!(!app.live_share_starting);
+    assert!(app.live_share.is_some());
+    assert!(app.notice.as_ref().unwrap().1.contains("t=ok"));
+
+    // Failure: clears the starting flag, surfaces the reason, stores nothing.
+    app.live_share = None;
+    app.live_share_starting = true;
+    app.apply_live_share_ready(Err("no link".to_string()));
+    assert!(!app.live_share_starting);
+    assert!(app.live_share.is_none());
+    assert_eq!(app.notice.as_ref().unwrap().1, "no link");
+}
+
+#[test]
+fn test_footer_shows_live_badge_only_when_sharing() {
+    use crate::services::share_live::LiveShareHandle;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // No share → no badge.
+    let (screen, _) = render_full_screen(&mut app, 80, 12);
+    assert!(
+        !screen.contains("● live"),
+        "live badge shown without an active share:\n{screen}"
+    );
+
+    // Active share → the `● live` badge appears in the footer.
+    app.live_share = Some(LiveShareHandle::for_test(
+        "https://s.getaivo.dev/v.html?t=ab",
+    ));
+    let (screen, _) = render_full_screen(&mut app, 80, 12);
+    assert!(
+        screen.contains("● live"),
+        "no live badge in footer while sharing:\n{screen}"
+    );
+}
+
+#[tokio::test]
+async fn test_maybe_start_live_share_defers_until_session_settles() {
+    use crate::services::share_live::LiveShareHandle;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // No `--live` request → never starts.
+    assert!(!app.maybe_start_live_share().await);
+
+    app.live_requested = true;
+
+    // A pending `--resume` load defers the start (it must pin the resumed session).
+    app.loading_resume = Some(LoadingResume {
+        request_id: 1,
+        preview: SessionPreview {
+            key_id: "k".into(),
+            key_name: "k".into(),
+            base_url: "u".into(),
+            session_id: "resumed".into(),
+            raw_model: "m".into(),
+            updated_at: "t".into(),
+            title: "t".into(),
+            preview_text: "p".into(),
+        },
+    });
+    assert!(!app.maybe_start_live_share().await);
+    assert!(
+        app.live_requested,
+        "request stays pending while resume loads"
+    );
+    app.loading_resume = None;
+
+    // An already-running share or an in-flight start are both no-ops.
+    app.live_share = Some(LiveShareHandle::for_test("https://x"));
+    assert!(!app.maybe_start_live_share().await);
+    app.live_share = None;
+    app.live_share_starting = true;
+    assert!(!app.maybe_start_live_share().await);
+    assert!(app.live_requested);
+}
+
+#[test]
+fn test_empty_state_notice_selects_via_screen_surface() {
+    use crate::services::share_live::LiveShareHandle;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // `--live` launch state: empty transcript, live-URL notice (the notice draws
+    // the URL line; the handle just drives the badge).
+    assert!(app.is_transcript_empty());
+    app.live_share = Some(LiveShareHandle::for_test(
+        "https://s.getaivo.dev/s/uniqueurlzz",
+    ));
+    app.notice = Some((
+        LIVE,
+        format!("{LIVE_NOTICE_PREFIX}https://s.getaivo.dev/s/uniqueurlzz"),
+    ));
+    let (_, rows) = render_full_screen(&mut app, 80, 16);
+    let url_row = rows
+        .iter()
+        .position(|r| r.contains("uniqueurlzz"))
+        .expect("live URL rendered in the empty state") as u16;
+
+    // The press must target the screen surface, not the empty transcript hitbox.
+    let mouse = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 12,
+        row: url_row,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(
+        matches!(
+            app.selection_target(mouse, false),
+            Some((SelectionSurface::Screen, _))
+        ),
+        "empty-state notice should select via the screen surface"
+    );
+}
+
+#[test]
+fn test_notice_spans_splits_live_url_from_indicator() {
+    // The live notice paints `● Live:` red but the URL a calm link color, so the
+    // long line doesn't read as an error. Other notices stay a single span.
+    let live = (
+        LIVE,
+        format!("{LIVE_NOTICE_PREFIX}https://s.getaivo.dev/s/abc"),
+    );
+    let spans = notice_spans(Some(&live)).unwrap();
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].content.as_ref(), LIVE_NOTICE_PREFIX);
+    assert_eq!(spans[0].style.fg, Some(LIVE));
+    assert_eq!(spans[1].content.as_ref(), "https://s.getaivo.dev/s/abc");
+    assert_eq!(spans[1].style.fg, Some(LINK));
+
+    let plain = (MUTED, "just a status".to_string());
+    let spans = notice_spans(Some(&plain)).unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].style.fg, Some(MUTED));
+
+    // ERROR keeps its `Error:` prefix and single span.
+    let err = (ERROR, "boom".to_string());
+    let spans = notice_spans(Some(&err)).unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].content.as_ref(), "Error: boom");
 }
 
 #[tokio::test]

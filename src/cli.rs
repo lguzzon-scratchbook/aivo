@@ -875,6 +875,11 @@ pub struct ChatArgs {
     /// Print the resolved key, model, endpoint, and agent without connecting
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Publish a live, redacted view of this chat to a viewer URL (shown in the
+    /// TUI). Needs a linked account (`aivo login`); toggle in-chat with `/live`.
+    #[arg(long)]
+    pub live: bool,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE
