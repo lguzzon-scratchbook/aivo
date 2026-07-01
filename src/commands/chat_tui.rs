@@ -190,7 +190,6 @@ impl ChatTuiApp {
             picker_hitbox: None,
             exit_confirm_pending: false,
             cursor_acp_session: None,
-            active_agent: params.initial_agent,
             pending_agent_messages: None,
             goal_mode: None,
             capturing_plan: false,

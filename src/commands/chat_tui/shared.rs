@@ -192,12 +192,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
-        name: "agent",
-        help_label: "/agent [name]",
-        description: "switch agent profile (bare opens a picker)",
-        takes_argument: true,
-    },
-    SlashCommandSpec {
         name: "goal",
         help_label: "/goal <objective>",
         description: "work autonomously toward a goal until done",
@@ -258,7 +252,6 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "mcp" => Some("[add <command> [args…] | rm <name>]"),
         "skills" => Some("[add <name>|<github:owner/repo> | rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
-        "agent" => Some("[name|default]"),
         "goal" => Some("<objective> | stop"),
         "plan" => Some("<objective> | go [guidance] | stop"),
         "live" => Some("[stop]"),
@@ -315,9 +308,6 @@ pub(crate) struct ChatTuiParams {
     /// `--resume` request: `Some("")` opens the session picker at startup,
     /// `Some(id)` jumps straight to that session, `None` starts fresh.
     pub initial_resume: Option<String>,
-    /// `--agent <name>`: the top-level agent profile to start in (validated lazily
-    /// on first engine build; an unknown name warns and falls back to default).
-    pub initial_agent: Option<String>,
     /// `--max-context <SIZE>` manual context-window override (tokens). Session-only.
     pub max_context: Option<u64>,
     /// `--live`: start live sharing at launch (device-link verified beforehand).
@@ -728,8 +718,6 @@ pub(super) enum PickerValue {
     },
     /// A `/effort` reasoning level (e.g. `low`/`high`).
     Effort(String),
-    /// A `/agent` profile name (`default` resets to the built-in agent).
-    Agent(String),
 }
 
 /// A model option ready for the picker: stable id and display label.
@@ -770,7 +758,6 @@ pub(super) enum PickerKind {
     Session,
     Rewind,
     Effort,
-    Agent,
 }
 
 #[derive(Clone)]
@@ -1281,9 +1268,6 @@ pub(super) enum SlashCommand {
     Skills(Option<String>),
     /// MCP servers: bare opens the overlay; `add …` / `rm <name>` manage them.
     Mcp(Option<String>),
-    /// Switch the top-level agent profile: bare lists them, `none` clears,
-    /// `<name>` selects (only at chat start).
-    Agent(Option<String>),
     /// Goal mode: `<objective>` works autonomously until done; bare shows status,
     /// `stop` ends it.
     Goal(Option<String>),
@@ -1664,10 +1648,6 @@ pub(super) struct ChatTuiApp {
     /// Live `cursor-agent acp` connection scoped to the current chat session.
     /// `None` outside of cursor keys and before the first turn.
     pub(super) cursor_acp_session: Option<crate::services::cursor_acp::CursorAcpSession>,
-    /// Active top-level agent profile name (`--agent` / `/agent`), from
-    /// `~/.config/aivo/agents`. Its role + tool scope are folded into the
-    /// engine on build. `None` = the default agent. Switchable only at chat start.
-    pub(super) active_agent: Option<String>,
     /// A resumed session's durable agent transcript (raw OpenAI messages with
     /// tool_calls + results), awaiting the next engine build to be restored
     /// verbatim (exact tool history). Consumed (`take`) on build; `None` otherwise.

@@ -98,7 +98,6 @@ pub(super) fn build_footer_text(
     base_url: &str,
     cwd: &str,
     branch: Option<&str>,
-    agent: Option<&str>,
     width: u16,
 ) -> String {
     let host = footer_host_label(base_url);
@@ -112,18 +111,11 @@ pub(super) fn build_footer_text(
         .filter(|b| !b.is_empty())
         .map(|b| format!(" ({b})"))
         .unwrap_or_default();
-    // An active top-level agent profile shows as a leading `[name]` badge, kept
-    // until the last (model-only) fallback so "which agent" survives a tight width.
-    let prefix = agent
-        .filter(|a| !a.is_empty())
-        .map(|a| format!("[{a}] "))
-        .unwrap_or_default();
     let candidates = [
-        format!("{prefix}{model} · {host} · {cwd_full}{branch_suffix}"),
-        format!("{prefix}{model} · {host} · {cwd_base}{branch_suffix}"),
-        format!("{prefix}{model} · {host} · {cwd_base}"),
-        format!("{prefix}{model} · {host}"),
-        format!("{prefix}{model}"),
+        format!("{model} · {host} · {cwd_full}{branch_suffix}"),
+        format!("{model} · {host} · {cwd_base}{branch_suffix}"),
+        format!("{model} · {host} · {cwd_base}"),
+        format!("{model} · {host}"),
         model.to_string(),
     ];
 
@@ -371,7 +363,6 @@ mod tests {
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
                 None,
-                None,
                 80
             ),
             "gpt-4o · openrouter.ai · /tmp/project"
@@ -382,7 +373,6 @@ mod tests {
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
-                None,
                 None,
                 34
             ),
@@ -395,7 +385,6 @@ mod tests {
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
                 None,
-                None,
                 22
             ),
             "gpt-4o · openrouter.ai"
@@ -406,7 +395,6 @@ mod tests {
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
-                None,
                 None,
                 6
             ),
@@ -423,7 +411,6 @@ mod tests {
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
                 Some("feat/agent"),
-                None,
                 80
             ),
             "gpt-4o · openrouter.ai · /tmp/project (feat/agent)"
@@ -435,7 +422,6 @@ mod tests {
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
                 Some("main"),
-                None,
                 40
             ),
             "gpt-4o · openrouter.ai · project (main)"
@@ -447,7 +433,6 @@ mod tests {
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
                 Some("main"),
-                None,
                 35
             ),
             "gpt-4o · openrouter.ai · project"
@@ -459,62 +444,9 @@ mod tests {
                 "https://openrouter.ai/api/v1",
                 "/tmp/project",
                 Some(""),
-                None,
                 80
             ),
             "gpt-4o · openrouter.ai · /tmp/project"
-        );
-    }
-
-    #[test]
-    fn test_build_footer_text_shows_agent_badge() {
-        // An active agent shows as a leading `[name]` badge at a wide width.
-        assert_eq!(
-            build_footer_text(
-                "gpt-4o",
-                "https://openrouter.ai/api/v1",
-                "/tmp/project",
-                None,
-                Some("reviewer"),
-                80
-            ),
-            "[reviewer] gpt-4o · openrouter.ai · /tmp/project"
-        );
-        // The badge is kept while segments drop (model + badge fit before host/cwd).
-        assert_eq!(
-            build_footer_text(
-                "gpt-4o",
-                "https://openrouter.ai/api/v1",
-                "/tmp/project",
-                None,
-                Some("reviewer"),
-                20
-            ),
-            "[reviewer] gpt-4o"
-        );
-        // Tiniest width: the badge is dropped before the model is lost.
-        assert_eq!(
-            build_footer_text(
-                "gpt-4o",
-                "https://openrouter.ai/api/v1",
-                "/tmp/project",
-                None,
-                Some("reviewer"),
-                6
-            ),
-            "gpt-4o"
-        );
-        // Empty agent → no badge (same as None).
-        assert_eq!(
-            build_footer_text(
-                "gpt-4o",
-                "https://openrouter.ai/api/v1",
-                "/tmp/p",
-                None,
-                Some(""),
-                80
-            ),
-            "gpt-4o · openrouter.ai · /tmp/p"
         );
     }
 
@@ -528,7 +460,6 @@ mod tests {
             "gpt-4o",
             "https://openrouter.ai/api/v1",
             "/tmp/项目",
-            None,
             None,
             32,
         );

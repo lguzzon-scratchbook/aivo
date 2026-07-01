@@ -1384,9 +1384,6 @@ impl ChatTuiApp {
             (PickerKind::Effort, PickerValue::Effort(level)) => {
                 self.apply_reasoning_effort(level).await;
             }
-            (PickerKind::Agent, PickerValue::Agent(name)) => {
-                self.apply_agent_selection(name).await;
-            }
             _ => {}
         }
 

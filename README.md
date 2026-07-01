@@ -136,7 +136,6 @@ aivo models --json | jq '.models[].id'
 ```bash
 aivo chat                                    # full-screen agent TUI
 aivo chat -m gpt-4o                          # pick a model (remembered per key)
-aivo chat --agent reviewer                   # start as a named agent profile
 aivo chat --attach README.md                 # attach a file for the agent to read
 ```
 

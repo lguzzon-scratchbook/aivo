@@ -2,7 +2,6 @@ use super::*;
 
 use crate::agent::engine::RewindOutcome;
 use crate::agent::protocol::Decision;
-use crate::agent::subagents::is_default_agent_name;
 use crate::services::acp_client::PromptEvent;
 use crate::services::cursor_acp::{self, CursorAcpSession, CursorChunk, CursorTurnResult};
 use anyhow::Context;
@@ -605,31 +604,6 @@ impl ChatTuiApp {
             let subagents =
                 crate::agent::subagents::discover_subagents(self.session_store.config_dir());
             engine.set_subagents(&subagents);
-            // If a top-level agent is active (`--agent` / `/agent`), fold its role +
-            // tool scope into THIS engine. `default` (the built-in agent) is not a
-            // profile — clear it silently. An unknown name warns once and clears, so
-            // a stale `--agent foo` can't keep applying nothing every rebuild.
-            if let Some(name) = self.active_agent.clone() {
-                if is_default_agent_name(&name) {
-                    self.active_agent = None;
-                } else if let Some(profile) = subagents.iter().find(|s| s.name == name) {
-                    engine.apply_profile(profile);
-                } else {
-                    let available: Vec<&str> = subagents.iter().map(|s| s.name.as_str()).collect();
-                    self.notice = Some((
-                        ERROR,
-                        if available.is_empty() {
-                            format!("no agent named `{name}` (none are defined)")
-                        } else {
-                            format!(
-                                "no agent named `{name}` (available: {})",
-                                available.join(", ")
-                            )
-                        },
-                    ));
-                    self.active_agent = None;
-                }
-            }
             // Carry prior conversation in, best fidelity first: a resumed session's
             // durable transcript, else the outgoing engine's messages on a model
             // switch (both verbatim), else the lossy text seed of display history.
@@ -1027,10 +1001,6 @@ impl ChatTuiApp {
             }
             SlashCommand::Mcp(arg) => {
                 self.run_mcp_command(arg).await?;
-                Ok(false)
-            }
-            SlashCommand::Agent(arg) => {
-                self.run_agent_command(arg).await;
                 Ok(false)
             }
             SlashCommand::Goal(arg) => {
@@ -1445,141 +1415,6 @@ impl ChatTuiApp {
         self.command_menu.reset();
         self.draft_history_index = None;
         self.draft_history_stash = None;
-    }
-
-    /// `/agent`: switch the top-level agent profile (from `~/.config/aivo/agents`).
-    /// Bare `/agent` opens a picker (built-in `default` first, then every profile,
-    /// active one pre-selected); `/agent none` (or `off`) clears it; `/agent <name>`
-    /// selects it directly — but switching is ONLY allowed at the start of a
-    /// conversation. Switching the role/tools mid-thread would desync the system
-    /// prompt the model has already been steered by, so any change is gated to an
-    /// empty, idle history (run `/new` first) — and bare `/agent` falls back to a
-    /// read-only notice there rather than opening a picker that can't apply.
-    pub(super) async fn run_agent_command(&mut self, arg: Option<String>) {
-        let Some(name) = arg else {
-            let available =
-                crate::agent::subagents::discover_subagents(self.session_store.config_dir());
-            if available.is_empty() {
-                self.notice = Some((
-                    MUTED,
-                    "No agents defined. Add one at ~/.config/aivo/agents/<name>.md".to_string(),
-                ));
-                return;
-            }
-            // Switching is gated to a fresh chat; mid-thread, show a read-only
-            // listing instead of a picker that couldn't apply.
-            if self.sending || !self.history.is_empty() {
-                let names: Vec<&str> = available.iter().map(|s| s.name.as_str()).collect();
-                let current = self.active_agent.as_deref().unwrap_or("default");
-                self.notice = Some((
-                    MUTED,
-                    format!(
-                        "agent: {current} · available: {} · switch at chat start — /new first",
-                        names.join(", ")
-                    ),
-                ));
-                return;
-            }
-            self.open_agent_picker(&available);
-            return;
-        };
-
-        self.apply_agent_selection(name).await;
-    }
-
-    /// Build the `/agent` picker: the built-in `default` agent first, then every
-    /// discovered profile (name — description), with the active one pre-selected
-    /// and marked `(current)`.
-    fn open_agent_picker(&mut self, available: &[crate::agent::subagents::Subagent]) {
-        let current = self.active_agent.as_deref();
-        let mut items: Vec<PickerEntry> = Vec::with_capacity(available.len() + 1);
-        items.push(PickerEntry {
-            label: picker_current_label("default — built-in agent".to_string(), current.is_none()),
-            search_text: "default".to_string(),
-            value: PickerValue::Agent("default".to_string()),
-        });
-        for sa in available {
-            let is_current = current == Some(sa.name.as_str());
-            let desc = crate::agent::skills::advert_description(&sa.description);
-            items.push(PickerEntry {
-                label: picker_current_label(format!("{} — {desc}", sa.name), is_current),
-                search_text: sa.name.clone(),
-                value: PickerValue::Agent(sa.name.clone()),
-            });
-        }
-        // Pre-select the active profile (offset by the leading `default` row).
-        let selected = current
-            .and_then(|c| available.iter().position(|s| s.name == c))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let mut state =
-            PickerState::ready("Agent profile", String::new(), items, PickerKind::Agent);
-        state.selected = selected;
-        self.overlay = Overlay::Picker(Box::new(state));
-    }
-
-    /// Apply an agent switch chosen via `/agent <name>` or the `/agent` picker.
-    /// Gated to the start of a chat (an in-flight turn or non-empty history is
-    /// rejected). `default` (and aliases) reset to the built-in agent; an unknown
-    /// name errors. Drops the cached engine so the next turn rebuilds with the new
-    /// profile, and adopts the profile's pinned `model:` (a later `/model`
-    /// overrides it — mirroring how `--agent` supplies a default model at launch).
-    pub(super) async fn apply_agent_selection(&mut self, name: String) {
-        if self.sending {
-            self.notice = Some((
-                ERROR,
-                "Can't switch agent while a turn is in progress".to_string(),
-            ));
-            return;
-        }
-        if !self.history.is_empty() {
-            self.notice = Some((
-                ERROR,
-                "Switch agents at the start of a chat — run /new first".to_string(),
-            ));
-            return;
-        }
-
-        if is_default_agent_name(&name) {
-            if self.active_agent.is_none() {
-                self.notice = Some((MUTED, "Already using the default agent".to_string()));
-            } else {
-                self.active_agent = None;
-                self.agent_engine = None; // rebuild as the built-in default agent
-                self.notice = Some((MUTED, "Switched to the default agent".to_string()));
-            }
-            return;
-        }
-
-        let available =
-            crate::agent::subagents::discover_subagents(self.session_store.config_dir());
-        match available.iter().find(|s| s.name == name) {
-            Some(profile) => {
-                let agent_name = profile.name.clone();
-                let desc = crate::agent::skills::advert_description(&profile.description);
-                let model = profile.model.clone();
-                self.active_agent = Some(agent_name.clone());
-                self.agent_engine = None; // rebuild with the new profile folded in
-                // `apply_model` clears the notice, so set ours after.
-                if let Some(model) = model
-                    && let Err(e) = self.apply_model(model).await
-                {
-                    self.notice = Some((
-                        ERROR,
-                        format!("agent `{agent_name}` set, model switch failed: {e}"),
-                    ));
-                    return;
-                }
-                self.notice = Some((MUTED, format!("agent: {agent_name} — {desc}")));
-            }
-            None => {
-                let names: Vec<&str> = available.iter().map(|s| s.name.as_str()).collect();
-                self.notice = Some((
-                    ERROR,
-                    format!("no agent named `{name}` (available: {})", names.join(", ")),
-                ));
-            }
-        }
     }
 
     /// `/goal`: autonomous goal mode. `<objective>` starts it (submits the first

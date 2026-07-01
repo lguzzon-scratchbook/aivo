@@ -817,11 +817,6 @@ pub struct ChatArgs {
     )]
     pub key: Option<String>,
 
-    /// Start as a named agent profile from ~/.config/aivo/agents
-    /// (folds its role + tool scope in). Switch in-chat with `/agent`.
-    #[arg(long, value_name = "NAME")]
-    pub agent: Option<String>,
-
     /// Bypass cache and fetch fresh model list for the model picker
     #[arg(short = 'r', long)]
     pub refresh: bool,
@@ -872,7 +867,7 @@ pub struct ChatArgs {
     #[arg(long = "2m")]
     pub two_m: bool,
 
-    /// Print the resolved key, model, endpoint, and agent without connecting
+    /// Print the resolved key, model, and endpoint without connecting
     #[arg(long)]
     pub dry_run: bool,
 

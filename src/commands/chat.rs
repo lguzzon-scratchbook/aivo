@@ -282,35 +282,20 @@ impl ChatCommand {
     }
 
     /// Read-only preview for `aivo chat --dry-run`: resolves the key, model,
-    /// endpoint, agent profile, sandbox dir, and mode the way a real launch
-    /// would — but performs no HTTP, persistence, model picker, or server spawn.
-    /// HF refs show a placeholder endpoint (llama-server is not started).
+    /// endpoint, sandbox dir, and mode the way a real launch would — but performs
+    /// no HTTP, persistence, model picker, or server spawn. HF refs show a
+    /// placeholder endpoint (llama-server is not started).
     async fn print_chat_dry_run(
         &self,
         model_input: Option<String>,
         attachments: &[String],
         key_override: Option<ApiKey>,
         one_shot: Option<&str>,
-        agent: Option<&str>,
         max_context: Option<u64>,
     ) -> Result<ExitCode> {
         let hf = model_input.as_deref().is_some_and(|m| {
             huggingface::is_hf_or_local_gguf(m) || huggingface::is_bare_hf_picker_trigger(m)
         });
-
-        // Agent profile is read-only (discovered from disk, never persisted).
-        let (agent_label, agent_model) = match agent {
-            Some(name) if !crate::agent::subagents::is_default_agent_name(name) => {
-                match crate::agent::subagents::discover_subagents(self.session_store.config_dir())
-                    .into_iter()
-                    .find(|s| s.name == name)
-                {
-                    Some(p) => (name.to_string(), p.model),
-                    None => (format!("default (no agent named '{name}')"), None),
-                }
-            }
-            _ => ("default".to_string(), None),
-        };
 
         println!("{}", style::bold("Dry run — aivo chat would start with:"));
         println!();
@@ -342,15 +327,13 @@ impl ChatCommand {
                     style::dim("(none — run `aivo keys add`)"),
                 ),
             }
-            // Model precedence, read-only: explicit `-m` > agent profile model >
-            // per-key persisted model > last selection > picker (shown as a hint).
+            // Model precedence, read-only: explicit `-m` > per-key persisted
+            // model > last selection > picker (shown as a hint).
             let model = match model_input.as_deref() {
                 Some(m) if !m.is_empty() => Some(m.to_string()),
                 _ => {
-                    let mut m = agent_model.clone();
-                    if m.is_none()
-                        && let Some(k) = &key
-                    {
+                    let mut m: Option<String> = None;
+                    if let Some(k) = &key {
                         m = self
                             .session_store
                             .get_chat_model(&k.id)
@@ -376,7 +359,6 @@ impl ChatCommand {
             );
         }
 
-        println!("{} {}", style::bold("Agent: "), agent_label);
         println!(
             "{} {}",
             style::bold("Mode:  "),
@@ -419,7 +401,6 @@ impl ChatCommand {
         key_override: Option<ApiKey>,
         json: bool,
         resume: Option<String>,
-        agent: Option<String>,
         max_context: Option<String>,
         dry_run: bool,
         live: bool,
@@ -433,7 +414,6 @@ impl ChatCommand {
                 key_override,
                 json,
                 resume,
-                agent,
                 max_context,
                 dry_run,
                 live,
@@ -458,7 +438,6 @@ impl ChatCommand {
         key_override: Option<ApiKey>,
         json: bool,
         resume: Option<String>,
-        agent: Option<String>,
         max_context: Option<String>,
         dry_run: bool,
         live: bool,
@@ -483,7 +462,6 @@ impl ChatCommand {
                     &attachments,
                     key_override,
                     one_shot.as_deref(),
-                    agent.as_deref(),
                     max_context,
                 )
                 .await;
@@ -556,42 +534,14 @@ impl ChatCommand {
         // `aivo run claude` / `aivo run codex` / etc.
         let cwd = chat_sandbox_dir()?.to_string_lossy().into_owned();
 
-        // Resolve `--agent` up front (before model resolution) so a profile's
-        // pinned `model:` can seed the model when `--model` wasn't given. `default`
-        // (and aliases) mean the built-in agent (no profile); an unknown name falls
-        // back to default with a startup notice — reported now, not on the first
-        // turn — so `initial_agent` reaching the TUI is always a real profile or
-        // None.
-        let (initial_agent, agent_notice, agent_model) = match agent.as_deref() {
-            None => (None, None, None),
-            Some(name) if crate::agent::subagents::is_default_agent_name(name) => {
-                (None, None, None)
-            }
-            Some(name) => {
-                match crate::agent::subagents::discover_subagents(self.session_store.config_dir())
-                    .into_iter()
-                    .find(|s| s.name == name)
-                {
-                    Some(profile) => (Some(name.to_string()), None, profile.model),
-                    None => (
-                        None,
-                        Some(format!(
-                            "No agent named '{name}' — using the default agent."
-                        )),
-                        None,
-                    ),
-                }
-            }
-        };
-
         // HF mode already has the model set; skip `resolve_model` to
         // avoid persisting it under the ephemeral synthetic key id.
         let resolved = if hf_active {
             Some(model_flag.clone().unwrap_or_default())
         } else {
-            // Precedence: explicit `--model` > the `--agent` profile's `model:` >
-            // the per-key persisted model > last selection > picker.
-            let effective = model_flag.clone().or(agent_model);
+            // Precedence: explicit `--model` > the per-key persisted model >
+            // last selection > picker.
+            let effective = model_flag.clone();
             self.resolve_model(&key, effective).await?
         };
         let raw_model = match resolved {
@@ -869,13 +819,7 @@ impl ChatCommand {
         let initial_session = new_chat_session_id();
         let initial_history = Vec::new();
 
-        // The agent notice (if any, from the early `--agent` resolution) leads; an
-        // attachment notice follows.
-        let startup_notice = match (agent_notice, attachment_notice(&pending_attachments)) {
-            (Some(a), Some(b)) => Some(format!("{a} {b}")),
-            (Some(a), None) => Some(a),
-            (None, b) => b,
-        };
+        let startup_notice = attachment_notice(&pending_attachments);
 
         self.session_store
             .record_selection(&key.id, "chat", Some(&raw_model))
@@ -895,7 +839,6 @@ impl ChatCommand {
             initial_draft_attachments: pending_attachments,
             startup_notice,
             initial_resume: resume,
-            initial_agent,
             max_context,
             live,
         })
@@ -938,10 +881,6 @@ impl ChatCommand {
             "Select API key by ID or name (-k opens key picker)",
         );
         print_opt(
-            "--agent <name>",
-            "Start as an agent profile from ~/.config/aivo/agents",
-        );
-        print_opt(
             "-p, --prompt [prompt]",
             "Send one prompt and exit (reads stdin when no value given; -x is a legacy alias)",
         );
@@ -971,7 +910,7 @@ impl ChatCommand {
         );
         print_opt(
             "--dry-run",
-            "Print the resolved key, model, endpoint, and agent without connecting",
+            "Print the resolved key, model, and endpoint without connecting",
         );
         println!();
         println!("{}", style::bold("Examples:"));

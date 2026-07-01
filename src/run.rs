@@ -269,22 +269,11 @@ pub async fn run() -> ! {
             maybe_init_http_debug(&chat_args.debug).await;
             let key_explicit = chat_args.key.is_some();
             lift_chat_positional_to_prompt(&mut chat_args);
-            // Positional lifts into model; explicit -m still wins. A `--agent`
-            // whose profile pins a `model:` contributes a DEFAULT model — below an
-            // explicit -m/positional, above the remembered model — so `-m` and
-            // `--agent` compose: `-m` owns the model axis, `--agent` the role +
-            // tools, and the profile's model only fills in when no `-m` is given.
-            let agent_model: Option<String> = chat_args.agent.as_deref().and_then(|name| {
-                crate::agent::subagents::discover_subagents(session_store.config_dir())
-                    .into_iter()
-                    .find(|s| s.name == name)
-                    .and_then(|s| s.model)
-            });
+            // Positional lifts into model; explicit -m still wins.
             let model_input = chat_args
                 .model
                 .clone()
-                .or_else(|| chat_args.reference.clone())
-                .or_else(|| agent_model.clone());
+                .or_else(|| chat_args.reference.clone());
             let have_model_input = model_input.is_some();
             // Expand alias before the HF check so `-m <alias-to-hf-ref>`
             // takes the HF path. `run`'s flow does the same.
@@ -302,9 +291,8 @@ pub async fn run() -> ! {
                     .await,
                 )
             };
-            // When -k is used without -m (and no --agent model), force model picker
-            // (same as run/start). A resolved -m / positional / --agent-default
-            // model takes the concrete path.
+            // When -k is used without -m, force the model picker (same as
+            // run/start). A resolved -m / positional takes the concrete path.
             let model = if have_model_input {
                 expanded_model
             } else if key_explicit {
@@ -322,7 +310,6 @@ pub async fn run() -> ! {
                     key_override,
                     chat_args.json,
                     chat_args.resume,
-                    chat_args.agent,
                     // `--1m`/`--2m` shorthands collapse into max_context, same
                     // as the `run` path; chat takes it as a raw window size.
                     chat_args

@@ -117,13 +117,6 @@ fn load_subagent(path: &Path) -> Option<Subagent> {
     })
 }
 
-/// Reserved keyword(s) meaning "the built-in default agent" (no profile) for
-/// `--agent` / `/agent`. `default` is canonical; `none`/`off`/`-` are tolerated
-/// aliases. Used to reset to the default and to avoid treating it as a profile.
-pub fn is_default_agent_name(name: &str) -> bool {
-    matches!(name.trim(), "default" | "none" | "off" | "-")
-}
-
 /// A usable sub-agent name (also the `agent` enum value): non-empty, `[A-Za-z0-9_-]`.
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -421,17 +414,5 @@ mod tests {
         assert_eq!(normalize_tool_name("apply"), Some("apply_patch"));
         assert_eq!(normalize_tool_name("str_replace_editor"), Some("edit_file"));
         assert_eq!(normalize_tool_name("edit_file"), Some("edit_file"));
-    }
-
-    #[test]
-    fn default_agent_keyword_recognized() {
-        for k in ["default", "none", "off", "-", " default "] {
-            assert!(
-                is_default_agent_name(k),
-                "{k:?} should be the default agent"
-            );
-        }
-        assert!(!is_default_agent_name("reviewer"));
-        assert!(!is_default_agent_name(""));
     }
 }

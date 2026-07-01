@@ -28,7 +28,6 @@ pub enum StyleName {
     Yellow,
     Blue,
     Cyan,
-    #[allow(dead_code)]
     Magenta,
 }
 

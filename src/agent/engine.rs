@@ -754,8 +754,8 @@ impl AgentEngine {
     /// to that allow-list (plus `update_plan`, always harmless). The list is an
     /// allow-list over the full offered set, so under a scope any unlisted tool —
     /// including MCP tools — is dropped. A list that resolves to nothing doesn't
-    /// scope (see `Subagent::resolved_tools`). Used both for a delegated sub-agent
-    /// (a freshly built sub-engine) and for a top-level `--agent`/`/agent` profile.
+    /// scope (see `Subagent::resolved_tools`). Applied to a delegated sub-agent's
+    /// freshly built sub-engine.
     pub fn apply_profile(&mut self, sa: &Subagent) {
         if !sa.body.is_empty()
             && let Some(sys) = self.messages.first_mut()

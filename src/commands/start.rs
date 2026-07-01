@@ -466,7 +466,6 @@ impl StartCommand {
                 false,
                 None,
                 None,
-                None,
                 false,
                 false,
             )

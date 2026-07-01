@@ -1899,7 +1899,6 @@ impl ChatTuiApp {
             &self.key.base_url,
             self.display_cwd(),
             self.git_branch.as_deref(),
-            self.active_agent.as_deref(),
             left_width.saturating_sub(badge_w),
         );
         // Status-line hierarchy instead of one flat gray: the model name (first

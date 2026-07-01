@@ -1078,7 +1078,6 @@ fn make_test_app(
         picker_hitbox: None,
         exit_confirm_pending: false,
         cursor_acp_session: None,
-        active_agent: None,
         pending_agent_messages: None,
         goal_mode: None,
         capturing_plan: false,
@@ -6437,117 +6436,6 @@ async fn test_skills_command_dispatch() {
         "notice: {}",
         app.notice.as_ref().unwrap().1
     );
-}
-
-#[test]
-fn test_parse_agent_command() {
-    assert_eq!(
-        parse_slash_command("agent").unwrap(),
-        SlashCommand::Agent(None)
-    );
-    assert_eq!(
-        parse_slash_command("agent reviewer").unwrap(),
-        SlashCommand::Agent(Some("reviewer".to_string()))
-    );
-}
-
-/// `/agent`: bare opens a picker (built-in `default` + profiles, active
-/// pre-selected); picking a row switches; typed `/agent <name>` selects
-/// directly; `default` clears; unknowns error; switching is blocked once a
-/// conversation has started (bare falls back to a read-only notice there).
-/// Discovers from the throwaway store's `<config_dir>/agents`, never the real
-/// `~/.config/aivo/agents`.
-#[tokio::test]
-async fn test_agent_command_dispatch() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    // Sub-agents discover from `<config_dir>/agents`; the throwaway store points
-    // config_dir at a tempdir, keeping this hermetic.
-    let agents = app.session_store.config_dir().join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(
-        agents.join("reviewer.md"),
-        "---\nname: reviewer\ndescription: Reviews a diff.\n---\nBe terse.\n",
-    )
-    .unwrap();
-
-    // Bare /agent opens a picker: built-in `default` (current → pre-selected),
-    // then each profile.
-    app.run_agent_command(None).await;
-    let Overlay::Picker(picker) = &app.overlay else {
-        panic!("bare /agent should open a picker");
-    };
-    assert!(matches!(picker.kind, PickerKind::Agent));
-    assert_eq!(picker.items.len(), 2, "default + reviewer");
-    assert_eq!(picker.selected, 0, "default is current → pre-selected");
-    assert!(picker.items[0].label.contains("default"));
-    assert!(picker.items[0].label.contains("(current)"));
-    assert!(picker.items[1].label.contains("reviewer"));
-
-    // Picking the reviewer row applies the switch and closes the picker.
-    app.activate_picker_selection(1).await.unwrap();
-    assert_eq!(app.active_agent.as_deref(), Some("reviewer"));
-    assert!(matches!(app.overlay, Overlay::None));
-
-    // Reopening the picker now pre-selects and marks the active reviewer.
-    app.run_agent_command(None).await;
-    let Overlay::Picker(picker) = &app.overlay else {
-        panic!("picker should reopen");
-    };
-    assert_eq!(picker.selected, 1, "active reviewer pre-selected");
-    assert!(picker.items[1].label.contains("(current)"));
-    app.overlay = Overlay::None;
-
-    // Typed `/agent <name>` still selects directly.
-    app.run_agent_command(Some("reviewer".to_string())).await;
-    assert_eq!(app.active_agent.as_deref(), Some("reviewer"));
-    assert!(app.notice.as_ref().unwrap().1.contains("reviewer"));
-
-    // Reset to the built-in default agent via `default`.
-    app.run_agent_command(Some("default".to_string())).await;
-    assert!(app.active_agent.is_none());
-    assert!(
-        app.notice.as_ref().unwrap().1.contains("default"),
-        "notice: {}",
-        app.notice.as_ref().unwrap().1
-    );
-
-    // Unknown name → error notice, stays cleared.
-    app.run_agent_command(Some("ghost".to_string())).await;
-    assert!(app.active_agent.is_none());
-    assert!(
-        app.notice.as_ref().unwrap().1.contains("no agent named"),
-        "notice: {}",
-        app.notice.as_ref().unwrap().1
-    );
-
-    // Re-select, then a started conversation blocks any further switch.
-    app.run_agent_command(Some("reviewer".to_string())).await;
-    app.history.push(ChatMessage {
-        role: "user".to_string(),
-        content: "hi".to_string(),
-        reasoning_content: None,
-        attachments: Vec::new(),
-    });
-    app.run_agent_command(Some("default".to_string())).await;
-    assert_eq!(
-        app.active_agent.as_deref(),
-        Some("reviewer"),
-        "agent switch is blocked once a conversation has started"
-    );
-    assert!(app.notice.as_ref().unwrap().1.contains("/new"));
-
-    // Bare /agent mid-conversation: a read-only notice, never a picker.
-    app.notice = None;
-    app.run_agent_command(None).await;
-    assert!(matches!(app.overlay, Overlay::None), "no picker mid-chat");
-    let n = app.notice.as_ref().unwrap().1.clone();
-    assert!(
-        n.contains("reviewer") && n.contains("/new first"),
-        "notice: {n}"
-    );
-
-    let _ = std::fs::remove_dir_all(app.session_store.config_dir());
 }
 
 #[test]

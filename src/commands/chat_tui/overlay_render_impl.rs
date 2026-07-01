@@ -1206,10 +1206,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ),
     ("Model & key", &["model", "key"]),
     ("Context", &["attach", "detach", "compact"]),
-    (
-        "Skills & tools",
-        &["skills", "create-skill", "mcp", "agent"],
-    ),
+    ("Skills & tools", &["skills", "create-skill", "mcp"]),
     ("Autonomous", &["plan", "goal"]),
 ];
 
