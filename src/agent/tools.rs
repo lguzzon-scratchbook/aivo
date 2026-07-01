@@ -176,7 +176,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "run_bash",
-            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist).",
+            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist). Runs non-interactively with no TTY: interactive programs (editors, `ssh`/`sudo` prompts, TUIs) are refused, and long-running ones are killed at the timeout — use non-interactive flags, or background a server with `&`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1428,6 +1428,124 @@ pub async fn run_bash_unconfined(args: &Value, cwd: &Path) -> Result<String, Str
     run_bash_inner(args, cwd, false).await.result
 }
 
+fn is_shell_operator(tok: &str) -> bool {
+    matches!(tok, "|" | "||" | "&&" | ";" | "&" | "|&" | ";;")
+}
+
+fn program_basename(prog: &str) -> &str {
+    prog.rsplit(['/', '\\']).next().unwrap_or(prog)
+}
+
+/// Whether ssh/sftp/telnet carries a remote command (an operand past the
+/// destination), which makes it non-interactive.
+fn ssh_has_remote_command(args: &[String]) -> bool {
+    const VALUE_FLAGS: &[&str] = &[
+        "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p",
+        "-Q", "-R", "-S", "-W", "-w",
+    ];
+    let mut seen_dest = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') && a.len() > 1 {
+            if VALUE_FLAGS.contains(&a.as_str()) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if seen_dest {
+            return true;
+        }
+        seen_dest = true;
+        i += 1;
+    }
+    false
+}
+
+/// Interactive `git` subcommands (`git commit` w/o `-m` is handled by `GIT_EDITOR`).
+fn blocking_git(args: &[String]) -> Option<String> {
+    let sub = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str);
+    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
+    match sub {
+        Some("rebase") if has(&["-i", "--interactive"]) => Some(
+            "`git rebase -i` opens an interactive editor and can't run here. Script the rebase \
+             non-interactively, or ask the user to run it."
+                .into(),
+        ),
+        Some("add") if has(&["-p", "--patch", "-i", "--interactive"]) => Some(
+            "`git add -p/-i` is interactive and can't run here. Stage paths explicitly \
+             (`git add <path>`) instead."
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+/// The refusal reason if `prog`+`args` would block the non-interactive shell.
+fn blocking_program(prog: &str, args: &[String]) -> Option<String> {
+    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
+    match prog {
+        "vim" | "vi" | "nvim" | "nano" | "pico" | "emacs" | "joe" | "mcedit" => Some(format!(
+            "`{prog}` opens an interactive editor, which can't run under the agent's \
+             non-interactive shell. Edit files with the write/edit tools instead, or ask the \
+             user to run it."
+        )),
+        "ssh" | "sftp" | "telnet" if !ssh_has_remote_command(args) => Some(format!(
+            "`{prog}` with no remote command opens an interactive session that will block here. \
+             Run a non-interactive form like `{prog} <host> '<command>'`, or ask the user to \
+             run it."
+        )),
+        "sudo" if !has(&["-n", "--non-interactive", "-A", "--askpass"]) => Some(
+            "`sudo` may prompt for a password on the terminal and block here. Use `sudo -n` \
+             (it fails fast when credentials aren't cached), or ask the user to run it."
+                .into(),
+        ),
+        "top" | "htop" if !has(&["-b", "--batch"]) => Some(format!(
+            "`{prog}` is a full-screen monitor that never exits on its own. Use a one-shot \
+             snapshot like `ps aux` (or `top -b -n1`)."
+        )),
+        "watch" => Some(
+            "`watch` reruns a command forever and never exits. Run the command once instead."
+                .into(),
+        ),
+        "tail" if has(&["-f", "-F", "--follow"]) => Some(
+            "`tail -f` follows the file forever and never exits. Read a bounded slice with \
+             `tail -n <N>`, or background it."
+                .into(),
+        ),
+        "git" => blocking_git(args),
+        "docker" | "podman" | "kubectl"
+            if has(&["-it", "-ti"]) || (has(&["-i", "--interactive"]) && has(&["-t", "--tty"])) =>
+        {
+            Some(format!(
+                "`{prog}` with an interactive TTY (`-it`) opens a session that will block here. \
+                 Drop `-t` and pass the command non-interactively, or ask the user to run it."
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Refusal reason if `command` would block the shell (TTY prompt, full-screen
+/// program, or never terminates). Conservative + argument-aware so ordinary slow
+/// commands still run to the timeout; each pipeline segment's program is checked.
+fn interactive_block_reason(command: &str) -> Option<String> {
+    let tokens = shlex::split(command)?;
+    for seg in tokens.split(|t| is_shell_operator(t)) {
+        let Some((prog, rest)) = seg.split_first() else {
+            continue;
+        };
+        if let Some(reason) = blocking_program(program_basename(prog), rest) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
 async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome {
     let early = |result| BashOutcome {
         result,
@@ -1437,6 +1555,10 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
         Ok(c) => c,
         Err(e) => return early(Err(e)),
     };
+    // Refuse blockers up front, so they don't burn the whole timeout as dead air.
+    if let Some(reason) = interactive_block_reason(command) {
+        return early(Err(reason));
+    }
     let timeout = arg_u64(args, "timeout")
         .unwrap_or(BASH_DEFAULT_TIMEOUT)
         .min(BASH_MAX_TIMEOUT);
@@ -1448,15 +1570,20 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     } else {
         crate::agent::sandbox::bare_shell(command)
     };
-    let child = match tokio::process::Command::new(&spawn.program)
+    let mut builder = tokio::process::Command::new(&spawn.program);
+    builder
         .args(&spawn.args)
         .current_dir(cwd)
+        // Make common headless git hangs fail fast instead of blocking on a prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    // Unix-only: `true`/`cat` aren't launchable as editor/pager on Windows.
+    #[cfg(unix)]
+    builder.env("GIT_EDITOR", "true").env("PAGER", "cat");
+    let child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return early(Err(format!("spawn shell: {e}"))),
     };
@@ -1464,7 +1591,16 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
         match tokio::time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return early(Err(format!("run command: {e}"))),
-            Err(_) => return early(Err(format!("command timed out after {timeout}s"))),
+            Err(_) => {
+                return early(Err(format!(
+                    "command timed out after {timeout}s and was killed. If it was waiting on \
+                     interactive input (a password, prompt, or editor), a REPL, or a \
+                     long-running server/watcher that never exits on its own, it can't run \
+                     under the agent's non-interactive shell — use a non-interactive form, \
+                     start it in the background (append ` &`), or ask the user to run it. If \
+                     it's just slow, retry with a larger `timeout` (max {BASH_MAX_TIMEOUT}).",
+                )));
+            }
         };
     let mut out = String::new();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2449,6 +2585,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("timed out"));
+    }
+
+    #[test]
+    fn interactive_commands_are_refused_argument_aware() {
+        // refuse:
+        for cmd in [
+            "vim file.txt",
+            "nano",
+            "/usr/bin/emacs notes.md",
+            "ssh prod",
+            "ssh -p 2222 user@host",
+            "sudo apt update",
+            "top",
+            "htop",
+            "watch ls",
+            "tail -f server.log",
+            "git rebase -i HEAD~3",
+            "git add -p",
+            "docker run -it ubuntu bash",
+            "kubectl exec -it pod -- sh",
+            "make && vim Cargo.toml",
+        ] {
+            assert!(
+                interactive_block_reason(cmd).is_some(),
+                "should refuse: {cmd}"
+            );
+        }
+        // allow:
+        for cmd in [
+            "ssh prod 'systemctl status'",
+            "ssh -p 22 host uptime",
+            "sudo -n systemctl restart x",
+            "tail -n 100 server.log",
+            "top -b -n1",
+            "git commit -m \"msg\"",
+            "git add src/",
+            "docker build -t x .",
+            "cargo build --release",
+            "python script.py",
+            "psql -c 'select 1'",
+            "ls | grep foo",
+            "echo \"ssh prod\"",
+        ] {
+            assert!(
+                interactive_block_reason(cmd).is_none(),
+                "should allow: {cmd}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_bash_refuses_interactive_command_before_spawning() {
+        let dir = tmp();
+        let err = run_bash(&json!({"command":"vim notes.txt"}), &dir)
+            .await
+            .unwrap_err();
+        assert!(err.contains("interactive editor"), "got: {err}");
     }
 
     #[tokio::test]

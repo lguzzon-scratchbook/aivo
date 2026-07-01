@@ -2496,7 +2496,10 @@ or use `run_bash` (e.g. `find`, `ls`, `rg`). Only ask the user once you're genui
 after looking.\n\n\
 You are part of aivo, so you can inspect aivo itself: for questions about its API keys, models, \
 providers, configuration, or usage, run the `aivo` command (e.g. `aivo keys list`, `aivo \
-models`, `aivo stats`) or read the usage from `aivo --help-json`.\n\n\
+models`, `aivo stats`) or read the usage from `aivo --help-json`. Two commands are the \
+exception: `aivo account login` and `logout` are interactive and act on the user's own device — \
+tell the user to run those in their own terminal rather than running them yourself (run headless \
+they just block until they time out).\n\n\
 Read files before editing, and make focused changes. After changing code, verify it before you \
 call the task done: run the project's build, tests, and linter (find the commands in the \
 convention files, README, Makefile, or build config — don't guess or invent a framework) and \
@@ -4883,6 +4886,7 @@ mod tests {
         assert!(p.contains("never invent file contents")); // don't fabricate
         assert!(p.contains("never print, log, hard-code, or commit secrets")); // secrets hygiene
         assert!(p.contains("change tactics rather than repeating it")); // loop-breaking
+        assert!(p.contains("run those in their own terminal rather than running them yourself")); // interactive login is the user's
     }
 
     #[test]

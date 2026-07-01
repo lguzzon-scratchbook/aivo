@@ -64,6 +64,26 @@ impl LoginCommand {
             AccountSync::Unlinked { had_local: false } | AccountSync::Unverified(None) => false,
         };
 
+        // Headless (agent shell, CI, both ends piped): nobody can see the code or
+        // approve it, so the poll below would just block to expiry. Refuse fast.
+        {
+            use std::io::IsTerminal as _;
+            if is_headless(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            ) {
+                eprintln!(
+                    "{} `aivo account login` needs an interactive terminal to sign in.",
+                    style::red("Error:")
+                );
+                eprintln!(
+                    "  Run it directly in your terminal:  {}",
+                    style::cyan("aivo account login")
+                );
+                return Ok(ExitCode::UserError);
+            }
+        }
+
         let label = args.label.unwrap_or_else(default_label);
 
         let device = device_auth::start_device_auth(Some(&label)).await?;
@@ -357,6 +377,11 @@ fn default_label() -> String {
     }
 }
 
+/// No terminal to complete the device flow: neither stdin nor stdout a TTY.
+fn is_headless(stdin_tty: bool, stdout_tty: bool) -> bool {
+    !(stdin_tty || stdout_tty)
+}
+
 #[derive(Default)]
 pub struct LogoutCommand;
 
@@ -437,5 +462,18 @@ async fn confirm_unlink(account: &account_store::Account) -> Result<bool> {
             "Refusing to unlink without confirmation on a non-interactive session. Pass --yes to proceed."
         ),
         Some(answer) => Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headless_only_when_neither_stream_is_a_tty() {
+        assert!(is_headless(false, false));
+        assert!(!is_headless(true, false));
+        assert!(!is_headless(false, true));
+        assert!(!is_headless(true, true));
     }
 }
