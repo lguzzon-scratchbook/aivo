@@ -516,7 +516,6 @@ impl ChatTuiApp {
     /// streams text/tool-steps and permission requests back as `RuntimeEvent`s.
     async fn spawn_agent_turn(&mut self, input: String) {
         use crate::agent::engine::{AgentEngine, TurnCtx};
-        use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
 
         // The agent works in the real launch directory — NOT chat's sandbox
         // (`self.cwd`). It reads/edits the user's actual project.
@@ -665,29 +664,7 @@ impl ChatTuiApp {
         }
         let engine = self.agent_engine.as_ref().unwrap().engine.clone();
 
-        // Per-turn loopback serve from the current key — the sole network egress,
-        // with usage counted under the "chat" tool (`aivo chat` IS the in-process
-        // agent; the standalone `agent` command was retired, so its tokens belong
-        // to chat's per-tool stats, not a phantom "agent" bucket).
-        let auth = random_auth_token();
-        let config = ServeRouterConfig::from_key(
-            &self.key,
-            false,
-            300,
-            Some(auth.clone()),
-            std::collections::HashMap::new(),
-        );
-        // Shared cache: serve seeds from the known protocol and learns into a
-        // place `persist_agent_route` can write back after the turn.
-        let route_cache = self.agent_route_cache();
-        let router = ServeRouter::new(config, self.key.clone(), self.session_store.logs())
-            .with_route_cache(route_cache)
-            .with_usage_accounting(self.session_store.clone(), "chat".to_string())
-            // The chat TUI owns the terminal in raw mode; router progress lines on
-            // stderr (protocol auto-switch, failover) would corrupt the prompt box.
-            .quiet(true);
-        let (handle, shutdown, port) = match router.start_background_with_addr("127.0.0.1", 0).await
-        {
+        let (base, auth) = match self.start_agent_serve().await {
             Ok(t) => t,
             Err(e) => {
                 self.notice = Some((ERROR, format!("agent serve failed to start: {e}")));
@@ -697,8 +674,6 @@ impl ChatTuiApp {
                 return;
             }
         };
-        self.agent_serve = Some((handle, shutdown));
-        let base = format!("http://127.0.0.1:{port}");
 
         let tx = self.tx.clone();
         let cwd = real_cwd;
@@ -755,6 +730,110 @@ impl ChatTuiApp {
             shutdown.notify_one();
             handle.abort();
         }
+    }
+
+    /// Start this turn's loopback serve (sole egress, usage under "chat"); sets
+    /// `self.agent_serve`, returns `(base, auth)`. Shared by run/compact turns.
+    async fn start_agent_serve(&mut self) -> Result<(String, String)> {
+        use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
+        let auth = random_auth_token();
+        let config = ServeRouterConfig::from_key(
+            &self.key,
+            false,
+            300,
+            Some(auth.clone()),
+            std::collections::HashMap::new(),
+        );
+        // Route cache carries the negotiated protocol to `persist_agent_route`;
+        // `.quiet` keeps router stderr off the raw-mode prompt.
+        let router = ServeRouter::new(config, self.key.clone(), self.session_store.logs())
+            .with_route_cache(self.agent_route_cache())
+            .with_usage_accounting(self.session_store.clone(), "chat".to_string())
+            .quiet(true);
+        let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
+        self.agent_serve = Some((handle, shutdown));
+        Ok((format!("http://127.0.0.1:{port}"), auth))
+    }
+
+    /// `/compact` folds older turns via the LLM; `/compact fast` clears stale output.
+    /// Both refuse mid-turn (the running turn holds the engine lock) and no-op with
+    /// no agent conversation.
+    pub(super) async fn run_compact_command(&mut self, fast: bool) {
+        if self.sending {
+            self.notice = Some((MUTED, "can't compact while a turn is running".to_string()));
+            return;
+        }
+        let Some(session) = self.agent_engine.as_ref() else {
+            self.notice = Some((MUTED, "nothing to compact yet".to_string()));
+            return;
+        };
+        let engine = session.engine.clone();
+        if fast {
+            let (before, after) = engine.lock().await.compact_now_local();
+            let freed = before.saturating_sub(after) as usize;
+            self.context_tokens = after;
+            self.context_is_estimate = true;
+            self.notice = Some(freed_notice(freed, "cleared stale output"));
+            return;
+        }
+        // LLM summary path: skip a pointless round-trip when nothing is foldable.
+        let before = {
+            let engine = engine.lock().await;
+            if !engine.has_compactable_history() {
+                self.notice = Some((MUTED, "already compact — nothing older to fold".to_string()));
+                return;
+            }
+            engine.estimated_context_tokens()
+        };
+        self.spawn_compact_turn(engine, before).await;
+    }
+
+    /// Run a manual LLM compaction on a background task; finishes via `ui.footer` →
+    /// `finish_agent_turn` (which tears the serve down and reports the freed delta).
+    async fn spawn_compact_turn(
+        &mut self,
+        engine: std::sync::Arc<tokio::sync::Mutex<crate::agent::engine::AgentEngine>>,
+        before: u64,
+    ) {
+        use crate::agent::engine::TurnCtx;
+
+        let (base, auth) = match self.start_agent_serve().await {
+            Ok(t) => t,
+            Err(e) => {
+                self.notice = Some((ERROR, format!("compact serve failed to start: {e}")));
+                return;
+            }
+        };
+        let cwd = if self.real_cwd.is_empty() {
+            ".".to_string()
+        } else {
+            self.real_cwd.clone()
+        };
+        let tx = self.tx.clone();
+        // Turn state: block the composer, show status; flag the freed-delta report.
+        self.sending = true;
+        self.request_started_at = Some(Instant::now());
+        self.compact_before = Some(before);
+        self.response_task = Some(tokio::spawn(async move {
+            let client = crate::services::http_utils::router_http_client();
+            let ctx = TurnCtx {
+                client: &client,
+                serve_base: &base,
+                auth: Some(&auth),
+                cwd: std::path::Path::new(&cwd),
+                yes: false,
+                auto_approve: None,
+            };
+            let mut ui = ChatAgentUi {
+                tx,
+                cwd: std::path::PathBuf::from(&cwd),
+            };
+            let started = Instant::now();
+            let mut engine = engine.lock().await;
+            engine
+                .compact_now(&ctx, &mut ui, started.elapsed().as_millis() as u64)
+                .await;
+        }));
     }
 
     fn spawn_cursor_turn(&mut self, input: String, attachments: Vec<MessageAttachment>) {
@@ -972,6 +1051,10 @@ impl ChatTuiApp {
             }
             SlashCommand::Config => {
                 self.open_config_overlay();
+                Ok(false)
+            }
+            SlashCommand::Compact { fast } => {
+                self.run_compact_command(fast).await;
                 Ok(false)
             }
             SlashCommand::Live(arg) => {

@@ -219,6 +219,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: false,
     },
     SlashCommandSpec {
+        name: "compact",
+        help_label: "/compact [fast]",
+        description: "compact context now (fast = clear stale output, no model call)",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "effort",
         help_label: "/effort [level]",
         description: "set reasoning effort (bare opens a picker)",
@@ -253,6 +259,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "goal" => Some("<objective> | stop"),
         "plan" => Some("<objective> | go [guidance] | stop"),
         "live" => Some("[stop]"),
+        "compact" => Some("[fast]"),
         "model" => Some("[name]"),
         "key" => Some("[id|name]"),
         "resume" => Some("[query]"),
@@ -262,6 +269,30 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         // completion, which is more useful than a static `<path>` ghost — and a
         // ghost would suppress that menu (see `visible_command_menu`).
         _ => None,
+    }
+}
+
+/// Compact a count: `1234` → `1.2k`, `12345` → `12k`, `<1000` verbatim.
+pub(super) fn humanize_count(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{}k", n / 1000)
+    }
+}
+
+/// `/compact` result notice; `kind` names what happened ("cleared stale output" /
+/// "summarized older turns").
+pub(super) fn freed_notice(freed: usize, kind: &str) -> (Color, String) {
+    if freed == 0 {
+        (MUTED, "already compact — nothing to free".to_string())
+    } else {
+        (
+            MUTED,
+            format!("freed ~{} tokens — {kind}", humanize_count(freed)),
+        )
     }
 }
 
@@ -1277,6 +1308,10 @@ pub(super) enum SlashCommand {
     Rewind,
     /// Open the `/config` overlay: a toggle list of chat preferences.
     Config,
+    /// `/compact` folds older turns via the LLM; `fast` clears stale tool output only.
+    Compact {
+        fast: bool,
+    },
     /// Live share: bare/`start` opens a viewer URL (re-shown if already live);
     /// `stop` ends it.
     Live(Option<String>),
@@ -1520,6 +1555,9 @@ pub(super) struct ChatTuiApp {
     pub(super) pending_submit: Option<PendingSubmission>,
     pub(super) sending: bool,
     pub(super) request_started_at: Option<Instant>,
+    /// Context fill before a manual `/compact` (LLM) turn, so the finish path reports
+    /// the freed delta and skips the duration marker. `None` outside a compact.
+    pub(super) compact_before: Option<u64>,
     /// Current tool step, present-tense (`running grep`), + when it started.
     /// Feeds the inline status label.
     pub(super) last_tool_action: Option<(String, Instant)>,

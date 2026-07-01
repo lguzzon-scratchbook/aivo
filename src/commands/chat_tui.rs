@@ -142,6 +142,7 @@ impl ChatTuiApp {
             pending_submit: None,
             sending: false,
             request_started_at: None,
+            compact_before: None,
             last_tool_action: None,
             status_display: None,
             turn_output_tokens: 0,

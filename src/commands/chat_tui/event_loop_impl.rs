@@ -527,18 +527,25 @@ impl ChatTuiApp {
         context_tokens: u64,
     ) -> Result<()> {
         self.flush_pending_assistant();
-        // `✶ Done in …` marker — skipped under 1s and on an errored turn. Attach
-        // to the last VISIBLE entry: a trailing plan renders in its own panel, so
-        // stamping it there hides/misplaces the marker once the plan clears.
-        let errored = self.notice.as_ref().is_some_and(|(c, _)| *c == ERROR);
-        if let Some(started) = self.request_started_at
-            && !errored
-        {
-            let elapsed = started.elapsed();
-            if elapsed.as_secs() >= 1
-                && let Some(idx) = self.history.iter().rposition(|m| m.role != "plan")
+        // A `/compact` turn has no assistant reply: report freed context, not a marker.
+        let compact_before = self.compact_before.take();
+        if let Some(before) = compact_before {
+            let freed = before.saturating_sub(context_tokens) as usize;
+            self.notice = Some(freed_notice(freed, "summarized older turns"));
+        } else {
+            // `✶ Done in …` marker — skipped under 1s and on an errored turn. Attach
+            // to the last VISIBLE entry: a trailing plan renders in its own panel, so
+            // stamping it there hides/misplaces the marker once the plan clears.
+            let errored = self.notice.as_ref().is_some_and(|(c, _)| *c == ERROR);
+            if let Some(started) = self.request_started_at
+                && !errored
             {
-                self.turn_durations.insert(idx, elapsed.as_millis() as u64);
+                let elapsed = started.elapsed();
+                if elapsed.as_secs() >= 1
+                    && let Some(idx) = self.history.iter().rposition(|m| m.role != "plan")
+                {
+                    self.turn_durations.insert(idx, elapsed.as_millis() as u64);
+                }
             }
         }
         self.retrying = false;
@@ -550,9 +557,12 @@ impl ChatTuiApp {
         self.stop_agent_serve();
         // Adopt + persist the protocol the serve negotiated this turn.
         self.persist_agent_route().await;
-        // Prefer the engine's provider-measured fill (last step's prompt+completion);
-        // fall back to the chars/4 transcript estimate only when no usage was reported.
-        if context_tokens > 0 {
+        // A compact reports a calibrated estimate; a real turn prefers the provider-
+        // measured fill, falling back to the chars/4 estimate when no usage was reported.
+        if compact_before.is_some() {
+            self.context_tokens = context_tokens;
+            self.context_is_estimate = true;
+        } else if context_tokens > 0 {
             self.context_tokens = context_tokens;
             self.context_is_estimate = false;
         } else {
@@ -572,7 +582,10 @@ impl ChatTuiApp {
         // rebuilds with them (must happen while not sending).
         self.maybe_apply_mcp_rebuild();
         self.persist_history().await?;
-        self.log_agent_turn(tokens).await;
+        // A compact adds no user/assistant message; logging would duplicate the prior row.
+        if compact_before.is_none() {
+            self.log_agent_turn(tokens).await;
+        }
         // Pick up skills created/edited during the turn (e.g. via `/create-skill`):
         // refresh the `/` menu and, if the set changed, rebuild the engine next turn
         // so the model sees the new skills. Runs while not sending, so the engine

@@ -713,6 +713,9 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         // `undo` kept as a hidden alias for muscle memory; only `/rewind` is advertised.
         "rewind" | "undo" => Ok(SlashCommand::Rewind),
         "config" => Ok(SlashCommand::Config),
+        "compact" => Ok(SlashCommand::Compact {
+            fast: argument.as_deref() == Some("fast"),
+        }),
         "live" => Ok(SlashCommand::Live(argument)),
         "help" => Ok(SlashCommand::Help),
         "" => anyhow::bail!("Type a command after '/'"),

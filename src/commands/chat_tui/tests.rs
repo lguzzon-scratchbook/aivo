@@ -1030,6 +1030,7 @@ fn make_test_app(
         pending_submit: None,
         sending: false,
         request_started_at: None,
+        compact_before: None,
         last_tool_action: None,
         status_display: None,
         turn_output_tokens: 0,
@@ -5675,6 +5676,39 @@ fn test_parse_slash_live() {
     );
 }
 
+#[test]
+fn test_parse_slash_compact() {
+    assert_eq!(
+        parse_slash_command("compact").unwrap(),
+        SlashCommand::Compact { fast: false }
+    );
+    assert_eq!(
+        parse_slash_command("compact fast").unwrap(),
+        SlashCommand::Compact { fast: true }
+    );
+    assert_eq!(
+        parse_slash_command("compact now").unwrap(),
+        SlashCommand::Compact { fast: false }
+    );
+}
+
+#[tokio::test]
+async fn test_compact_command_no_engine_notices() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.run_compact_command(true).await;
+    assert!(
+        app.notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("nothing to compact"),
+        "notice: {:?}",
+        app.notice
+    );
+    assert!(app.agent_serve.is_none() && app.response_task.is_none());
+}
+
 #[tokio::test]
 async fn test_live_command_stop_and_usage_notices() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -7156,7 +7190,7 @@ async fn project_mcp_server_connects_by_default_and_toggles_like_user() {
 
 #[test]
 fn test_humanize_count() {
-    use super::overlay_render_impl::humanize_count;
+    use super::shared::humanize_count;
     assert_eq!(humanize_count(0), "0");
     assert_eq!(humanize_count(999), "999");
     assert_eq!(humanize_count(1234), "1.2k");

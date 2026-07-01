@@ -1205,7 +1205,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Model & key", &["model", "key"]),
-    ("Context", &["attach", "detach"]),
+    ("Context", &["attach", "detach", "compact"]),
     (
         "Skills & tools",
         &["skills", "create-skill", "mcp", "agent"],
@@ -1416,17 +1416,6 @@ pub(super) fn mcp_tool_lines(tools: &[(&str, &str)], width: usize) -> Vec<Line<'
         }
     }
     lines
-}
-
-/// Compact a count: `1234` → `1.2k`, `12345` → `12k`, `<1000` verbatim.
-pub(super) fn humanize_count(n: usize) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 10_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        format!("{}k", n / 1000)
-    }
 }
 
 /// A skill dir with the home prefix abbreviated to `~`, for the detail views.

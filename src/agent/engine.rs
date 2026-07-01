@@ -1114,14 +1114,9 @@ impl AgentEngine {
             let mut sent_estimate = estimate_tokens(&request.messages);
 
             ui.turn_start();
-            // Seed the live context-fill with a request estimate (system prompt +
-            // tools + conversation) so the UI's stat is realistic before the model
-            // reports usage; the measured total replaces it once the step returns.
-            // Scaled by calibration to match the enforced budget.
-            ui.context_usage(
-                (self.estimated_prompt_tokens() as f64 * self.token_calibration) as u64,
-                false,
-            );
+            // Seed the live context-fill before the model reports usage; the measured
+            // total replaces it once the step returns.
+            ui.context_usage(self.estimated_context_tokens(), false);
             // Auto-retry transient failures (rate limit / overload / 5xx / network)
             // with exponential backoff — but only when nothing streamed yet, since
             // re-streaming would duplicate the rendered text.
@@ -1666,58 +1661,91 @@ Re-run the full command without write confinement?",
             return 0;
         }
 
-        let mut tokens = 0u64;
-        // Prefer an LLM summary of the old turns. Only attempt it when there's a
-        // real user boundary past the system prompt to fold; otherwise fall
-        // straight through to the mechanical backstop below.
-        if cut > 1 {
-            let transcript = serialize_transcript(&self.messages[1..cut]);
-            let request = self.build_summary_request(&transcript);
-            ui.notify("compacting context…");
-            match serve_client::complete(
-                ctx.client,
-                ctx.serve_base,
-                ctx.auth,
-                &request,
-                &mut |_| {},
-            )
-            .await
-            {
-                Ok(m) => {
-                    tokens = usage_tokens(&m.usage);
-                    let summary = m.content.unwrap_or_default();
-                    if summary.trim().is_empty() {
-                        // Empty summary — fold a mechanical note rather than leave
-                        // the history overflowed.
-                        let note = self.mechanical_summary();
-                        self.apply_compaction(cut, &note);
-                    } else {
-                        self.apply_compaction(cut, &summary);
-                        // Carry this summary forward so the next compaction updates
-                        // it in place instead of re-summarizing a blob that already
-                        // contains it (anti-drift).
-                        self.last_summary = Some(summary);
-                    }
-                }
-                Err(_) => {
-                    // Summarization failed. Do NOT give up and re-send an
-                    // overflowed request — context-overflow errors aren't
-                    // retryable, so that would brick the turn (and, since the bad
-                    // prefix re-sends every turn, the whole session). Drop the old
-                    // transcript mechanically instead.
-                    ui.notify("compaction summary unavailable — trimming older context");
-                    let note = self.mechanical_summary();
-                    self.apply_compaction(cut, &note);
-                }
-            }
-        }
+        let tokens = self.summarize_range(ctx, ui, cut).await;
         // Backstop: guarantee the next request actually fits the window. A single
         // summary pass can fall short when the recent tail is itself huge, and
         // `cut <= 1` means nothing was old enough to fold even though we're over
-        // budget. Trim deterministically (no model call) so a turn is always
-        // sendable.
+        // budget. Trim deterministically (no model call) so a turn is always sendable.
         self.enforce_budget(budget);
         tokens
+    }
+
+    /// Summarize `messages[1..cut]` and fold it in (no-op when `cut <= 1`); on empty
+    /// output or failure folds a mechanical note. Returns tokens the call consumed.
+    async fn summarize_range(
+        &mut self,
+        ctx: &TurnCtx<'_>,
+        ui: &mut dyn AgentUi,
+        cut: usize,
+    ) -> u64 {
+        if cut <= 1 {
+            return 0;
+        }
+        let transcript = serialize_transcript(&self.messages[1..cut]);
+        let request = self.build_summary_request(&transcript);
+        ui.notify("compacting context…");
+        match serve_client::complete(ctx.client, ctx.serve_base, ctx.auth, &request, &mut |_| {})
+            .await
+        {
+            Ok(m) => {
+                let summary = m.content.unwrap_or_default();
+                if summary.trim().is_empty() {
+                    let note = self.mechanical_summary();
+                    self.apply_compaction(cut, &note);
+                } else {
+                    self.apply_compaction(cut, &summary);
+                    // Carry forward so the next compaction updates it in place instead
+                    // of re-summarizing a blob that already contains it (anti-drift).
+                    self.last_summary = Some(summary);
+                }
+                usage_tokens(&m.usage)
+            }
+            Err(_) => {
+                // Don't re-send an overflowed request (not retryable → bricks the
+                // turn). Drop the old transcript mechanically instead.
+                ui.notify("compaction summary unavailable — trimming older context");
+                let note = self.mechanical_summary();
+                self.apply_compaction(cut, &note);
+                0
+            }
+        }
+    }
+
+    /// Calibrated estimate of the current context fill — the footer's pre-measurement
+    /// value (`estimated_prompt_tokens` scaled by calibration).
+    pub fn estimated_context_tokens(&self) -> u64 {
+        (self.estimated_prompt_tokens() as f64 * self.token_calibration) as u64
+    }
+
+    /// Whether a compaction could fold or clear anything — lets `/compact` skip a
+    /// pointless round-trip on a short conversation.
+    pub fn has_compactable_history(&self) -> bool {
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        cut > 1 || self.stale_tool_result_savings(cut) > 0
+    }
+
+    /// Manual `/compact`: summarize older turns now regardless of budget (or clear
+    /// stale tool output when nothing is old enough), then `footer` so the chat's
+    /// finish path tears the serve down.
+    pub async fn compact_now(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi, elapsed_ms: u64) {
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let tokens = if cut > 1 {
+            self.summarize_range(ctx, ui, cut).await
+        } else {
+            self.clear_stale_tool_results(cut);
+            0
+        };
+        // Footer carries the reduced fill; the chat layer reports the freed delta.
+        ui.footer(None, 0, tokens, self.estimated_context_tokens(), elapsed_ms);
+    }
+
+    /// `/compact fast`: clear stale tool output (older than the keep window), no model
+    /// call. Returns the `(before, after)` calibrated estimate for the freed report.
+    pub fn compact_now_local(&mut self) -> (u64, u64) {
+        let before = self.estimated_context_tokens();
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        self.clear_stale_tool_results(cut);
+        (before, self.estimated_context_tokens())
     }
 
     /// Tokens reclaimable by [`clear_stale_tool_results`]: for each OLD
@@ -4492,6 +4520,59 @@ mod tests {
             role(&engine.messages[0]),
             "system",
             "the system prompt is never dropped"
+        );
+    }
+
+    /// A huge RECENT tool result fills the keep window; an OLDER one before the cut
+    /// gets stubbed.
+    #[test]
+    fn compact_now_local_clears_stale_tool_output() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        let recent = "r".repeat(120_000); // ~30k tokens — fills the 20k keep window
+        let stale = "s".repeat(8_000); // > TOOL_RESULT_CLEAR_MIN, older than the cut
+        engine.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q1"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"a","content": stale}),
+            json!({"role":"user","content":"q2"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"b","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"b","content": recent.clone()}),
+        ];
+        assert!(
+            engine.has_compactable_history(),
+            "an old bulky tool result is foldable"
+        );
+        let (before, after) = engine.compact_now_local();
+        assert!(
+            after < before,
+            "clearing stale output frees context: {before} → {after}"
+        );
+        assert_eq!(
+            engine.messages[3]["content"].as_str(),
+            Some(TOOL_RESULT_CLEARED),
+            "old stale tool output cleared"
+        );
+        assert_eq!(
+            engine.messages[6]["content"].as_str(),
+            Some(recent.as_str()),
+            "recent tool output kept intact"
+        );
+    }
+
+    #[test]
+    fn has_compactable_history_false_for_short_conversation() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"hi"}),
+            json!({"role":"assistant","content":"hello"}),
+        ];
+        assert!(
+            !engine.has_compactable_history(),
+            "a tiny recent-only conversation has nothing to fold"
         );
     }
 
