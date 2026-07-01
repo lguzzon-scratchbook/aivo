@@ -1861,10 +1861,16 @@ impl ChatTuiApp {
         } else {
             area.width.saturating_sub(right_label_width + 1)
         };
-        // Reserve columns for the `● sharing` badge so the text truncates to fit it.
+        // Reserve columns for the model-line badges so the text truncates to fit them.
         let live = self.live_share.is_some();
+        let plain_chat = !self.agent_tools_enabled;
+        let glue = 3u16; // " · " between the model and each badge
         let badge_w = if live {
-            display_width(LIVE_BADGE) as u16 + 3 // + " · " glue
+            display_width(LIVE_BADGE) as u16 + glue
+        } else {
+            0
+        } + if plain_chat {
+            display_width(PLAIN_CHAT_BADGE) as u16 + glue
         } else {
             0
         };
@@ -1888,10 +1894,16 @@ impl ChatTuiApp {
                 segment.to_string(),
                 Style::default().fg(color),
             ));
-            // Badge sits right after the model (first segment).
-            if index == 0 && live {
-                spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
-                spans.push(Span::styled(LIVE_BADGE, Style::default().fg(LIVE)));
+            // Badges sit right after the model (first segment).
+            if index == 0 {
+                if live {
+                    spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+                    spans.push(Span::styled(LIVE_BADGE, Style::default().fg(LIVE)));
+                }
+                if plain_chat {
+                    spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+                    spans.push(Span::styled(PLAIN_CHAT_BADGE, Style::default().fg(USER)));
+                }
             }
         }
         let left_len = display_width(&left_text) as u16 + badge_w;

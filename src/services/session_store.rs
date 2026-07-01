@@ -733,6 +733,7 @@ pub struct ChatToggles {
     pub thinking_enabled: bool,
     /// aivo's hosted web_search (`/config`). Defaults off (opt-in).
     pub web_search_enabled: bool,
+    pub agent_tools_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1840,6 +1841,12 @@ impl SessionStore {
         self.write_chat_prefs(&prefs).await
     }
 
+    pub async fn set_chat_agent_tools_enabled(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_chat_prefs().await;
+        prefs.insert("agentTools".into(), serde_json::Value::Bool(on));
+        self.write_chat_prefs(&prefs).await
+    }
+
     /// The persisted `/effort` reasoning level for `model` (remembered across
     /// `aivo chat` sessions). Effort levels are model-specific, so they're stored
     /// per-model under `reasoningEffort: {<model>: <level>}` in chat-prefs.json.
@@ -1898,6 +1905,7 @@ impl SessionStore {
             auto_approve: bool_or("autoApprove", false),
             thinking_enabled,
             web_search_enabled: bool_or("useWebSearch", false),
+            agent_tools_enabled: bool_or("agentTools", true),
         }
     }
 
@@ -2689,6 +2697,29 @@ mod tests {
         assert!(store.get_chat_auto_approve().await);
         store.set_chat_thinking_enabled(true).await.unwrap();
         assert!(store.get_chat_thinking_enabled().await);
+    }
+
+    #[tokio::test]
+    async fn chat_agent_tools_toggle_persists_and_defaults_on() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path.clone());
+
+        assert!(store.get_chat_toggles().await.agent_tools_enabled);
+
+        store.set_chat_agent_tools_enabled(false).await.unwrap();
+        assert!(!store.get_chat_toggles().await.agent_tools_enabled);
+        let prefs: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(temp_dir.path().join("chat-prefs.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prefs["agentTools"], serde_json::json!(false));
+        assert!(!tokio::fs::try_exists(&config_path).await.unwrap());
+
+        store.set_chat_agent_tools_enabled(true).await.unwrap();
+        assert!(store.get_chat_toggles().await.agent_tools_enabled);
     }
 
     #[tokio::test]

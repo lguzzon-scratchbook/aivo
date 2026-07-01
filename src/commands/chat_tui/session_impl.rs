@@ -360,6 +360,11 @@ impl ChatTuiApp {
                 label: "aivo web search",
                 description: "let the agent search the web via aivo (daily quota)",
             },
+            ConfigToggle {
+                setting: ConfigSetting::AgentTools,
+                label: "Agent tools",
+                description: "off = plain chat: no tools, no system prompt",
+            },
         ];
         self.overlay = Overlay::Config(ConfigOverlay { items, selected: 0 });
     }
@@ -371,6 +376,7 @@ impl ChatTuiApp {
             ConfigSetting::Thinking => self.thinking_enabled,
             ConfigSetting::AutoApprove => self.agent_auto_approve,
             ConfigSetting::UseWebSearch => self.web_search_enabled,
+            ConfigSetting::AgentTools => self.agent_tools_enabled,
         }
     }
 
@@ -390,6 +396,10 @@ impl ChatTuiApp {
             ConfigSetting::AutoApprove => self.set_auto_approve(!self.agent_auto_approve),
             ConfigSetting::UseWebSearch => {
                 self.set_web_search_enabled(!self.web_search_enabled).await
+            }
+            ConfigSetting::AgentTools => {
+                self.set_agent_tools_enabled(!self.agent_tools_enabled)
+                    .await
             }
         }
     }
@@ -420,6 +430,19 @@ impl ChatTuiApp {
             "aivo web search off — the agent won't search via aivo"
         });
         let _ = self.session_store.set_chat_web_search_enabled(on).await;
+    }
+
+    pub(super) async fn set_agent_tools_enabled(&mut self, on: bool) {
+        if self.agent_tools_enabled == on {
+            return;
+        }
+        self.agent_tools_enabled = on;
+        self.show_toast(if on {
+            "Agent tools on"
+        } else {
+            "Agent tools off — plain chat (no tools, no system prompt)"
+        });
+        let _ = self.session_store.set_chat_agent_tools_enabled(on).await;
     }
 
     /// `/skills`: discover the agent skills available for the working dir and show

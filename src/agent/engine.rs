@@ -391,6 +391,8 @@ pub struct AgentEngine {
     thinking_enabled: bool,
     /// `/config` toggle for aivo's hosted web_search (the local tool); native search untouched.
     use_web_search_enabled: bool,
+    /// `/config` master switch; off → plain chat (no tools, no system prompt).
+    agent_tools_enabled: bool,
     /// Whether this model can reason at all (snapshot). Cached at construction so the
     /// disable path doesn't send an effort field that would 400.
     reasoning_capable: bool,
@@ -481,6 +483,7 @@ impl AgentEngine {
             reasoning_efforts: Vec::new(),
             thinking_enabled: true,
             use_web_search_enabled: true,
+            agent_tools_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
             first_party: false,
@@ -542,6 +545,10 @@ impl AgentEngine {
         } else if !on && has {
             self.tools_openai.retain(|t| !is_web_search(t));
         }
+    }
+
+    pub fn set_agent_tools_enabled(&mut self, on: bool) {
+        self.agent_tools_enabled = on;
     }
 
     /// Set the catalog-advertised effort levels for this turn. See `reasoning_efforts`.
@@ -902,6 +909,19 @@ impl AgentEngine {
         self.prefix_fp = Some(fp);
     }
 
+    /// Cloned per step; strips the leading system prompt in plain-chat mode, so the
+    /// single-system-message invariant `restore_conversation` relies on stays intact.
+    fn outgoing_messages(&self) -> Vec<Value> {
+        if self.agent_tools_enabled {
+            return self.messages.clone();
+        }
+        self.messages
+            .iter()
+            .filter(|m| role(m) != "system")
+            .cloned()
+            .collect()
+    }
+
     pub async fn run_turn(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi, user_text: String) {
         self.repair_interrupted_tail();
         self.check_prefix_drift();
@@ -947,7 +967,10 @@ impl AgentEngine {
             tokens += self.maybe_compact(ctx, ui).await;
 
             let mut extra = Map::new();
-            extra.insert("tool_choice".into(), json!("auto"));
+            // Omit tool_choice when no tools are offered — a bridge can 400 on it.
+            if self.agent_tools_enabled {
+                extra.insert("tool_choice".into(), json!("auto"));
+            }
             // Thinking control (see `thinking_request`); the serve translates
             // `reasoning_effort` per upstream. `thinking:{type:"disabled"}` = the off-switch where the scale has no "off".
             let (effort, disable_thinking) = self.thinking_request();
@@ -957,10 +980,15 @@ impl AgentEngine {
             if disable_thinking {
                 extra.insert("thinking".into(), json!({ "type": "disabled" }));
             }
+            let tools = if self.agent_tools_enabled {
+                self.tools_openai.clone()
+            } else {
+                Vec::new()
+            };
             let mut request = ChatRequest {
                 model: self.model.clone(),
-                messages: self.messages.clone(),
-                tools: self.tools_openai.clone(),
+                messages: self.outgoing_messages(),
+                tools,
                 extra,
             };
             // Paired with measured usage below to calibrate; re-measured if overflow recovery shrinks the request.
@@ -1008,7 +1036,7 @@ impl AgentEngine {
                         forced_compactions += 1;
                         self.recalibrate_from_overflow(&e);
                         self.force_fit_budget();
-                        request.messages = self.messages.clone();
+                        request.messages = self.outgoing_messages();
                         sent_estimate = estimate_tokens(&request.messages);
                         ui.notify("context over the model's limit — compacting and retrying…");
                     }
@@ -2697,6 +2725,23 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(!tool_names.contains(&"skill"));
+    }
+
+    #[test]
+    fn agent_tools_off_strips_system_prompt() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.push_text_turn("user", "hi".into());
+
+        assert!(engine.agent_tools_enabled);
+        assert_eq!(role(&engine.outgoing_messages()[0]), "system");
+
+        engine.set_agent_tools_enabled(false);
+        let out = engine.outgoing_messages();
+        assert!(out.iter().all(|m| role(m) != "system"));
+        assert_eq!(role(&out[0]), "user");
+
+        engine.set_agent_tools_enabled(true);
+        assert_eq!(role(&engine.outgoing_messages()[0]), "system");
     }
 
     #[test]

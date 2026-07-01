@@ -1183,6 +1183,7 @@ fn make_test_app(
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         thinking_enabled: true,
         web_search_enabled: true,
+        agent_tools_enabled: true,
         model_supports_thinking: true,
         model_image_input: None,
         cursor_effort_label: None,
@@ -1563,6 +1564,28 @@ async fn test_config_overlay_toggles_thinking() {
     assert!(!app.config_setting_enabled(ConfigSetting::Thinking));
 }
 
+#[tokio::test]
+async fn test_config_overlay_toggles_agent_tools() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.agent_tools_enabled = true;
+
+    app.open_config_overlay();
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay");
+    };
+    let idx = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::AgentTools)
+        .expect("Agent tools row present");
+    assert!(app.config_setting_enabled(ConfigSetting::AgentTools));
+
+    app.toggle_config_setting(idx).await;
+    assert!(!app.agent_tools_enabled);
+    assert!(!app.config_setting_enabled(ConfigSetting::AgentTools));
+}
+
 #[test]
 fn test_flush_pending_assistant_keeps_reasoning() {
     // Regression: the native agent path (flush_pending_assistant, used before each
@@ -1933,6 +1956,34 @@ fn test_footer_status_label_marks_estimates() {
         ..Default::default()
     });
     assert_eq!(app.footer_status_label().0, "40k / 200k · 20%");
+}
+
+#[test]
+fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn footer_text(app: &ChatTuiApp) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| app.render_footer(frame, frame.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // On (default): no badge.
+    app.agent_tools_enabled = true;
+    assert!(!footer_text(&app).contains("plain chat"));
+
+    // Off: the badge marks plain-chat mode in the footer.
+    app.agent_tools_enabled = false;
+    assert!(footer_text(&app).contains("plain chat"));
 }
 
 #[test]

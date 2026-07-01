@@ -29,6 +29,8 @@ pub(super) const LIVE: Color = Color::Rgb(232, 96, 92); // share "recording" red
 pub(super) const LIVE_NOTICE_PREFIX: &str = "● Sharing: ";
 /// Footer badge shown while sharing.
 pub(super) const LIVE_BADGE: &str = "● sharing";
+/// Footer badge shown when `/config` "Agent tools" is off (plain-chat mode).
+pub(super) const PLAIN_CHAT_BADGE: &str = "plain chat";
 // Inline-diff palette for the compact edit preview under a tool call. The
 // changed line gets a subtle dark tint (not a saturated terminal-diff fill) that
 // fills the full row width (see `fill_trailing_background`) so a wrapped line
@@ -586,6 +588,7 @@ pub(super) enum ConfigSetting {
     AutoApprove,
     /// Whether the agent may use aivo's hosted web_search (`/v1/search`).
     UseWebSearch,
+    AgentTools,
 }
 
 /// One row in the `/config` overlay: a boolean preference with a label and a
@@ -1731,6 +1734,7 @@ pub(super) struct ChatTuiApp {
     pub(super) thinking_enabled: bool,
     /// aivo's hosted web_search; `/config` toggle, applied to the engine each turn.
     pub(super) web_search_enabled: bool,
+    pub(super) agent_tools_enabled: bool,
     /// Whether the current model is known to support reasoning/thinking (from the
     /// model-limits snapshot). Cached on each model resolve (see
     /// `refresh_context_window`); gates the footer effort badge so it only shows
