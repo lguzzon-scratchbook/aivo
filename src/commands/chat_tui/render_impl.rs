@@ -1,12 +1,10 @@
 use super::*;
 
 /// The text width a markdown table is laid out to fit, given the full transcript
-/// column width: drop the accent gutter and reserve one column for a possible
-/// scrollbar. Reserving the scrollbar unconditionally keeps the table the same
-/// width whether or not it actually appears, so a resize can't shear a table that
-/// was sized when no scrollbar was showing (and vice-versa).
+/// column width: drop the accent gutter. The transcript reserves no scrollbar
+/// column, so the full remaining width is available in every case.
 fn table_layout_width(area_width: u16) -> u16 {
-    area_width.saturating_sub(ACCENT_GUTTER_WIDTH + 1)
+    area_width.saturating_sub(ACCENT_GUTTER_WIDTH)
 }
 
 /// The inner content rect of a centered overlay — mirrors the `Margin` every
@@ -74,9 +72,7 @@ impl ChatTuiApp {
     /// fresh tail) so a growing stream never re-renders the whole history.
     pub(super) fn build_transcript_body(&self) -> RenderedTranscript {
         // `transcript_width` is the last-rendered text-area width (already gutter-
-        // and scrollbar-adjusted) — the width tables should fit into. It equals the
-        // render path's reserved width whenever a scrollbar is present, which is the
-        // only case `max_scroll` (the consumer of this path) actually cares about.
+        // adjusted) — the width tables should fit into.
         let text_width = self.transcript_width;
         let body = self.build_transcript_history_body(text_width);
         let (tail_lines, tail_bars) = self.volatile_tail_blocks(text_width);
@@ -1222,23 +1218,13 @@ impl ChatTuiApp {
         };
         let composer_outer = chunks[chunk_idx];
         let footer_outer = chunks[chunk_idx + 1];
-        let transcript_total_lines = prepass_rows;
         // The composer reserves its own blank spacing row above the divider (see
         // the composer layout below), so the transcript fills its whole area here
         // — no extra bottom padding carved from within, in overflow or otherwise.
         let transcript_view_area = transcript_area;
         let view_height = transcript_view_area.height.max(1);
-        let needs_scrollbar = transcript_total_lines > usize::from(view_height);
-        let transcript_content_area = Rect {
-            x: transcript_view_area.x,
-            y: transcript_view_area.y,
-            width: if needs_scrollbar {
-                transcript_view_area.width.saturating_sub(1).max(1)
-            } else {
-                transcript_view_area.width
-            },
-            height: transcript_view_area.height,
-        };
+        // The transcript uses its full width — no column reserved for a scrollbar.
+        let transcript_content_area = transcript_view_area;
         // Reserve a left gutter for per-role accent bars. Content wraps and
         // renders into the inset text area; the bars are painted separately so
         // they never bleed into copied/selected text.
@@ -1298,8 +1284,8 @@ impl ChatTuiApp {
             // spinner forces a ~60fps repaint, and on the single-thread runtime
             // that O(n) draw starves the streaming task — a long session makes a
             // subagent crawl. Slice to the visible window and render at scroll 0
-            // → O(visible rows). The full row model (gutter, selection, scrollbar,
-            // hitbox) below is unchanged, so geometry stays exact.
+            // → O(visible rows). The full row model (gutter, selection, hitbox)
+            // below is unchanged, so geometry stays exact.
             let view_start = self.transcript_scroll.min(wrapped_text.lines.len());
             let view_end = view_start
                 .saturating_add(usize::from(transcript_text_area.height))
@@ -1315,18 +1301,6 @@ impl ChatTuiApp {
                 &visual_bars,
             );
             self.render_transcript_selection_highlight(frame, transcript_text_area);
-            let total_lines = transcript_total_lines;
-            if total_lines > usize::from(view_height) {
-                let mut scrollbar_state =
-                    ScrollbarState::new(total_lines.saturating_sub(usize::from(view_height)))
-                        .position(self.transcript_scroll);
-                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .thumb_style(Style::default().fg(FAINT))
-                    .track_style(Style::default().fg(Color::Rgb(44, 40, 35)))
-                    .begin_symbol(None)
-                    .end_symbol(None);
-                frame.render_stateful_widget(scrollbar, transcript_view_area, &mut scrollbar_state);
-            }
             // Clickable jump-to-bottom pill (like Ctrl+End), only while scrolled up.
             self.jump_to_bottom_hit = if self.transcript_scroll < max_scroll {
                 render_jump_to_bottom(frame, transcript_view_area)

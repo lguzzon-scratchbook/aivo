@@ -2660,7 +2660,7 @@ fn test_render_main_keeps_composer_near_short_empty_transcript() {
 
     assert!(composer_area.y + composer_area.height < 11);
     assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.y, 0);
-    // 80 cols minus the 2-col accent gutter, no scrollbar on a short transcript.
+    // 80 cols minus the 2-col accent gutter (no scrollbar column reserved).
     assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.width, 78);
     assert_eq!(app.transcript_width, 78);
 }
@@ -4793,9 +4793,10 @@ fn test_render_main_uses_full_height_for_long_transcript() {
     // Bottom of the composer = terminal height (12) minus the 2-row footer.
     assert_eq!(composer_area.y + composer_area.height, 10);
     assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.y, 0);
-    // 80 cols minus 1 for the scrollbar, minus the 2-col accent gutter.
-    assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.width, 77);
-    assert_eq!(app.transcript_width, 77);
+    // 80 cols minus the 2-col accent gutter; the overflow transcript keeps full
+    // width now that no scrollbar column is reserved.
+    assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.width, 78);
+    assert_eq!(app.transcript_width, 78);
 }
 
 #[tokio::test]
@@ -5179,7 +5180,7 @@ async fn jump_to_bottom_pill_shows_when_scrolled_up_and_clicks_to_latest() {
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // Enough turns to overflow an 80x24 viewport, so a scrollbar (and the pill) apply.
+    // Enough turns to overflow an 80x24 viewport, so the jump-to-bottom pill applies.
     for i in 0..40 {
         app.history.push(ChatMessage {
             role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),

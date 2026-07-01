@@ -1192,7 +1192,8 @@ pub(super) struct TranscriptCache {
     /// The logical body lines (no spinner), already compacted.
     pub(super) body: RenderedTranscript,
     /// Char-wrapped row count of `body` at `area_width - ACCENT_GUTTER_WIDTH`,
-    /// used to size the transcript pane before the scrollbar decision.
+    /// used to size the transcript pane; with no scrollbar column reserved this
+    /// is also the exact text width.
     pub(super) plain_prepass: usize,
     /// Text width `wrapped` is valid for (0 = not wrapped yet).
     pub(super) styled_width: u16,
