@@ -10,8 +10,9 @@ use anyhow::Context;
 const GOAL_DEFAULT_MAX_ITERS: usize = 20;
 /// Framing prepended to the first `/goal` turn so the agent knows the contract.
 const GOAL_PREAMBLE: &str = "[Goal mode] Work autonomously toward this objective, doing as many \
-steps as it takes. When the objective is FULLY achieved, reply with exactly `GOAL COMPLETE` on its \
-own line. If anything remains, keep going.";
+steps as it takes — build directly without pausing to confirm the plan first. When the objective \
+is FULLY achieved, reply with exactly `GOAL COMPLETE` on its own line. If anything remains, keep \
+going.";
 /// Self-checking continuation sent between goal turns.
 const GOAL_CONTINUE: &str = "Continue toward the goal. If the objective is now fully met, reply \
 with exactly `GOAL COMPLETE` and nothing else; otherwise do the next step.";
@@ -599,9 +600,12 @@ impl ChatTuiApp {
             // Enable `/rewind` tree-checkpointing (top-level chat only — sub-engines
             // never call this, so they don't pay the git cost).
             engine.enable_rewind_checkpoints(&real_cwd);
-            // `/plan` investigation turn: strip the mutating tools.
+            // `/plan` investigation strips mutating tools; otherwise (interactive)
+            // the agent confirms before a big build. Read-only makes the latter moot.
             if self.capturing_plan {
                 engine.restrict_read_only();
+            } else {
+                engine.set_confirm_before_build();
             }
             // Share the live thinking toggle so the engine requests reasoning (on
             // reasoning-capable models) only while thinking is on.

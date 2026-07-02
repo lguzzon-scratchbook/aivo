@@ -425,6 +425,8 @@ pub struct AgentEngine {
     /// Plan mode: mutating tools refused so a `/plan` investigation can't modify the
     /// workspace. See `restrict_read_only`.
     read_only: bool,
+    /// Interactive chat only (off for headless/sub-agents): see [`CONFIRM_BEFORE_BUILD`].
+    confirm_before_build: bool,
     /// First-party branding (aivo-starter): present as aivo, not the upstream model.
     first_party: bool,
     /// `(system, tools)` prefix fingerprint from the last turn; checked under `AIVO_DEBUG`.
@@ -513,6 +515,7 @@ impl AgentEngine {
             agent_tools_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
+            confirm_before_build: false,
             first_party: false,
             prefix_fp: None,
         }
@@ -535,6 +538,21 @@ impl AgentEngine {
         };
         if let Some(s) = content.as_str() {
             *content = Value::String(format!("{s}\n\n{FIRST_PARTY_IDENTITY}"));
+        }
+    }
+
+    /// Append [`CONFIRM_BEFORE_BUILD`] to the system prompt in place, like
+    /// [`Self::set_first_party`] (single-system-message invariant). Idempotent.
+    pub fn set_confirm_before_build(&mut self) {
+        if self.confirm_before_build {
+            return;
+        }
+        self.confirm_before_build = true;
+        let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content")) else {
+            return;
+        };
+        if let Some(s) = content.as_str() {
+            *content = Value::String(format!("{s}\n\n{CONFIRM_BEFORE_BUILD}"));
         }
     }
 
@@ -2380,6 +2398,28 @@ pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
         .map(|name| name.to_string())
         .collect()
 }
+
+/// Appended (interactive chat only) via [`AgentEngine::set_confirm_before_build`]: the
+/// agent proposes a plan and waits for the user before a sizeable build.
+const CONFIRM_BEFORE_BUILD: &str = "One refinement to the action-bias above, for this \
+interactive session: before you BUILD something substantial — scaffolding a new project, \
+adding a whole feature, or making a large multi-file change — don't dive straight into \
+creating or editing files. You may first investigate read-only (`read_file`, `grep`, `glob`, \
+`list_dir`) to ground the plan, then reply with a short plan — the approach and a numbered \
+list of the steps you'd take — and ask the user to confirm or adjust it. Do NOT create or \
+modify files, or run build/scaffold/state-changing commands, until they approve; end your \
+turn after asking. Wait for a clear go-ahead before you build. A reply that only asks for a \
+change or states a preference — e.g. \"use a light theme\", \"add auth\", \"drop the export \
+step\", \"make it Postgres\" — is a plan REVISION, not approval: fold it in, show the updated \
+plan, and ask again. Start building only when the user clearly signals to proceed with no \
+further changes (\"go\", \"yes, build it\", \"proceed\", \"lgtm\"). If one message both \
+requests a change and says go (\"use a light theme, then go\"), apply the change and build. \
+When it's unclear whether a reply means \"proceed\" or \"also change this\", ask rather than \
+assuming. This is ONLY for \
+sizeable, multi-step build work — for quick fixes, small single-file edits, answering \
+questions, and read-only exploration, keep acting directly rather than making the user \
+approve trivial work. And if the user has already told you to proceed, handed you a plan to \
+implement, or asked you to work autonomously, skip the confirmation and just build.";
 
 const FIRST_PARTY_IDENTITY: &str = "You are aivo's own assistant. If the user asks what model you \
 are, who built you, or which provider or company is behind you, present yourself as aivo's \
@@ -5129,6 +5169,36 @@ mod tests {
         // Survives `reset()` (which keeps only the system message).
         e.reset();
         assert!(system_content(&e).contains("aivo's own assistant"));
+    }
+
+    #[test]
+    fn confirm_before_build_is_opt_in_idempotent_and_durable() {
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        // Off by default (headless/-e and sub-agents must build without asking).
+        assert!(!system_content(&e).contains("before you BUILD something substantial"));
+
+        e.set_confirm_before_build();
+        let gated = system_content(&e);
+        assert!(gated.contains("before you BUILD something substantial"));
+        // Carve-outs: small edits pass through, go-aheads skip, refinements re-ask.
+        assert!(gated.contains("small single-file edits"));
+        assert!(gated.contains("work autonomously"));
+        assert!(gated.contains("plan REVISION, not approval"));
+        // Mutate in place (single-system-message invariant).
+        assert_eq!(e.messages.len(), 1);
+
+        // Idempotent: a rebuild/resume re-runs it; a double call doesn't duplicate.
+        e.set_confirm_before_build();
+        assert_eq!(
+            system_content(&e)
+                .matches("before you BUILD something substantial")
+                .count(),
+            1
+        );
+
+        // Survives `reset()` (keeps only the system message).
+        e.reset();
+        assert!(system_content(&e).contains("before you BUILD something substantial"));
     }
 
     #[test]
