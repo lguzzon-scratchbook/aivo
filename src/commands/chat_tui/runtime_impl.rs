@@ -2121,6 +2121,23 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
         self.tx.send(RuntimeEvent::AgentTurnTokens(output)).ok();
     }
 
+    fn subagent_activity(
+        &mut self,
+        agent: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        step: usize,
+    ) {
+        self.tx
+            .send(RuntimeEvent::AgentSubActivity {
+                agent: agent.to_string(),
+                tool: tool.to_string(),
+                args: args.clone(),
+                step,
+            })
+            .ok();
+    }
+
     fn plan_updated(&mut self, items: &[crate::agent::plan::PlanItem]) {
         let value = serde_json::to_value(items).unwrap_or(serde_json::Value::Null);
         self.tx.send(RuntimeEvent::AgentPlan(value)).ok();

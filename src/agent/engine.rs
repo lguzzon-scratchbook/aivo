@@ -250,6 +250,10 @@ pub trait AgentUi: Send {
     fn context_usage(&mut self, _tokens: u64, _measured: bool) {}
     /// Turn's cumulative output tokens so far (live per-turn counter). Default no-op.
     fn turn_tokens(&mut self, _output: u64) {}
+    /// A delegated sub-agent began a step — surfaced on the parent's status line
+    /// (label-only) so a long delegation isn't a frozen label. `tool` empty =
+    /// thinking between calls; `step` = child's 1-based turn. Default no-op.
+    fn subagent_activity(&mut self, _agent: &str, _tool: &str, _args: &Value, _step: usize) {}
     /// Prompt for the next REPL turn. `None` ends the session (EOF / `/exit`);
     /// default `None` → one-shot only.
     fn read_user_input(&mut self) -> Option<String> {
@@ -2058,9 +2062,21 @@ Re-run the full command without write confinement?",
             sub.apply_profile(p);
         }
 
+        // Matched specialist, else the requested name, else generic.
+        let agent_name = profile
+            .map(|p| p.name.clone())
+            .or_else(|| {
+                args.get("agent")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
         let mut ui = SubagentUi {
             parent: Some(parent_ui),
             base,
+            agent_name,
             ..Default::default()
         };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
@@ -2127,6 +2143,9 @@ struct SubagentUi<'a> {
     /// Forward live token growth (base + sub so-far) to the parent UI.
     parent: Option<&'a mut dyn AgentUi>,
     base: u64,
+    /// Specialist name + turn counter, forwarded to the parent's status feed.
+    agent_name: String,
+    turn_no: usize,
 }
 
 impl SubagentUi<'_> {
@@ -2157,6 +2176,18 @@ impl SubagentUi<'_> {
             )
         }
     }
+
+    fn forward_activity(&mut self, tool: &str, args: &Value) {
+        let Self {
+            parent,
+            agent_name,
+            turn_no,
+            ..
+        } = self;
+        if let Some(p) = parent.as_deref_mut() {
+            p.subagent_activity(agent_name, tool, args, *turn_no);
+        }
+    }
 }
 
 impl AgentUi for SubagentUi<'_> {
@@ -2165,6 +2196,8 @@ impl AgentUi for SubagentUi<'_> {
         if !self.cur_text.trim().is_empty() {
             self.last_nonempty = std::mem::take(&mut self.cur_text);
         }
+        self.turn_no += 1;
+        self.forward_activity("", &Value::Null);
     }
     fn assistant_text(&mut self, delta: &str) {
         self.cur_text.push_str(delta);
@@ -2172,7 +2205,9 @@ impl AgentUi for SubagentUi<'_> {
     fn discard_streamed_segment(&mut self) {
         self.cur_text.clear();
     }
-    fn tool_start(&mut self, _name: &str, _args: &Value) {}
+    fn tool_start(&mut self, name: &str, args: &Value) {
+        self.forward_activity(name, args);
+    }
     fn tool_result(&mut self, _name: &str, _result: &Result<String, String>) {}
     fn notify(&mut self, text: &str) {
         self.last_notice = text.to_string();
@@ -2710,6 +2745,8 @@ mod tests {
         ask_tools: Vec<String>,
         turn_token_reports: Vec<u64>,
         discards: usize,
+        /// Each forwarded sub-agent step: `(agent, tool, step)`.
+        sub_activity: Vec<(String, String, usize)>,
     }
     impl AgentUi for CapturingUi {
         fn assistant_text(&mut self, t: &str) {
@@ -2735,6 +2772,10 @@ mod tests {
         }
         fn turn_tokens(&mut self, output: u64) {
             self.turn_token_reports.push(output);
+        }
+        fn subagent_activity(&mut self, agent: &str, tool: &str, _: &Value, step: usize) {
+            self.sub_activity
+                .push((agent.to_string(), tool.to_string(), step));
         }
         fn ask_permission<'a>(
             &'a mut self,
@@ -2768,6 +2809,32 @@ mod tests {
         sub.turn_tokens(55);
         drop(sub);
         assert_eq!(parent.turn_token_reports, vec![120, 155]);
+    }
+
+    /// `turn_start` bumps the step + reports thinking (empty tool); `tool_start`
+    /// reports the tool — both tagged with the specialist name and 1-based step.
+    #[test]
+    fn subagent_forwards_step_activity_to_parent() {
+        let mut parent = CapturingUi::default();
+        let mut sub = SubagentUi {
+            agent_name: "code-reviewer".to_string(),
+            parent: Some(&mut parent),
+            ..Default::default()
+        };
+        sub.turn_start();
+        sub.tool_start("grep", &json!({"pattern": "fn"}));
+        sub.turn_start();
+        sub.tool_start("read_file", &json!({"path": "src/lib.rs"}));
+        drop(sub);
+        assert_eq!(
+            parent.sub_activity,
+            vec![
+                ("code-reviewer".to_string(), String::new(), 1),
+                ("code-reviewer".to_string(), "grep".to_string(), 1),
+                ("code-reviewer".to_string(), String::new(), 2),
+                ("code-reviewer".to_string(), "read_file".to_string(), 2),
+            ]
+        );
     }
 
     /// A sub-agent forwards permission asks to the parent (else the catastrophic floor is

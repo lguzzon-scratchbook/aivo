@@ -2122,6 +2122,41 @@ fn test_current_action_shows_inline_on_status_line() {
 }
 
 #[test]
+fn test_subagent_activity_drives_status_line() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    // Parent's `subagent` call in flight (no result) — the case that used to
+    // freeze the status line on the parent's last tool for the whole delegation.
+    app.apply_agent_tool_call(
+        None,
+        "subagent".to_string(),
+        serde_json::json!({"agent": "code-reviewer", "task": "review mcp.rs"}),
+        vec![],
+    );
+    app.apply_subagent_activity(
+        "code-reviewer".to_string(),
+        "grep".to_string(),
+        serde_json::json!({"pattern": "fn"}),
+        7,
+    );
+    let status = app
+        .build_transcript()
+        .plain_lines
+        .into_iter()
+        .find(|l| l.contains("code-reviewer: searching"))
+        .expect("nested sub-agent activity shown on the status line");
+    assert!(
+        status.contains("step 7"),
+        "carries the child's step count: {status:?}"
+    );
+    assert!(
+        status.contains('↳'),
+        "marked as nested delegation: {status:?}"
+    );
+}
+
+#[test]
 fn test_done_marker_stays_above_new_input_after_plan_clear() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);

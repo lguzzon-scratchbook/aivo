@@ -1421,6 +1421,14 @@ pub(super) enum RuntimeEvent {
     /// The turn's cumulative generated (output) tokens so far — drives the live
     /// per-turn counter in the status line.
     AgentTurnTokens(u64),
+    /// A delegated sub-agent began a step — updates the parent's status-line label
+    /// (`↳ <agent>: <action> · step N`) only, never a transcript card.
+    AgentSubActivity {
+        agent: String,
+        tool: String,
+        args: serde_json::Value,
+        step: usize,
+    },
     /// An agent error (e.g. an LLM/API failure) — shown as an error-hued notice.
     AgentError(String),
     /// The agent turn finished (engine called `footer`) — commit the turn.

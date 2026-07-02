@@ -475,14 +475,24 @@ impl ChatTuiApp {
         } else {
             "esc to interrupt".to_string()
         };
+        // A named tool step is timed by its own runtime, not the whole turn's —
+        // else a fast read reads "20m" when a sibling subagent dominates the turn.
+        let elapsed = if self.current_action_label().is_some() {
+            self.last_tool_action
+                .as_ref()
+                .map(|(_, since)| since.elapsed())
+                .unwrap_or_default()
+        } else {
+            started_at
+                .map(|started_at| started_at.elapsed())
+                .unwrap_or_default()
+        };
         let mut block = Vec::new();
         render_pending_status(
             &mut block,
             self.frame_tick,
             self.reduce_motion,
-            started_at
-                .map(|started_at| started_at.elapsed())
-                .unwrap_or_default(),
+            elapsed,
             &activity,
             &tail,
         );

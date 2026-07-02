@@ -53,6 +53,12 @@ impl ChatTuiApp {
                 args,
                 line_starts,
             } => self.apply_agent_tool_call(id, name, args, line_starts),
+            RuntimeEvent::AgentSubActivity {
+                agent,
+                tool,
+                args,
+                step,
+            } => self.apply_subagent_activity(agent, tool, args, step),
             RuntimeEvent::AgentToolUpdate {
                 id,
                 args,
@@ -373,6 +379,35 @@ impl ChatTuiApp {
         // a streamed tool step shouldn't yank the view back to the bottom. The
         // render already follows new output while `follow_output` is set, and
         // scrolling back to the bottom re-arms it.
+    }
+
+    /// Nested sub-agent step → the status-line label only; the parent's own
+    /// `subagent` tool-call card still owns the transcript.
+    pub(super) fn apply_subagent_activity(
+        &mut self,
+        agent: String,
+        tool: String,
+        args: serde_json::Value,
+        step: usize,
+    ) {
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        let who: &str = if agent.is_empty() { "subagent" } else { &agent };
+        // Empty tool = child thinking between calls.
+        let inner = if tool.is_empty() {
+            "working".to_string()
+        } else {
+            super::render::tool_action_label(&tool, &args, &cwd)
+        };
+        let label = if step > 0 {
+            format!("↳ {who}: {inner} · step {step}")
+        } else {
+            format!("↳ {who}: {inner}")
+        };
+        self.last_tool_action = Some((label, Instant::now()));
     }
 
     /// Enrich the matching tool-call entry in place (cursor reports the resolved
