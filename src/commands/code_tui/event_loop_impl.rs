@@ -799,10 +799,9 @@ impl CodeTuiApp {
         });
     }
 
-    /// Enrich the matching tool-call entry in place (cursor reports the resolved
-    /// path/pattern and the result in a later `tool_call_update`, keyed by id):
-    /// swap in the real args and attach a compact result / failed flag. Bumps the
-    /// transcript revision so the memoized body re-renders.
+    /// Enrich the matching tool-call entry in place (cursor's later
+    /// `tool_call_update`, keyed by id). Bump revision only when the card is
+    /// in the committed body — in-flight progress is hidden behind the spinner.
     pub(super) fn apply_agent_tool_update(
         &mut self,
         id: String,
@@ -810,7 +809,7 @@ impl CodeTuiApp {
         result: Option<String>,
         failed: bool,
     ) {
-        let Some(entry) = self.history.iter_mut().rev().find(|m| {
+        let Some(idx) = self.history.iter().rposition(|m| {
             m.role == "tool_call"
                 && serde_json::from_str::<serde_json::Value>(&m.content)
                     .ok()
@@ -820,7 +819,7 @@ impl CodeTuiApp {
         }) else {
             return;
         };
-        let mut obj = serde_json::from_str::<serde_json::Value>(&entry.content)
+        let mut obj = serde_json::from_str::<serde_json::Value>(&self.history[idx].content)
             .unwrap_or_else(|_| serde_json::json!({}));
         let args_updated = args.is_some();
         if let Some(args) = args {
@@ -839,11 +838,17 @@ impl CodeTuiApp {
         if failed {
             obj["failed"] = serde_json::Value::Bool(true);
         }
-        entry.content = obj.to_string();
+        let new_content = obj.to_string();
+        if new_content == self.history[idx].content {
+            return;
+        }
+        self.history[idx].content = new_content;
         // Enriched args on a live call refresh the status label too
         // (a `cursor/task` notice delivers the real task after the call frame).
-        let relabel = (args_updated && decode_tool_outcome(&entry.content).0.is_none() && !failed)
-            .then(|| super::render::decode_tool_call(&entry.content));
+        let relabel = (args_updated
+            && decode_tool_outcome(&self.history[idx].content).0.is_none()
+            && !failed)
+            .then(|| super::render::decode_tool_call(&self.history[idx].content));
         if let Some((name, new_args)) = relabel {
             let cwd = if self.real_cwd.is_empty() {
                 self.cwd.clone()
@@ -854,7 +859,9 @@ impl CodeTuiApp {
                 *label = super::render::tool_action_label(&name, &new_args, &cwd);
             }
         }
-        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        if idx < self.committed_render_len() {
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        }
     }
 
     /// A background MCP connect resolved: cache the client and, if it brought
@@ -2150,9 +2157,10 @@ impl CodeTuiApp {
                 needs_redraw = true;
             }
 
-            // Spinner advances only while animating.
+            // +5 on the slow cadence so `spinner_frame_indexed` (`tick / 5`) still rotates.
             if self.is_animating() {
-                self.frame_tick = self.frame_tick.wrapping_add(1);
+                let step = if self.wants_fast_animation() { 1 } else { 5 };
+                self.frame_tick = self.frame_tick.wrapping_add(step);
             }
 
             // Non-blocking nap, never a blocking poll — that would freeze the
@@ -2163,7 +2171,7 @@ impl CodeTuiApp {
             let nap = if needs_redraw {
                 INPUT_REPAINT_INTERVAL
             } else if self.is_animating() {
-                ANIMATING_FRAME_INTERVAL
+                self.animation_nap()
             } else {
                 IDLE_POLL_INTERVAL
             };
@@ -2243,6 +2251,13 @@ impl CodeTuiApp {
             if let Event::Key(key) = &event
                 && key.kind == KeyEventKind::Release
             {
+                continue;
+            }
+            if is_non_visual_event(&event) {
+                drained += 1;
+                if drained >= MAX_INPUT_EVENTS_PER_TICK {
+                    break;
+                }
                 continue;
             }
             *needs_redraw = true;
@@ -3898,4 +3913,12 @@ pub(super) fn model_reads_images(model: &str) -> bool {
 pub(super) fn cache_hit_pct(read: u64, write: u64, prompt: u64) -> Option<u8> {
     (prompt > 0 && read.saturating_add(write) > 0)
         .then(|| (read.saturating_mul(100) / prompt).min(100) as u8)
+}
+
+pub(super) fn is_non_visual_event(event: &Event) -> bool {
+    match event {
+        Event::FocusGained | Event::FocusLost => true,
+        Event::Mouse(mouse) => matches!(mouse.kind, MouseEventKind::Moved),
+        _ => false,
+    }
 }

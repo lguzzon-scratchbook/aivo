@@ -435,8 +435,11 @@ pub(super) const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 pub(super) const DRAG_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
 /// How long each welcome-screen tip stays up before rotating (see `tick_welcome_tip`).
 pub(super) const WELCOME_TIP_ROTATE_INTERVAL: Duration = Duration::from_secs(12);
-// Tight repaint cadence while animating; slower when idle to cut wakeups.
+// Typewriter/drag. Spinner/clock use the slower intervals — 16ms for a
+// minutes-long Thinking wait is the CPU hog.
 pub(super) const ANIMATING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+pub(super) const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+pub(super) const REDUCED_MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 pub(super) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Nap after a pass that handled input: short enough that a scroll/keystroke
 /// repaints near-instantly and in fine increments (not trailing the idle

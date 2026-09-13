@@ -29,6 +29,20 @@ impl CodeTuiApp {
             || self.btw.as_ref().is_some_and(|exchange| exchange.streaming)
     }
 
+    pub(super) fn wants_fast_animation(&self) -> bool {
+        !self.incoming_buffer.is_empty() || self.drag_autoscroll.is_some()
+    }
+
+    pub(super) fn animation_nap(&self) -> Duration {
+        if self.wants_fast_animation() {
+            ANIMATING_FRAME_INTERVAL
+        } else if self.reduce_motion {
+            REDUCED_MOTION_FRAME_INTERVAL
+        } else {
+            SPINNER_FRAME_INTERVAL
+        }
+    }
+
     /// Advance the welcome-screen tip once its interval elapses; returns `true`
     /// when it changed (the cue to repaint). Only runs on the untouched welcome
     /// screen — an overlay, a draft, or any message pauses it and resets the clock,

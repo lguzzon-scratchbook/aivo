@@ -1,5 +1,6 @@
 use super::super::event_loop_impl::{
-    EscReassembly, EscStep, FragStep, osc_reply_frag_step, parse_sgr_scroll, sgr_mouse_frag_step,
+    EscReassembly, EscStep, FragStep, is_non_visual_event, osc_reply_frag_step, parse_sgr_scroll,
+    sgr_mouse_frag_step,
 };
 use super::super::*;
 use super::helpers::*;
@@ -290,4 +291,39 @@ async fn test_truncated_osc_reply_dropped_at_flush() {
     }
     assert!(!app.flush_esc_reassembly(esc).await.unwrap());
     assert_eq!(app.draft, "", "truncated reply leaked at flush");
+}
+
+#[test]
+fn test_hover_and_focus_are_non_visual() {
+    let moved = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 4,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(is_non_visual_event(&moved));
+    assert!(is_non_visual_event(&Event::FocusGained));
+    assert!(is_non_visual_event(&Event::FocusLost));
+    assert!(!is_non_visual_event(&Event::Mouse(left_click(4, 2))));
+    assert!(!is_non_visual_event(&Event::Resize(80, 24)));
+}
+
+#[test]
+fn test_animation_nap_slows_spinner_and_honors_reduce_motion() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    assert!(
+        !app.wants_fast_animation(),
+        "spinner-only wait is not the 16ms path"
+    );
+    assert_eq!(app.animation_nap(), SPINNER_FRAME_INTERVAL);
+
+    app.reduce_motion = true;
+    assert_eq!(app.animation_nap(), REDUCED_MOTION_FRAME_INTERVAL);
+
+    app.reduce_motion = false;
+    app.incoming_buffer = "hello".into();
+    assert!(app.wants_fast_animation());
+    assert_eq!(app.animation_nap(), ANIMATING_FRAME_INTERVAL);
 }

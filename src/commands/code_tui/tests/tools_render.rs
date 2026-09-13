@@ -1324,7 +1324,6 @@ fn test_cursor_tool_update_enriches_call_in_place() {
         Some("42 lines".to_string()),
         false,
     );
-    // The cache fingerprint must move so the edited (middle) entry re-renders.
     assert!(app.transcript_revision > rev_before);
 
     let plain = app.build_transcript().plain_lines.join("\n");
@@ -1348,6 +1347,37 @@ fn test_cursor_tool_update_enriches_call_in_place() {
     assert!(
         plain.contains("read_file(src/chat.rs) · permission denied"),
         "{plain}"
+    );
+}
+
+#[test]
+fn test_in_flight_cursor_tool_update_does_not_bump_transcript_revision() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.request_started_at = Some(std::time::Instant::now());
+    app.apply_agent_tool_call(
+        Some("c1".to_string()),
+        "read_file".to_string(),
+        serde_json::json!({"path": "Read File"}),
+        vec![],
+        None,
+    );
+    let rev = app.transcript_revision;
+    app.apply_agent_tool_update(
+        "c1".to_string(),
+        Some(serde_json::json!({"path": "src/chat.rs"})),
+        None,
+        false,
+    );
+    assert_eq!(
+        app.transcript_revision, rev,
+        "in-flight progress must not bust the history body cache"
+    );
+    app.apply_agent_tool_update("c1".to_string(), None, Some("42 lines".into()), false);
+    assert!(
+        app.transcript_revision > rev,
+        "settling the last live tool must re-render the now-visible card"
     );
 }
 
