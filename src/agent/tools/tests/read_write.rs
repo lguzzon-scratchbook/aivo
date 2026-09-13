@@ -27,7 +27,7 @@ fn resolve_expands_leading_tilde() {
 fn write_then_read_roundtrips() {
     let dir = tmp();
     write_file(&json!({"path":"a.txt","content":"hello\nworld"}), &dir).unwrap();
-    let out = read_file(&json!({"path":"a.txt"}), &dir).unwrap();
+    let out = read_file(&json!({"path":"a.txt"}), &dir).unwrap().text;
     assert!(out.contains("hello"));
     assert!(out.contains("     1\t"));
 }
@@ -37,7 +37,9 @@ fn read_file_paging() {
     let dir = tmp();
     let body: String = (1..=10).map(|n| format!("line{n}\n")).collect();
     write_file(&json!({"path":"b.txt","content":body}), &dir).unwrap();
-    let out = read_file(&json!({"path":"b.txt","offset":3,"limit":2}), &dir).unwrap();
+    let out = read_file(&json!({"path":"b.txt","offset":3,"limit":2}), &dir)
+        .unwrap()
+        .text;
     assert!(out.contains("line3"));
     assert!(out.contains("line4"));
     assert!(!out.contains("line5"));
@@ -53,7 +55,7 @@ fn read_file_cap_notices_carry_resume_offset() {
     // Line cap: 3000 short lines, so the first 2000 fit under the byte cap.
     let body: String = (1..=3000).map(|n| format!("L{n}\n")).collect();
     write_file(&json!({"path":"lines.txt","content":body}), &dir).unwrap();
-    let out = read_file(&json!({"path":"lines.txt"}), &dir).unwrap();
+    let out = read_file(&json!({"path":"lines.txt"}), &dir).unwrap().text;
     assert!(out.contains("continue with offset=2001"), "{out}");
 
     // Byte cap mid-line: 108-byte rows cut at 30000 = 277 whole lines plus a
@@ -62,7 +64,7 @@ fn read_file_cap_notices_carry_resume_offset() {
         .map(|_| format!("{}\n", "x".repeat(100)))
         .collect();
     write_file(&json!({"path":"wide.txt","content":body}), &dir).unwrap();
-    let out = read_file(&json!({"path":"wide.txt"}), &dir).unwrap();
+    let out = read_file(&json!({"path":"wide.txt"}), &dir).unwrap().text;
     assert!(out.contains("continue with offset=278"), "{out}");
 }
 
@@ -71,16 +73,21 @@ fn read_file_accepts_start_line_end_line_aliases() {
     let dir = tmp();
     let body: String = (1..=10).map(|n| format!("line{n}\n")).collect();
     write_file(&json!({"path":"b.txt","content":body}), &dir).unwrap();
-    let out = read_file(&json!({"path":"b.txt","start_line":3}), &dir).unwrap();
+    let out = read_file(&json!({"path":"b.txt","start_line":3}), &dir)
+        .unwrap()
+        .text;
     assert!(out.contains("line3") && !out.contains("line2"));
-    let out = read_file(&json!({"path":"b.txt","start_line":3,"end_line":5}), &dir).unwrap();
+    let out = read_file(&json!({"path":"b.txt","start_line":3,"end_line":5}), &dir)
+        .unwrap()
+        .text;
     assert!(out.contains("line3") && out.contains("line5") && !out.contains("line6"));
     // Explicit offset/limit win over the aliases.
     let out = read_file(
         &json!({"path":"b.txt","offset":2,"limit":1,"start_line":9}),
         &dir,
     )
-    .unwrap();
+    .unwrap()
+    .text;
     assert!(out.contains("line2") && !out.contains("line3"));
 }
 
@@ -90,10 +97,14 @@ fn read_file_accepts_start_line_end_line_aliases() {
 fn read_file_huge_offset_does_not_overflow() {
     let dir = tmp();
     write_file(&json!({"path":"h.txt","content":"a\nb\nc\n"}), &dir).unwrap();
-    let out = read_file(&json!({"path":"h.txt","offset": u64::MAX}), &dir).unwrap();
+    let out = read_file(&json!({"path":"h.txt","offset": u64::MAX}), &dir)
+        .unwrap()
+        .text;
     assert!(out.contains("past end of file"), "got: {out}");
     // A huge limit (with a sane offset) must not overflow either.
-    let out2 = read_file(&json!({"path":"h.txt","limit": u64::MAX}), &dir).unwrap();
+    let out2 = read_file(&json!({"path":"h.txt","limit": u64::MAX}), &dir)
+        .unwrap()
+        .text;
     assert!(
         out2.contains("a") && !out2.contains("more lines"),
         "got: {out2}"
@@ -108,6 +119,56 @@ fn read_file_rejects_binary_and_directory() {
     assert!(err.contains("binary"), "got: {err}");
     let err = read_file(&json!({"path":"."}), &dir).unwrap_err();
     assert!(err.contains("directory"), "got: {err}");
+}
+
+#[test]
+fn read_file_returns_png_as_image() {
+    let dir = tmp();
+    std::fs::write(
+        dir.join("shot.png"),
+        crate::services::image_optimize::test_tiny_png(),
+    )
+    .unwrap();
+    let out = read_file(&json!({"path":"shot.png"}), &dir).unwrap();
+    assert!(out.text.contains("[image saved:") && out.text.contains("image/png"));
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(out.images[0].mime, "image/png");
+}
+
+#[test]
+fn read_file_images_need_a_real_header() {
+    let dir = tmp();
+    std::fs::write(
+        dir.join("icon.png"),
+        b"<svg xmlns='http://www.w3.org/2000/svg'></svg>\n",
+    )
+    .unwrap();
+    let out = read_file(&json!({"path":"icon.png"}), &dir).unwrap();
+    assert!(out.images.is_empty() && out.text.contains("<svg"));
+
+    std::fs::write(
+        dir.join("bad.png"),
+        [0x89, b'P', b'N', b'G', 0x00, 0x01, 0x02],
+    )
+    .unwrap();
+    assert!(
+        read_file(&json!({"path":"bad.png"}), &dir)
+            .unwrap_err()
+            .contains("binary")
+    );
+
+    // GIF has NULs; without a decoder, refuse rather than risk a 400.
+    let gif: &[u8] = &[
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21, 0xF9,
+        0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3B,
+    ];
+    std::fs::write(dir.join("dot.gif"), gif).unwrap();
+    assert!(
+        read_file(&json!({"path":"dot.gif"}), &dir)
+            .unwrap_err()
+            .contains("binary")
+    );
 }
 
 /// A FIFO/device read blocks forever and once froze the whole TUI — these

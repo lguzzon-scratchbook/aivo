@@ -1,6 +1,7 @@
 //! File tools: read/list/write and the edit family with no-match hints.
 
 use super::*;
+use crate::agent::engine::ToolImage;
 
 /// Effective `read_file` range (offset/limit aliases + defaults) — shared with
 /// `read_dedupe_key` so the dedupe identity can't drift from the read.
@@ -65,7 +66,7 @@ pub(crate) fn read_dedupe_key(name: &str, args: &Value, cwd: &Path) -> Option<St
     }
 }
 
-pub(super) fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
+pub(super) fn read_file(args: &Value, cwd: &Path) -> Result<ToolOutput, String> {
     let path = arg_str(args, "path")?;
     let full = resolve(cwd, path);
     let meta = regular_file_metadata(&full).map_err(|e| format!("read {path}: {e}"))?;
@@ -77,6 +78,14 @@ pub(super) fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
     file.take(MAX_READ_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("read {path}: {e}"))?;
+    if let Some(mime) = crate::services::image_optimize::sniff_validated_image(&bytes) {
+        if oversize {
+            return Err(format!(
+                "read {path}: image exceeds 10 MB ({mime}) — shrink it before reading"
+            ));
+        }
+        return Ok(image_read(&full, mime, &bytes));
+    }
     // A NUL byte means binary — line/offset semantics don't apply, and dumping
     // it would flood the model with garbage.
     if bytes.contains(&0) {
@@ -112,12 +121,29 @@ pub(super) fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
     if out.is_empty() {
         out.push_str("(empty or past end of file)");
     }
-    Ok(cap_head_resume(out, |whole_lines| {
+    Ok(ToolOutput::from(cap_head_resume(out, |whole_lines| {
         format!(
             "continue with offset={}",
             offset.saturating_add(whole_lines)
         )
-    }))
+    })))
+}
+
+fn image_read(full: &Path, mime: &str, bytes: &[u8]) -> ToolOutput {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    ToolOutput {
+        // `[image saved:]` is the TUI preview hook, same as MCP/`generate_image`.
+        text: format!(
+            "Read image file [{mime}]\n[image saved: {} ({mime})]",
+            full.display()
+        ),
+        images: vec![ToolImage {
+            path: full.to_path_buf(),
+            mime: mime.to_string(),
+            data_b64: BASE64.encode(bytes),
+        }],
+    }
 }
 
 pub(super) fn list_dir(args: &Value, cwd: &Path) -> Result<String, String> {

@@ -18,7 +18,7 @@ fn edit_requires_unique_match() {
         &dir,
     )
     .unwrap();
-    let out = read_file(&json!({"path":"d.txt"}), &dir).unwrap();
+    let out = read_file(&json!({"path":"d.txt"}), &dir).unwrap().text;
     assert!(out.contains("foo baz"));
 }
 
@@ -71,7 +71,7 @@ fn edit_replace_all_replaces_every_occurrence() {
     )
     .unwrap();
     assert!(ok.contains("3 replacements"), "got: {ok}");
-    let out = read_file(&json!({"path":"r.txt"}), &dir).unwrap();
+    let out = read_file(&json!({"path":"r.txt"}), &dir).unwrap().text;
     assert!(out.contains("b b b"));
 }
 
@@ -107,7 +107,7 @@ fn multi_edit_is_atomic_and_sequential() {
     )
     .unwrap();
     assert!(ok.contains("2 edits"), "got: {ok}");
-    let out = read_file(&json!({"path":"m.txt"}), &dir).unwrap();
+    let out = read_file(&json!({"path":"m.txt"}), &dir).unwrap().text;
     assert!(out.contains("1 2 three"));
 
     // A failing later edit leaves the file untouched (atomic).
@@ -120,7 +120,7 @@ fn multi_edit_is_atomic_and_sequential() {
     )
     .unwrap_err();
     assert!(err.contains("edit #2"), "got: {err}");
-    let after = read_file(&json!({"path":"m.txt"}), &dir).unwrap();
+    let after = read_file(&json!({"path":"m.txt"}), &dir).unwrap().text;
     assert!(after.contains("1 2 three"), "file was half-edited: {after}");
 }
 

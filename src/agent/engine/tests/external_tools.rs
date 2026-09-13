@@ -565,3 +565,63 @@ async fn external_tools_hide_and_refuse_in_plan_mode() {
         "external tool executed during plan mode"
     );
 }
+
+#[tokio::test]
+async fn read_file_images_inject_only_for_vision_models() {
+    for reads_images in [true, false] {
+        let dir = tmp();
+        std::fs::write(
+            dir.join("shot.png"),
+            crate::services::image_optimize::test_tiny_png(),
+        )
+        .unwrap();
+        let call = tool_call_sse("read_file", json!({ "path": "shot.png" }));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_model_reads_images(reads_images);
+
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("look".into()),
+            &mut ui,
+        )
+        .await;
+
+        let injected: Vec<&Value> = engine
+            .messages
+            .iter()
+            .filter(|m| m.get("aivo").and_then(|v| v.as_str()) == Some("tool_images"))
+            .collect();
+        let tool_text = tool_result_texts(&engine).join("\n");
+        assert!(
+            tool_text.contains("[image saved:") && tool_text.contains("shot.png"),
+            "tool result should name the image: {tool_text}"
+        );
+        if reads_images {
+            assert_eq!(injected.len(), 1, "vision model gets the pixels");
+            let parts = injected[0]["content"].as_array().unwrap();
+            assert_eq!(parts[1]["type"], "image_url");
+            assert!(
+                parts[1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,"),
+                "expected png data url"
+            );
+            assert!(!tool_text.contains("was not sent"));
+        } else {
+            assert!(
+                injected.is_empty(),
+                "text-only model must not get image_url"
+            );
+            assert!(
+                tool_text.contains("does not support images"),
+                "text-only model needs an explicit note: {tool_text}"
+            );
+        }
+    }
+}

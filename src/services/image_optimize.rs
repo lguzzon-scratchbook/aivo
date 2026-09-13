@@ -78,6 +78,17 @@ pub(crate) fn sniff_format(bytes: &[u8]) -> Option<SniffedFormat> {
     }
 }
 
+/// PNG/JPEG with a decodable header. GIF/WebP stay out — magic-only tagging
+/// 400s the next turn when the bytes aren't a real image.
+pub(crate) fn sniff_validated_image(bytes: &[u8]) -> Option<&'static str> {
+    let fmt = sniff_format(bytes)?;
+    probe_dimensions(bytes, fmt)?;
+    Some(match fmt {
+        SniffedFormat::Png => "image/png",
+        SniffedFormat::Jpeg => "image/jpeg",
+    })
+}
+
 /// Reads dimensions before allocating a decoded pixel buffer.
 pub(crate) fn probe_dimensions(bytes: &[u8], format: SniffedFormat) -> Option<(u32, u32)> {
     let (w, h) = match format {
@@ -354,6 +365,14 @@ mod tests {
         let mut fake = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         fake.extend(std::iter::repeat_n(0xAB, BYTE_BUDGET + 16));
         assert!(optimize_image(&fake).is_none());
+    }
+
+    #[test]
+    fn sniff_validated_image_requires_a_real_header() {
+        assert_eq!(sniff_validated_image(&test_tiny_png()), Some("image/png"));
+        assert_eq!(sniff_validated_image(b"\xFF\xD8\xFF\xE0rest"), None);
+        assert_eq!(sniff_validated_image(b"GIF89a...."), None);
+        assert_eq!(sniff_validated_image(b"<svg"), None);
     }
 
     #[test]

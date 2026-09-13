@@ -10,7 +10,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "read_file",
             "Read a file's contents with line numbers. Paths are relative to the working \
 directory unless absolute. Use offset/limit to page a large file instead of pulling it whole. \
-Not for directories — use list_dir.",
+PNG and JPEG images are returned as visual content (detected from the file bytes, not \
+the extension) so a vision model can see them. Not for directories — use list_dir.",
             json!({
                 "type": "object",
                 "properties": {
@@ -218,7 +219,8 @@ pub fn generate_image_tool_spec() -> ToolSpec {
         "generate_image",
         "Generate an image from a text prompt with the user's configured image model. \
 Returns the saved file path — use run_bash to copy or move it where the user wants it. \
-Not for reading, editing, or converting existing images (use run_bash for those). \
+Not for reading, editing, or converting existing images (use read_file to inspect an \
+image; run_bash to convert or move it). \
 If a dedicated image-generation tool from an MCP server is available, prefer that one.",
         json!({
             "type": "object",

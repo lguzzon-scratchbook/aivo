@@ -5,6 +5,7 @@
 //! grep shells to rg/grep when present, else a literal-substring fallback).
 //! (`skill` and `update_plan` are engine-handled, not dispatched here.)
 
+use crate::agent::engine::ToolOutput;
 use crate::agent::protocol::ToolSpec;
 use crate::agent::subagents;
 use serde_json::{Value, json};
@@ -136,7 +137,7 @@ pub fn preview(name: &str, args: &Value) -> Option<String> {
 
 /// Execute a tool. Returns Ok(result) or Err(message); errors are fed back to
 /// the model as a tool result so it can self-correct (they don't abort the loop).
-pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, String> {
+pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<ToolOutput, String> {
     // Normalize known aliases (e.g. "shell" / "bash" → "run_bash") before
     // dispatching, so external APIs that use different tool names still work.
     let name = match subagents::normalize_tool_name(name) {
@@ -147,20 +148,22 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
     refuse_writes_in_read_only(name)?;
     match name {
         "read_file" => blocking_tool(args, cwd, read_file).await,
-        "list_dir" => blocking_tool(args, cwd, list_dir).await,
-        "glob" => glob(args, cwd).await,
-        "grep" => grep(args, cwd).await,
-        "write_file" => blocking_tool(args, cwd, write_file).await,
-        "edit_file" => blocking_tool(args, cwd, edit_file).await,
-        "multi_edit" => blocking_tool(args, cwd, multi_edit).await,
+        "list_dir" => blocking_tool(args, cwd, list_dir).await.map(Into::into),
+        "glob" => glob(args, cwd).await.map(Into::into),
+        "grep" => grep(args, cwd).await.map(Into::into),
+        "write_file" => blocking_tool(args, cwd, write_file).await.map(Into::into),
+        "edit_file" => blocking_tool(args, cwd, edit_file).await.map(Into::into),
+        "multi_edit" => blocking_tool(args, cwd, multi_edit).await.map(Into::into),
         "apply_patch" => {
             let patch = arg_str(args, "input")?.to_string();
             let cwd = cwd.to_path_buf();
-            spawn_blocking_tool(move || crate::agent::apply_patch::apply(&patch, &cwd)).await
+            spawn_blocking_tool(move || crate::agent::apply_patch::apply(&patch, &cwd))
+                .await
+                .map(Into::into)
         }
-        "web_fetch" => web_fetch(args).await,
-        "web_search" => web_search(args).await,
-        "run_bash" => run_bash(args, cwd).await,
+        "web_fetch" => web_fetch(args).await.map(Into::into),
+        "web_search" => web_search(args).await.map(Into::into),
+        "run_bash" => run_bash(args, cwd).await.map(Into::into),
         other => Err(format!(
             "unknown tool `{other}` (available: {})",
             registry::workspace_exec_names()
@@ -194,18 +197,19 @@ pub async fn execute_write_unconfined(
 }
 
 /// Offload a sync tool so it can't freeze the current-thread TUI runtime.
-async fn blocking_tool<F>(args: &Value, cwd: &Path, f: F) -> Result<String, String>
+async fn blocking_tool<F, T>(args: &Value, cwd: &Path, f: F) -> Result<T, String>
 where
-    F: FnOnce(&Value, &Path) -> Result<String, String> + Send + 'static,
+    F: FnOnce(&Value, &Path) -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
 {
     let args = args.clone();
     let cwd = cwd.to_path_buf();
     spawn_blocking_tool(move || f(&args, &cwd)).await
 }
 
-async fn spawn_blocking_tool(
-    f: impl FnOnce() -> Result<String, String> + Send + 'static,
-) -> Result<String, String> {
+async fn spawn_blocking_tool<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
     tokio::task::spawn_blocking(f)
         .await
         .unwrap_or_else(|e| Err(format!("tool: {e}")))
