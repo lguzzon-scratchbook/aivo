@@ -327,3 +327,44 @@ fn test_animation_nap_slows_spinner_and_honors_reduce_motion() {
     assert!(app.wants_fast_animation());
     assert_eq!(app.animation_nap(), ANIMATING_FRAME_INTERVAL);
 }
+
+#[test]
+fn test_loop_nap_polls_input_faster_than_slow_spinner_frames() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    assert_eq!(app.animation_nap(), SPINNER_FRAME_INTERVAL);
+
+    assert_eq!(
+        app.loop_nap(false, Duration::ZERO),
+        INPUT_POLL_INTERVAL,
+        "spinner-only wait still polls input at the fast cadence"
+    );
+    assert!(!app.animation_frame_due(Duration::ZERO));
+    assert!(!app.animation_frame_due(SPINNER_FRAME_INTERVAL / 2));
+    assert!(app.animation_frame_due(SPINNER_FRAME_INTERVAL));
+
+    let almost = SPINNER_FRAME_INTERVAL - Duration::from_millis(3);
+    assert_eq!(app.loop_nap(false, almost), Duration::from_millis(3));
+    assert_eq!(
+        app.loop_nap(false, SPINNER_FRAME_INTERVAL),
+        INPUT_REPAINT_INTERVAL
+    );
+
+    assert_eq!(app.loop_nap(true, Duration::ZERO), INPUT_REPAINT_INTERVAL);
+
+    app.incoming_buffer = "hello".into();
+    assert!(app.animation_frame_due(ANIMATING_FRAME_INTERVAL));
+    assert_eq!(
+        app.loop_nap(false, Duration::ZERO),
+        ANIMATING_FRAME_INTERVAL
+    );
+
+    app.incoming_buffer.clear();
+    app.sending = false;
+    assert!(!app.animation_frame_due(Duration::from_secs(5)));
+    assert_eq!(
+        app.loop_nap(false, Duration::from_secs(5)),
+        IDLE_POLL_INTERVAL
+    );
+}

@@ -76,6 +76,51 @@ fn test_parallel_bridged_batch_counts_and_lists_calls() {
 }
 
 #[test]
+fn test_trailing_tool_calls_memo_reused_and_invalidated_by_update() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    for id in ["a", "b"] {
+        app.apply_agent_tool_call(
+            Some(id.to_string()),
+            "edit_file".to_string(),
+            serde_json::json!({"path": format!("src/{id}.rs"), "old_string": "x", "new_string": "y"}),
+            vec![],
+            None,
+        );
+    }
+    let (start, first) = app.trailing_tool_calls();
+    assert_eq!(first.len(), 2);
+    assert_eq!(app.history.len() - start, 2);
+    let (_, again) = app.trailing_tool_calls();
+    assert!(
+        std::rc::Rc::ptr_eq(&first, &again),
+        "unchanged history must hit the memo"
+    );
+    assert_eq!(app.trailing_tool_call_index("b"), Some(start + 1));
+    assert_eq!(app.trailing_tool_call_index("zzz"), None);
+
+    app.apply_agent_tool_update("b".to_string(), None, Some("ok".to_string()), false);
+    let (_, after_first) = app.trailing_tool_calls();
+    assert_eq!(after_first[1].2.0.as_deref(), Some("ok"));
+    app.apply_agent_tool_update("b".to_string(), None, Some("no".to_string()), false);
+    let (_, after_second) = app.trailing_tool_calls();
+    assert_eq!(after_second[1].2.0.as_deref(), Some("no"));
+    assert_eq!(app.desired_status(), "running 2 parallel steps (1/2 done)");
+
+    app.apply_agent_tool_call(
+        Some("c".to_string()),
+        "grep".to_string(),
+        serde_json::json!({"pattern": "x"}),
+        vec![],
+        None,
+    );
+    let (_, grown) = app.trailing_tool_calls();
+    assert_eq!(grown.len(), 3);
+    assert_eq!(grown[2].0, "grep");
+}
+
+#[test]
 fn test_parallel_bridged_batch_mixed_tools_noun() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);

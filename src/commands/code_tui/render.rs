@@ -1252,7 +1252,7 @@ pub(super) fn subagent_row_text(row: &super::shared::SubagentRow) -> String {
 /// Cursor ACP often fires 20+ edits at once; listing each hides the transcript.
 pub(super) const PARALLEL_LIVE_MAX_ROWS: usize = 6;
 
-type ParallelLiveCall = (String, serde_json::Value, (Option<String>, bool));
+pub(super) type ParallelLiveCall = (String, serde_json::Value, (Option<String>, bool));
 
 pub(super) fn parallel_live_row_texts(calls: &[ParallelLiveCall], cwd: &str) -> Vec<String> {
     if calls.is_empty() {

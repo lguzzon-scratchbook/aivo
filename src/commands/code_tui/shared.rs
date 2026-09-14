@@ -441,6 +441,8 @@ pub(super) const ANIMATING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(super) const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const REDUCED_MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 pub(super) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Cap on sleep while a slow spinner frame is pending, so input stays sampled at ~60Hz.
+pub(super) const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// Nap after a pass that handled input: short enough that a scroll/keystroke
 /// repaints near-instantly and in fine increments (not trailing the idle
 /// cadence), but still a real yield so the streaming task keeps progressing on
@@ -3842,10 +3844,21 @@ pub(super) struct RenderCache {
     pub(super) overlay_hitbox: Option<Rect>,
     /// Memo of [`estimate_context_tokens`] so a spinner tick does not re-walk history.
     pub(super) history_token_est: std::cell::Cell<Option<(u64, u64)>>,
+    /// Memo of `trailing_tool_calls` — cursor `edit_file` args are huge JSON.
+    pub(super) tool_batch: std::cell::RefCell<Option<ToolBatchCache>>,
     /// Region the screen selection is confined to — a modal's inner content rect
     /// while one is open, so a drag selects inside the modal, not the whole line.
     /// `None` = the full screen.
     pub(super) screen_region: Option<Rect>,
+}
+
+/// Memo of the trailing `tool_call` run. `apply_agent_tool_update` clears it
+/// because an in-place edit may not change content length.
+pub(super) struct ToolBatchCache {
+    pub(super) fp: u64,
+    pub(super) start: usize,
+    pub(super) ids: Vec<Option<String>>,
+    pub(super) calls: std::rc::Rc<Vec<super::render::ParallelLiveCall>>,
 }
 
 /// `/resume` picker preview state (cache + debounce + in-flight load), driven

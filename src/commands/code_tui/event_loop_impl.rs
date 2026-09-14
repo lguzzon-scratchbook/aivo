@@ -811,14 +811,17 @@ impl CodeTuiApp {
         result: Option<String>,
         failed: bool,
     ) {
-        let Some(idx) = self.history.iter().rposition(|m| {
-            m.role == "tool_call"
-                && serde_json::from_str::<serde_json::Value>(&m.content)
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(str::to_string))
-                    .as_deref()
-                    == Some(id.as_str())
-        }) else {
+        let idx = self.trailing_tool_call_index(&id).or_else(|| {
+            self.history.iter().rposition(|m| {
+                m.role == "tool_call"
+                    && serde_json::from_str::<serde_json::Value>(&m.content)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(str::to_string))
+                        .as_deref()
+                        == Some(id.as_str())
+            })
+        });
+        let Some(idx) = idx else {
             return;
         };
         let mut obj = serde_json::from_str::<serde_json::Value>(&self.history[idx].content)
@@ -845,6 +848,8 @@ impl CodeTuiApp {
             return;
         }
         self.history[idx].content = new_content;
+        // Length fingerprint misses same-length in-place edits.
+        self.render_cache.tool_batch.borrow_mut().take();
         // Enriched args on a live call refresh the status label too
         // (a `cursor/task` notice delivers the real task after the call frame).
         let relabel = (args_updated
@@ -2008,6 +2013,7 @@ impl CodeTuiApp {
         let mut needs_redraw = true;
         let mut was_streaming = false;
         let mut last_stream_repaint = std::time::Instant::now();
+        let mut last_animation_frame = std::time::Instant::now();
         let run_result = loop {
             match self.handle_runtime_events().await {
                 Ok(true) => needs_redraw = true,
@@ -2074,7 +2080,8 @@ impl CodeTuiApp {
             }
 
             // Animations repaint without input.
-            if self.is_animating() {
+            let animation_frame = self.animation_frame_due(last_animation_frame.elapsed());
+            if animation_frame {
                 needs_redraw = true;
             }
 
@@ -2160,9 +2167,10 @@ impl CodeTuiApp {
             }
 
             // +5 on the slow cadence so `spinner_frame_indexed` (`tick / 5`) still rotates.
-            if self.is_animating() {
+            if animation_frame {
                 let step = if self.wants_fast_animation() { 1 } else { 5 };
                 self.frame_tick = self.frame_tick.wrapping_add(step);
+                last_animation_frame = std::time::Instant::now();
             }
 
             // Non-blocking nap, never a blocking poll — that would freeze the
@@ -2170,13 +2178,7 @@ impl CodeTuiApp {
             // handled input, nap only briefly so the scroll/keystroke repaints
             // near-instantly and in fine increments instead of trailing the idle
             // cadence; the short sleep still yields so streaming keeps flowing.
-            let nap = if needs_redraw {
-                INPUT_REPAINT_INTERVAL
-            } else if self.is_animating() {
-                self.animation_nap()
-            } else {
-                IDLE_POLL_INTERVAL
-            };
+            let nap = self.loop_nap(needs_redraw, last_animation_frame.elapsed());
             tokio::time::sleep(nap).await;
         };
 

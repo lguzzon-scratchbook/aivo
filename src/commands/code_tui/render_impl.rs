@@ -1215,12 +1215,13 @@ impl CodeTuiApp {
         }
         // A bridged parallel batch: count the trailing run rather than naming
         // only the newest call.
-        if let Some((start, total, done)) = self.trailing_tool_batch()
+        if let Some((_, total, done)) = self.trailing_tool_batch()
             && total >= 2
         {
-            let all_delegates = self.history[start..].iter().all(|m| {
-                super::render::canonical_tool_name(&decode_tool_call(&m.content).0) == "subagent"
-            });
+            let (_, calls) = self.trailing_tool_calls();
+            let all_delegates = calls
+                .iter()
+                .all(|(name, _, _)| super::render::canonical_tool_name(name) == "subagent");
             let noun = if all_delegates {
                 "sub-agents"
             } else {
@@ -1303,7 +1304,7 @@ impl CodeTuiApp {
                 .map(|row| line_plain(super::render::subagent_row_text(row), style))
                 .collect();
         }
-        let Some((start, total, _)) = self.trailing_tool_batch() else {
+        let Some((_, total, _)) = self.trailing_tool_batch() else {
             return Vec::new();
         };
         if total < 2 {
@@ -1314,13 +1315,7 @@ impl CodeTuiApp {
         } else {
             self.real_cwd.as_str()
         };
-        let calls: Vec<_> = self.history[start..]
-            .iter()
-            .map(|m| {
-                let (name, args) = decode_tool_call(&m.content);
-                (name, args, decode_tool_outcome(&m.content))
-            })
-            .collect();
+        let (_, calls) = self.trailing_tool_calls();
         super::render::parallel_live_row_texts(&calls, cwd)
             .into_iter()
             .map(|text| line_plain(text, style))
@@ -1754,6 +1749,7 @@ impl CodeTuiApp {
     fn wrapped_spinner_block(
         &self,
         spinner: &StyledLine,
+        subagent_rows: &[StyledLine],
         base_nonempty: bool,
         text_width: u16,
     ) -> WrappedTranscript {
@@ -1765,8 +1761,8 @@ impl CodeTuiApp {
         }
         tail.push(spinner.clone());
         tail_bars.push(None);
-        for row in self.subagent_status_rows() {
-            tail.push(row);
+        for row in subagent_rows {
+            tail.push(row.clone());
             tail_bars.push(None);
         }
         for row in self.tool_output_tail_rows(text_width) {
@@ -2718,6 +2714,10 @@ impl CodeTuiApp {
         // parse + wrap are reused across animation frames of an unchanged reply.
         self.ensure_volatile_tail(table_layout_width(area.width));
         let spinner = self.spinner_status_line();
+        let subagent_rows = spinner
+            .as_ref()
+            .map(|_| self.subagent_status_rows())
+            .unwrap_or_default();
         let plain_width = area.width.saturating_sub(ACCENT_GUTTER_WIDTH).max(1);
         // The volatile tail's char-wrap height, sized like the body's estimate so
         // the pane grows to fit the streamed reply (which left the cached body).
@@ -2728,7 +2728,7 @@ impl CodeTuiApp {
             .as_ref()
             .map(|line| {
                 let mut plain = vec![String::new(), line.plain.clone()];
-                plain.extend(self.subagent_status_rows().into_iter().map(|r| r.plain));
+                plain.extend(subagent_rows.iter().map(|r| r.plain.clone()));
                 wrap_plain_lines(&plain, plain_width).len()
             })
             .unwrap_or(0);
@@ -2842,7 +2842,12 @@ impl CodeTuiApp {
             .len();
         let tail_len: usize = self.volatile_tail_parts().map(|part| part.rows.len()).sum();
         let spinner_wrap = spinner.as_ref().map(|line| {
-            self.wrapped_spinner_block(line, body_len + tail_len > 0, transcript_text_area.width)
+            self.wrapped_spinner_block(
+                line,
+                &subagent_rows,
+                body_len + tail_len > 0,
+                transcript_text_area.width,
+            )
         });
         let transcript_total_lines =
             body_len + tail_len + spinner_wrap.as_ref().map_or(0, |sw| sw.rows.len());
@@ -4016,19 +4021,89 @@ impl CodeTuiApp {
         if !self.sending || !self.pending_response.is_empty() || !self.incoming_buffer.is_empty() {
             return None;
         }
+        let (start, calls) = self.trailing_tool_calls();
+        let total = calls.len();
+        let done = calls
+            .iter()
+            .filter(|(_, _, (result, failed))| result.is_some() || *failed)
+            .count();
+        (done < total).then_some((start, total, done))
+    }
+
+    pub(super) fn trailing_tool_calls(
+        &self,
+    ) -> (usize, std::rc::Rc<Vec<super::render::ParallelLiveCall>>) {
+        use std::hash::{Hash, Hasher};
         let mut start = self.history.len();
         while start > 0 && self.history[start - 1].role == "tool_call" {
             start -= 1;
         }
-        let total = self.history.len() - start;
-        let done = self.history[start..]
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.history.len().hash(&mut hasher);
+        start.hash(&mut hasher);
+        for m in &self.history[start..] {
+            m.content.len().hash(&mut hasher);
+        }
+        let fp = hasher.finish();
+        let mut slot = self.render_cache.tool_batch.borrow_mut();
+        if let Some(cache) = slot.as_ref()
+            && cache.fp == fp
+        {
+            return (cache.start, std::rc::Rc::clone(&cache.calls));
+        }
+        let mut ids = Vec::with_capacity(self.history.len() - start);
+        let calls: Vec<super::render::ParallelLiveCall> = self.history[start..]
             .iter()
-            .filter(|m| {
-                let (result, failed) = decode_tool_outcome(&m.content);
-                result.is_some() || failed
+            .map(|m| {
+                let decoded = serde_json::from_str::<serde_json::Value>(&m.content).ok();
+                ids.push(
+                    decoded
+                        .as_ref()
+                        .and_then(|v| v.get("id"))
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                );
+                let name = decoded
+                    .as_ref()
+                    .and_then(|v| v.get("name"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                let result = decoded
+                    .as_ref()
+                    .and_then(|v| v.get("result"))
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                let failed = decoded
+                    .as_ref()
+                    .and_then(|v| v.get("failed"))
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let args = decoded
+                    .and_then(|mut v| v.get_mut("args").map(serde_json::Value::take))
+                    .unwrap_or(serde_json::Value::Null);
+                (name, args, (result, failed))
             })
-            .count();
-        (done < total).then_some((start, total, done))
+            .collect();
+        let calls = std::rc::Rc::new(calls);
+        *slot = Some(ToolBatchCache {
+            fp,
+            start,
+            ids,
+            calls: std::rc::Rc::clone(&calls),
+        });
+        (start, calls)
+    }
+
+    pub(super) fn trailing_tool_call_index(&self, id: &str) -> Option<usize> {
+        let (start, _) = self.trailing_tool_calls();
+        let slot = self.render_cache.tool_batch.borrow();
+        let cache = slot.as_ref()?;
+        cache
+            .ids
+            .iter()
+            .rposition(|entry| entry.as_deref() == Some(id))
+            .map(|offset| start + offset)
     }
 
     /// Tokens to show in the footer fill right now, and whether the figure is a

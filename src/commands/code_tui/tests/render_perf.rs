@@ -244,6 +244,45 @@ fn bench_real_session() {
     );
 }
 
+/// Live trailing `edit_file` batch with large args, unresolved while thinking.
+#[test]
+#[ignore = "timing probe, run with --nocapture"]
+fn bench_cursor_live_batch_frame() {
+    for (batch, arg_kb) in [(4usize, 36usize), (4, 385), (9, 385)] {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        seed_large_history(&mut app, 20);
+        let payload =
+            "fn resolve() { let probe = probe_provider(key); }\n".repeat(arg_kb * 1024 / 52);
+        for i in 0..batch {
+            app.apply_agent_tool_call(
+                Some(format!("call_{i}")),
+                "edit_file".to_string(),
+                serde_json::json!({
+                    "path": format!("src/services/router_{i}.rs"),
+                    "old_string": payload,
+                    "new_string": payload,
+                }),
+                vec![],
+                None,
+            );
+        }
+        app.sending = true;
+        app.request_started_at = Some(Instant::now());
+        app.pending_reasoning = "Let me look at these files. ".to_string();
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        let label = format!("cursor live batch ×{batch} @ {arg_kb}KB args, thinking + scroll");
+        let mut i = 0usize;
+        time_frames(&label, &mut app, &mut terminal, 60, |app| {
+            i += 1;
+            app.pending_reasoning
+                .push_str(&format!("token{i} and more reasoning text flows here, "));
+            app.tick_status_throttle();
+            app.scroll_up_lines(3);
+        });
+    }
+}
+
 /// Typewriter frame: each tick reveals a slice of the buffered stream, so the
 /// volatile tail re-renders — the cost that scales with reply length.
 #[test]

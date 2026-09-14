@@ -43,6 +43,22 @@ impl CodeTuiApp {
         }
     }
 
+    pub(super) fn animation_frame_due(&self, since_frame: Duration) -> bool {
+        self.is_animating() && since_frame >= self.animation_nap()
+    }
+
+    pub(super) fn loop_nap(&self, handled_input: bool, since_frame: Duration) -> Duration {
+        if handled_input {
+            INPUT_REPAINT_INTERVAL
+        } else if self.is_animating() {
+            self.animation_nap()
+                .saturating_sub(since_frame)
+                .clamp(INPUT_REPAINT_INTERVAL, INPUT_POLL_INTERVAL)
+        } else {
+            IDLE_POLL_INTERVAL
+        }
+    }
+
     /// Advance the welcome-screen tip once its interval elapses; returns `true`
     /// when it changed (the cue to repaint). Only runs on the untouched welcome
     /// screen — an overlay, a draft, or any message pauses it and resets the clock,
