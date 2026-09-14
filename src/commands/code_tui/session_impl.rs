@@ -3528,6 +3528,7 @@ conversation is preserved."
         self.stop_live_share();
         self.overlay = Overlay::None;
         if self.sending {
+            self.discard_queued_input();
             self.cancel_inflight_request(CancelKind::Discard);
         }
 

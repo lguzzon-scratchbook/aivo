@@ -4046,6 +4046,7 @@ and keep each turn's work small"
         self.discard_resume_state();
         // The share is pinned to the current session; a new chat swaps it out.
         self.stop_live_share();
+        self.discard_queued_input();
         self.cancel_inflight_request(CancelKind::Discard);
         // /new abandons this conversation — persist it first so `/resume` and
         // `/plan resume` can find it (otherwise a mid-turn `/new` orphans the
@@ -4138,22 +4139,12 @@ and keep each turn's work small"
         self.stop_agent_serve();
     }
 
-    /// `Unsend` (ESC before anything streamed) puts the cancelled submission back
-    /// in the composer; `Discard` (ESC / resume / `/new`) un-sends it instead,
-    /// leaving the composer empty — recallable via ↑.
     pub(super) fn cancel_inflight_request(&mut self, kind: CancelKind) {
         let was_sending = self.sending;
-        // Cancelling (interrupt path 1, /new, resume, key switch) also exits any
-        // autonomous /goal loop, so it can't auto-continue after the dropped turn.
-        // The interrupt-with-partial path clears it separately, before this runs.
         self.goal_mode = None;
         self.goal_guard_stop = None;
         self.cursor_plan_go_pending = false;
-        // A cancelled /compact must not mark the NEXT turn as a compact.
         self.compact_before = None;
-        // Plan mode persists across an interrupt (it's a session mode). Apply a
-        // deferred discard-exit opportunistically; if the turn task still holds
-        // the lock, the flag stays set and the next dispatch/turn-end applies it.
         if self.plan_exit_pending
             && let Some(session) = self.agent_engine.as_ref()
             && let Ok(mut engine) = session.engine.try_lock()
@@ -4168,11 +4159,6 @@ and keep each turn's work small"
             engine.set_ask_mode(false);
             self.ask_exit_pending = false;
         }
-        // An in-process agent turn is in flight when its per-turn serve is up. The
-        // engine has ALREADY consumed this turn (and may have run side-effecting
-        // tools — file writes, shell commands), and it keeps its own conversation
-        // record. So un-sending the turn from the transcript would hide that work
-        // and diverge the display from the engine; keep the user turn instead.
         let was_agent_turn = self.agent_serve.is_some();
         if let Some(task) = self.response_task.take() {
             task.abort();
@@ -4180,14 +4166,9 @@ and keep each turn's work small"
         if was_agent_turn {
             self.finalize_interrupted_checkpoint();
         }
-        // Tear down the agent turn's serve and drop any pending permission card
-        // (the dropped reply makes the engine's awaiting tool fail closed).
         self.stop_agent_serve();
         self.cards.clear_agent_cards();
-        let discarded = self.discard_queued_input();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
-            // Fire-and-forget session/cancel so the agent stops generating
-            // even though our task already dropped the prompt stream.
             let client = session.client_handle();
             let sid = session.session_id().to_string();
             tokio::spawn(async move {
@@ -4203,18 +4184,12 @@ and keep each turn's work small"
                 &mut self.draft_attachments,
                 &mut self.pending_submit,
             );
-            // Un-send from the engine too, or the resent (possibly edited) text
-            // merges with the stale copy. Async because the aborted turn task may
-            // still hold the engine lock; the pending flag re-applies at next
-            // dispatch as the ordering backstop.
             if was_agent_turn && let Some(session) = &self.agent_engine {
                 self.agent_unsend_pending = true;
                 let engine = session.engine.clone();
                 tokio::spawn(async move { engine.lock().await.unsend_last_user_turn() });
             }
         } else if was_agent_turn {
-            // Keep the user turn in the transcript; just drop the restore buffer so
-            // it can't be resurrected by a later non-agent cancel.
             self.pending_submit = None;
         } else {
             self.pending_submit = None;
@@ -4226,7 +4201,6 @@ and keep each turn's work small"
                 self.history.pop();
             }
         }
-        // Either pop above may have removed a flagged user row / its checkpoint.
         self.agent_turn_indices.retain(|&i| i < self.history.len());
         let len = self.history.len();
         self.acp_checkpoints.retain(|cp| cp.history_index < len);
@@ -4239,26 +4213,16 @@ and keep each turn's work small"
         self.pending_finish = None;
         self.pending_reasoning.clear();
         self.follow_output = true;
-        self.notice = Some((MUTED(), with_discarded("Request cancelled", discarded)));
+        self.notice = Some((MUTED(), "Request cancelled".to_string()));
     }
 
     pub(super) async fn interrupt_inflight_request(&mut self) -> Result<()> {
-        // Interrupting ends any autonomous /goal loop (both interrupt paths route
-        // through here; the partial-text path below doesn't call
-        // `cancel_inflight_request`, so clear it up front for both).
         let goal_was_active = self.goal_mode.take().is_some();
-        // Same for /compact and the approved-plan auto-continue (the
-        // partial-text path skips `cancel_inflight_request`).
         self.compact_before = None;
         self.cursor_plan_go_pending = false;
-        // Reveal any buffered text so the full received reply is kept, and drop
-        // a deferred finish — we're committing the partial turn ourselves.
         self.drain_incoming_buffer();
         self.pending_finish = None;
         if self.pending_response.is_empty() {
-            // Still "just pending" (nothing streamed, no tool/reasoning row after the
-            // user turn) → return the message to the composer. Goal-mode
-            // continuations are synthetic, so leave those on the discard path.
             let nothing_produced = !goal_was_active
                 && self
                     .history
@@ -4273,7 +4237,7 @@ and keep each turn's work small"
             if goal_was_active {
                 self.notice = Some((MUTED(), "Goal mode stopped".to_string()));
             }
-            return Ok(());
+            return self.continue_queued_after_interrupt().await;
         }
 
         let was_agent_turn = self.agent_serve.is_some();
@@ -4284,14 +4248,10 @@ and keep each turn's work small"
         if was_agent_turn {
             self.finalize_interrupted_checkpoint();
         }
-        // Tear down an agent turn's serve / permission card if this was one.
         self.stop_agent_serve();
         self.cards.clear_agent_cards();
-        let discarded = self.discard_queued_input();
 
         let partial = std::mem::take(&mut self.pending_response);
-        // Keep the reasoning shown for this partial reply (the user saw it); the
-        // empty-response interrupt above already returned without committing.
         let reasoning_content = (!self.pending_reasoning.is_empty())
             .then(|| std::mem::take(&mut self.pending_reasoning));
         self.pending_submit = None;
@@ -4313,20 +4273,22 @@ and keep each turn's work small"
         self.persist_history().await?;
         self.notice = Some((
             MUTED(),
-            with_discarded(
-                if goal_was_active {
-                    "Response interrupted — goal mode stopped"
-                } else {
-                    "Response interrupted"
-                },
-                discarded,
-            ),
+            if goal_was_active {
+                "Response interrupted — goal mode stopped"
+            } else {
+                "Response interrupted"
+            }
+            .to_string(),
         ));
-        Ok(())
+        self.continue_queued_after_interrupt().await
     }
 
-    /// Drop unconsumed mid-turn input, returning the count so the interrupt
-    /// notice can say so instead of losing it silently.
+    async fn continue_queued_after_interrupt(&mut self) -> Result<()> {
+        self.reclaim_unsent_steering();
+        self.drain_queued_commands().await;
+        self.drain_queued_message().await
+    }
+
     pub(super) fn discard_queued_input(&mut self) -> usize {
         let count = self.queued_messages.len()
             + self.queued_commands.len()
@@ -4642,15 +4604,6 @@ fn compute_line_starts(
             Some(1 + content[..offset].matches('\n').count())
         })
         .collect()
-}
-
-/// Interrupt notice + how many queued messages it threw away.
-fn with_discarded(base: &str, discarded: usize) -> String {
-    match discarded {
-        0 => base.to_string(),
-        1 => format!("{base} — 1 queued message discarded"),
-        n => format!("{base} — {n} queued messages discarded"),
-    }
 }
 
 /// A `write_file`'s pre-write snapshot for the transcript diff card, captured

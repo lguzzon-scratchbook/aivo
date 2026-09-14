@@ -3640,22 +3640,16 @@ pub(super) struct CodeTuiApp {
     /// Valid effort levels for the active model (from `caps.reasoning_efforts`),
     /// refreshed on model/key change. Empty = the model exposes none.
     pub(super) model_reasoning_efforts: Vec<String>,
-    /// Messages typed while a turn was in flight, in submit order; each is
-    /// auto-sent (one per turn) as the preceding turn finishes — a real FIFO so
-    /// a second queued message doesn't silently clobber the first.
+    /// Mid-turn follow-ups; sent one per turn when the current turn ends.
     pub(super) queued_messages: Vec<String>,
     /// Session-mail messages seen waiting while a turn ran; the "arrives when
     /// this turn ends" notice fires only when this count grows.
     pub(super) mail_waiting_seen: usize,
     /// Claimed mail the outgoing turn should answer; consumed on every dispatch route.
     pub(super) pending_reply_obligation: Option<crate::agent::engine::ReplyObligation>,
-    /// Mid-turn steering handoff to the engine task; leftovers reclaim into
-    /// `queued_messages` at turn end, cleared with it on interrupt/cancel.
+    /// Mid-turn steering; leftovers reclaim into `queued_messages`.
     pub(super) steering_queue: SteeringQueue,
-    /// Slash commands typed while a turn was in flight that need the engine idle
-    /// (`/compact`, `/rewind`, `/goal`, `/plan`), in submit order; executed as the
-    /// turn finishes, before any queued message. Cleared with `queued_messages` on
-    /// interrupt/cancel.
+    /// Mid-turn slash commands that need the engine idle; run before queued messages.
     pub(super) queued_commands: Vec<SlashCommand>,
     /// An in-flight `!cmd` local shell run streaming output into the transcript,
     /// or `None`. Separate from `sending` (model turns) so the two don't entangle.

@@ -163,9 +163,8 @@ async fn test_engine_idle_commands_queue_and_drain() {
     assert!(notice.contains("Nothing to rewind"), "{notice}");
 }
 
-/// A queued command is dropped by an interrupt/cancel, like queued messages.
 #[tokio::test]
-async fn test_queued_commands_cleared_on_cancel() {
+async fn test_new_chat_clears_queued_commands() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
@@ -175,8 +174,101 @@ async fn test_queued_commands_cleared_on_cancel() {
         vec![SlashCommand::Compact { fast: true }]
     );
 
-    app.cancel_inflight_request(CancelKind::Discard);
+    app.start_new_chat().await;
     assert!(app.queued_commands.is_empty());
+}
+
+#[tokio::test]
+async fn test_interrupt_drains_queued_messages() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "first".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_response = "partial".to_string();
+    app.sending = true;
+    app.queued_messages = vec!["fix login".to_string(), "run tests".to_string()];
+
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert!(
+        app.history
+            .iter()
+            .any(|m| m.role == "assistant" && m.content == "partial")
+    );
+    assert!(
+        app.history
+            .last()
+            .is_some_and(|m| m.role == "user" && m.content == "fix login")
+    );
+    assert_eq!(app.queued_messages, vec!["run tests".to_string()]);
+    assert!(app.sending);
+}
+
+#[tokio::test]
+async fn test_interrupt_reclaims_steering_then_drains() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "first".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_response = "partial".to_string();
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .push("actually use tabs".to_string());
+
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert!(app.steering_queue.lock().unwrap().is_empty());
+    assert!(
+        app.history
+            .last()
+            .is_some_and(|m| m.role == "user" && m.content == "actually use tabs")
+    );
+    assert!(app.sending);
+}
+
+#[tokio::test]
+async fn test_interrupt_empty_unsends_then_drains_queue() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "first message".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_submit = Some(PendingSubmission {
+        content: "first message".to_string(),
+        attachments: Vec::new(),
+    });
+    app.sending = true;
+    app.queued_messages = vec!["do this instead".to_string()];
+
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert_eq!(app.draft, "first message");
+    assert!(
+        app.history
+            .last()
+            .is_some_and(|m| m.role == "user" && m.content == "do this instead")
+    );
+    assert!(app.queued_messages.is_empty());
+    assert!(app.sending);
 }
 
 #[tokio::test]
