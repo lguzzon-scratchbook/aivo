@@ -326,6 +326,33 @@ async fn exit_plan_mode_dismissal_is_a_result_not_a_failure() {
     );
 }
 
+#[tokio::test]
+async fn exit_plan_mode_empty_keep_planning_suppresses_repeat_card() {
+    let dir = tmp();
+    let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+    let revised = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X, same"}));
+    let port = spawn_sse_sequence(vec![exit, revised, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    let mut ui = CapturingUi {
+        plan_decision: Some(PlanDecision::KeepPlanning { feedback: None }),
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("plan it".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.approved_plans.len(), 1);
+    assert!(ui.notices.iter().any(|n| n.contains("suppressed")));
+    assert!(engine.read_only, "plan mode stays on");
+}
+
 /// A re-presented plan after Esc is auto-dismissed — no second card.
 #[tokio::test]
 async fn second_plan_card_after_dismissal_is_suppressed() {

@@ -529,7 +529,7 @@ async fn test_cursor_plan_approval_arms_auto_continue() {
     assert_eq!(rx2.try_recv().unwrap(), Ok(PlanDecision::Approve));
     assert!(app.cursor_plan_go_pending, "cursor approval arms");
 
-    // Keep-planning revises within the same turn — must not arm.
+    // Keep-planning must not arm.
     app.cursor_plan_go_pending = false;
     let (reply, _rx3) = tokio::sync::oneshot::channel();
     app.cards

@@ -604,10 +604,11 @@ impl CodeTuiApp {
                 });
             }
             PlanDecision::KeepPlanning { feedback } => {
-                self.show_toast(if feedback.is_some() {
+                let has_feedback = feedback.as_deref().is_some_and(|f| !f.trim().is_empty());
+                self.show_toast(if has_feedback {
                     "Feedback sent — still planning"
                 } else {
-                    "Keeping planning — still read-only"
+                    "Still planning — type a follow-up to revise"
                 });
             }
         }

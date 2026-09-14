@@ -74,8 +74,8 @@ pub fn keep_planning_result(feedback: Option<&str>) -> String {
             "The user wants to keep planning — plan mode stays on. Their feedback:\n{f}\n\nRevise \
 the plan accordingly and call `exit_plan_mode` again when it's ready."
         ),
-        None => "The user wants to keep planning — plan mode stays on. Revise the plan from the \
-conversation so far and call `exit_plan_mode` again when it's ready."
+        None => "The user wants to keep planning — plan mode stays on. They will send a follow-up \
+in the next message. End your turn; do not call `exit_plan_mode` again until they reply."
             .to_string(),
     }
 }
@@ -105,5 +105,6 @@ mod tests {
         );
         assert!(!keep_planning_result(Some("  ")).contains("Their feedback"));
         assert!(keep_planning_result(None).contains("keep planning"));
+        assert!(keep_planning_result(None).contains("End your turn"));
     }
 }

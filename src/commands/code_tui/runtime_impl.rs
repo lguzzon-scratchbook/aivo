@@ -1768,16 +1768,9 @@ impl CodeTuiApp {
                 {
                     return cursor_acp::CursorPlanOutcome::Cancelled;
                 }
-                use crate::agent::protocol::PlanDecision;
                 match rx.await {
-                    Ok(Ok(PlanDecision::Approve)) => cursor_acp::CursorPlanOutcome::Accepted,
-                    // Feedback rides back as the rejection reason so the model can revise.
-                    Ok(Ok(PlanDecision::KeepPlanning { feedback })) => {
-                        cursor_acp::CursorPlanOutcome::Rejected(
-                            feedback.unwrap_or_else(|| "Keep planning".to_string()),
-                        )
-                    }
-                    _ => cursor_acp::CursorPlanOutcome::Cancelled, // discard/dismiss/drop
+                    Ok(decision) => cursor_plan_decision_outcome(decision),
+                    Err(_) => cursor_acp::CursorPlanOutcome::Cancelled,
                 }
             })
         })
@@ -5178,6 +5171,25 @@ fn is_permanent_cursor_open_error(err: &anyhow::Error) -> bool {
         || crate::services::cursor_acp::looks_like_cursor_auth_failure(&msg)
 }
 
+fn cursor_plan_decision_outcome(
+    decision: std::result::Result<crate::agent::protocol::PlanDecision, String>,
+) -> cursor_acp::CursorPlanOutcome {
+    use crate::agent::protocol::PlanDecision;
+    match decision {
+        Ok(PlanDecision::Approve) => cursor_acp::CursorPlanOutcome::Accepted,
+        Ok(PlanDecision::KeepPlanning { feedback }) => {
+            match feedback
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                Some(reason) => cursor_acp::CursorPlanOutcome::Rejected(reason),
+                None => cursor_acp::CursorPlanOutcome::Cancelled,
+            }
+        }
+        Err(_) => cursor_acp::CursorPlanOutcome::Cancelled,
+    }
+}
+
 /// Compose cursor's structured plan (title/overview/body + todo & phase
 /// checklists) into a markdown body for the approval card.
 fn render_cursor_plan_markdown(req: &cursor_acp::CursorPlanRequest) -> String {
@@ -5394,8 +5406,14 @@ async fn drive_cursor_turn(
 
 #[cfg(test)]
 mod ask_id_tests {
-    use super::{map_cursor_todo_status, render_cursor_plan_markdown, select_ids_for_answer};
-    use crate::services::cursor_acp::{CursorPlanPhase, CursorPlanRequest, CursorTodo};
+    use super::{
+        cursor_plan_decision_outcome, map_cursor_todo_status, render_cursor_plan_markdown,
+        select_ids_for_answer,
+    };
+    use crate::agent::protocol::PlanDecision;
+    use crate::services::cursor_acp::{
+        CursorPlanOutcome, CursorPlanPhase, CursorPlanRequest, CursorTodo,
+    };
 
     #[test]
     fn cursor_plan_markdown_includes_title_todos_and_phases() {
@@ -5436,6 +5454,34 @@ mod ask_id_tests {
             phases: vec![],
         };
         assert!(render_cursor_plan_markdown(&req).contains("no details"));
+    }
+
+    #[test]
+    fn cursor_keep_planning_without_feedback_cancels_instead_of_rejecting() {
+        assert!(matches!(
+            cursor_plan_decision_outcome(Ok(PlanDecision::Approve)),
+            CursorPlanOutcome::Accepted
+        ));
+        assert!(matches!(
+            cursor_plan_decision_outcome(Ok(PlanDecision::KeepPlanning {
+                feedback: Some("cover retries".into()),
+            })),
+            CursorPlanOutcome::Rejected(reason) if reason == "cover retries"
+        ));
+        assert!(matches!(
+            cursor_plan_decision_outcome(Ok(PlanDecision::KeepPlanning { feedback: None })),
+            CursorPlanOutcome::Cancelled
+        ));
+        assert!(matches!(
+            cursor_plan_decision_outcome(Ok(PlanDecision::KeepPlanning {
+                feedback: Some("   ".into()),
+            })),
+            CursorPlanOutcome::Cancelled
+        ));
+        assert!(matches!(
+            cursor_plan_decision_outcome(Err("dismissed".into())),
+            CursorPlanOutcome::Cancelled
+        ));
     }
 
     #[test]

@@ -438,8 +438,17 @@ planning is off) — continue with the task."
                                 Ok(plan_mode::PLAN_APPROVED_RESULT.to_string())
                             }
                             Ok(PlanDecision::KeepPlanning { feedback }) => {
-                                self.turn_dismissals = 0;
-                                self.plan_card_dismissed = false;
+                                let has_feedback = feedback
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .is_some_and(|f| !f.is_empty());
+                                if has_feedback {
+                                    self.turn_dismissals = 0;
+                                    self.plan_card_dismissed = false;
+                                } else {
+                                    self.turn_dismissals += 1;
+                                    self.plan_card_dismissed = true;
+                                }
                                 Ok(plan_mode::keep_planning_result(feedback.as_deref()))
                             }
                             // User action, not a tool failure (see the ask_user intrinsic).
