@@ -104,8 +104,7 @@ fn streamed_reply_matches_single_pass_at_every_prefix() {
     }
 }
 
-/// Non-reply inputs (growing reasoning, notice set/cleared) reset the sections
-/// without desyncing them from the reply.
+/// Reasoning growth and notice changes stay byte-identical to a single-pass render.
 #[test]
 fn streamed_reply_with_reasoning_and_notice_matches() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -167,6 +166,144 @@ fn shrunken_reply_resets_settled_sections() {
     let _ = composed_rows(&mut app, &mut terminal);
 
     app.pending_response = "A different, shorter answer.\n\nWith two blocks.".to_string();
+    let composed = composed_rows(&mut app, &mut terminal);
+    assert_eq!(composed, reference_rows(&app));
+}
+
+#[tokio::test]
+async fn discarded_reply_replaced_at_same_length_rebuilds_tail() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "go".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.sending = true;
+    app.pending_response = "stale reply".to_string();
+    let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    let old = composed_rows(&mut app, &mut terminal);
+    assert!(old.iter().any(|row| row.contains("stale reply")));
+
+    app.tx.send(RuntimeEvent::AgentDiscardSegment).unwrap();
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
+            "fresh reply".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(app.tick_typewriter());
+
+    let composed = composed_rows(&mut app, &mut terminal);
+    assert_eq!(composed, reference_rows(&app));
+    assert!(composed.iter().any(|row| row.contains("fresh reply")));
+    assert!(!composed.iter().any(|row| row.contains("stale reply")));
+}
+
+#[tokio::test]
+async fn discarded_reasoning_replaced_at_same_length_rebuilds_tail() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "go".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.sending = true;
+    app.thinking_enabled = true;
+    app.pending_reasoning = "stale thought".to_string();
+    let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    let old = composed_rows(&mut app, &mut terminal);
+    assert!(old.iter().any(|row| row.contains("stale thought")));
+
+    app.tx.send(RuntimeEvent::AgentDiscardReasoning).unwrap();
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Reasoning(
+            "fresh thought".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+
+    let composed = composed_rows(&mut app, &mut terminal);
+    assert_eq!(composed, reference_rows(&app));
+    assert!(composed.iter().any(|row| row.contains("fresh thought")));
+    assert!(!composed.iter().any(|row| row.contains("stale thought")));
+}
+
+#[test]
+fn growing_reasoning_keeps_settled_reply_sections() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "go".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.sending = true;
+    app.thinking_enabled = true;
+    let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+
+    app.pending_response = corpus()[0].to_string();
+    let _ = composed_rows(&mut app, &mut terminal);
+    let settled = app
+        .render_cache
+        .volatile_tail
+        .as_ref()
+        .map(|cache| cache.settled.len())
+        .unwrap_or(0);
+    assert!(settled > 0, "reply should have settled chunks");
+
+    app.pending_reasoning
+        .push_str("first thought\nsecond thought\nthird thought\n");
+    let composed = composed_rows(&mut app, &mut terminal);
+    assert_eq!(
+        app.render_cache
+            .volatile_tail
+            .as_ref()
+            .map(|cache| cache.settled.len())
+            .unwrap_or(0),
+        settled
+    );
+    assert_eq!(composed, reference_rows(&app));
+    assert!(
+        composed.iter().any(|row| row.contains("third thought")),
+        "window should show the new thought: {composed:?}"
+    );
+}
+
+#[test]
+fn thought_commit_matches_single_pass() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.thinking_enabled = true;
+    app.sending = true;
+    for i in 0..8 {
+        app.history.push(ChatMessage {
+            model: None,
+            role: "user".to_string(),
+            content: format!("q{i}"),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        app.history.push(ChatMessage {
+            model: None,
+            role: "assistant".to_string(),
+            content: format!("answer {i} with enough prose to wrap at this width"),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    let _ = composed_rows(&mut app, &mut terminal);
+
+    app.pending_reasoning = "thinking before the next tool".to_string();
+    app.flush_pending_assistant();
     let composed = composed_rows(&mut app, &mut terminal);
     assert_eq!(composed, reference_rows(&app));
 }

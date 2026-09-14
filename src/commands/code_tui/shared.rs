@@ -2550,9 +2550,8 @@ pub(super) struct TranscriptCache {
     pub(super) area_width: u16,
     /// The logical body lines (no spinner), already compacted.
     pub(super) body: RenderedTranscript,
-    /// Char-wrapped row count of `body` at `area_width - ACCENT_GUTTER_WIDTH`,
-    /// used to size the transcript pane; with no scrollbar column reserved this
-    /// is also the exact text width.
+    /// Word-wrapped row count of `body` — same metric paint uses — so the pane
+    /// is sized without a second wrap of the whole body.
     pub(super) plain_prepass: usize,
     /// Text width `wrapped` is valid for (0 = not wrapped yet).
     pub(super) styled_width: u16,
@@ -2605,12 +2604,11 @@ impl TailSection {
 /// `live` (reply suffix + `!cmd` preview + notice, rebuilt per content change
 /// but bounded by the trailing block, not the reply length).
 pub(super) struct VolatileTailCache {
-    /// Fingerprint of every tail input EXCEPT the reply length (see
-    /// `volatile_tail_fp`); any change resets all sections.
+    /// Tail inputs except reply/reasoning length; any change resets sections.
     pub(super) fp: u64,
     pub(super) render_width: u16,
-    /// `pending_response` byte length the sections currently cover.
     pub(super) reply_len: usize,
+    pub(super) reasoning_len: usize,
     /// `pending_response` bytes covered by `settled` (always a safe boundary).
     pub(super) settled_src: usize,
     /// Whether a settled chunk already placed the `◆ ` reply marker.

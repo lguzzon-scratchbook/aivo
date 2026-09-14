@@ -22,13 +22,13 @@ fn test_finished_turn_renders_done_marker() {
     app.turn_durations.insert(1, 404_000); // stamped on the last entry; 6m 44s
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("✻ Done in 6m 44s"), "{plain}");
 
     // No recorded duration → no marker.
     app.turn_durations.clear();
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(!plain.contains("Done in"), "{plain}");
 }
 
@@ -511,7 +511,7 @@ fn test_current_action_shows_inline_on_status_line() {
     // line), so the layout never shifts as steps come and go.
     let status = app
         .build_transcript()
-        .plain_lines
+        .plain_lines()
         .into_iter()
         .find(|l| l.contains("searching parse_expr"))
         .expect("action shown inline on the status line");
@@ -541,7 +541,7 @@ fn test_subagent_activity_drives_status_line() {
     );
     let status = app
         .build_transcript()
-        .plain_lines
+        .plain_lines()
         .into_iter()
         .find(|l| l.contains("code-reviewer: searching"))
         .expect("nested sub-agent activity shown on the status line");
@@ -582,7 +582,7 @@ fn test_parallel_subagent_rows_render_under_status_line() {
     app.apply_subagent_done(1, true, 8, 1200);
     // Headline counts completions; per-delegate rows sit under it.
     assert_eq!(app.desired_status(), "running 2 sub-agents (1/2 done)");
-    let lines = app.build_transcript().plain_lines;
+    let lines = app.build_transcript().plain_lines();
     let running = lines
         .iter()
         .find(|l| l.contains("audit auth flow — searching session"))
@@ -655,7 +655,7 @@ fn test_cursor_task_notice_renames_generic_batch_rows() {
         None,
         false,
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("↳ explore — Audit the auth flow"),
         "row renamed by the notice: {plain:?}"
@@ -681,10 +681,10 @@ fn test_parallel_subagent_tokens_fold_into_status_tail() {
     assert_eq!(app.subagent_token_base, 200);
     app.apply_subagent_tokens(0, 50);
     app.apply_subagent_tokens(1, 80);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("330 tokens"), "base+sum of slots: {plain:?}");
     app.apply_subagent_done(0, true, 3, 90);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("370 tokens"),
         "done tokens replace live for that slot: {plain:?}"
@@ -698,7 +698,7 @@ fn test_status_tail_shows_turn_output_tokens() {
     app.sending = true;
     app.apply_runtime_delta(ChatResponseChunk::Content("x".repeat(4_000))); // ~1k tokens streamed
     // A live ~-flagged estimate remains visible without extra keyboard hints.
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("~1k tokens"), "estimate shown: {plain:?}");
     assert!(
         !plain.contains("esc to interrupt"),
@@ -708,7 +708,7 @@ fn test_status_tail_shows_turn_output_tokens() {
     // distinct from the prompt-dominated context total (which stays in the footer).
     app.turn_output_tokens = 512;
     app.turn_stream_chars_measured = app.turn_stream_chars;
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("512 tokens"), "turn output shown: {plain:?}");
     assert!(!plain.contains("~512"), "measured, not estimate: {plain:?}");
 }
@@ -723,11 +723,11 @@ fn test_status_tail_ticks_between_round_measurements() {
     app.turn_stream_chars = 2_000;
     app.turn_stream_chars_measured = 2_000;
     app.apply_runtime_delta(ChatResponseChunk::Reasoning("y".repeat(2_000)));
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("~1k tokens"), "512 + ~500 shown: {plain:?}");
     // A segment commit clears the buffers; the monotonic count must not shrink.
     app.pending_reasoning.clear();
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("~1k tokens"), "estimate held: {plain:?}");
 }
 
@@ -738,7 +738,7 @@ fn test_status_tail_counts_queued_input() {
     app.sending = true;
     app.queued_messages.push("follow-up one".to_string());
     app.queued_messages.push("follow-up two".to_string());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("2 queued"), "queued chip missing: {plain:?}");
 }
 
@@ -817,7 +817,7 @@ fn test_bash_status_clock_shows_timeout_budget() {
     );
     let (_, _, budget) = app.last_tool_action.as_ref().unwrap();
     assert_eq!(*budget, Some(300));
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains(" / "),
         "deadline missing from clock: {plain:?}"
@@ -847,7 +847,7 @@ fn test_done_marker_appends_turn_note() {
     let idx = app.history.len() - 1;
     app.turn_durations.insert(idx, 42_000);
     app.turn_notes.insert(idx, "3.1k tokens".to_string());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("✻ Done in 42s · 3.1k tokens"), "{plain}");
 }
 
@@ -885,7 +885,7 @@ async fn test_agent_error_persists_in_transcript() {
     app.handle_runtime_events().await.unwrap();
     let last = app.history.last().expect("error entry committed");
     assert_eq!(last.role, "error");
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("✗ the provider rejected this API key"),
         "{plain}"
@@ -897,7 +897,7 @@ async fn test_agent_error_persists_in_transcript() {
     );
     // A later unrelated error notice (no matching entry) still renders.
     app.notice = Some((ERROR(), "boom".to_string()));
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("Error: boom"), "{plain}");
     // Never seeded back to the model on an engine rebuild.
     assert!(
@@ -1460,7 +1460,7 @@ fn test_inline_status_stays_in_transcript_across_phases() {
 
     // Model-compute phase: the Thinking heartbeat shows, no streamed text yet —
     // and no round tokens generated, so no "0 tokens" noise.
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("Thinking"), "compute phase: {plain:?}");
     assert!(!plain.contains("tokens"), "no token tail at 0: {plain:?}");
 
@@ -1469,7 +1469,7 @@ fn test_inline_status_stays_in_transcript_across_phases() {
         "streaming the answer".to_string(),
     ));
     app.drain_incoming_buffer();
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("streaming the answer"));
     assert!(plain.contains("Working"), "streaming phase: {plain:?}");
     assert!(plain.contains("tokens"));
@@ -1531,7 +1531,7 @@ fn test_subagents_render_individually_not_coalesced() {
     );
     app.apply_agent_tool_result("## Findings\nfirst\nsecond".to_string());
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         !plain.contains("subagent ×"),
         "subagents must not coalesce: {plain}"
@@ -1851,7 +1851,7 @@ fn test_paused_marker_over_unfinished_plan() {
     app.turn_durations.insert(idx, 277_000);
     app.turn_notes.insert(idx, "9.6k tokens".to_string());
     app.turn_pauses.insert(idx, TurnPause::Steps(3));
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("✻ Paused after 4m 37s · 9.6k tokens · 3 steps left — reply to continue"),
         "{plain}"
@@ -1862,7 +1862,7 @@ fn test_paused_marker_over_unfinished_plan() {
 
     app.turn_pauses.insert(idx, TurnPause::Steps(1));
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("· 1 step left — reply to continue"),
         "{plain}"
@@ -2031,7 +2031,7 @@ fn test_asked_then_idle_marker_text() {
     app.turn_durations.insert(idx, 154_000);
     app.turn_notes.insert(idx, "2.6k tokens".to_string());
     app.turn_pauses.insert(idx, TurnPause::AskedThenIdle);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("✻ Paused after 2m 34s · 2.6k tokens · nothing changed — reply to continue"),
         "{plain}"

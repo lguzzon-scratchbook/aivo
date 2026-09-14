@@ -62,7 +62,7 @@ fn test_build_transcript_shows_pending_status_without_visible_stream() {
     app.sending = true;
 
     let transcript = app.build_transcript();
-    let plain = transcript.plain_lines.join("\n");
+    let plain = transcript.plain_lines().join("\n");
 
     assert!(plain.contains("Thinking"));
 }
@@ -830,6 +830,59 @@ fn test_wrap_transcript_fills_background_to_full_width() {
     }];
     let wrapped = wrap_transcript(&plain, &[None], 12);
     assert_eq!(wrapped.rows[0], "hi");
+}
+
+fn styled(plain: &str) -> StyledLine {
+    use ratatui::text::Line;
+    StyledLine {
+        line: Line::from(plain.to_string()),
+        plain: plain.to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_splice_transcript_wrap_keeps_prefix_and_matches_full_wrap() {
+    let width = 16u16;
+    let old_lines = ["alpha beta gamma", "second line here", "tail one"]
+        .into_iter()
+        .map(styled)
+        .collect::<Vec<_>>();
+    let old_bars = vec![Some(TOOL()), Some(TOOL()), Some(ACCENT())];
+    let old = RenderedTranscript::new(old_lines, old_bars);
+    let old_wrap = wrap_transcript(&old.lines, &old.bar_colors, width);
+    let old_prefix = old_wrap.rows_per_line[..2].to_vec();
+
+    let new_lines = [
+        "alpha beta gamma",
+        "second line here",
+        "tail replaced with a much longer suffix that wraps",
+        "and another",
+    ]
+    .into_iter()
+    .map(styled)
+    .collect::<Vec<_>>();
+    let new_bars = vec![Some(TOOL()), Some(TOOL()), Some(ACCENT()), Some(ACCENT())];
+    let new = RenderedTranscript::new(new_lines, new_bars);
+
+    let spliced =
+        splice_transcript_wrap(&old, old_wrap, &new, width).expect("shared prefix should splice");
+    let full = wrap_transcript(&new.lines, &new.bar_colors, width);
+    assert_eq!(*spliced.rows, *full.rows);
+    assert_eq!(spliced.bars, full.bars);
+    assert_eq!(spliced.rows_per_line, full.rows_per_line);
+    assert_eq!(spliced.rows_per_line[..2], old_prefix);
+}
+
+#[test]
+fn test_splice_transcript_wrap_rejects_empty_common_prefix() {
+    let width = 16u16;
+    let old_lines = [styled("alpha beta gamma")];
+    let old_bars = vec![Some(TOOL())];
+    let old = RenderedTranscript::new(old_lines.to_vec(), old_bars);
+    let old_wrap = wrap_transcript(&old.lines, &old.bar_colors, width);
+    let new = RenderedTranscript::new(vec![styled("completely different")], vec![Some(TOOL())]);
+    assert!(splice_transcript_wrap(&old, old_wrap, &new, width).is_none());
 }
 
 #[test]

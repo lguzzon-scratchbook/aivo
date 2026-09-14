@@ -7,6 +7,16 @@ const FOLD_KEEP_TAIL: usize = 8;
 /// marker costs more indirection than it saves.
 const FOLD_MIN: usize = 12;
 
+/// Thinking-only assistant rows stay in the tool run; a real reply ends it.
+fn is_step_foldable(message: &ChatMessage) -> bool {
+    match message.role.as_str() {
+        "tool_result" => true,
+        "tool_call" => decode_tool_name(&message.content) != "exit_plan_mode",
+        "assistant" => message.content.trim().is_empty(),
+        _ => false,
+    }
+}
+
 struct HistorySpan {
     lines: Vec<StyledLine>,
     bars: Vec<Option<Color>>,
@@ -250,21 +260,15 @@ impl CodeTuiApp {
     /// prefix is itself long enough ([`FOLD_MIN`]) to be worth the indirection.
     /// Pure over (history, render_len) so render and click mapping agree.
     pub(super) fn step_folds(&self, render_len: usize) -> Vec<(usize, usize)> {
-        // A plan payload renders as a card, never inside a fold.
-        let foldable = |m: &ChatMessage| match m.role.as_str() {
-            "tool_result" => true,
-            "tool_call" => decode_tool_name(&m.content) != "exit_plan_mode",
-            _ => false,
-        };
         let mut folds = Vec::new();
         let mut i = 0;
         while i < render_len {
-            if !foldable(&self.history[i]) {
+            if !is_step_foldable(&self.history[i]) {
                 i += 1;
                 continue;
             }
             let start = i;
-            while i < render_len && foldable(&self.history[i]) {
+            while i < render_len && is_step_foldable(&self.history[i]) {
                 i += 1;
             }
             let run_len = i - start;
@@ -323,13 +327,8 @@ impl CodeTuiApp {
 
     /// Start of the trailing tool-card run — the prefix before this is stable across appends.
     pub(super) fn trailing_foldable_start(&self, render_len: usize) -> usize {
-        let foldable = |m: &ChatMessage| match m.role.as_str() {
-            "tool_result" => true,
-            "tool_call" => decode_tool_name(&m.content) != "exit_plan_mode",
-            _ => false,
-        };
         let mut i = render_len;
-        while i > 0 && foldable(&self.history[i - 1]) {
+        while i > 0 && is_step_foldable(&self.history[i - 1]) {
             i -= 1;
         }
         i
@@ -1379,11 +1378,11 @@ impl CodeTuiApp {
         hasher.finish()
     }
 
-    /// Rebuilds the cached transcript history body (and its char-wrap height
-    /// estimate) only when the history fingerprint or the terminal width changed.
-    /// The expensive markdown render and tool decoding happen here, at most once
-    /// per *history* change — not on every animation frame, keystroke, or streamed
-    /// token (the live reply and notice are the volatile tail, composed outside).
+    /// Rebuilds the cached transcript history body (and its word-wrap) only when
+    /// the history fingerprint or the terminal width changed. The expensive
+    /// markdown render and tool decoding happen here, at most once per *history*
+    /// change — not on every animation frame, keystroke, or streamed token (the
+    /// live reply and notice are the volatile tail, composed outside).
     fn ensure_transcript_cache(&mut self, area_width: u16) {
         let fp = self.transcript_body_fp();
         let fresh = self
@@ -1401,14 +1400,16 @@ impl CodeTuiApp {
         let render_len = self.committed_render_len();
         let prefix_end = self.trailing_foldable_start(render_len);
         let prefix_fp = self.history_prefix_fp(prefix_end);
-        let prefix = if let Some(cache) = self.render_cache.transcript.as_ref()
-            && cache.prefix_fp == prefix_fp
-            && cache.prefix_end == prefix_end
-            && cache.area_width == area_width
-        {
+        let prefix_reused = self.render_cache.transcript.as_ref().is_some_and(|cache| {
+            cache.prefix_fp == prefix_fp
+                && cache.prefix_end == prefix_end
+                && cache.area_width == area_width
+        });
+        let prefix = if prefix_reused {
+            let cache = self.render_cache.transcript.as_mut().unwrap();
             HistorySpan {
-                lines: cache.prefix_lines.clone(),
-                bars: cache.prefix_bars.clone(),
+                lines: std::mem::take(&mut cache.prefix_lines),
+                bars: std::mem::take(&mut cache.prefix_bars),
                 deferred: self.deferred_mention_before(prefix_end),
                 previewed: std::collections::HashSet::new(),
             }
@@ -1417,9 +1418,25 @@ impl CodeTuiApp {
         };
         let prefix_lines = prefix.lines.clone();
         let prefix_bars = prefix.bars.clone();
+        // Salvage the previous wrap at this text width even when the prefix
+        // itself was rebuilt (fold expand inserts in the middle): splice keeps
+        // the unchanged leading rows and rewraps only the suffix.
+        let old_wrap = self.render_cache.transcript.as_mut().and_then(|cache| {
+            let wrapped = cache.wrapped.take()?;
+            if cache.styled_width != text_width
+                || wrapped.rows_per_line.len() != cache.body.lines.len()
+            {
+                return None;
+            }
+            Some((wrapped, std::mem::take(&mut cache.body)))
+        });
         let body = self.assemble_history_body(prefix, prefix_end, render_len, text_width);
-        let plain_width = text_width.max(1);
-        let plain_prepass = wrap_plain_lines(&body.plain_lines, plain_width).len();
+        let wrapped = old_wrap
+            .and_then(|(old_wrap, old_body)| {
+                splice_transcript_wrap(&old_body, old_wrap, &body, text_width)
+            })
+            .unwrap_or_else(|| wrap_transcript(&body.lines, &body.bar_colors, text_width));
+        let plain_prepass = wrapped.rows.len();
         self.render_cache.transcript = Some(TranscriptCache {
             fp,
             area_width,
@@ -1429,8 +1446,8 @@ impl CodeTuiApp {
             prefix_lines,
             prefix_bars,
             plain_prepass,
-            styled_width: 0,
-            wrapped: None,
+            styled_width: text_width,
+            wrapped: Some(wrapped),
         });
     }
 
@@ -1445,24 +1462,23 @@ impl CodeTuiApp {
         if cache.wrapped.is_some() && cache.styled_width == text_width {
             return;
         }
-        let wrapped = wrap_transcript(&cache.body.lines, &cache.body.bar_colors, text_width);
+        cache.wrapped = Some(wrap_transcript(
+            &cache.body.lines,
+            &cache.body.bar_colors,
+            text_width,
+        ));
         cache.styled_width = text_width;
-        cache.wrapped = Some(wrapped);
     }
 
-    /// Cheap O(1) fingerprint of every volatile-tail input EXCEPT the streamed
-    /// reply's length — the reply is handled by the settled/live split, so a
-    /// streamed token re-renders only the live remainder while any change here
-    /// resets all sections. The spinner is excluded (wrapped fresh per frame),
-    /// so a pure animation tick hits the cache.
+    /// Fingerprint of tail inputs except streamed reply/reasoning length —
+    /// those grow in place (empty↔nonempty still flips the head). A /config
+    /// thinking toggle is hashed so the cached tail repaints.
     pub(super) fn volatile_tail_fp(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.is_transcript_empty().hash(&mut hasher);
-        // The empty↔non-empty flip changes the head's shape; growth is NOT hashed.
         self.pending_response.is_empty().hash(&mut hasher);
-        // A /config thinking toggle mid-turn must invalidate too.
-        self.pending_reasoning.len().hash(&mut hasher);
+        self.pending_reasoning.is_empty().hash(&mut hasher);
         self.thinking_enabled.hash(&mut hasher);
         match &self.local_command {
             Some(run) => {
@@ -1554,18 +1570,16 @@ impl CodeTuiApp {
         TailSection::new(lines, bars)
     }
 
-    /// Renders the volatile tail incrementally: a non-reply input (or width)
-    /// change resets all sections; a grown reply renders only the newly settled
-    /// chunk and the live suffix; an unchanged tail returns untouched.
     fn ensure_volatile_tail(&mut self, render_width: u16) {
         let fp = self.volatile_tail_fp();
         let reply_len = self.pending_response.len();
+        let reasoning_len = self.pending_reasoning.len();
         if let Some(cache) = self.render_cache.volatile_tail.as_ref()
             && cache.fp == fp
             && cache.render_width == render_width
             && reply_len >= cache.reply_len
         {
-            if reply_len == cache.reply_len {
+            if reply_len == cache.reply_len && reasoning_len == cache.reasoning_len {
                 return;
             }
         } else {
@@ -1574,6 +1588,7 @@ impl CodeTuiApp {
                 fp,
                 render_width,
                 reply_len: 0,
+                reasoning_len,
                 settled_src: 0,
                 settled_marked: false,
                 settled_fence: None,
@@ -1583,6 +1598,25 @@ impl CodeTuiApp {
                 plain_width: 0,
                 styled_width: 0,
             });
+        }
+        if self
+            .render_cache
+            .volatile_tail
+            .as_ref()
+            .is_some_and(|cache| cache.reasoning_len != reasoning_len)
+        {
+            let head = self.build_tail_head(render_width);
+            let cache = self.render_cache.volatile_tail.as_mut().unwrap();
+            cache.head = head;
+            cache.reasoning_len = reasoning_len;
+        }
+        if self
+            .render_cache
+            .volatile_tail
+            .as_ref()
+            .is_some_and(|cache| cache.reply_len == reply_len)
+        {
+            return;
         }
         let ends_blank = |section: &TailSection| {
             section
@@ -1706,7 +1740,7 @@ impl CodeTuiApp {
 
     /// The tail sections' cached wraps in display order; valid after
     /// [`ensure_volatile_tail_wrap`].
-    fn volatile_tail_parts(&self) -> impl Iterator<Item = &WrappedTranscript> {
+    pub(super) fn volatile_tail_parts(&self) -> impl Iterator<Item = &WrappedTranscript> {
         self.render_cache
             .volatile_tail
             .iter()

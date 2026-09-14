@@ -133,9 +133,10 @@ async fn test_mouse_wheel_scrolls_only_inside_transcript_hitbox() {
     app.transcript_hitbox = Some(TranscriptHitbox::from_rows(
         Rect::new(0, 0, 80, 6),
         0,
-        wrap_plain_lines(&app.build_transcript().plain_lines, 80),
+        wrap_plain_lines(&app.build_transcript().plain_lines(), 80),
     ));
     app.follow_output = false;
+    app.last_max_scroll = Some(40);
     app.scroll_speed = 4;
 
     app.handle_mouse(MouseEvent {
@@ -731,6 +732,7 @@ async fn test_drag_to_bottom_edge_arms_and_advances_autoscroll() {
     app.transcript_view_height = 4;
     app.transcript_scroll = 0;
     app.follow_output = false;
+    app.last_max_scroll = Some(56);
     app.transcript_hitbox = Some(TranscriptHitbox::from_rows(
         Rect::new(0, 0, 20, 4),
         0,

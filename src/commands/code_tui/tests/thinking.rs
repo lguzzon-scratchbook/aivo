@@ -16,7 +16,7 @@ fn test_streaming_reasoning_windows_when_answering() {
     app.pending_response = "Working on it".to_string();
 
     let transcript = app.build_transcript();
-    let plain = transcript.plain_lines.join("\n");
+    let plain = transcript.plain_lines().join("\n");
 
     assert!(
         plain.contains("▸"),
@@ -51,7 +51,7 @@ fn test_streams_thinking_window_during_thinking_only_phase() {
     app.pending_reasoning = "Working out the approach".to_string();
     assert!(app.pending_response.is_empty(), "no answer text yet");
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("✻"), "streaming window marker: {plain}");
     assert!(
         plain.contains("Working out the approach"),
@@ -74,7 +74,7 @@ fn test_thinking_window_shows_only_recent_lines() {
     app.pending_reasoning = "aaa\nbbb\nccc\nddd\neee".to_string();
     assert!(app.pending_response.is_empty());
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("bbb")
             && plain.contains("ccc")
@@ -179,7 +179,7 @@ fn test_build_transcript_hides_streaming_reasoning_when_disabled() {
     app.pending_response = "Working on it".to_string();
 
     let transcript = app.build_transcript();
-    let plain = transcript.plain_lines.join("\n");
+    let plain = transcript.plain_lines().join("\n");
 
     assert!(!plain.contains("▸ thought"));
     assert!(!plain.contains("  ✻"));
@@ -233,9 +233,6 @@ fn test_flush_pending_assistant_commits_reasoning_only_segment() {
 
 #[test]
 fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
-    // Regression: the live "Thinking" block lives in the volatile tail, so its
-    // fingerprint must change as reasoning streams and when thinking_enabled flips —
-    // otherwise the cached tail never repaints during the reasoning-only gap.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
@@ -250,16 +247,19 @@ fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
 
     let base = app.volatile_tail_fp();
     app.pending_reasoning.push_str("more thinking");
-    let after_reasoning = app.volatile_tail_fp();
-    assert_ne!(
-        base, after_reasoning,
-        "fp must change as reasoning streams (pending_response stays empty)"
+    let after_first = app.volatile_tail_fp();
+    assert_ne!(base, after_first, "empty→nonempty flips the thinking head");
+    app.pending_reasoning.push_str(" and more");
+    assert_eq!(
+        after_first,
+        app.volatile_tail_fp(),
+        "growth must not reset settled tail sections"
     );
 
     app.thinking_enabled = false;
-    let after_toggle = app.volatile_tail_fp();
     assert_ne!(
-        after_reasoning, after_toggle,
+        after_first,
+        app.volatile_tail_fp(),
         "fp must change when thinking_enabled flips so a /config toggle repaints"
     );
 }
@@ -281,7 +281,7 @@ fn test_thinking_block_has_distinct_bar_color() {
 
     let t = app.build_transcript();
     let bar_for = |needle: &str| {
-        t.plain_lines
+        t.plain_lines()
             .iter()
             .position(|l| l.contains(needle))
             .and_then(|i| t.bar_colors[i])
@@ -317,7 +317,7 @@ fn test_history_reasoning_windows_when_thinking_enabled() {
     // chevron; earlier lines scroll off (expand to see them).
     app.thinking_enabled = true;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
-    let shown = app.build_transcript().plain_lines.join("\n");
+    let shown = app.build_transcript().plain_lines().join("\n");
     assert!(shown.contains("▸"), "windowed-with-more shows ▸: {shown}");
     assert!(
         shown.contains("the private chain of thought"),
@@ -332,7 +332,7 @@ fn test_history_reasoning_windows_when_thinking_enabled() {
     // Expanded (user clicked): the chevron flips to `▾` and every line shows.
     app.expanded_thinking.insert(0);
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
-    let expanded = app.build_transcript().plain_lines.join("\n");
+    let expanded = app.build_transcript().plain_lines().join("\n");
     assert!(expanded.contains("▾"), "expanded shows ▾: {expanded}");
     assert!(
         expanded.contains("the gist line") && expanded.contains("the private chain of thought"),
@@ -341,7 +341,7 @@ fn test_history_reasoning_windows_when_thinking_enabled() {
 
     app.thinking_enabled = false;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
-    let hidden = app.build_transcript().plain_lines.join("\n");
+    let hidden = app.build_transcript().plain_lines().join("\n");
     assert!(!hidden.contains("  ✻"));
     assert!(!hidden.contains("the private chain of thought"));
     assert!(hidden.contains("the answer"));
@@ -427,7 +427,7 @@ fn test_committed_thinking_windows_and_expands_on_click() {
         reasoning_content: Some("line one\nline two".to_string()),
         attachments: vec![],
     });
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("✻"), "thinking marker present: {plain}");
     assert!(
         plain.contains("line one") && plain.contains("line two"),
@@ -444,7 +444,7 @@ fn test_committed_thinking_windows_and_expands_on_click() {
         attachments: vec![],
     });
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     // Short thought keeps `✻` (nothing hidden); the long one shows `▸` (more to
     // reveal) and is not yet expanded.
     assert!(plain.contains("✻"), "short thought keeps ✻: {plain}");
@@ -462,7 +462,7 @@ fn test_committed_thinking_windows_and_expands_on_click() {
     // Expand the long one (index 1): the marker flips to `▾` and every line shows.
     app.expanded_thinking.insert(1);
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("▾"),
         "expanded thought carries the ▾ marker: {plain}"
@@ -530,7 +530,7 @@ fn test_punctuation_only_reasoning_renders_no_thought_row() {
         reasoning_content: Some("...".to_string()),
         attachments: vec![],
     });
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(!plain.contains("▸ thought"), "{plain}");
     assert!(plain.contains("the answer"));
 }

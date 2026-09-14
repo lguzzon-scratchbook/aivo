@@ -10,7 +10,7 @@ pub(super) struct ImageAnchor {
     pub(super) rows: u16,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(super) struct StyledLine {
     pub(super) line: Line<'static>,
     pub(super) plain: String,
@@ -22,12 +22,12 @@ pub(super) struct StyledLine {
     pub(super) no_wrap: bool,
 }
 
+#[derive(Default)]
 pub(super) struct RenderedTranscript {
     /// The logical (unwrapped) lines. Wrapped to the render width via
     /// [`wrap_transcript`] at draw time so our row model matches what ratatui
     /// actually paints (it word-wraps; a char-wrap count under-scrolls).
     pub(super) lines: Vec<StyledLine>,
-    pub(super) plain_lines: Vec<String>,
     /// Per logical line: the accent-bar color for the block it belongs to, or
     /// `None` for chrome (intro, inter-block spacing). Aligned with `lines`.
     pub(super) bar_colors: Vec<Option<Color>>,
@@ -35,12 +35,12 @@ pub(super) struct RenderedTranscript {
 
 impl RenderedTranscript {
     pub(super) fn new(lines: Vec<StyledLine>, bar_colors: Vec<Option<Color>>) -> Self {
-        let plain_lines = lines.iter().map(|l| l.plain.clone()).collect();
-        Self {
-            lines,
-            plain_lines,
-            bar_colors,
-        }
+        Self { lines, bar_colors }
+    }
+
+    #[cfg(test)]
+    pub(super) fn plain_lines(&self) -> Vec<String> {
+        self.lines.iter().map(|l| l.plain.clone()).collect()
     }
 }
 
@@ -202,6 +202,8 @@ pub(super) struct WrappedTranscript {
     pub(super) bars: Vec<Option<Color>>,
     /// Image anchors by wrapped-row index, in display order.
     pub(super) image_rows: Vec<(usize, ImageAnchor)>,
+    /// Visual rows produced by each logical input line; used to splice a wrap.
+    pub(super) rows_per_line: Vec<usize>,
 }
 
 /// Word-wrap all logical lines to `width`, carrying each line's bar color onto
@@ -216,23 +218,26 @@ pub(super) fn wrap_transcript(
     let mut rows: Vec<String> = Vec::new();
     let mut row_bars: Vec<Option<Color>> = Vec::new();
     let mut image_rows: Vec<(usize, ImageAnchor)> = Vec::new();
+    let mut rows_per_line = Vec::with_capacity(lines.len());
     for (idx, sl) in lines.iter().enumerate() {
         let bar = bars.get(idx).copied().flatten();
+        let start = text_lines.len();
         if let Some(anchor) = sl.image {
-            image_rows.push((text_lines.len(), anchor));
+            image_rows.push((start, anchor));
         }
         if sl.no_wrap {
             text_lines.push(sl.line.clone());
             rows.push(sl.plain.clone());
             row_bars.push(bar);
-            continue;
+        } else {
+            for vrow in wrap_styled_line(&sl.line.spans, width) {
+                let vrow = fill_trailing_background(vrow, width);
+                text_lines.push(vrow.line);
+                rows.push(vrow.plain);
+                row_bars.push(bar);
+            }
         }
-        for vrow in wrap_styled_line(&sl.line.spans, width) {
-            let vrow = fill_trailing_background(vrow, width);
-            text_lines.push(vrow.line);
-            rows.push(vrow.plain);
-            row_bars.push(bar);
-        }
+        rows_per_line.push(text_lines.len() - start);
     }
     if text_lines.is_empty() {
         text_lines.push(Line::default());
@@ -244,7 +249,76 @@ pub(super) fn wrap_transcript(
         rows: std::sync::Arc::new(rows),
         bars: row_bars,
         image_rows,
+        rows_per_line,
     }
+}
+
+/// Keep the wrap of the unchanged logical prefix; rewrap only the suffix.
+pub(super) fn splice_transcript_wrap(
+    old: &RenderedTranscript,
+    old_wrap: WrappedTranscript,
+    new: &RenderedTranscript,
+    width: u16,
+) -> Option<WrappedTranscript> {
+    if old_wrap.rows_per_line.len() != old.lines.len() {
+        return None;
+    }
+    let common = old
+        .lines
+        .iter()
+        .zip(&new.lines)
+        .zip(old.bar_colors.iter().zip(&new.bar_colors))
+        .take_while(|((a, b), (ab, bb))| a == b && ab == bb)
+        .count();
+    if common == 0 {
+        return None;
+    }
+    if common == old.lines.len() && common == new.lines.len() {
+        return Some(old_wrap);
+    }
+    let prefix_rows: usize = old_wrap.rows_per_line[..common].iter().sum();
+    if prefix_rows > old_wrap.rows.len() || prefix_rows > old_wrap.text.lines.len() {
+        return None;
+    }
+    let mut rows_per_line = old_wrap.rows_per_line[..common].to_vec();
+    let mut text_lines = old_wrap.text.lines;
+    text_lines.truncate(prefix_rows);
+    let mut rows = match std::sync::Arc::try_unwrap(old_wrap.rows) {
+        Ok(mut rows) => {
+            rows.truncate(prefix_rows);
+            rows
+        }
+        Err(rows) => rows[..prefix_rows].to_vec(),
+    };
+    let mut row_bars = old_wrap.bars;
+    row_bars.truncate(prefix_rows);
+    let mut image_rows: Vec<(usize, ImageAnchor)> = old_wrap
+        .image_rows
+        .into_iter()
+        .filter(|(idx, _)| *idx < prefix_rows)
+        .collect();
+    if common < new.lines.len() {
+        let tail = wrap_transcript(&new.lines[common..], &new.bar_colors[common..], width);
+        rows_per_line.extend(tail.rows_per_line);
+        text_lines.extend(tail.text.lines);
+        rows.extend(tail.rows.iter().cloned());
+        row_bars.extend(tail.bars);
+        image_rows.extend(
+            tail.image_rows
+                .into_iter()
+                .map(|(idx, anchor)| (idx + prefix_rows, anchor)),
+        );
+    }
+    if text_lines.is_empty() {
+        return None;
+    }
+    Some(WrappedTranscript {
+        text: Text::from(text_lines),
+        rows: std::sync::Arc::new(rows),
+        bars: row_bars,
+        image_rows,
+        rows_per_line,
+    })
 }
 
 /// If a wrapped visual row ends in a background-colored span, extend that
@@ -802,27 +876,24 @@ pub(super) fn render_reasoning_full(lines: &mut Vec<StyledLine>, reasoning: &str
     render_reasoning_rows(lines, &rows, marker);
 }
 
-/// The most recent [`THINKING_WINDOW_LINES`] rows (the default/live view).
-/// Only the last window's worth of source lines can reach it (each yields ≥1
-/// row), so only that tail is wrapped — O(window) per reasoning delta.
+/// Last [`THINKING_WINDOW_LINES`] rows; walks from the end so a long thought stays O(window).
 pub(super) fn render_reasoning_window(lines: &mut Vec<StyledLine>, reasoning: &str, width: u16) {
-    let mut total_lines = 0usize;
-    let mut tail: std::collections::VecDeque<&str> =
-        std::collections::VecDeque::with_capacity(THINKING_WINDOW_LINES);
-    for raw_line in reasoning.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        total_lines += 1;
+    let mut tail = Vec::with_capacity(THINKING_WINDOW_LINES);
+    let mut older = false;
+    for trimmed in reasoning
+        .rsplit('\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if tail.len() == THINKING_WINDOW_LINES {
-            tail.pop_front();
+            older = true;
+            break;
         }
-        tail.push_back(trimmed);
+        tail.push(trimmed);
     }
+    tail.reverse();
     let wrap_w = usize::from(width).saturating_sub(2);
     let rows: Vec<String> = if wrap_w < 2 {
-        // width 0 before the first frame; the paint-time wrapper sizes them
         tail.iter().map(|line| line.to_string()).collect()
     } else {
         tail.iter()
@@ -833,7 +904,7 @@ pub(super) fn render_reasoning_window(lines: &mut Vec<StyledLine>, reasoning: &s
             })
             .collect()
     };
-    let windowed = total_lines > THINKING_WINDOW_LINES || rows.len() > THINKING_WINDOW_LINES;
+    let windowed = older || rows.len() > THINKING_WINDOW_LINES;
     let marker = thinking_marker(windowed, false);
     let start = rows.len().saturating_sub(THINKING_WINDOW_LINES);
     render_reasoning_rows(lines, &rows[start..], marker);
@@ -2712,9 +2783,29 @@ pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> 
 /// Path-only cursor start events still coalesce; once `tool_call_update`
 /// supplies the diff, the card must stay split or `edited N files` hides it.
 pub(super) fn tool_has_inline_diff(content: &str) -> bool {
-    let (name, args) = decode_tool_call(content);
-    !edit_diffs(canonical_tool_name(&name), &args).is_empty()
-        || decode_old_content(content).is_some()
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    let nonempty = |obj: &serde_json::Value, k: &str| {
+        obj.get(k)
+            .and_then(|x| x.as_str())
+            .is_some_and(|s| !s.is_empty())
+    };
+    if nonempty(&v, "old_content") {
+        return true;
+    }
+    let name = canonical_tool_name(v.get("name").and_then(|x| x.as_str()).unwrap_or(""));
+    let args = v.get("args").unwrap_or(&serde_json::Value::Null);
+    match name {
+        "write_file" => nonempty(args, "content"),
+        "edit_file" => nonempty(args, "old_string") || nonempty(args, "new_string"),
+        "multi_edit" => args
+            .get("edits")
+            .and_then(|x| x.as_array())
+            .is_some_and(|edits| !edits.is_empty()),
+        "apply_patch" => nonempty(args, "input"),
+        _ => false,
+    }
 }
 
 /// Expand tabs to 4 spaces so a raw `\t` (unicode-width 1) can't desync the

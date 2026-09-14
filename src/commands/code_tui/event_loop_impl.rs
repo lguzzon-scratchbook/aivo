@@ -179,6 +179,7 @@ impl CodeTuiApp {
             RuntimeEvent::AgentDiscardReasoning => {
                 self.pending_reasoning.clear();
                 self.reasoning_started_at = None;
+                self.render_cache.volatile_tail = None;
             }
             RuntimeEvent::McpConnected { client, generation } => {
                 // Drop a connect that started before a `/mcp` toggle changed the
@@ -506,6 +507,7 @@ impl CodeTuiApp {
     pub(super) fn discard_streamed_segment(&mut self) {
         self.incoming_buffer.clear();
         self.pending_response.clear();
+        self.render_cache.volatile_tail = None;
     }
 
     /// Commit any streamed assistant text into a history entry. Called before a
@@ -3108,9 +3110,7 @@ impl CodeTuiApp {
         if !self.thinking_enabled {
             return Vec::new();
         }
-        self.history
-            .iter()
-            .enumerate()
+        self.visible_history()
             .filter(|(_, m)| m.role == "assistant")
             .filter(|(_, m)| {
                 m.reasoning_content
@@ -3121,13 +3121,24 @@ impl CodeTuiApp {
             .collect()
     }
 
+    fn visible_history(&self) -> impl Iterator<Item = (usize, &ChatMessage)> {
+        let render_len = self.committed_render_len();
+        let folds = self.step_folds(render_len);
+        self.history[..render_len]
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| {
+                !folds.iter().any(|&(start, len)| {
+                    *i >= start && *i < start + len && !self.expanded_step_folds.contains(&start)
+                })
+            })
+    }
+
     /// History index behind each expander marker row, in display order. Must
     /// repeat an index exactly as many times as the render emits markers for
     /// it — one per block, two for a long expanded tool result.
     fn expandable_output_indices(&self) -> Vec<usize> {
-        self.history
-            .iter()
-            .enumerate()
+        self.visible_history()
             .flat_map(|(i, m)| {
                 let markers = match m.role.as_str() {
                     "local_command" => {

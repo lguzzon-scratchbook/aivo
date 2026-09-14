@@ -165,6 +165,85 @@ fn bench_tail_scaling_curve() {
     }
 }
 
+#[test]
+#[ignore = "timing probe, run with --nocapture"]
+fn bench_real_session() {
+    use super::super::render::wrap_transcript;
+    let Ok(path) = std::env::var("AIVO_PERF_SESSION") else {
+        println!("skip bench_real_session: set AIVO_PERF_SESSION to a session.json path");
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        println!("skip bench_real_session: {path} not found");
+        return;
+    };
+    let session: serde_json::Value = serde_json::from_str(&raw).expect("session json");
+    let messages = session["messages"].as_array().expect("messages");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let field =
+        |m: &serde_json::Value, k: &str| m.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    for m in messages {
+        app.history.push(ChatMessage {
+            model: field(m, "model"),
+            role: field(m, "role").unwrap_or_else(|| "assistant".to_string()),
+            content: field(m, "content").unwrap_or_default(),
+            reasoning_content: field(m, "reasoning_content"),
+            attachments: vec![],
+        });
+    }
+    println!(
+        "session {path}: {} messages, {} content bytes",
+        app.history.len(),
+        app.history.iter().map(|m| m.content.len()).sum::<usize>()
+    );
+
+    let width = 116u16;
+    let start = Instant::now();
+    let body = app.build_transcript_history_body(width);
+    println!(
+        "build_transcript_history_body: {:?} ({} styled lines)",
+        start.elapsed(),
+        body.lines.len()
+    );
+    let start = Instant::now();
+    let wrapped = wrap_transcript(&body.lines, &body.bar_colors, width);
+    println!(
+        "wrap_transcript: {:?} ({} visual rows)",
+        start.elapsed(),
+        wrapped.rows.len()
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let start = Instant::now();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    println!("first full render (cache fill): {:?}", start.elapsed());
+
+    time_frames("idle cached frames", &mut app, &mut terminal, 60, |_| {});
+    time_frames("typing frames", &mut app, &mut terminal, 60, |app| {
+        app.draft.push('x');
+    });
+    time_frames("scroll frames", &mut app, &mut terminal, 60, |app| {
+        app.follow_output = false;
+        app.transcript_scroll = app.transcript_scroll.saturating_add(3);
+    });
+
+    for (start, _) in app.step_folds(app.history.len()) {
+        app.expanded_step_folds.insert(start);
+    }
+    app.bump_transcript_revision();
+    let start = Instant::now();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    println!("first render with folds expanded: {:?}", start.elapsed());
+    time_frames(
+        "idle frames, folds expanded",
+        &mut app,
+        &mut terminal,
+        30,
+        |_| {},
+    );
+}
+
 /// Typewriter frame: each tick reveals a slice of the buffered stream, so the
 /// volatile tail re-renders — the cost that scales with reply length.
 #[test]

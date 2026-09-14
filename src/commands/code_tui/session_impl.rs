@@ -3857,17 +3857,28 @@ conversation is preserved."
     }
 
     pub(super) fn max_scroll(&self) -> usize {
-        let transcript = self.build_transcript();
-        // Word-wrap to match the render's row count (char-wrap under-counts).
-        let wrapped = wrap_transcript(
-            &transcript.lines,
-            &transcript.bar_colors,
-            self.transcript_width,
-        );
-        wrapped
-            .rows
-            .len()
-            .saturating_sub(usize::from(self.transcript_view_height))
+        let rows = match self
+            .render_cache
+            .transcript
+            .as_ref()
+            .and_then(|cache| cache.wrapped.as_ref())
+        {
+            Some(wrapped) => wrapped
+                .rows
+                .len()
+                .saturating_add(self.volatile_tail_parts().map(|part| part.rows.len()).sum()),
+            None => {
+                let transcript = self.build_transcript();
+                wrap_transcript(
+                    &transcript.lines,
+                    &transcript.bar_colors,
+                    self.transcript_width,
+                )
+                .rows
+                .len()
+            }
+        };
+        rows.saturating_sub(usize::from(self.transcript_view_height))
     }
 
     pub(super) fn selected_transcript_text(&self) -> Option<String> {

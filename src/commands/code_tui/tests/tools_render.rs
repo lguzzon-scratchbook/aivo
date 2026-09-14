@@ -15,7 +15,7 @@ fn test_in_flight_tool_card_hidden_until_result() {
     );
     // In flight: only the status names it — the `→ run_bash(…)` card is held back
     // so the same action isn't shown twice (the dup the user reported).
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         !plain.contains("run_bash("),
         "card hidden while running: {plain:?}"
@@ -26,7 +26,7 @@ fn test_in_flight_tool_card_hidden_until_result() {
     );
     // Result lands → the card (with the command) renders.
     app.apply_agent_tool_result("ok".to_string());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("run_bash("),
         "card shown after result: {plain:?}"
@@ -48,7 +48,7 @@ fn test_parallel_bridged_batch_counts_and_lists_calls() {
         );
     }
     assert_eq!(app.desired_status(), "running 3 sub-agents (0/3 done)");
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("↳ Audit auth"), "per-call rows: {plain:?}");
     assert!(plain.contains("↳ Scan CLI"), "per-call rows: {plain:?}");
 
@@ -56,7 +56,7 @@ fn test_parallel_bridged_batch_counts_and_lists_calls() {
     app.apply_agent_tool_update("3".to_string(), None, Some("12 files".to_string()), false);
     assert_eq!(app.desired_status(), "running 3 sub-agents (1/3 done)");
     assert!(app.current_action_label().is_some());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("✓ Scan CLI — 12 files"),
         "done row: {plain:?}"
@@ -70,7 +70,7 @@ fn test_parallel_bridged_batch_counts_and_lists_calls() {
     app.apply_agent_tool_update("1".to_string(), None, Some("ok".to_string()), false);
     app.apply_agent_tool_update("2".to_string(), None, Some("ok".to_string()), true);
     assert_ne!(app.desired_status(), "running 3 sub-agents (3/3 done)");
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(!plain.contains("↳ "), "live rows cleared: {plain:?}");
     assert!(plain.contains("Audit auth"), "cards render: {plain:?}");
 }
@@ -89,7 +89,7 @@ fn test_parallel_bridged_batch_mixed_tools_noun() {
     assert_eq!(app.desired_status(), "running 2 parallel steps (0/2 done)");
     let status = app
         .build_transcript()
-        .plain_lines
+        .plain_lines()
         .into_iter()
         .find(|line| line.contains("running 2 parallel steps"))
         .expect("parallel status line");
@@ -128,7 +128,7 @@ fn test_parallel_live_rows_coalesce_cursor_style_edits() {
         app.desired_status(),
         format!("running {n} parallel steps (0/{n} done)")
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     let live: Vec<&str> = plain
         .lines()
         .filter(|l| l.contains("↳ editing") || l.contains("editing runtime_impl"))
@@ -295,7 +295,7 @@ fn test_edit_diff_numbers_rows_from_line_starts() {
         reasoning_content: None,
         attachments: vec![],
     });
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("11 - b"),
         "removed line numbered by its old-file offset:\n{plain}"
@@ -373,7 +373,7 @@ fn test_edit_diff_trims_context_and_collapses_gap() {
         reasoning_content: None,
         attachments: vec![],
     });
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     // Both edited lines are flagged; the deep-interior context collapses.
     assert!(
         plain.contains("- A") && plain.contains("+ A2"),
@@ -451,7 +451,7 @@ fn test_folded_run_bash_result_keeps_streaming_tail_height() {
         None,
     );
     app.apply_agent_tool_result("line one\nline two\nline three".to_string());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("+3 lines"), "{plain}");
     assert!(
         !plain.contains("line one") && !plain.contains("line three"),
@@ -472,7 +472,7 @@ fn test_folded_run_bash_result_keeps_streaming_tail_height() {
         .collect::<Vec<_>>()
         .join("\n");
     app.apply_agent_tool_result(long);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("exited 7"), "{plain}");
     assert!(plain.contains("row 39"), "last lines kept: {plain}");
     // The `[exit 7]` sentinel is dropped from the tail (the call row already
@@ -502,7 +502,7 @@ fn test_folded_run_bash_result_keeps_streaming_tail_height() {
     );
     let blob = format!("head-marker {}", "x".repeat(30_000));
     app.apply_agent_tool_result(format!("banner line\n{blob}\n[exit 3]"));
-    let plain_lines = app.build_transcript().plain_lines;
+    let plain_lines = app.build_transcript().plain_lines();
     let row = plain_lines
         .iter()
         .find(|l| l.contains("head-marker"))
@@ -522,7 +522,7 @@ fn test_folded_run_bash_result_keeps_streaming_tail_height() {
         None,
     );
     app.apply_agent_tool_result("secret-alpha\nsecret-beta".to_string());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         !plain.contains("secret-alpha"),
         "a non-run_bash result stays folded: {plain}"
@@ -616,7 +616,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         None,
     );
     app.apply_agent_tool_result("128 lines".to_string());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("read_file(src/ui/views/panel.rs)"),
         "{plain}"
@@ -632,7 +632,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         "read_file".to_string(),
         serde_json::json!({"path": "/Users/alice/proj/src/module/feature/component/section/detail/view/inner/widget.rs"}),
     vec![], None);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("…/"), "expected left-truncation: {plain}");
     assert!(plain.contains("widget.rs"), "basename lost: {plain}");
 }
@@ -658,7 +658,7 @@ fn test_tool_result_count_units_by_tool() {
             None,
         );
         app.apply_agent_tool_result(output.to_string());
-        let plain = app.build_transcript().plain_lines.join("\n");
+        let plain = app.build_transcript().plain_lines().join("\n");
         assert!(
             plain.contains(expected),
             "{tool}: expected {expected:?} in {plain}"
@@ -686,7 +686,7 @@ fn test_batched_tool_results_resolve_unit_and_target_by_position() {
     app.apply_agent_tool_result("1: x\n2: y\n3: z".to_string()); // 3 matches
     app.apply_agent_tool_result("1: x\n2: y\n3: z\n4: w".to_string()); // 4 matches
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("2 matches"), "{plain}");
     assert!(plain.contains("3 matches"), "{plain}");
     assert!(plain.contains("4 matches"), "{plain}");
@@ -724,7 +724,7 @@ fn test_adjacent_search_tools_merge_into_one_group() {
     app.apply_agent_tool_result("1:a\n2:b".to_string()); // grep -> 2 matches
     app.apply_agent_tool_result("1:a\n2:b\n3:c\n4:d".to_string()); // grep -> 4 matches
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("searched ×4"), "{plain}");
     assert_eq!(plain.matches("searched ×").count(), 1, "{plain}");
     assert!(plain.contains("3 files"), "{plain}");
@@ -746,7 +746,7 @@ fn test_run_bash_label_strips_redundant_cd_prefix() {
         vec![],
         None,
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("run_bash(git show f391ffd)"), "{plain}");
     assert!(
         !plain.contains("cd /Users/alice/project/work/aivo"),
@@ -776,7 +776,7 @@ fn test_detached_results_in_batch_interleave_under_their_call() {
     app.apply_agent_tool_result("a\nb\nc".to_string()); // read -> 3 lines
     app.apply_agent_tool_result("1:x\n2:y".to_string()); // grep -> 2 matches
 
-    let lines = app.build_transcript().plain_lines;
+    let lines = app.build_transcript().plain_lines();
     let read_call = lines
         .iter()
         .position(|l| l.contains("gemini_router.rs"))
@@ -839,7 +839,7 @@ fn test_mixed_batch_with_adjacent_pair_keeps_results_under_their_calls() {
     app.apply_agent_tool_result("x/\ny/\nz/".to_string()); // list_dir src -> 3 entries
     app.apply_agent_tool_result("m/\nn/".to_string()); // list_dir public -> 2 entries
 
-    let lines = app.build_transcript().plain_lines;
+    let lines = app.build_transcript().plain_lines();
     let plain = lines.join("\n");
     // The stray adjacent pair never collapses in a mixed batch.
     assert!(!plain.contains("list_dir ×"), "must not coalesce:\n{plain}");
@@ -960,7 +960,7 @@ fn long_tool_run_folds_to_summary_row() {
     }
 
     // 24 entries → the leading 16 (8 steps) fold; the last 4 steps stay.
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("▸\u{a0}8 earlier steps"), "{plain}");
     assert!(plain.contains("run_bash ×8"), "{plain}");
     assert!(plain.contains("1 failed"), "{plain}");
@@ -972,9 +972,73 @@ fn long_tool_run_folds_to_summary_row() {
     let folds = app.step_folds(app.history.len());
     assert_eq!(folds.len(), 1, "{folds:?}");
     app.expanded_step_folds.insert(folds[0].0);
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("▾\u{a0}earlier steps (8)"), "{plain}");
     assert!(plain.contains("cmd-3"), "expanded rows visible: {plain}");
+}
+
+#[test]
+fn tool_has_inline_diff_is_a_field_check_not_a_diff() {
+    let path_only = serde_json::json!({
+        "name": "edit_file",
+        "args": { "path": "src/main.rs" }
+    })
+    .to_string();
+    assert!(
+        !tool_has_inline_diff(&path_only),
+        "cursor start events still coalesce"
+    );
+
+    let with_old = serde_json::json!({
+        "name": "edit_file",
+        "args": { "path": "src/main.rs", "old_string": "a", "new_string": "b" }
+    })
+    .to_string();
+    assert!(tool_has_inline_diff(&with_old));
+
+    let huge = "x".repeat(200_000);
+    let write = serde_json::json!({
+        "name": "write_file",
+        "args": { "path": "big.txt", "content": huge }
+    })
+    .to_string();
+    assert!(
+        tool_has_inline_diff(&write),
+        "must not build the full write diff just to decide coalescing"
+    );
+}
+
+#[test]
+fn thinking_only_assistants_do_not_split_step_folds() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.thinking_enabled = true;
+    for i in 1..=16 {
+        app.history.push(ChatMessage {
+            model: None,
+            role: "assistant".to_string(),
+            content: String::new(),
+            reasoning_content: Some(format!("thinking about step {i}")),
+            attachments: vec![],
+        });
+        app.apply_agent_tool_call(
+            None,
+            "run_bash".to_string(),
+            serde_json::json!({ "command": format!("cmd-{i}") }),
+            vec![],
+            None,
+        );
+    }
+    let folds = app.step_folds(app.history.len());
+    assert_eq!(
+        folds.len(),
+        1,
+        "one run, not one fold per thought: {folds:?}"
+    );
+    let plain = app.build_transcript().plain_lines().join("\n");
+    assert!(plain.contains("▸\u{a0}12 earlier steps"), "{plain}");
+    assert!(!plain.contains("cmd-3"), "early tools stay folded: {plain}");
+    assert!(plain.contains("cmd-16"), "tail tools stay visible: {plain}");
 }
 
 #[test]
@@ -992,7 +1056,7 @@ fn short_tool_run_stays_unfolded() {
         app.apply_agent_tool_result(format!("out-{i}"));
     }
     // 12 entries: prefix past the keep-tail is 4 < FOLD_MIN — every row shows.
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(!plain.contains("earlier steps"), "{plain}");
     assert!(plain.contains("cmd-1"), "{plain}");
     assert!(plain.contains("cmd-6"), "{plain}");
@@ -1018,7 +1082,7 @@ fn test_tool_result_expands_inline_via_keyboard_toggle() {
             .to_string(),
     );
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("run_bash(cargo test) ▸\u{a0}+8 lines"),
         "{plain}"
@@ -1034,7 +1098,7 @@ fn test_tool_result_expands_inline_via_keyboard_toggle() {
     );
 
     assert!(app.toggle_latest_output());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("test 1 ... ok"),
         "expanded result must show all its lines: {plain}"
@@ -1044,7 +1108,7 @@ fn test_tool_result_expands_inline_via_keyboard_toggle() {
     assert!(!plain.contains(OUTPUT_EXPANDED_PREFIX), "{plain}");
 
     assert!(app.toggle_latest_output());
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(!plain.contains("test 1 ... ok"), "{plain}");
 }
 
@@ -1146,7 +1210,7 @@ fn tool_result_expander_click_maps_across_mixed_blocks() {
 
     assert!(app.toggle_output_at_row(marker_rows[1]));
     assert!(app.expanded_output.contains(&result_idx));
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("beta"), "{plain}");
 }
 
@@ -1162,7 +1226,7 @@ fn write_file_snapshot_rides_tool_call_entry() {
         vec![Some(1)],
         Some("fn keep() {}\nfn original() {}\n".to_string()),
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("original"), "old side missing: {plain}");
     assert!(plain.contains("renamed"), "new side missing: {plain}");
     assert!(
@@ -1193,7 +1257,7 @@ fn cursor_edit_update_shows_diff_card() {
         Some("ok".to_string()),
         false,
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("let x = 1;"), "old side missing: {plain}");
     assert!(plain.contains("let x = 2;"), "new side missing: {plain}");
     assert!(
@@ -1222,7 +1286,7 @@ fn consecutive_edits_with_diffs_do_not_coalesce() {
             attachments: vec![],
         });
     }
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         !plain.contains("edited 2 files"),
         "diffs must not hide behind a coalesced header: {plain}"
@@ -1244,7 +1308,7 @@ fn consecutive_path_only_edits_still_coalesce() {
             attachments: vec![],
         });
     }
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("→ edited 3 files"),
         "path-only edits should still coalesce: {plain}"
@@ -1271,7 +1335,7 @@ fn cursor_generate_image_update_names_prompt_and_path() {
         Some("saved to /tmp/icon.png".to_string()),
         false,
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("generate_image(Minimal app icon)"),
         "prompt missing from card: {plain}"
@@ -1293,7 +1357,7 @@ fn test_run_bash_label_drops_redirection_noise() {
         vec![],
         None,
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("which aivo && aivo --help"), "{plain}");
     assert!(!plain.contains("2>/dev/null"), "{plain}");
     assert!(!plain.contains("2>&1"), "{plain}");
@@ -1314,7 +1378,7 @@ fn test_cursor_tool_update_enriches_call_in_place() {
         None,
     );
     let rev_before = app.transcript_revision;
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("read_file(Read File)"), "{plain}");
 
     // The follow-up update resolves the path and carries a compact result.
@@ -1326,7 +1390,7 @@ fn test_cursor_tool_update_enriches_call_in_place() {
     );
     assert!(app.transcript_revision > rev_before);
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("read_file(src/chat.rs) · 42 lines"),
         "{plain}"
@@ -1343,7 +1407,7 @@ fn test_cursor_tool_update_enriches_call_in_place() {
         Some("permission denied".into()),
         true,
     );
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("read_file(src/chat.rs) · permission denied"),
         "{plain}"
@@ -1454,7 +1518,7 @@ fn test_build_transcript_renders_tool_steps() {
     });
 
     let transcript = app.build_transcript();
-    let plain = transcript.plain_lines.join("\n");
+    let plain = transcript.plain_lines().join("\n");
     assert!(
         plain.contains("→ read_file(src/parser.rs) ▸\u{a0}+3 lines"),
         "missing merged call+result row in:\n{plain}"
@@ -1469,7 +1533,7 @@ fn test_build_transcript_renders_tool_steps() {
     );
 
     let call_idx = transcript
-        .plain_lines
+        .plain_lines()
         .iter()
         .position(|l| l.contains("→ read_file"))
         .unwrap();
@@ -1533,7 +1597,7 @@ fn test_build_transcript_renders_edit_diff() {
         attachments: vec![],
     });
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     // The call line, a removed line, an added line, then the confirmation.
     assert!(
         plain.contains("→ edit_file(src/a.rs)"),
@@ -1564,7 +1628,7 @@ fn test_build_transcript_prettifies_mcp_tool_name() {
         reasoning_content: None,
         attachments: vec![],
     });
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
         plain.contains("→ filesystem/read_file"),
         "mcp tool name not prettified in:\n{plain}"
@@ -1602,7 +1666,7 @@ fn test_build_transcript_coalesces_consecutive_tool_calls() {
         attachments: vec![],
     });
 
-    let plain = app.build_transcript().plain_lines.join("\n");
+    let plain = app.build_transcript().plain_lines().join("\n");
     // The three reads collapse to one line naming their basenames; the lone grep
     // renders on its own.
     assert!(

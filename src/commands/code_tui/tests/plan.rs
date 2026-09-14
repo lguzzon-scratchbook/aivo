@@ -40,7 +40,7 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
         attachments: vec![],
     });
 
-    let plain = app.build_transcript().plain_lines;
+    let plain = app.build_transcript().plain_lines();
     let done = plain.iter().position(|l| l.contains("Done in"));
     let next = plain.iter().position(|l| l.contains("second task"));
     assert!(done.is_some(), "Done marker still shown: {plain:?}");
@@ -108,7 +108,7 @@ fn test_plan_renders_in_pinned_panel_not_inline() {
 
     // The plan is pinned in its own panel above the composer — it must NOT render
     // inline in the transcript (where it would scroll away under later content).
-    let inline = app.build_transcript().plain_lines.join("\n");
+    let inline = app.build_transcript().plain_lines().join("\n");
     assert!(
         !inline.contains("Tasks") && !inline.contains("scan code"),
         "plan leaked into the inline transcript:\n{inline}"
