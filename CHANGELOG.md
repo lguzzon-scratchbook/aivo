@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.49.7
+
+The code TUI stops burning CPU on long turns — spinner redraws, streaming wrap, and Thinking-wait JSON parse no longer run every frame. Esc sends queued follow-ups instead of dropping them, empty keep-planning no longer re-shows the same plan, and `read_file` can send PNG/JPEG to vision models.
+
+- improve(code): let read_file send PNG/JPEG to vision models (21906136)
+- perf(code): stop 60fps spinner redraws from burning CPU on long turns (d2033258)
+- perf(code): stop re-wrapping the whole transcript on every streaming delta (47a20029)
+- perf(code): stop a Thinking wait from re-parsing live tool-call JSON every frame (9c87e04d)
+- fix(code): stop empty keep-planning from re-showing the same plan (3dbc5548)
+- fix(code): send queued follow-ups after Esc instead of discarding them (3908d93b)
+- chore(data): re-sync model limits from models.dev (7463f995)
+
 ## v0.49.6
 
 Cursor transport drops are retried only before the turn has begun using tools, preventing a duplicate or unsafe retry after tool execution.
