@@ -245,6 +245,9 @@ impl CodeTuiApp {
                 Ok(Some(SubmitAction::Send(String::new())))
             };
         }
+        if trimmed.eq_ignore_ascii_case("exit") {
+            return Ok(Some(SubmitAction::Command(SlashCommand::Exit)));
+        }
         if self.draft.contains('\n') {
             return Ok(Some(SubmitAction::Send(trimmed.to_string())));
         }
