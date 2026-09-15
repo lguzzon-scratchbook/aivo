@@ -538,6 +538,36 @@ async fn test_ctrl_x_ctrl_e_chord_requests_external_edit() {
 }
 
 #[tokio::test]
+async fn test_ctrl_x_ctrl_e_chord_works_with_at_mention_and_shift() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "@src".to_string();
+    app.cursor = app.draft.len();
+    app.sync_command_menu_state();
+    assert!(app.visible_command_menu().is_some());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.pending_external_edit);
+
+    app.pending_external_edit = false;
+    app.pending_ctrl_x = false;
+    let shift_ctrl = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    app.handle_key(KeyEvent::new(KeyCode::Char('X'), shift_ctrl))
+        .await
+        .unwrap();
+    assert!(app.pending_ctrl_x);
+    app.handle_key(KeyEvent::new(KeyCode::Char('E'), shift_ctrl))
+        .await
+        .unwrap();
+    assert!(app.pending_external_edit);
+}
+
+#[tokio::test]
 async fn test_ctrl_x_chord_cancelled_by_other_key() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);

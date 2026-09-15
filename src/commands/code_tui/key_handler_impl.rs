@@ -43,13 +43,15 @@ fn is_composer_prev_key(key: KeyEvent) -> bool {
     }
 }
 
+fn is_ctrl_letter(key: KeyEvent, letter: char) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&letter))
+}
+
 impl CodeTuiApp {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         // Ctrl+X Ctrl+E chord: Ctrl+E completes it; any other key cancels and runs normally.
-        if std::mem::take(&mut self.pending_ctrl_x)
-            && matches!(key.code, KeyCode::Char('e'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if std::mem::take(&mut self.pending_ctrl_x) && is_ctrl_letter(key, 'e') {
             self.pending_external_edit = true;
             return Ok(false);
         }
@@ -1592,7 +1594,7 @@ impl CodeTuiApp {
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor_home();
             }
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if is_ctrl_letter(key, 'e') => {
                 self.cursor_end();
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1607,7 +1609,7 @@ impl CodeTuiApp {
                 self.delete_char_at_cursor();
                 self.sync_command_menu_state();
             }
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if is_ctrl_letter(key, 'x') => {
                 self.pending_ctrl_x = true;
             }
             KeyCode::Backspace => {
