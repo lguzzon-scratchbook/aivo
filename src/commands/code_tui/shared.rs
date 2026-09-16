@@ -3341,9 +3341,7 @@ pub(super) struct CodeTuiApp {
     pub(super) injected_context: Option<String>,
     /// One-line `injected_context` summary, shown as the `/context` header.
     pub(super) injected_context_summary: Option<String>,
-    /// `context_tokens` is a chars/4 estimate of the visible transcript, not a
-    /// provider-measured count (cursor ACP and agents-without-usage). The footer
-    /// marks these with `~` since the model's real context is larger.
+    /// True → `context_tokens` is chars/4 (footer `~`). Cursor `usage_update` is measured.
     pub(super) context_is_estimate: bool,
     pub(super) follow_output: bool,
     /// Bumped on any in-place edit of a history entry (cursor tool-call

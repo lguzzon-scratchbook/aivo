@@ -101,8 +101,6 @@ fn test_footer_status_label_marks_estimates() {
     app.context_window = 200_000;
     app.context_tokens = 10_000;
 
-    // cursor ACP / agents without reported usage: the chars/4 transcript figure
-    // understates the model's real context, so flag it with `~`.
     app.context_is_estimate = true;
     app.last_usage = None;
     assert_eq!(app.footer_status_label().0, "~10k/200k");
@@ -434,6 +432,72 @@ fn test_agent_context_drives_footer_live() {
     app.pending_response = "x".repeat(8_000); // would add ~2k if double-counted
     app.apply_agent_context(60_000, true);
     assert_eq!(app.footer_status_label().0, "60k/200k");
+}
+
+/// Cursor `usage_update` occupancy must remain the idle fill when result usage is absent.
+#[tokio::test]
+async fn test_cursor_usage_update_survives_turn_end() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.context_window = 500_000;
+    app.sending = true;
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "x".repeat(80_000),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.apply_agent_context(180_000, true);
+    assert_eq!(app.footer_status_label().0, "180k/500k");
+
+    app.sending = false;
+    app.adopt_turn_context_fill(None).await;
+
+    assert!(!app.context_is_estimate);
+    assert_eq!(app.live_usage, None);
+    assert_eq!(app.footer_status_label().0, "180k/500k");
+}
+
+#[tokio::test]
+async fn test_turn_result_usage_beats_live_occupancy() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.context_window = 200_000;
+    app.apply_agent_context(180_000, true);
+    app.adopt_turn_context_fill(Some(TokenUsage {
+        prompt_tokens: 40_000,
+        completion_tokens: 2_000,
+        ..Default::default()
+    }))
+    .await;
+
+    assert_eq!(app.live_usage, None);
+    assert_eq!(app.footer_status_label().0, "42k/200k");
+}
+
+#[tokio::test]
+async fn test_no_measured_fill_falls_back_to_estimate() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.context_window = 200_000;
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "hello".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    app.adopt_turn_context_fill(None).await;
+
+    assert!(app.context_is_estimate);
+    assert!(app.last_usage.is_none());
+    assert!(
+        app.footer_status_label().0.starts_with('~'),
+        "expected estimate marker, got {}",
+        app.footer_status_label().0
+    );
 }
 
 #[test]

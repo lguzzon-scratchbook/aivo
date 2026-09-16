@@ -555,6 +555,20 @@ impl CodeTuiApp {
         })
     }
 
+    /// Result usage, else Cursor `usage_update` occupancy, else chars/4.
+    pub(super) async fn adopt_turn_context_fill(&mut self, turn_usage: Option<TokenUsage>) {
+        let live = self.live_usage.take();
+        if let Some(usage) = turn_usage.or(live) {
+            self.context_tokens = usage.total_tokens();
+            self.context_is_estimate = false;
+            self.last_usage = Some(usage);
+        } else {
+            self.context_tokens = self.estimated_context_used().await;
+            self.context_is_estimate = true;
+            self.last_usage = None;
+        }
+    }
+
     /// Live context-fill from the agent engine. A measured step total flows
     /// through `live_usage` so the footer shows it exactly (no `~`, and without
     /// re-adding streamed text on top); a pre-usage estimate updates the baseline
@@ -1620,16 +1634,8 @@ impl CodeTuiApp {
             self.session_cost_usd += cost;
         }
         self.session_tokens = self.session_tokens.merge(split);
-        self.context_tokens = if turn.usage.is_some() {
-            usage.total_tokens()
-        } else {
-            self.estimated_context_used().await
-        };
-        // cursor ACP returns no usage → the figure is a transcript estimate.
-        self.context_is_estimate = turn.usage.is_none();
-        self.last_usage = turn.usage;
-        self.live_usage = None;
-        // `turn.usage`, not the chars/4 estimate — that has no cache split.
+        self.adopt_turn_context_fill(turn.usage).await;
+        // Occupancy / chars/4 have no cache split.
         self.last_cache_hit_pct = turn.usage.and_then(|u| {
             cache_hit_pct(
                 u.cache_read_input_tokens,

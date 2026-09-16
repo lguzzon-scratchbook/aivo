@@ -4177,9 +4177,7 @@ impl CodeTuiApp {
         // Percent isn't shown (the used/window pair already implies it) but still
         // drives the meter color.
         let pct = (used.saturating_mul(100) / self.context_window).min(100);
-        // Mark estimate-only figures (cursor ACP / agents without reported usage):
-        // aivo's tracked transcript is a fraction of the model's real context, so
-        // the number understates the true fill — `~` flags it as approximate.
+        // Transcript chars/4 understates real fill — `~` marks it approximate.
         let approx = if is_estimate && used > 0 { "~" } else { "" };
         let label = format!(
             "{approx}{}/{}{}",
