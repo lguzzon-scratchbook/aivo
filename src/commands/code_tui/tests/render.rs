@@ -384,6 +384,69 @@ fn test_long_reply_scrolls_to_show_last_line() {
 }
 
 #[test]
+fn test_notice_renders_when_turn_ended_on_a_tool_step() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let screen_of = |app: &mut CodeTuiApp| {
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_main(frame, frame.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut screen = String::new();
+        for y in 0..16u16 {
+            for x in 0..80u16 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        screen
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for (role, content) in [
+        ("user", "retry"),
+        (
+            "tool_call",
+            r#"{"name":"grep","args":{"pattern":"x"},"id":"c1"}"#,
+        ),
+    ] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    assert!(app.pending_response.is_empty());
+
+    app.notice = Some((ERROR(), "Cursor went silent — resend".to_string()));
+    let screen = screen_of(&mut app);
+    assert!(
+        screen.contains("Error: Cursor went silent"),
+        "notice missing with an empty live reply:\n{screen}"
+    );
+
+    app.notice = None;
+    let screen = screen_of(&mut app);
+    assert!(
+        !screen.contains("Cursor went silent"),
+        "stale notice:\n{screen}"
+    );
+    app.notice = Some((MUTED(), "Request cancelled".to_string()));
+    let screen = screen_of(&mut app);
+    assert!(
+        screen.contains("Request cancelled"),
+        "notice missing after cache reuse:\n{screen}"
+    );
+}
+
+#[test]
 fn test_transcript_cache_reuses_across_frames_until_content_changes() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

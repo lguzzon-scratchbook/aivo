@@ -2,10 +2,8 @@ use super::*;
 
 use crate::agent::engine::RewindOutcome;
 use crate::agent::protocol::Decision;
-use crate::services::acp_client::PromptEvent;
 use crate::services::cursor_acp::{self, CursorAcpSession, CursorChunk, CursorTurnResult};
 use crate::services::vision_describe;
-use anyhow::Context;
 
 /// Default cap on total `/goal` turns (override: `AIVO_GOAL_MAX_ITERS`).
 const GOAL_DEFAULT_MAX_ITERS: usize = 20;
@@ -4175,9 +4173,7 @@ and keep each turn's work small"
             let client = session.client_handle();
             let sid = session.session_id().to_string();
             tokio::spawn(async move {
-                let _ = client
-                    .notify("session/cancel", serde_json::json!({"sessionId": sid}))
-                    .await;
+                let _ = client.cancel_session(&sid).await;
             });
         }
         if matches!(kind, CancelKind::Unsend) {
@@ -5307,37 +5303,24 @@ async fn drive_cursor_turn(
         let mut stream = client.start_prompt(&session_id, blocks.clone()).await?;
         let mut turn_result = CursorTurnResult::default();
         let mut reasoning_buf = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                PromptEvent::Update(value) => {
-                    cursor_acp::consume_session_update(
-                        &value,
-                        &mut turn_result,
-                        &mut reasoning_buf,
-                        &mut forward,
-                    )?;
-                }
-                PromptEvent::Done(result) => {
-                    let value = result
-                        .map_err(|e| anyhow::anyhow!(e))
-                        .context("cursor-agent ACP session/prompt failed")?;
-                    turn_result.usage = cursor_acp::parse_result_usage(&value);
-                    break;
-                }
-            }
-        }
-        // `reasoning_buf` is required by `consume_session_update`'s signature, but the
-        // chat TUI doesn't read it: cursor reasoning reaches the UI live via
-        // `CursorChunk::Reasoning` → `pending_reasoning` (committed at turn finish like
-        // every other provider), so there's no `reasoning_content` on `ChatTurnResult`
-        // to populate here.
+        let drain = cursor_acp::drain_prompt_stream(
+            &mut stream,
+            &mut turn_result,
+            &mut reasoning_buf,
+            &mut forward,
+            cursor_acp::CURSOR_PROMPT_IDLE,
+        )
+        .await?;
         let _ = &reasoning_buf;
 
         let Some(report) = turn_result.transport_failure.take() else {
             break turn_result;
         };
+        if matches!(drain, cursor_acp::PromptDrain::Idle) {
+            let _ = client.cancel_session(&session_id).await;
+        }
         if !turn_result.is_retry_safe() || attempt >= cursor_acp::CURSOR_PROMPT_ATTEMPTS {
-            return Err(cursor_acp::cursor_transport_error(&report));
+            return Err(cursor_acp::cursor_prompt_error(drain, &report));
         }
         tx.send(RuntimeEvent::AgentDiscardReasoning).ok();
         tx.send(RuntimeEvent::AgentNotice(format!(

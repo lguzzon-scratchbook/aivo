@@ -100,6 +100,11 @@ impl PromptStream {
     pub async fn next(&mut self) -> Option<PromptEvent> {
         self.rx.recv().await
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_rx(rx: mpsc::UnboundedReceiver<PromptEvent>) -> Self {
+        Self { rx }
+    }
 }
 
 pub struct AcpClient {
@@ -291,6 +296,11 @@ impl AcpClient {
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
         write_frame(&self.writer, &frame, None).await
+    }
+
+    pub async fn cancel_session(&self, session_id: &str) -> Result<()> {
+        self.notify("session/cancel", json!({"sessionId": session_id}))
+            .await
     }
 
     /// Subscribe to `session/update` notifications for `session_id` and send a

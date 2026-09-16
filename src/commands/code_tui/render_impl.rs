@@ -1569,12 +1569,28 @@ impl CodeTuiApp {
         let fp = self.volatile_tail_fp();
         let reply_len = self.pending_response.len();
         let reasoning_len = self.pending_reasoning.len();
-        if let Some(cache) = self.render_cache.volatile_tail.as_ref()
-            && cache.fp == fp
-            && cache.render_width == render_width
-            && reply_len >= cache.reply_len
-        {
-            if reply_len == cache.reply_len && reasoning_len == cache.reasoning_len {
+        let reusable = self
+            .render_cache
+            .volatile_tail
+            .as_ref()
+            .is_some_and(|cache| {
+                cache.fp == fp && cache.render_width == render_width && reply_len >= cache.reply_len
+            });
+        if reusable {
+            let (stale_head, same_reply) = {
+                let cache = self.render_cache.volatile_tail.as_ref().unwrap();
+                (
+                    cache.reasoning_len != reasoning_len,
+                    cache.reply_len == reply_len,
+                )
+            };
+            if stale_head {
+                let head = self.build_tail_head(render_width);
+                let cache = self.render_cache.volatile_tail.as_mut().unwrap();
+                cache.head = head;
+                cache.reasoning_len = reasoning_len;
+            }
+            if same_reply {
                 return;
             }
         } else {
@@ -1593,25 +1609,6 @@ impl CodeTuiApp {
                 plain_width: 0,
                 styled_width: 0,
             });
-        }
-        if self
-            .render_cache
-            .volatile_tail
-            .as_ref()
-            .is_some_and(|cache| cache.reasoning_len != reasoning_len)
-        {
-            let head = self.build_tail_head(render_width);
-            let cache = self.render_cache.volatile_tail.as_mut().unwrap();
-            cache.head = head;
-            cache.reasoning_len = reasoning_len;
-        }
-        if self
-            .render_cache
-            .volatile_tail
-            .as_ref()
-            .is_some_and(|cache| cache.reply_len == reply_len)
-        {
-            return;
         }
         let ends_blank = |section: &TailSection| {
             section

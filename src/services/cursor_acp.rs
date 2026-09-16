@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::agent::protocol::Decision;
@@ -868,8 +869,11 @@ pub fn looks_like_cursor_auth_failure(msg: &str) -> bool {
 
 pub(crate) const CURSOR_PROMPT_ATTEMPTS: u32 = 3;
 
-pub(crate) fn cursor_reconnect_backoff(attempt: u32) -> std::time::Duration {
-    std::time::Duration::from_millis(800u64 << (attempt.saturating_sub(1)).min(3))
+/// Inactivity timeout, not a wall-clock cap: turns may run tools for minutes.
+pub(crate) const CURSOR_PROMPT_IDLE: Duration = Duration::from_secs(180);
+
+pub(crate) fn cursor_reconnect_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(800u64 << (attempt.saturating_sub(1)).min(3))
 }
 
 /// In-band transport death: cursor-agent appends this to the assistant message
@@ -893,6 +897,65 @@ pub(crate) fn cursor_transport_error(report: &str) -> anyhow::Error {
         Some("If this repeats, a proxy is usually in the path — add `cursor.sh` to NO_PROXY."),
     )
     .into()
+}
+
+/// An idle stream gets a distinct error from an in-band transport failure.
+pub(crate) fn cursor_idle_error(report: &str) -> anyhow::Error {
+    crate::errors::CLIError::new(
+        format!("Cursor went silent — {report}"),
+        crate::errors::ErrorCategory::Network,
+        None::<String>,
+        Some("Esc and resend the prompt. If this repeats, check the path to cursor.sh (proxy / NO_PROXY)."),
+    )
+    .into()
+}
+
+pub(crate) fn cursor_prompt_error(drain: PromptDrain, report: &str) -> anyhow::Error {
+    match drain {
+        PromptDrain::Idle => cursor_idle_error(report),
+        PromptDrain::Finished => cursor_transport_error(report),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptDrain {
+    Finished,
+    Idle,
+}
+
+pub(crate) async fn drain_prompt_stream<F>(
+    stream: &mut PromptStream,
+    out: &mut CursorTurnResult,
+    reasoning_buf: &mut String,
+    on_chunk: &mut F,
+    idle: Duration,
+) -> Result<PromptDrain>
+where
+    F: FnMut(CursorChunk<'_>) -> Result<()>,
+{
+    loop {
+        match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(PromptEvent::Update(value))) => {
+                consume_session_update(&value, out, reasoning_buf, on_chunk)?;
+            }
+            Ok(Some(PromptEvent::Done(result))) => {
+                let value = result
+                    .map_err(|e| anyhow!(e))
+                    .context("cursor-agent ACP session/prompt failed")?;
+                out.stop_reason = value
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                out.usage = parse_result_usage(&value);
+                return Ok(PromptDrain::Finished);
+            }
+            Ok(None) => return Ok(PromptDrain::Finished),
+            Err(_) => {
+                out.transport_failure = Some(format!("no session/update for {}s", idle.as_secs()));
+                return Ok(PromptDrain::Idle);
+            }
+        }
+    }
 }
 
 pub fn map_cursor_auth_error(err: anyhow::Error, key_id_or_name: &str) -> anyhow::Error {
@@ -1837,9 +1900,7 @@ impl CursorAcpSession {
     /// user aborts so the agent stops generating; the spawned task is also
     /// aborted independently, so a failure here is non-fatal.
     pub async fn cancel(&self) -> Result<()> {
-        self.client
-            .notify("session/cancel", json!({"sessionId": self.session_id}))
-            .await
+        self.client.cancel_session(&self.session_id).await
     }
 }
 
@@ -1896,32 +1957,25 @@ where
             ..Default::default()
         };
         let mut reasoning_buf = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                PromptEvent::Update(value) => {
-                    consume_session_update(&value, &mut out, &mut reasoning_buf, on_chunk)?;
-                }
-                PromptEvent::Done(result) => {
-                    let value = result
-                        .map_err(|e| anyhow!(e))
-                        .context("cursor-agent ACP session/prompt failed")
-                        .map_err(|e| map_cursor_auth_error(e, &key.id))?;
-                    out.stop_reason = value
-                        .get("stopReason")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    out.usage = parse_result_usage(&value);
-                    break;
-                }
-            }
-        }
+        let drain = drain_prompt_stream(
+            &mut stream,
+            &mut out,
+            &mut reasoning_buf,
+            on_chunk,
+            CURSOR_PROMPT_IDLE,
+        )
+        .await
+        .map_err(|e| map_cursor_auth_error(e, &key.id))?;
         if let Some(report) = out.transport_failure.take() {
+            if matches!(drain, PromptDrain::Idle) {
+                let _ = session.cancel().await;
+            }
             if out.is_retry_safe() && attempt < CURSOR_PROMPT_ATTEMPTS {
                 tokio::time::sleep(cursor_reconnect_backoff(attempt)).await;
                 attempt += 1;
                 continue;
             }
-            return Err(cursor_transport_error(&report));
+            return Err(cursor_prompt_error(drain, &report));
         }
         if !reasoning_buf.is_empty() {
             out.reasoning_content = Some(reasoning_buf);
@@ -3521,6 +3575,88 @@ mod tests {
         assert!(!safe_after(&["agent_thought_chunk", "tool_call"]));
         assert!(!safe_after(&["tool_call_update"]));
         assert!(!safe_after(&["agent_message_chunk"]));
+    }
+
+    #[tokio::test]
+    async fn drain_prompt_stream_times_out_when_cursor_goes_silent() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = PromptStream::from_rx(rx);
+        let mut out = CursorTurnResult::default();
+        let mut reasoning = String::new();
+        let mut on_chunk = |_: CursorChunk<'_>| -> Result<()> { Ok(()) };
+        let drain = drain_prompt_stream(
+            &mut stream,
+            &mut out,
+            &mut reasoning,
+            &mut on_chunk,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(drain, PromptDrain::Idle);
+        assert!(
+            out.transport_failure
+                .as_deref()
+                .is_some_and(|r| r.contains("no session/update")),
+            "idle drain must set a transport_failure: {:?}",
+            out.transport_failure
+        );
+        assert!(out.is_retry_safe(), "silence before any tool is retry-safe");
+    }
+
+    #[tokio::test]
+    async fn drain_prompt_stream_idle_timer_resets_on_update() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = PromptStream::from_rx(rx);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(PromptEvent::Update(serde_json::json!({
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "hmm"}
+                }
+            })))
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(PromptEvent::Done(Ok(
+                serde_json::json!({"stopReason": "end_turn"}),
+            )))
+            .unwrap();
+        });
+        let mut out = CursorTurnResult::default();
+        let mut reasoning = String::new();
+        let mut on_chunk = |_: CursorChunk<'_>| -> Result<()> { Ok(()) };
+        let drain = drain_prompt_stream(
+            &mut stream,
+            &mut out,
+            &mut reasoning,
+            &mut on_chunk,
+            Duration::from_millis(80),
+        )
+        .await
+        .unwrap();
+        assert_eq!(drain, PromptDrain::Finished);
+        assert!(out.transport_failure.is_none());
+        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(reasoning, "hmm");
+    }
+
+    #[test]
+    fn cursor_prompt_error_routes_idle_away_from_the_proxy_hint() {
+        let idle = cursor_prompt_error(PromptDrain::Idle, "no session/update for 180s");
+        let idle_msg = format!("{idle:#}");
+        assert!(idle_msg.contains("went silent"), "{idle_msg}");
+        assert!(idle_msg.contains("resend"), "{idle_msg}");
+        let transport = cursor_prompt_error(
+            PromptDrain::Finished,
+            "RetriableError: [canceled] http/2 stream closed with error code CANCEL (0x8)",
+        );
+        let transport_msg = format!("{transport:#}");
+        assert!(
+            transport_msg.contains("lost its connection"),
+            "{transport_msg}"
+        );
+        assert!(transport_msg.contains("NO_PROXY"), "{transport_msg}");
     }
 
     #[test]
