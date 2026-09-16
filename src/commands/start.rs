@@ -101,7 +101,8 @@ impl StartCommand {
         }
     }
 
-    async fn execute_internal(&self, args: StartFlowArgs) -> Result<ExitCode> {
+    async fn execute_internal(&self, mut args: StartFlowArgs) -> Result<ExitCode> {
+        (args.key, args.model) = crate::cli_args::take_key_flag(args.key.take(), args.model.take());
         // Use global last selection for defaults
         let last_sel = self.session_store.get_last_selection().await?;
 

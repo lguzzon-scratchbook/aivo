@@ -687,6 +687,7 @@ async fn apply_key_model_spec(
             );
         }
     }
+    let (key_flag, model_flag) = crate::cli_args::take_key_flag(key_flag, model_flag);
     let Some(value) = model_flag else {
         return (key_flag, None);
     };
@@ -1746,6 +1747,54 @@ mod tests {
         assert_eq!(k.as_deref(), Some("work"));
         assert_eq!(m.as_deref(), Some("opus"));
         assert_eq!(rest, args(&["work::ignored"]));
+    }
+
+    #[tokio::test]
+    async fn key_flag_colon_suffix_peels_to_the_key() {
+        use crate::services::session_store::SessionStore;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::with_path(tmp.path().join("config.json"));
+
+        let mut rest = args(&[]);
+        let (k, m) = super::apply_key_model_spec(
+            &store,
+            Some("work::".into()),
+            None,
+            &mut rest,
+            true,
+            "amp",
+        )
+        .await;
+        assert_eq!(k.as_deref(), Some("work"));
+        assert!(m.is_none());
+
+        let mut rest = args(&[]);
+        let (k, m) = super::apply_key_model_spec(
+            &store,
+            Some("work::opus".into()),
+            None,
+            &mut rest,
+            true,
+            "amp",
+        )
+        .await;
+        assert_eq!(k.as_deref(), Some("work"));
+        assert_eq!(m.as_deref(), Some("opus"));
+
+        let mut rest = args(&[]);
+        let (k, m) = super::apply_key_model_spec(
+            &store,
+            Some("work::ignored".into()),
+            Some("opus".into()),
+            &mut rest,
+            true,
+            "amp",
+        )
+        .await;
+        assert_eq!(k.as_deref(), Some("work"));
+        assert_eq!(m.as_deref(), Some("opus"));
     }
 
     #[test]

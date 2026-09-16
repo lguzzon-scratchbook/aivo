@@ -241,6 +241,30 @@ pub fn split_tier_spec(value: &str) -> (Option<String>, String) {
     }
 }
 
+/// Strip a `::[model]` suffix from `-k` (`cursor::` → `cursor`). `-k ::` → `""`.
+fn peel_key_flag(value: Option<String>) -> (Option<String>, Option<String>) {
+    let Some(v) = value else {
+        return (None, None);
+    };
+    if !looks_like_key_model_spec(&v) {
+        return (Some(v), None);
+    }
+    let (key, model) = split_tier_spec(&v);
+    (
+        Some(key.unwrap_or_default()),
+        (!model.is_empty()).then_some(model),
+    )
+}
+
+/// `-k cursor::opus` with no `-m` acts like `-k cursor -m opus`; `-m` wins.
+pub fn take_key_flag(
+    key: Option<String>,
+    model: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let (key, leftover) = peel_key_flag(key);
+    (key, model.or(leftover))
+}
+
 /// Alias-resolves a model token, re-splitting so an alias that expands to
 /// `key::model` carries a provider (`fast` = `groq::llama`). An explicit
 /// `key_ref` wins; an empty model stays empty (picker trigger).
@@ -658,6 +682,43 @@ mod tests {
         );
         assert_eq!(split_tier_spec("::glm"), (None, "glm".to_string()));
         assert_eq!(split_tier_spec(""), (None, String::new()));
+    }
+
+    #[test]
+    fn peel_key_flag_strips_mixed_colon_shorthand() {
+        assert_eq!(peel_key_flag(None), (None, None));
+        assert_eq!(
+            peel_key_flag(Some("cursor".into())),
+            (Some("cursor".into()), None)
+        );
+        assert_eq!(
+            peel_key_flag(Some("cursor::".into())),
+            (Some("cursor".into()), None)
+        );
+        assert_eq!(
+            peel_key_flag(Some("cursor::opus".into())),
+            (Some("cursor".into()), Some("opus".into()))
+        );
+        assert_eq!(
+            peel_key_flag(Some(String::new())),
+            (Some(String::new()), None)
+        );
+        assert_eq!(
+            peel_key_flag(Some("::".into())),
+            (Some(String::new()), None)
+        );
+        assert_eq!(
+            peel_key_flag(Some("::opus".into())),
+            (Some(String::new()), Some("opus".into()))
+        );
+        assert_eq!(
+            take_key_flag(Some("cursor::opus".into()), None),
+            (Some("cursor".into()), Some("opus".into()))
+        );
+        assert_eq!(
+            take_key_flag(Some("cursor::opus".into()), Some("gpt".into())),
+            (Some("cursor".into()), Some("gpt".into()))
+        );
     }
 
     #[test]

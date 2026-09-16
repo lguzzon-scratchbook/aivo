@@ -425,6 +425,7 @@ pub(crate) fn merge_models_spec(
     key: Option<String>,
     search: Option<String>,
 ) -> Result<(Option<String>, Option<String>), String> {
+    let (key, search) = crate::cli_args::take_key_flag(key, search);
     let Some(spec) = spec else {
         return Ok((key, search));
     };
@@ -621,6 +622,18 @@ mod tests {
             Ok((s("acme"), s("glm")))
         );
         assert_eq!(merge_models_spec(s("::"), None, None), Ok((None, None)));
+        assert_eq!(
+            merge_models_spec(None, s("acme::"), None),
+            Ok((s("acme"), None))
+        );
+        assert_eq!(
+            merge_models_spec(None, s("acme::glm"), None),
+            Ok((s("acme"), s("glm")))
+        );
+        assert_eq!(
+            merge_models_spec(s("acme::"), s("acme::"), None),
+            Ok((s("acme"), None))
+        );
     }
 
     #[test]

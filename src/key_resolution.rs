@@ -65,7 +65,13 @@ async fn resolve_key_override_scoped(
 ) -> anyhow::Result<KeyResolution> {
     match key_flag {
         Some("") => prompt_temporary_key_override(session_store, compat).await,
-        Some(key_id_or_name) => resolve_by_id_or_name_or_pick(session_store, key_id_or_name).await,
+        Some(raw) => {
+            let (name, _) = crate::cli_args::take_key_flag(Some(raw.to_string()), None);
+            match name.filter(|s| !s.is_empty()) {
+                Some(name) => resolve_by_id_or_name_or_pick(session_store, &name).await,
+                None => prompt_temporary_key_override(session_store, compat).await,
+            }
+        }
         None => match mode {
             KeyLookupMode::RequireActiveOrPrompt => {
                 match resolve_active_key_or_prompt(session_store, compat).await {
@@ -361,5 +367,36 @@ mod tests {
         // Only one key exists
         let all_keys = store.get_keys().await.unwrap();
         assert_eq!(all_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn key_flag_colon_suffix_looks_up_the_key_half() {
+        let (_temp_dir, store) = temp_store();
+        let id = store
+            .add_key_with_protocol(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                None,
+                "sk-test",
+            )
+            .await
+            .unwrap();
+
+        for spec in ["openrouter::", "openrouter::opus"] {
+            let resolved = resolve_key_override(
+                &store,
+                Some(spec),
+                KeyLookupMode::RequireActiveOrPrompt,
+                KeyCompatContext::None,
+            )
+            .await;
+            match resolved.unwrap() {
+                KeyResolution::Selected(key) => assert_eq!(key.id, id, "spec {spec}"),
+                KeyResolution::Cancelled => panic!("expected selected key for {spec}, got cancel"),
+                KeyResolution::MissingAuth => {
+                    panic!("expected selected key for {spec}, got missing")
+                }
+            }
+        }
     }
 }

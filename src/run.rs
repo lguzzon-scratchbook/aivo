@@ -490,10 +490,13 @@ async fn dispatch_code(
         }
     };
     // Positional lifts into model; explicit -m still wins.
-    let model_input = code_args
-        .model
-        .clone()
-        .or_else(|| code_args.reference.clone());
+    let (code_key, model_input) = crate::cli_args::take_key_flag(
+        code_args.key.take(),
+        code_args
+            .model
+            .clone()
+            .or_else(|| code_args.reference.clone()),
+    );
     let have_model_input = model_input.is_some();
     // Split `[key::]model`; the model half is alias-expanded (may itself
     // carry `key::`). Empty half (`aivo::`) is key-only → picker.
@@ -505,7 +508,7 @@ async fn dispatch_code(
         }
         None => (None, String::new()),
     };
-    if let (Some(k), Some(kr)) = (code_args.key.as_deref(), model_key_ref.as_deref())
+    if let (Some(k), Some(kr)) = (code_key.as_deref(), model_key_ref.as_deref())
         && k != kr
     {
         eprintln!(
@@ -514,8 +517,8 @@ async fn dispatch_code(
         );
         process::exit(ExitCode::UserError.code());
     }
-    let key_explicit = code_args.key.is_some() || model_key_ref.is_some();
-    let effective_key = code_args.key.clone().or(model_key_ref);
+    let key_explicit = code_key.is_some() || model_key_ref.is_some();
+    let effective_key = code_key.or(model_key_ref);
     let expanded_model = have_model_input.then_some(model_half);
     let key_override = if is_hf_takeover(expanded_model.as_deref()) {
         None
@@ -655,6 +658,8 @@ async fn dispatch_run(
             );
         }
     }
+    (extracted.key_flag, extracted.model) =
+        crate::cli_args::take_key_flag(extracted.key_flag.take(), extracted.model.take());
     // Resolve aliases for main + 6 slot models against a single
     // in-memory snapshot of the alias map, instead of paying one disk
     // read per call (worst case 7).
