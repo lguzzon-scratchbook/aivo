@@ -122,7 +122,11 @@ impl ModelsCommand {
                     .await?;
             kimi_model_infos(models)
         } else if key.is_codex_oauth() {
-            crate::services::codex_oauth::known_model_ids()
+            SessionStore::decrypt_key_secret(&mut key)?;
+            let mut creds =
+                crate::services::codex_oauth::CodexOAuthCredential::from_json(&key.key)?;
+            crate::services::codex_oauth::list_model_ids(&mut creds, Some(&self.session_store))
+                .await
                 .into_iter()
                 .map(ModelInfo::id_only)
                 .collect()

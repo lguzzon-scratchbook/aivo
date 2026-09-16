@@ -34,6 +34,7 @@ pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// the same host the native `codex` CLI hits.
 pub const CHATGPT_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CHATGPT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub const CHATGPT_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 
 pub const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
@@ -41,7 +42,9 @@ pub const OPENAI_BETA_VALUE: &str = "responses=experimental";
 pub const ORIGINATOR_HEADER: &str = "originator";
 pub const ORIGINATOR_VALUE: &str = "codex_cli_rs";
 pub const SESSION_ID_HEADER: &str = "session_id";
-pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.144.1";
+/// ChatGPT hides newer slugs from older clients — keep near current native Codex.
+pub const CODEX_CLIENT_VERSION: &str = "0.153.4";
+pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.153.4";
 
 /// Fallback when a client asks for a non-Codex model; plain `gpt-5` is rejected.
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
@@ -515,15 +518,40 @@ pub fn process_session_id() -> &'static str {
     &ID
 }
 
-/// Model ids for a ChatGPT-account Codex credential. The backend has no
-/// `/v1/models` catalog, so read codex's own discovered cache, else fall back.
+pub async fn list_model_ids(
+    creds: &mut CodexOAuthCredential,
+    persist: Option<&crate::services::session_store::SessionStore>,
+) -> Vec<String> {
+    match fetch_model_ids(creds, persist).await {
+        Ok(ids) if !ids.is_empty() => ids,
+        _ => known_model_ids(),
+    }
+}
+
+pub async fn fetch_model_ids(
+    creds: &mut CodexOAuthCredential,
+    persist: Option<&crate::services::session_store::SessionStore>,
+) -> Result<Vec<String>> {
+    if let Some(store) = persist {
+        let prev_refresh = creds.refresh_token.clone();
+        if ensure_fresh(creds, REFRESH_SKEW_SECS).await? {
+            persist_rotated_credential(store, &prev_refresh, creds).await;
+        }
+    }
+    let version = listing_client_version();
+    let url = format!("{CHATGPT_MODELS_URL}?client_version={version}");
+    fetch_model_ids_from(&models_http_client(), &url, creds, &version).await
+}
+
 pub fn known_model_ids() -> Vec<String> {
-    cached_codex_model_ids().unwrap_or_else(|| {
-        ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    })
+    cached_codex_model_ids().unwrap_or_else(bundled_codex_model_ids)
+}
+
+fn bundled_codex_model_ids() -> Vec<String> {
+    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// `$CODEX_HOME` or `~/.codex`.
@@ -568,20 +596,140 @@ fn jwt_exp_claim(jwt: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(value.get("exp")?.as_i64()?, 0)
 }
 
+fn models_http_client() -> reqwest::Client {
+    crate::services::http_utils::router_http_client_with_timeout(30)
+}
+
+async fn fetch_model_ids_from(
+    client: &reqwest::Client,
+    url: &str,
+    creds: &CodexOAuthCredential,
+    client_version: &str,
+) -> Result<Vec<String>> {
+    let mut req = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", creds.access_token))
+        .header(ORIGINATOR_HEADER, ORIGINATOR_VALUE)
+        .header("User-Agent", format!("{ORIGINATOR_VALUE}/{client_version}"))
+        .header("Version", client_version)
+        .header("Accept", "application/json");
+    if let Some(account_id) = creds.account_id.as_deref() {
+        req = req.header(ACCOUNT_ID_HEADER, account_id);
+    }
+    let resp = req.send().await.context("GET chatgpt /codex/models")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let relogin_hint = if matches!(status.as_u16(), 401 | 403) {
+            crate::services::oauth_credential::REAUTH_HINT
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "codex models request failed ({}){}: {}",
+            status.as_u16(),
+            relogin_hint,
+            redact_oauth_body(&body)
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("parse chatgpt /codex/models response")?;
+    let ids = slugs_from_models_json(&value);
+    if ids.is_empty() {
+        anyhow::bail!("chatgpt /codex/models returned no usable models");
+    }
+    Ok(ids)
+}
+
+fn listing_client_version() -> String {
+    let embedded = CODEX_CLIENT_VERSION;
+    match cached_client_version() {
+        Some(cached) if version_newer(&cached, embedded) => cached,
+        _ => embedded.to_string(),
+    }
+}
+
+fn cached_client_version() -> Option<String> {
+    each_models_cache().find_map(|value| {
+        let version = value.get("client_version")?.as_str()?.trim();
+        (!version.is_empty()).then(|| version.to_string())
+    })
+}
+
+fn version_newer(a: &str, b: &str) -> bool {
+    fn parts(s: &str) -> Option<(u32, u32, u32)> {
+        let mut it = s.split('.');
+        Some((
+            it.next()?.parse().ok()?,
+            it.next()?.parse().ok()?,
+            it.next()?.parse().ok()?,
+        ))
+    }
+    match (parts(a), parts(b)) {
+        (Some(left), Some(right)) => left > right,
+        _ => false,
+    }
+}
+
 fn cached_codex_model_ids() -> Option<Vec<String>> {
-    let home = codex_home_dir()?;
-    let bytes = std::fs::read(home.join("models_cache.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let models = value.get("models")?.as_array()?;
-    let ids: Vec<String> = models
+    model_ids_from_cache_files(models_cache_paths())
+}
+
+fn models_cache_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let mut push = |dir: std::path::PathBuf| {
+        let path = dir.join("models_cache.json");
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+    if let Some(home) = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from)
+        && home.is_dir()
+    {
+        push(home);
+    }
+    if let Some(home) = crate::services::system_env::home_dir() {
+        push(home.join(".codex"));
+    }
+    paths
+}
+
+fn each_models_cache() -> impl Iterator<Item = serde_json::Value> {
+    models_cache_paths()
+        .into_iter()
+        .filter_map(|path| serde_json::from_slice(&std::fs::read(path).ok()?).ok())
+}
+
+fn model_ids_from_cache_files(
+    paths: impl IntoIterator<Item = impl AsRef<std::path::Path>>,
+) -> Option<Vec<String>> {
+    for path in paths {
+        let Ok(bytes) = std::fs::read(path.as_ref()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice(&bytes) else {
+            continue;
+        };
+        let ids = slugs_from_models_json(&value);
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+    }
+    None
+}
+
+fn slugs_from_models_json(value: &serde_json::Value) -> Vec<String> {
+    let Some(models) = value.get("models").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    models
         .iter()
         .filter(|m| {
             m.get("visibility").and_then(|v| v.as_str()) != Some("hide")
                 && m.get("supported_in_api").and_then(|v| v.as_bool()) != Some(false)
         })
         .filter_map(|m| m.get("slug").and_then(|s| s.as_str()).map(str::to_string))
-        .collect();
-    (!ids.is_empty()).then_some(ids)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -769,6 +917,173 @@ mod tests {
     #[test]
     fn known_model_ids_never_empty() {
         assert!(!known_model_ids().is_empty());
+    }
+
+    #[test]
+    fn model_ids_from_cache_files_skips_missing_and_empty() {
+        let empty_home = tempfile::tempdir().unwrap();
+        let real_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            empty_home.path().join("models_cache.json"),
+            r#"{"models":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            real_home.path().join("models_cache.json"),
+            serde_json::json!({
+                "models": [
+                    {"slug": "gpt-6-astra", "visibility": "list", "supported_in_api": true},
+                    {"slug": "gpt-reserve", "visibility": "hide"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            model_ids_from_cache_files([
+                empty_home.path().join("nope.json"),
+                empty_home.path().join("models_cache.json"),
+                real_home.path().join("models_cache.json"),
+            ]),
+            Some(vec!["gpt-6-astra".into()])
+        );
+        assert!(
+            model_ids_from_cache_files([empty_home.path().join("models_cache.json")]).is_none()
+        );
+    }
+
+    #[test]
+    fn slugs_from_models_json_drops_hidden_and_non_api() {
+        let value = serde_json::json!({
+            "models": [
+                {"slug": "gpt-5.6-sol", "visibility": "list", "supported_in_api": true},
+                {"slug": "gpt-reserve", "visibility": "hide", "supported_in_api": true},
+                {"slug": "gpt-internal", "visibility": "list", "supported_in_api": false},
+                {"slug": "gpt-5.5"}
+            ]
+        });
+        assert_eq!(
+            slugs_from_models_json(&value),
+            vec!["gpt-5.6-sol", "gpt-5.5"]
+        );
+        assert!(slugs_from_models_json(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn version_newer_compares_semver_triples() {
+        assert!(version_newer("0.153.4", "0.144.1"));
+        assert!(version_newer("1.0.0", "0.153.4"));
+        assert!(!version_newer("0.144.1", "0.153.4"));
+        assert!(!version_newer("0.153.4", "0.153.4"));
+        assert!(!version_newer("not-a-version", "0.153.4"));
+    }
+
+    #[test]
+    fn listing_client_version_is_at_least_embedded() {
+        let v = listing_client_version();
+        assert!(
+            v == CODEX_CLIENT_VERSION || version_newer(&v, CODEX_CLIENT_VERSION),
+            "listing version {v} older than embedded {CODEX_CLIENT_VERSION}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_model_ids_from_stub_filters_and_sends_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel();
+        let body = serde_json::json!({
+            "models": [
+                {"slug": "gpt-6-astra", "visibility": "list", "supported_in_api": true},
+                {"slug": "gpt-reserve", "visibility": "hide", "supported_in_api": true}
+            ]
+        })
+        .to_string();
+        let server = tokio::spawn(async move {
+            let Ok(Ok((mut socket, _))) = timeout(Duration::from_secs(2), listener.accept()).await
+            else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let size = socket.read(&mut buf).await.unwrap();
+            let _ = req_tx.send(String::from_utf8_lossy(&buf[..size]).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let creds = CodexOAuthCredential {
+            id_token: "id".into(),
+            access_token: "at-live".into(),
+            refresh_token: "rt".into(),
+            account_id: Some("acct_1".into()),
+            email: None,
+            expires_at: Utc::now() + ChronoDuration::seconds(3600),
+            last_refresh: Utc::now(),
+        };
+        let url = format!("http://{address}/models?client_version=0.153.4");
+        let client = crate::services::http_utils::router_http_client_loopback();
+        let ids = fetch_model_ids_from(&client, &url, &creds, "0.153.4")
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["gpt-6-astra"]);
+
+        let request = req_rx.recv().await.expect("stub saw a request");
+        let request = request.to_ascii_lowercase();
+        assert!(request.contains("get /models?client_version=0.153.4"));
+        assert!(request.contains("authorization: bearer at-live"));
+        assert!(request.contains("chatgpt-account-id: acct_1"));
+        assert!(request.contains("originator: codex_cli_rs"));
+        assert!(request.contains("user-agent: codex_cli_rs/0.153.4"));
+        assert!(request.contains("version: 0.153.4"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_model_ids_from_errors_on_empty_catalog() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = r#"{"models":[]}"#;
+        let server = tokio::spawn(async move {
+            let Ok(Ok((mut socket, _))) = timeout(Duration::from_secs(2), listener.accept()).await
+            else {
+                return;
+            };
+            let mut buf = vec![0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let creds = CodexOAuthCredential {
+            id_token: "id".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            account_id: None,
+            email: None,
+            expires_at: Utc::now() + ChronoDuration::seconds(3600),
+            last_refresh: Utc::now(),
+        };
+        let url = format!("http://{address}/models");
+        let client = crate::services::http_utils::router_http_client_loopback();
+        let err = fetch_model_ids_from(&client, &url, &creds, "0.153.4")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no usable models"), "got {err}");
+        server.abort();
     }
 
     #[test]

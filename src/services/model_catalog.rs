@@ -790,7 +790,10 @@ pub(crate) async fn fetch_models_detailed_filtered(
         return Ok(kimi_model_infos(models));
     }
     if key.is_codex_oauth() {
-        let ids = crate::services::codex_oauth::known_model_ids();
+        let mut key = key.clone();
+        SessionStore::decrypt_key_secret(&mut key)?;
+        let mut creds = crate::services::codex_oauth::CodexOAuthCredential::from_json(&key.key)?;
+        let ids = crate::services::codex_oauth::list_model_ids(&mut creds, None).await;
         return Ok(ids.into_iter().map(ModelInfo::id_only).collect());
     }
     // Native `/v1/models` accepts the OAuth bearer (no oauth beta needed) and

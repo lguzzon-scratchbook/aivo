@@ -1004,14 +1004,8 @@ impl AILauncher {
         })
     }
 
-    /// Fetches the key's available models for CodexApp's GUI dropdown. Soft
-    /// failure: returns `None` so the launch still works against codex's
-    /// built-in catalog (the user can pass `-m` explicitly).
-    ///
-    /// Skipped for keys whose `/v1/models` endpoint isn't meaningful here:
-    /// Codex OAuth (uses ChatGPT's hardcoded list, not /v1/models), Ollama
-    /// and Copilot sentinels (custom URL schemes handled by their own
-    /// runners). Avoids a pointless spinner + guaranteed failure on those.
+    /// Soft-fail model list for CodexApp's GUI dropdown. Skipped for Codex
+    /// OAuth, Ollama, and Copilot (those aren't `/v1/models`).
     async fn discover_codex_app_models(&self, key: &ApiKey) -> Option<Vec<String>> {
         if key.is_codex_oauth() || is_ollama_base(&key.base_url) || is_copilot_base(&key.base_url) {
             return None;
