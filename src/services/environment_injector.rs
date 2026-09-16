@@ -751,8 +751,8 @@ impl EnvironmentInjector {
             let mut env =
                 Self::for_cursor_acp_tool(key, "GOOGLE_GEMINI_BASE_URL", Some("GEMINI_API_KEY"));
             // gemini-cli's OAuth picker would otherwise wait for stdin on
-            // first launch — force api-key path via the system-scope settings
-            // override prepared by `prepare_gemini_api_key_settings_override`.
+            // first launch — force api-key path via the settings override
+            // prepared by `prepare_gemini_api_key_settings_override`.
             env.insert(
                 "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
                 "1".to_string(),
@@ -813,7 +813,6 @@ impl EnvironmentInjector {
             env.insert("AIVO_GEMINI_MODEL_CONFIG_MODEL".to_string(), gemini_model);
         }
 
-        // Signal to launch_runtime::prepare_gemini_api_key_settings_override.
         env.insert(
             "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
             "1".to_string(),

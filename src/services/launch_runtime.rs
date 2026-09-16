@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -39,11 +39,9 @@ pub(crate) struct LaunchRuntimeState {
     pub(crate) learned_requires_reasoning: Option<Arc<AtomicBool>>,
     pub(crate) pi_agent_dir: Option<String>,
     pub(crate) codex_oauth_sync: Option<CodexOAuthSync>,
-    /// Holds the temp dir that backs `GEMINI_CLI_SYSTEM_SETTINGS_PATH`
-    /// for non-OAuth gemini launches. Dropping it deletes the settings
-    /// override file; must outlive the spawned gemini process.
-    #[allow(dead_code)] // kept alive solely for its Drop impl
-    pub(crate) gemini_system_settings: Option<tempfile::TempDir>,
+    /// Must outlive the gemini child; Drop syncs user-scope edits then deletes the temp dir.
+    #[allow(dead_code)]
+    pub(crate) gemini_settings_override: Option<GeminiSettingsOverride>,
     /// Per-run tally from accounting-enabled routers, stamped onto the finished row.
     pub(crate) run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
 }
@@ -265,7 +263,7 @@ pub(crate) async fn prepare_runtime_env(
         prepare_codex_app_home_without_auth(&mut env, session_store).await?;
     }
 
-    let gemini_system_settings =
+    let gemini_settings_override =
         if tool == AIToolType::Gemini && env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH") {
             Some(prepare_gemini_api_key_settings_override(&mut env).await?)
         } else {
@@ -306,7 +304,7 @@ pub(crate) async fn prepare_runtime_env(
         learned_requires_reasoning,
         pi_agent_dir,
         codex_oauth_sync,
-        gemini_system_settings,
+        gemini_settings_override,
         run_tally,
     })
 }
@@ -553,26 +551,73 @@ pub(crate) fn is_oauth_invalid_grant(e: &anyhow::Error) -> bool {
         || s.contains("refresh failed (404")
 }
 
-/// Writes a gemini-cli *system-scope* settings file containing just
-/// `security.auth.selectedType = "gemini-api-key"` and points
-/// `GEMINI_CLI_SYSTEM_SETTINGS_PATH` at it. The CLI merges system over
-/// user over defaults, so this forces the `USE_GEMINI` auth path (which
-/// honors `GEMINI_API_KEY` + `GOOGLE_GEMINI_BASE_URL`) even when the
-/// user's `~/.gemini/settings.json` has a stale `oauth-personal`
-/// selection from a prior Google login. Without this,
-/// `configuredAuthType || getAuthTypeFromEnv()` in gemini-cli returns
-/// `LOGIN_WITH_GOOGLE` and every request bypasses aivo's router.
-///
-/// The user's real settings file is never read, copied, or written by
-/// aivo; in-session edits (theme, vim mode, MCP server tweaks, model
-/// preferences) persist to `~/.gemini/` as usual. Auto-fallbacks via
-/// `activateFallbackMode` use `isTemporary=true` in gemini-cli and so
-/// skip the user-scope `model.name` write, which is the only automatic
-/// write path that could leak an aivo-injected model back into the
-/// user's defaults.
+/// 0.60+ skips a user-owned `GEMINI_CLI_SYSTEM_SETTINGS_PATH`, so we also pin
+/// `selectedType` via a `GEMINI_CLI_HOME` shadow. Drop restores the real file.
+pub(crate) struct GeminiSettingsOverride {
+    #[allow(dead_code)]
+    dir: tempfile::TempDir,
+    shadow_user_settings: PathBuf,
+    real_user_settings: Option<PathBuf>,
+    original_selected_type: Option<serde_json::Value>,
+    had_selected_type: bool,
+    original_model_configs: Option<serde_json::Value>,
+    had_model_configs: bool,
+    had_real_file: bool,
+    sync_back: bool,
+}
+
+impl Drop for GeminiSettingsOverride {
+    fn drop(&mut self) {
+        self.sync_user_settings_back();
+    }
+}
+
+impl GeminiSettingsOverride {
+    fn sync_user_settings_back(&self) {
+        let Some(real) = self.real_user_settings.as_ref() else {
+            return;
+        };
+        if !self.sync_back {
+            return;
+        }
+        let Ok(bytes) = std::fs::read(&self.shadow_user_settings) else {
+            return;
+        };
+        let Ok(mut current) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        restore_gemini_user_settings_pins(
+            &mut current,
+            self.original_selected_type.as_ref(),
+            self.had_selected_type,
+            self.original_model_configs.as_ref(),
+            self.had_model_configs,
+        );
+        let empty = current.as_object().is_some_and(|o| o.is_empty());
+        if empty && !self.had_real_file {
+            let _ = std::fs::remove_file(real);
+            return;
+        }
+        if let Some(parent) = real.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(body) = serde_json::to_vec_pretty(&current) {
+            let _ = std::fs::write(real, body);
+        }
+    }
+}
+
 async fn prepare_gemini_api_key_settings_override(
     env: &mut HashMap<String, String>,
-) -> Result<tempfile::TempDir> {
+) -> Result<GeminiSettingsOverride> {
+    let real_gemini = crate::services::system_env::home_dir().map(|h| h.join(".gemini"));
+    prepare_gemini_api_key_settings_override_with_real(env, real_gemini.as_deref()).await
+}
+
+async fn prepare_gemini_api_key_settings_override_with_real(
+    env: &mut HashMap<String, String>,
+    real_gemini: Option<&Path>,
+) -> Result<GeminiSettingsOverride> {
     use anyhow::Context;
     env.remove("AIVO_GEMINI_FORCE_API_KEY_AUTH");
     let model_config_model = env.remove("AIVO_GEMINI_MODEL_CONFIG_MODEL");
@@ -581,7 +626,7 @@ async fn prepare_gemini_api_key_settings_override(
         .prefix("aivo-gemini-settings-")
         .tempdir()
         .context("create aivo gemini settings override temp dir")?;
-    let path = dir.path().join("settings.json");
+
     let mut settings = serde_json::json!({
         "security": {
             "auth": {
@@ -592,15 +637,158 @@ async fn prepare_gemini_api_key_settings_override(
     if let Some(model) = model_config_model.filter(|m| !m.trim().is_empty()) {
         settings["modelConfigs"] = gemini_internal_model_config_override(&model);
     }
-    tokio::fs::write(&path, serde_json::to_vec(&settings)?)
+    let system_path = dir.path().join("settings.json");
+    tokio::fs::write(&system_path, serde_json::to_vec(&settings)?)
         .await
         .context("write aivo gemini system settings override")?;
-
     env.insert(
         "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
-        path.to_string_lossy().to_string(),
+        system_path.to_string_lossy().to_string(),
     );
-    Ok(dir)
+
+    let fake_home = dir.path().join("home");
+    let shadow_gemini = fake_home.join(".gemini");
+    tokio::fs::create_dir_all(&shadow_gemini)
+        .await
+        .context("create aivo gemini GEMINI_CLI_HOME .gemini dir")?;
+
+    let real_user_settings = real_gemini.map(|p| p.join("settings.json"));
+    let (mut user_settings, had_real_file, sync_back) =
+        load_gemini_user_settings(real_user_settings.as_deref()).await;
+    let original_selected_type = user_settings
+        .pointer("/security/auth/selectedType")
+        .cloned();
+    let had_selected_type = original_selected_type.is_some();
+    let original_model_configs = user_settings.get("modelConfigs").cloned();
+    let had_model_configs = original_model_configs.is_some();
+    pin_gemini_api_key_auth(&mut user_settings, settings.get("modelConfigs"));
+
+    let shadow_user_settings = shadow_gemini.join("settings.json");
+    tokio::fs::write(
+        &shadow_user_settings,
+        serde_json::to_vec_pretty(&user_settings)?,
+    )
+    .await
+    .context("write aivo gemini user-scope settings overlay")?;
+
+    if let Some(real_gemini) = real_gemini.filter(|p| p.is_dir()) {
+        link_gemini_user_state(real_gemini, &shadow_gemini).await;
+    }
+
+    env.insert(
+        "GEMINI_CLI_HOME".to_string(),
+        fake_home.to_string_lossy().to_string(),
+    );
+
+    Ok(GeminiSettingsOverride {
+        dir,
+        shadow_user_settings,
+        real_user_settings,
+        original_selected_type,
+        had_selected_type,
+        original_model_configs,
+        had_model_configs,
+        had_real_file,
+        sync_back,
+    })
+}
+
+fn pin_gemini_api_key_auth(
+    settings: &mut serde_json::Value,
+    model_configs: Option<&serde_json::Value>,
+) {
+    settings["security"]["auth"]["selectedType"] =
+        serde_json::Value::String("gemini-api-key".into());
+    if let Some(model_configs) = model_configs {
+        settings["modelConfigs"] = model_configs.clone();
+    }
+}
+
+async fn load_gemini_user_settings(path: Option<&Path>) -> (serde_json::Value, bool, bool) {
+    let Some(path) = path else {
+        return (serde_json::json!({}), false, false);
+    };
+    match tokio::fs::read(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (serde_json::json!({}), false, true),
+        Err(_) => (serde_json::json!({}), true, false),
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(v) if v.is_object() => (v, true, true),
+            _ => (serde_json::json!({}), true, false),
+        },
+    }
+}
+
+async fn link_gemini_user_state(real_gemini: &Path, shadow_gemini: &Path) {
+    let Ok(mut rd) = tokio::fs::read_dir(real_gemini).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if entry.file_name() == "settings.json" {
+            continue;
+        }
+        let src = entry.path();
+        let dest = shadow_gemini.join(entry.file_name());
+        if src.is_dir() {
+            let _ = symlink_dir(&src, &dest).await;
+        } else {
+            let _ = symlink_file(&src, &dest).await;
+        }
+    }
+}
+
+fn restore_gemini_user_settings_pins(
+    current: &mut serde_json::Value,
+    original_selected_type: Option<&serde_json::Value>,
+    had_selected_type: bool,
+    original_model_configs: Option<&serde_json::Value>,
+    had_model_configs: bool,
+) {
+    if had_selected_type && let Some(v) = original_selected_type {
+        current["security"]["auth"]["selectedType"] = v.clone();
+    } else if !had_selected_type {
+        remove_json_path(current, &["security", "auth", "selectedType"]);
+        prune_empty_json_object(current, &["security", "auth"]);
+        prune_empty_json_object(current, &["security"]);
+    }
+
+    if had_model_configs && let Some(v) = original_model_configs {
+        current["modelConfigs"] = v.clone();
+    } else if !had_model_configs && let Some(obj) = current.as_object_mut() {
+        obj.remove("modelConfigs");
+    }
+}
+
+fn remove_json_path(value: &mut serde_json::Value, path: &[&str]) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() == 1 {
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove(path[0]);
+        }
+        return;
+    }
+    if let Some(child) = value.get_mut(path[0]) {
+        remove_json_path(child, &path[1..]);
+    }
+}
+
+fn prune_empty_json_object(value: &mut serde_json::Value, path: &[&str]) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() > 1
+        && let Some(child) = value.get_mut(path[0])
+    {
+        prune_empty_json_object(child, &path[1..]);
+    }
+    let empty = value
+        .get(path[0])
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.is_empty());
+    if empty && let Some(obj) = value.as_object_mut() {
+        obj.remove(path[0]);
+    }
 }
 
 fn gemini_internal_model_config_override(model: &str) -> serde_json::Value {
@@ -1708,7 +1896,7 @@ async fn start_responses_to_chat_copilot_router(
 mod tests {
     use super::{
         clear_node_proxy_env, is_oauth_invalid_grant, patch_opencode_config_content,
-        prepare_gemini_api_key_settings_override,
+        prepare_gemini_api_key_settings_override_with_real,
     };
     use crate::services::provider_protocol::ProviderProtocol;
     use std::collections::{BTreeMap, HashMap};
@@ -1964,33 +2152,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_gemini_api_key_settings_override_pins_selected_type() {
-        let mut env = HashMap::from([
-            (
-                "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
-                "1".to_string(),
-            ),
-            (
-                "AIVO_GEMINI_MODEL_CONFIG_MODEL".to_string(),
-                "aivo/starter".to_string(),
-            ),
-        ]);
-        let dir = prepare_gemini_api_key_settings_override(&mut env)
-            .await
-            .unwrap();
-
-        // Sentinel consumed — must not leak to the spawned child.
-        assert!(!env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH"));
-        assert!(!env.contains_key("AIVO_GEMINI_MODEL_CONFIG_MODEL"));
-
-        // Child sees a system-scope settings override path. Because
-        // system-scope wins over user-scope in gemini-cli's merge, this
-        // pins selectedType regardless of any stale `oauth-personal` in
-        // the user's real ~/.gemini/settings.json.
-        let path = env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH").unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    fn assert_gemini_api_key_pin(parsed: &serde_json::Value) {
         assert_eq!(
             parsed["security"]["auth"]["selectedType"].as_str(),
             Some("gemini-api-key")
@@ -2004,14 +2166,175 @@ mod tests {
             parsed["modelConfigs"]["customAliases"]["classifier"]["modelConfig"]["model"].as_str(),
             Some("aivo/starter")
         );
+    }
 
-        // We deliberately don't redirect GEMINI_CLI_HOME — user's real
-        // ~/.gemini/ stays the gemini-cli user-scope root so in-session
-        // edits (theme, vim mode, MCP tweaks) persist normally.
-        assert!(!env.contains_key("GEMINI_CLI_HOME"));
+    #[tokio::test]
+    async fn prepare_gemini_api_key_settings_override_pins_selected_type() {
+        let mut env = HashMap::from([
+            (
+                "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "AIVO_GEMINI_MODEL_CONFIG_MODEL".to_string(),
+                "aivo/starter".to_string(),
+            ),
+        ]);
+        let overlay = prepare_gemini_api_key_settings_override_with_real(&mut env, None)
+            .await
+            .unwrap();
 
-        drop(dir);
-        assert!(!std::path::Path::new(path).exists());
+        assert!(!env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH"));
+        assert!(!env.contains_key("AIVO_GEMINI_MODEL_CONFIG_MODEL"));
+
+        let path = env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH").unwrap().clone();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_gemini_api_key_pin(&parsed);
+
+        let home = env.get("GEMINI_CLI_HOME").unwrap();
+        let user_path = std::path::Path::new(home).join(".gemini/settings.json");
+        let user: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&user_path).unwrap()).unwrap();
+        assert_gemini_api_key_pin(&user);
+
+        drop(overlay);
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(!user_path.exists());
+    }
+
+    #[tokio::test]
+    async fn gemini_home_shadow_overrides_oauth_personal_without_touching_real_file() {
+        let real_home = tempfile::tempdir().unwrap();
+        let real_gemini = real_home.path().join(".gemini");
+        std::fs::create_dir_all(&real_gemini).unwrap();
+        let real_settings = real_gemini.join("settings.json");
+        std::fs::write(
+            &real_settings,
+            r#"{"security":{"auth":{"selectedType":"oauth-personal"}},"theme":"dark"}"#,
+        )
+        .unwrap();
+        std::fs::write(real_gemini.join("oauth_creds.json"), "{}").unwrap();
+
+        let mut env = HashMap::from([(
+            "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+            "1".to_string(),
+        )]);
+        let overlay = prepare_gemini_api_key_settings_override_with_real(
+            &mut env,
+            Some(real_gemini.as_path()),
+        )
+        .await
+        .unwrap();
+
+        let home = env.get("GEMINI_CLI_HOME").unwrap();
+        let shadow_settings = std::path::Path::new(home).join(".gemini/settings.json");
+        let shadow: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&shadow_settings).unwrap()).unwrap();
+        assert_eq!(
+            shadow["security"]["auth"]["selectedType"].as_str(),
+            Some("gemini-api-key")
+        );
+        assert_eq!(shadow["theme"].as_str(), Some("dark"));
+
+        let real: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real_settings).unwrap()).unwrap();
+        assert_eq!(
+            real["security"]["auth"]["selectedType"].as_str(),
+            Some("oauth-personal")
+        );
+
+        let shadow_creds = std::path::Path::new(home).join(".gemini/oauth_creds.json");
+        assert!(
+            std::fs::symlink_metadata(&shadow_creds)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+                || shadow_creds.exists(),
+            "non-settings ~/.gemini entries should surface through the shadow"
+        );
+
+        drop(overlay);
+        let restored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real_settings).unwrap()).unwrap();
+        assert_eq!(
+            restored["security"]["auth"]["selectedType"].as_str(),
+            Some("oauth-personal")
+        );
+        assert_eq!(restored["theme"].as_str(), Some("dark"));
+    }
+
+    #[tokio::test]
+    async fn gemini_home_shadow_syncs_session_edits_back_without_leaving_the_pin() {
+        let real_home = tempfile::tempdir().unwrap();
+        let real_gemini = real_home.path().join(".gemini");
+        std::fs::create_dir_all(&real_gemini).unwrap();
+        let real_settings = real_gemini.join("settings.json");
+        std::fs::write(
+            &real_settings,
+            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+        )
+        .unwrap();
+
+        let mut env = HashMap::from([(
+            "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+            "1".to_string(),
+        )]);
+        let overlay = prepare_gemini_api_key_settings_override_with_real(
+            &mut env,
+            Some(real_gemini.as_path()),
+        )
+        .await
+        .unwrap();
+
+        let home = env.get("GEMINI_CLI_HOME").unwrap();
+        let shadow_settings = std::path::Path::new(home).join(".gemini/settings.json");
+        let mut shadow: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&shadow_settings).unwrap()).unwrap();
+        shadow["theme"] = serde_json::Value::String("ansi".into());
+        std::fs::write(
+            &shadow_settings,
+            serde_json::to_vec_pretty(&shadow).unwrap(),
+        )
+        .unwrap();
+
+        drop(overlay);
+        let restored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real_settings).unwrap()).unwrap();
+        assert_eq!(
+            restored["security"]["auth"]["selectedType"].as_str(),
+            Some("oauth-personal"),
+            "injected pin must not leak into the real user settings"
+        );
+        assert_eq!(
+            restored["theme"].as_str(),
+            Some("ansi"),
+            "in-session edits to the overlay should persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_home_shadow_does_not_create_real_settings_when_unused() {
+        let real_home = tempfile::tempdir().unwrap();
+        let real_gemini = real_home.path().join(".gemini");
+        let real_settings = real_gemini.join("settings.json");
+
+        let mut env = HashMap::from([(
+            "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+            "1".to_string(),
+        )]);
+        let overlay = prepare_gemini_api_key_settings_override_with_real(
+            &mut env,
+            Some(real_gemini.as_path()),
+        )
+        .await
+        .unwrap();
+        drop(overlay);
+
+        assert!(
+            !real_settings.exists(),
+            "fresh HOME (canary) must not grow a leftover settings.json"
+        );
     }
 
     #[tokio::test]
