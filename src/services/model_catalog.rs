@@ -71,8 +71,10 @@ impl ModelInfo {
     }
 }
 
+/// `{"data":[{"id":…}]}`, or `{"models":[{"name":…}]}` (TypeSafe).
 #[derive(Deserialize)]
 struct OpenAIModelsResponse {
+    #[serde(alias = "models")]
     data: Vec<OpenAIModel>,
 }
 
@@ -81,6 +83,8 @@ struct OpenAIModelsResponse {
 /// any provider's response shape (OpenRouter, Vercel, OpenAI, etc.).
 #[derive(Deserialize)]
 struct OpenAIModel {
+    // TypeSafe-style listings name models instead of id-ing them.
+    #[serde(alias = "name")]
     id: String,
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
@@ -1020,8 +1024,10 @@ pub(crate) async fn fetch_models_detailed_filtered(
             let candidates = openai_models_candidates(base);
             let auth = format!("Bearer {}", key.key.as_str());
 
-            let mut last_err = String::new();
-            let mut missing_everywhere = true;
+            let mut missing_err = String::new();
+            // Anything else is the real problem — a later candidate's 404 must
+            // not mask it.
+            let mut real_err: Option<String> = None;
             let mut success: Option<Vec<ModelInfo>> = None;
             for url in &candidates {
                 let response = crate::services::opencode_session::with_session_header(
@@ -1042,9 +1048,11 @@ pub(crate) async fn fetch_models_detailed_filtered(
                     if crate::services::provider_protocol::is_terminal_upstream_error(code) {
                         return Err(error);
                     }
-                    missing_everywhere &=
-                        crate::services::provider_protocol::is_endpoint_missing(code);
-                    last_err = error.to_string();
+                    if crate::services::provider_protocol::is_endpoint_missing(code) {
+                        missing_err = error.to_string();
+                    } else {
+                        real_err = Some(error.to_string());
+                    }
                     continue;
                 }
 
@@ -1061,18 +1069,15 @@ pub(crate) async fn fetch_models_detailed_filtered(
                         break;
                     }
                     Err(e) => {
-                        missing_everywhere = false;
-                        last_err = format!("Invalid models response from {}: {}", url, e);
+                        real_err = Some(format!("Invalid models response from {}: {}", url, e));
                     }
                 }
             }
 
-            match success {
-                Some(v) => Ok(v),
-                None if missing_everywhere => {
-                    Err(anyhow::Error::new(NoModelsEndpoint).context(last_err))
-                }
-                None => anyhow::bail!("{}", last_err),
+            match (success, real_err) {
+                (Some(v), _) => Ok(v),
+                (None, Some(e)) => anyhow::bail!("{}", e),
+                (None, None) => Err(anyhow::Error::new(NoModelsEndpoint).context(missing_err)),
             }
         }
     }?
@@ -1229,6 +1234,64 @@ mod tests {
             "an auth error must not trigger the fallback /models request"
         );
         server.abort();
+    }
+
+    #[test]
+    fn models_response_accepts_named_envelope() {
+        let resp: OpenAIModelsResponse =
+            serde_json::from_str(r#"{"models":[{"name":"jev-latest"}]}"#).unwrap();
+        assert_eq!(resp.data[0].id, "jev-latest");
+    }
+
+    #[test]
+    fn models_response_error_names_openai_field() {
+        let Err(err) = serde_json::from_str::<OpenAIModelsResponse>(r#"{"ok":true}"#) else {
+            panic!("neither envelope must parse");
+        };
+        assert!(err.to_string().contains("data"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn openai_models_accepts_named_envelope() {
+        let (base, handle) = spawn_sequence_server(vec![(
+            200,
+            r#"{"models":[{"name":"jev-latest"}]}"#.to_string(),
+        )])
+        .await;
+        let key = make_key(&base);
+        let client = crate::services::http_utils::router_http_client_loopback();
+        let models = fetch_models_detailed_filtered(&client, &key, false)
+            .await
+            .expect("a non-OpenAI envelope must still list models");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "jev-latest");
+        assert_eq!(handle.await.unwrap(), vec!["/v1/models"]);
+    }
+
+    #[tokio::test]
+    async fn openai_models_unparseable_body_surfaces_over_fallback_404() {
+        let (base, handle) = spawn_sequence_server(vec![
+            (200, r#"{"ok":true}"#.to_string()),
+            (404, r#"{"detail":"Not Found"}"#.to_string()),
+        ])
+        .await;
+        let key = make_key(&base);
+        let client = crate::services::http_utils::router_http_client_loopback();
+        let error = fetch_models_detailed_filtered(&client, &key, false)
+            .await
+            .expect_err("an unreadable listing must fail");
+
+        let msg = error.to_string();
+        assert!(
+            msg.contains("Invalid models response") && msg.contains("/v1/models"),
+            "the parse failure must be reported, not the fallback 404: {msg}"
+        );
+        assert!(
+            !msg.contains("base URL may be wrong"),
+            "the fallback 404 must not be blamed on the base URL: {msg}"
+        );
+        assert_eq!(handle.await.unwrap(), vec!["/v1/models", "/models"]);
     }
 
     async fn spawn_sequence_server(
