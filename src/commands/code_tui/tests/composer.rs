@@ -171,6 +171,14 @@ fn test_insert_pasted_text_normalizes_cr_to_newline() {
     assert_eq!(app.cursor, app.draft.len());
 }
 
+#[test]
+fn test_insert_pasted_text_drops_kitty_graphics_replies() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.insert_pasted_text("_Gi=0;OK\\_Gi=0;OK");
+    assert!(app.draft.is_empty());
+}
+
 #[tokio::test]
 async fn paste_composes_while_sending() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

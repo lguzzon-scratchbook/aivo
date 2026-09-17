@@ -250,6 +250,9 @@ impl CodeTuiApp {
     }
 
     pub(super) fn insert_pasted_text(&mut self, text: &str) {
+        if crate::services::terminal_graphics::is_graphics_protocol_reply(text) {
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         self.leave_history_navigation();
         for ch in text.chars() {

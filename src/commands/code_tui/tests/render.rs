@@ -1192,7 +1192,11 @@ fn test_inline_image_preview_rows_reserved_and_anchored() {
     );
 
     let body = app.build_transcript_history_body(80);
-    let anchors: Vec<_> = body.lines.iter().filter_map(|l| l.image).collect();
+    let anchors: Vec<_> = body
+        .lines
+        .iter()
+        .flat_map(|l| l.images.iter().copied())
+        .collect();
     assert_eq!(anchors.len(), 1, "one attachment → one anchor");
     let anchor = anchors[0];
     assert_eq!(anchor.key, key);
@@ -1246,7 +1250,7 @@ fn test_inline_image_preview_rows_reserved_and_anchored() {
     app.inline_images.caps = GraphicsCaps::default();
     app.bump_transcript_revision();
     let body = app.build_transcript_history_body(80);
-    assert!(body.lines.iter().all(|l| l.image.is_none()));
+    assert!(body.lines.iter().all(|l| l.images.is_empty()));
     assert!(body.lines.iter().all(|l| !l.plain.contains('\u{200B}')));
 }
 
@@ -1296,14 +1300,14 @@ fn test_user_named_image_previews_under_the_reply() {
     let anchor_row = body
         .lines
         .iter()
-        .position(|l| l.image.is_some())
+        .position(|l| !l.images.is_empty())
         .expect("the mention previews somewhere");
     assert!(
         anchor_row > row_of("Here it is, rendered."),
         "the picture belongs under the reply, not above the work that found it"
     );
     assert_eq!(
-        body.lines.iter().filter(|l| l.image.is_some()).count(),
+        body.lines.iter().filter(|l| !l.images.is_empty()).count(),
         1,
         "one mention, one image"
     );
@@ -1326,7 +1330,7 @@ fn test_user_named_image_previews_under_the_reply() {
     let anchor_row = body
         .lines
         .iter()
-        .position(|l| l.image.is_some())
+        .position(|l| !l.images.is_empty())
         .expect("an unanswered turn still previews");
     let second_user = body
         .lines
@@ -1350,7 +1354,7 @@ fn test_user_named_image_previews_under_the_reply() {
     app.inline_images.previews.insert(KEY, ready(KEY));
     let body = app.build_transcript_history_body(80);
     assert!(
-        body.lines.iter().any(|l| l.image.is_some()),
+        body.lines.iter().any(|l| !l.images.is_empty()),
         "a turn with no reply yet still shows the picture"
     );
 }
@@ -1696,11 +1700,64 @@ fn test_inline_image_dedup_is_by_content_not_source_key() {
     app.inline_images.previews.insert(keys[0], ready(0x77));
     app.inline_images.previews.insert(keys[1], ready(0x77));
     let body = app.build_transcript_history_body(80);
-    assert_eq!(body.lines.iter().filter(|l| l.image.is_some()).count(), 1);
+    assert_eq!(body.lines.iter().map(|l| l.images.len()).sum::<usize>(), 1);
 
-    // Genuinely different pixels → two blocks.
+    // Genuinely different pixels → two previews (packed onto one band when they fit).
     app.inline_images.previews.insert(keys[1], ready(0x88));
     app.bump_transcript_revision();
     let body = app.build_transcript_history_body(80);
-    assert_eq!(body.lines.iter().filter(|l| l.image.is_some()).count(), 2);
+    assert_eq!(body.lines.iter().map(|l| l.images.len()).sum::<usize>(), 2);
+}
+
+#[test]
+fn test_consecutive_portrait_attachments_pack_on_one_band() {
+    use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: false,
+        ..GraphicsCaps::default()
+    };
+    let make_att = |data: &str| MessageAttachment {
+        name: format!("{data}.png"),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::Inline {
+            data: data.to_string(),
+        },
+    };
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "three portraits".to_string(),
+        reasoning_content: None,
+        attachments: vec![make_att("p1"), make_att("p2"), make_att("p3")],
+    });
+    let ready = |hash: u64| {
+        PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
+            format: PixelFormat::Png,
+            px_w: 500,
+            px_h: 1000,
+            payload_b64: "AAAA".to_string(),
+            thumb: None,
+            content_hash: hash,
+        }))
+    };
+    for (i, att) in app.history[0].attachments.iter().enumerate() {
+        let AttachmentStorage::Inline { data } = &att.storage else {
+            unreachable!();
+        };
+        app.inline_images
+            .previews
+            .insert(hash_inline(data), ready(0x100 + i as u64));
+    }
+    let body = app.build_transcript_history_body(80);
+    let band = body
+        .lines
+        .iter()
+        .find(|l| l.images.len() > 1)
+        .expect("portraits should share a band");
+    assert_eq!(band.images.len(), 3);
+    assert!(band.images[1].col_offset >= band.images[0].cols);
+    assert!(band.images[2].col_offset >= band.images[1].col_offset + band.images[1].cols);
 }

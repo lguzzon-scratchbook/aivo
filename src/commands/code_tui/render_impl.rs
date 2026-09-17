@@ -2935,6 +2935,11 @@ impl CodeTuiApp {
                     skip = 0;
                 }
             }
+            self.suppress_partial_inline_images(
+                &mut visible_lines,
+                view_start,
+                usize::from(transcript_text_area.height),
+            );
             let visible_text = Text::from(visible_lines);
             let transcript_widget = Paragraph::new(visible_text).style(Style::default().fg(TEXT()));
             frame.render_widget(transcript_widget, transcript_text_area);

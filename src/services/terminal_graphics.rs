@@ -454,6 +454,18 @@ pub fn image_id(key: u64) -> u32 {
     id.max(1)
 }
 
+/// `q=2` is not always honored; `_Gi=<id>;OK` then lands in stdin.
+pub fn is_graphics_protocol_reply(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    t.split(['\\', '\n', '\x1b'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .all(|part| part.starts_with("_Gi=") && part.contains(";OK"))
+}
+
 const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// Quantize one channel to `levels` with ordered dithering — banding on
@@ -637,6 +649,15 @@ mod tests {
         assert_eq!(image_id(0), 1);
         assert!(image_id(0xdead_beef_0000_0001) <= 0x00FF_FFFF);
         assert!(image_id(u64::MAX) >= 1);
+    }
+
+    #[test]
+    fn graphics_protocol_replies_are_detected() {
+        assert!(is_graphics_protocol_reply("_Gi=0;OK"));
+        assert!(is_graphics_protocol_reply("_Gi=0;OK\\_Gi=0;OK"));
+        assert!(is_graphics_protocol_reply("\x1b_Gi=3;OK\x1b\\"));
+        assert!(!is_graphics_protocol_reply("hello _Gi=0;OK"));
+        assert!(!is_graphics_protocol_reply("Gi=0;OK"));
     }
 
     #[test]

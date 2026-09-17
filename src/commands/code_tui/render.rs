@@ -3,19 +3,22 @@ use std::borrow::Cow;
 
 /// A logical line's inline-image block: `rows` reserved rows (this line is the
 /// first) that `render_main` maps to a screen rect for Kitty-graphics placement.
+/// Packed previews share a start row and distinguish themselves by `col_offset`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ImageAnchor {
     pub(super) key: u64,
     pub(super) cols: u16,
     pub(super) rows: u16,
+    /// Columns from the start of the preview band (before sub-block indent).
+    pub(super) col_offset: u16,
 }
 
 #[derive(Clone, Default, PartialEq)]
 pub(super) struct StyledLine {
     pub(super) line: Line<'static>,
     pub(super) plain: String,
-    /// Set on the first reserved row of an image preview block.
-    pub(super) image: Option<ImageAnchor>,
+    /// Anchors on the first reserved row of each preview (several when packed).
+    pub(super) images: Vec<ImageAnchor>,
     /// Bypass the word-wrapper (always exactly one visual row). Image preview
     /// rows need this: the wrapper counts every char ≥1 column, which would
     /// shear a placeholder row's zero-width diacritics across rows.
@@ -222,7 +225,7 @@ pub(super) fn wrap_transcript(
     for (idx, sl) in lines.iter().enumerate() {
         let bar = bars.get(idx).copied().flatten();
         let start = text_lines.len();
-        if let Some(anchor) = sl.image {
+        for &anchor in &sl.images {
             image_rows.push((start, anchor));
         }
         if sl.no_wrap {
@@ -999,7 +1002,7 @@ pub(super) fn mark_block_from(
             out.push(StyledLine {
                 line: Line::from(spans),
                 plain: format!("{lead_plain}{}", row.plain),
-                image: row.image,
+                images: row.images,
                 no_wrap: row.no_wrap,
             });
         }
@@ -2937,7 +2940,7 @@ pub(super) fn indent_styled_line(sl: StyledLine, n: usize) -> StyledLine {
     StyledLine {
         line: Line::from(spans),
         plain: format!("{pad}{}", sl.plain),
-        image: sl.image,
+        images: sl.images,
         no_wrap: sl.no_wrap,
     }
 }

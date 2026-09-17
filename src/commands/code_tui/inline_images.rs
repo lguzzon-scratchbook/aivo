@@ -8,7 +8,9 @@
 
 use super::*;
 use crate::services::session_store::AttachmentStorage;
-use crate::services::terminal_graphics::{self, EncodedPreview, GraphicsCaps, Protocol, image_id};
+use crate::services::terminal_graphics::{
+    self, EncodedPreview, GraphicsCaps, PLACEHOLDER_CHAR, Protocol, image_id,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,8 @@ use std::sync::Arc;
 
 const MAX_PREVIEW_COLS: u16 = 46;
 const MAX_PREVIEW_ROWS: u16 = 12;
+/// Gap between previews packed onto the same band.
+const PREVIEW_PACK_GAP: u16 = 2;
 /// Half-blocks get a bigger cell budget: every cell is worth only 1×2 pixels,
 /// so the grid IS the resolution — a square image at 12 rows would be a
 /// 24×24-pixel picture.
@@ -505,39 +509,98 @@ pub(super) fn prepare_preview_source(source: PreviewSource) -> Option<EncodedPre
     prepare_bytes(bytes)
 }
 
+fn preview_caps(protocol: Protocol) -> (u16, u16) {
+    if protocol == Protocol::HalfBlocks {
+        (MAX_HALF_BLOCK_COLS, MAX_HALF_BLOCK_ROWS)
+    } else {
+        (MAX_PREVIEW_COLS, MAX_PREVIEW_ROWS)
+    }
+}
+
+fn preview_col_budget(width: u16, protocol: Protocol) -> u16 {
+    preview_caps(protocol).0.min(width.saturating_sub(6))
+}
+
 pub(super) fn preview_grid(
     px_w: u32,
     px_h: u32,
     width: u16,
     protocol: Protocol,
 ) -> Option<(u16, u16)> {
-    if px_w == 0 || px_h == 0 {
-        return None;
+    pane_preview_grid(
+        px_w,
+        px_h,
+        preview_col_budget(width, protocol),
+        preview_caps(protocol).1,
+        protocol,
+    )
+}
+
+fn half_block_pixels(preview: &EncodedPreview, cols: u16, rows: u16) -> Option<Vec<u8>> {
+    let thumb = preview.thumb.as_ref()?;
+    Some(crate::services::image_optimize::resample_rgb_exact(
+        &thumb.rgb,
+        thumb.w,
+        thumb.h,
+        u32::from(cols),
+        u32::from(rows) * 2,
+    ))
+}
+
+/// One cell-row of a preview: placeholders, half-blocks, or a reserved ZWSP.
+fn preview_row_line(
+    key: u64,
+    row: u16,
+    cols: u16,
+    protocol: Protocol,
+    pixel_grid: Option<&[u8]>,
+) -> Line<'static> {
+    match protocol {
+        Protocol::KittyVirtual => {
+            let (r, g, b) = terminal_graphics::placeholder_fg(image_id(key));
+            Line::from(Span::styled(
+                terminal_graphics::placeholder_row(row, cols),
+                Style::default().fg(Color::Rgb(r, g, b)),
+            ))
+        }
+        Protocol::HalfBlocks => half_block_row(pixel_grid.unwrap_or(&[]), row, cols),
+        _ => Line::from(Span::raw(RESERVED_ROW)),
     }
-    let half_blocks = protocol == Protocol::HalfBlocks;
-    let (cap_cols, cap_rows, px_per_col) = if half_blocks {
-        (MAX_HALF_BLOCK_COLS, MAX_HALF_BLOCK_ROWS, 1)
-    } else {
-        (MAX_PREVIEW_COLS, MAX_PREVIEW_ROWS, MIN_SOURCE_PX_PER_COL)
-    };
-    let max_cols = cap_cols.min(width.saturating_sub(6));
-    if max_cols < 4 {
-        return None;
+}
+
+fn extend_preview_row(
+    line: &mut Line<'static>,
+    pad_cols: u16,
+    key: u64,
+    row: u16,
+    cols: u16,
+    protocol: Protocol,
+    pixel_grid: Option<&[u8]>,
+) {
+    if pad_cols > 0 {
+        line.spans
+            .push(Span::raw(" ".repeat(usize::from(pad_cols))));
     }
-    let source_cap = u16::try_from((px_w / px_per_col).max(4)).unwrap_or(u16::MAX);
-    let aspect = f64::from(px_h) / f64::from(px_w);
-    let mut cols = max_cols.min(source_cap);
-    let mut rows = (aspect * f64::from(cols) * CELL_WIDTH_OVER_HEIGHT)
-        .round()
-        .max(1.0) as u16;
-    if rows > cap_rows {
-        rows = cap_rows;
-        cols = (f64::from(rows) / CELL_WIDTH_OVER_HEIGHT / aspect)
-            .round()
-            .max(1.0) as u16;
-        cols = cols.min(max_cols);
+    line.spans
+        .extend(preview_row_line(key, row, cols, protocol, pixel_grid).spans);
+}
+
+fn band_row_width(anchors: &[ImageAnchor], row: u16) -> u16 {
+    anchors
+        .iter()
+        .filter(|a| row < a.rows)
+        .map(|a| a.col_offset.saturating_add(a.cols))
+        .max()
+        .unwrap_or(0)
+}
+
+fn reserved_preview_line(line: Line<'static>, images: Vec<ImageAnchor>) -> StyledLine {
+    StyledLine {
+        line,
+        plain: RESERVED_ROW.to_string(),
+        images,
+        no_wrap: true,
     }
-    Some((cols, rows.max(1)))
 }
 
 fn push_preview_rows(
@@ -550,46 +613,174 @@ fn push_preview_rows(
     let Some((cols, rows)) = preview_grid(preview.px_w, preview.px_h, width, protocol) else {
         return;
     };
-    // Half-blocks: box-average the thumb to exactly the cols×2·rows pixel
-    // grid once — smoother than per-cell nearest sampling.
-    let pixel_grid: Option<Vec<u8>> = match (protocol, &preview.thumb) {
-        (Protocol::HalfBlocks, Some(thumb)) => {
-            Some(crate::services::image_optimize::resample_rgb_exact(
-                &thumb.rgb,
-                thumb.w,
-                thumb.h,
-                u32::from(cols),
-                u32::from(rows) * 2,
-            ))
-        }
-        (Protocol::HalfBlocks, None) => return,
+    let pixel_grid = match protocol {
+        Protocol::HalfBlocks => match half_block_pixels(preview, cols, rows) {
+            Some(grid) => Some(grid),
+            None => return,
+        },
         _ => None,
     };
     for row in 0..rows {
-        // `plain` stays ZWSP in every mode, so copy/selection treat the block
-        // as empty.
-        let line = match protocol {
-            Protocol::KittyVirtual => {
-                let (r, g, b) = terminal_graphics::placeholder_fg(image_id(key));
-                Line::from(Span::styled(
-                    terminal_graphics::placeholder_row(row, cols),
-                    Style::default().fg(Color::Rgb(r, g, b)),
-                ))
-            }
-            Protocol::HalfBlocks => half_block_row(pixel_grid.as_deref().unwrap_or(&[]), row, cols),
-            _ => Line::from(Span::raw(RESERVED_ROW)),
-        };
-        lines.push(StyledLine {
-            line,
-            plain: RESERVED_ROW.to_string(),
-            image: (row == 0).then_some(ImageAnchor { key, cols, rows }),
-            no_wrap: true,
-        });
+        lines.push(reserved_preview_line(
+            preview_row_line(key, row, cols, protocol, pixel_grid.as_deref()),
+            if row == 0 {
+                vec![ImageAnchor {
+                    key,
+                    cols,
+                    rows,
+                    col_offset: 0,
+                }]
+            } else {
+                Vec::new()
+            },
+        ));
     }
 }
 
-/// Like `preview_grid`, but bounded on BOTH axes — the pane is a fixed rect,
-/// not transcript flow.
+fn last_preview_band(lines: &[StyledLine]) -> Option<(usize, usize)> {
+    let last = lines.last()?;
+    if last.plain != RESERVED_ROW {
+        return None;
+    }
+    let mut start = lines.len() - 1;
+    while start > 0 && lines[start - 1].plain == RESERVED_ROW {
+        start -= 1;
+    }
+    if lines[start].images.is_empty() {
+        return None;
+    }
+    Some((start, lines.len()))
+}
+
+fn try_pack_preview(
+    lines: &mut Vec<StyledLine>,
+    key: u64,
+    preview: &EncodedPreview,
+    width: u16,
+    protocol: Protocol,
+) -> bool {
+    let Some((band_start, band_end)) = last_preview_band(lines) else {
+        return false;
+    };
+    let used = band_row_width(&lines[band_start].images, 0);
+    let remain = match preview_col_budget(width, protocol)
+        .checked_sub(used.saturating_add(PREVIEW_PACK_GAP))
+    {
+        Some(remain) if remain >= 4 => remain,
+        _ => return false,
+    };
+    let Some((cols, rows)) = pane_preview_grid(
+        preview.px_w,
+        preview.px_h,
+        remain,
+        preview_caps(protocol).1,
+        protocol,
+    ) else {
+        return false;
+    };
+    let pixel_grid = match protocol {
+        Protocol::HalfBlocks => match half_block_pixels(preview, cols, rows) {
+            Some(grid) => Some(grid),
+            None => return false,
+        },
+        _ => None,
+    };
+    let col_offset = used.saturating_add(PREVIEW_PACK_GAP);
+    let band_len = band_end - band_start;
+    let placed = lines[band_start].images.clone();
+    for row in 0..rows {
+        let pad = col_offset.saturating_sub(band_row_width(&placed, row));
+        let idx = band_start + usize::from(row);
+        if usize::from(row) < band_len {
+            extend_preview_row(
+                &mut lines[idx].line,
+                pad,
+                key,
+                row,
+                cols,
+                protocol,
+                pixel_grid.as_deref(),
+            );
+        } else {
+            let mut line = Line::default();
+            extend_preview_row(
+                &mut line,
+                pad,
+                key,
+                row,
+                cols,
+                protocol,
+                pixel_grid.as_deref(),
+            );
+            lines.push(reserved_preview_line(line, Vec::new()));
+        }
+    }
+    lines[band_start].images.push(ImageAnchor {
+        key,
+        cols,
+        rows,
+        col_offset,
+    });
+    true
+}
+
+/// Clip `r` to the window. `None` when the top is off-screen — a clipped
+/// placement would index the wrong slice.
+fn image_place_rows(row: usize, rows: u16, view_start: usize, view_rows: usize) -> Option<u16> {
+    if row < view_start {
+        return None;
+    }
+    let view_end = view_start.saturating_add(view_rows);
+    if row >= view_end {
+        return None;
+    }
+    let fit = view_end - row;
+    let shown = usize::from(rows).min(fit);
+    u16::try_from(shown).ok().filter(|&n| n > 0)
+}
+
+fn suppress_partial_image_placeholders(
+    visible: &mut [Line<'static>],
+    image_rows: &[(usize, ImageAnchor)],
+    view_start: usize,
+    view_rows: usize,
+    body_rows: usize,
+) {
+    let view_end = view_start.saturating_add(view_rows);
+    for &(row, anchor) in image_rows {
+        if image_place_rows(row, anchor.rows, view_start, view_rows).is_some() {
+            continue;
+        }
+        let end = row.saturating_add(usize::from(anchor.rows));
+        let from = row.max(view_start);
+        let to = end.min(view_end).min(body_rows);
+        for abs in from..to {
+            let vis_idx = abs.saturating_sub(view_start);
+            let Some(line) = visible.get_mut(vis_idx) else {
+                continue;
+            };
+            blank_virtual_placeholders(line, anchor.key);
+        }
+    }
+}
+
+fn blank_virtual_placeholders(line: &mut Line<'static>, key: u64) {
+    let (r, g, b) = terminal_graphics::placeholder_fg(image_id(key));
+    let target = Color::Rgb(r, g, b);
+    for span in &mut line.spans {
+        if span.style.fg == Some(target) {
+            let cols = span
+                .content
+                .chars()
+                .filter(|&c| c == PLACEHOLDER_CHAR)
+                .count();
+            if cols > 0 {
+                *span = Span::raw(" ".repeat(cols));
+            }
+        }
+    }
+}
+
 pub(super) fn pane_preview_grid(
     px_w: u32,
     px_h: u32,
@@ -859,17 +1050,15 @@ impl CodeTuiApp {
         if !seen.insert(preview.content_hash) {
             return;
         }
+        let protocol = self.inline_images.caps.protocol;
+        if try_pack_preview(lines, key, &preview, width, protocol) {
+            return;
+        }
         // Back-to-back blocks read as one glued picture.
         if lines.last().is_some_and(|l| l.plain == RESERVED_ROW) {
             push_styled_line(lines, "", Style::default());
         }
-        push_preview_rows(
-            lines,
-            key,
-            &preview,
-            width,
-            self.inline_images.caps.protocol,
-        );
+        push_preview_rows(lines, key, &preview, width, protocol);
     }
 
     pub(super) fn push_attachment_preview_lines(
@@ -1266,15 +1455,23 @@ impl CodeTuiApp {
                 wrapped
                     .image_rows
                     .iter()
-                    .find(|&&(r, a)| row >= r && row < r + usize::from(a.rows))
+                    .find(|&&(r, a)| {
+                        if row < r || row >= r + usize::from(a.rows) {
+                            return false;
+                        }
+                        // `col_offset` is band-relative; `+ SUB_BLOCK_INDENT` is
+                        // the usual nest slop so indented and flush bands both hit.
+                        let start = a.col_offset;
+                        let end = start
+                            .saturating_add(a.cols)
+                            .saturating_add(SUB_BLOCK_INDENT);
+                        column >= start && column < end
+                    })
                     .map(|&(_, a)| a)
             })
         else {
             return false;
         };
-        if column > anchor.cols.saturating_add(SUB_BLOCK_INDENT) {
-            return false;
-        }
         let Some(target) = self.find_open_target(anchor.key) else {
             self.show_toast("image source unavailable");
             return true;
@@ -1287,12 +1484,6 @@ impl CodeTuiApp {
         true
     }
 
-    /// Maps the anchors inside the visible window to this frame's desired
-    /// image set (flushed post-draw). Virtual mode composites on the
-    /// placeholder cells the frame paints, so partially visible blocks
-    /// self-clip and x/y stay zero (a scroll then changes nothing → zero
-    /// bytes). Classic mode draws the whole box at a cursor address, so only
-    /// fully visible blocks qualify.
     pub(super) fn collect_desired_inline_images(&mut self, area: Rect) {
         self.inline_images.desired.clear();
         if !self.inline_images.caps.enabled() {
@@ -1312,24 +1503,36 @@ impl CodeTuiApp {
             return;
         };
         let virtual_placement = self.inline_images.caps.virtual_placement();
+        let cell_painted = self.inline_images.caps.protocol == Protocol::HalfBlocks;
         let view_start = self.transcript_scroll;
         let view_rows = usize::from(area.height);
         for &(row, anchor) in &body.image_rows {
             let end = row + usize::from(anchor.rows);
-            let cols = anchor.cols.min(area.width.saturating_sub(SUB_BLOCK_INDENT));
+            let indent = SUB_BLOCK_INDENT.saturating_add(anchor.col_offset);
+            let cols = anchor.cols.min(area.width.saturating_sub(indent));
             if cols < 4 {
                 continue;
             }
-            let place = if virtual_placement {
-                (end > view_start && row < view_start + view_rows).then_some((0, 0, anchor.cols))
+            let on_screen = end > view_start && row < view_start + view_rows;
+            let rows = if cell_painted {
+                if !on_screen {
+                    continue;
+                }
+                anchor.rows
             } else {
-                (row >= view_start && end <= view_start + view_rows).then(|| {
-                    (
-                        area.x.saturating_add(SUB_BLOCK_INDENT),
-                        area.y.saturating_add((row - view_start) as u16),
-                        cols,
-                    )
-                })
+                match image_place_rows(row, anchor.rows, view_start, view_rows) {
+                    Some(rows) => rows,
+                    None => continue,
+                }
+            };
+            let place = if virtual_placement {
+                Some((0, 0, anchor.cols))
+            } else {
+                Some((
+                    area.x.saturating_add(indent),
+                    area.y.saturating_add((row - view_start) as u16),
+                    cols,
+                ))
             };
             if let Some((x, y, cols)) = place {
                 self.inline_images.desired.push(PlacedImage {
@@ -1337,10 +1540,36 @@ impl CodeTuiApp {
                     x,
                     y,
                     cols,
-                    rows: anchor.rows,
+                    rows,
                 });
             }
         }
+    }
+
+    pub(super) fn suppress_partial_inline_images(
+        &self,
+        visible: &mut [Line<'static>],
+        view_start: usize,
+        view_rows: usize,
+    ) {
+        if !self.inline_images.caps.virtual_placement() {
+            return;
+        }
+        let Some(body) = self
+            .render_cache
+            .transcript
+            .as_ref()
+            .and_then(|cache| cache.wrapped.as_ref())
+        else {
+            return;
+        };
+        suppress_partial_image_placeholders(
+            visible,
+            &body.image_rows,
+            view_start,
+            view_rows,
+            body.rows.len(),
+        );
     }
 
     /// Sixel lives in tmux's pane-content layer: a full cell repaint (self-
@@ -1459,6 +1688,7 @@ impl CodeTuiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::terminal_graphics::PixelFormat;
 
     #[test]
     fn grid_preserves_landscape_aspect() {
@@ -1745,5 +1975,261 @@ logo.png\nbuild.rs\ndocs\nassets\n.gitignore\nchart.svg\n";
         let (cols, _) = preview_grid(32, 32, 80, Protocol::HalfBlocks).unwrap();
         assert!(cols <= 32);
         assert_eq!(preview_grid(0, 10, 80, Protocol::KittyVirtual), None);
+    }
+
+    fn ready_preview(px_w: u32, px_h: u32, hash: u64) -> EncodedPreview {
+        EncodedPreview {
+            format: PixelFormat::Png,
+            px_w,
+            px_h,
+            payload_b64: "AAAA".to_string(),
+            thumb: None,
+            content_hash: hash,
+        }
+    }
+
+    /// A placeholder row for `key`, styled as the terminal expects.
+    fn placeholder_line(key: u64, cols: u16) -> Line<'static> {
+        let (r, g, b) = terminal_graphics::placeholder_fg(image_id(key));
+        Line::from(Span::styled(
+            terminal_graphics::placeholder_row(0, cols),
+            Style::default().fg(Color::Rgb(r, g, b)),
+        ))
+    }
+
+    /// Cell column where `key`'s placeholder run starts.
+    fn paint_col(line: &Line<'static>, key: u64) -> Option<usize> {
+        let (r, g, b) = terminal_graphics::placeholder_fg(image_id(key));
+        let target = Color::Rgb(r, g, b);
+        let mut col = 0usize;
+        for span in &line.spans {
+            let cells = if span.style.fg.is_some() {
+                span.content
+                    .chars()
+                    .filter(|&c| c == PLACEHOLDER_CHAR)
+                    .count()
+            } else {
+                span.content.chars().count()
+            };
+            if span.style.fg == Some(target) {
+                return Some(col);
+            }
+            col += cells;
+        }
+        None
+    }
+
+    fn anchor(key: u64, cols: u16, rows: u16) -> ImageAnchor {
+        ImageAnchor {
+            key,
+            cols,
+            rows,
+            col_offset: 0,
+        }
+    }
+
+    #[test]
+    fn consecutive_portraits_pack_side_by_side() {
+        let a = ready_preview(500, 1000, 1);
+        let b = ready_preview(500, 1000, 2);
+        let c = ready_preview(500, 1000, 3);
+        let mut lines = Vec::new();
+        push_preview_rows(&mut lines, 1, &a, 80, Protocol::KittyVirtual);
+        assert!(try_pack_preview(
+            &mut lines,
+            2,
+            &b,
+            80,
+            Protocol::KittyVirtual
+        ));
+        assert!(try_pack_preview(
+            &mut lines,
+            3,
+            &c,
+            80,
+            Protocol::KittyVirtual
+        ));
+        let anchors = &lines[0].images;
+        assert_eq!(anchors.len(), 3, "three portraits share one band");
+        assert_eq!(anchors[0].col_offset, 0);
+        assert!(
+            anchors[1].col_offset >= anchors[0].cols,
+            "second image sits to the right of the first"
+        );
+        assert!(
+            anchors[2].col_offset >= anchors[1].col_offset + anchors[1].cols,
+            "third image sits to the right of the second"
+        );
+        assert_eq!(lines.iter().filter(|l| !l.images.is_empty()).count(), 1);
+        assert!(
+            lines.len() <= usize::from(MAX_PREVIEW_ROWS),
+            "packed band must not exceed one preview's row cap, got {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn wide_landscapes_still_stack() {
+        let a = ready_preview(1000, 500, 1);
+        let b = ready_preview(1000, 500, 2);
+        let mut lines = Vec::new();
+        push_preview_rows(&mut lines, 1, &a, 80, Protocol::KittyVirtual);
+        assert!(
+            !try_pack_preview(&mut lines, 2, &b, 80, Protocol::KittyVirtual),
+            "two 46-col landscapes cannot share a band"
+        );
+    }
+
+    #[test]
+    fn partial_image_placeholders_are_blanked() {
+        let mut visible: Vec<Line<'static>> = (0..10).map(|_| placeholder_line(1, 12)).collect();
+        suppress_partial_image_placeholders(&mut visible, &[(0, anchor(1, 12, 12))], 0, 10, 30);
+        for (i, line) in visible.iter().enumerate() {
+            assert!(
+                line.spans[0].content.contains(PLACEHOLDER_CHAR),
+                "clipped image keeps row {i}"
+            );
+        }
+
+        let short = anchor(1, 12, 6);
+        let mut visible: Vec<Line<'static>> = (0..10)
+            .map(|i| {
+                if i < 2 {
+                    placeholder_line(1, 12)
+                } else {
+                    Line::from(Span::raw(format!("row{i}")))
+                }
+            })
+            .collect();
+        suppress_partial_image_placeholders(&mut visible, &[(0, short)], 4, 10, 30);
+        for (i, line) in visible.iter().enumerate().take(2) {
+            assert!(
+                !line.spans[0].content.contains(PLACEHOLDER_CHAR),
+                "scrolled-off placeholder row {i} must be blanked"
+            );
+        }
+        for (i, line) in visible.iter().enumerate().skip(2) {
+            assert_eq!(line.spans[0].content.as_ref(), format!("row{i}"));
+        }
+        let mut visible: Vec<Line<'static>> = vec![Line::from(Span::raw("keep")); 12];
+        suppress_partial_image_placeholders(&mut visible, &[(0, short)], 0, 20, 20);
+        assert_eq!(visible[0].spans[0].content.as_ref(), "keep");
+    }
+
+    #[test]
+    fn partial_pack_blanks_only_the_straddling_image() {
+        let tall = anchor(1, 8, 12);
+        let short = ImageAnchor {
+            col_offset: 10,
+            ..anchor(2, 8, 6)
+        };
+        let (tr, tg, tb) = terminal_graphics::placeholder_fg(image_id(1));
+        let (sr, sg, sb) = terminal_graphics::placeholder_fg(image_id(2));
+        let mut visible: Vec<Line<'static>> = (0..10)
+            .map(|i| {
+                if i < 6 {
+                    let mut line = placeholder_line(1, 8);
+                    line.spans.push(Span::raw("  "));
+                    line.spans.extend(placeholder_line(2, 8).spans);
+                    line
+                } else {
+                    placeholder_line(1, 8)
+                }
+            })
+            .collect();
+        suppress_partial_image_placeholders(&mut visible, &[(0, tall), (0, short)], 0, 10, 12);
+        for (i, line) in visible.iter().enumerate() {
+            let has = |c: (u8, u8, u8)| {
+                line.spans
+                    .iter()
+                    .any(|s| s.style.fg == Some(Color::Rgb(c.0, c.1, c.2)))
+            };
+            assert!(has((tr, tg, tb)), "clipped tall image keeps row {i}");
+            if i < 6 {
+                assert!(has((sr, sg, sb)), "visible sibling keeps row {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn packed_images_align_on_every_row() {
+        let tall = ready_preview(500, 1000, 1);
+        let short = ready_preview(100, 50, 2);
+        let third = ready_preview(500, 1000, 3);
+        let mut lines = Vec::new();
+        push_preview_rows(&mut lines, 1, &tall, 80, Protocol::KittyVirtual);
+        assert!(try_pack_preview(
+            &mut lines,
+            2,
+            &short,
+            80,
+            Protocol::KittyVirtual
+        ));
+        assert!(try_pack_preview(
+            &mut lines,
+            3,
+            &third,
+            80,
+            Protocol::KittyVirtual
+        ));
+        let third_offset = lines[0]
+            .images
+            .iter()
+            .find(|a| a.key == 3)
+            .expect("third image anchored")
+            .col_offset;
+        for (row, line) in lines.iter().enumerate() {
+            let painted = paint_col(&line.line, 3)
+                .unwrap_or_else(|| panic!("image 3 must paint on row {row}"));
+            assert_eq!(
+                painted,
+                usize::from(third_offset),
+                "row {row} paints image 3 at {painted}, anchor says {third_offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_place_rows_clips_to_the_window() {
+        assert_eq!(image_place_rows(0, 12, 0, 10), Some(10), "clip 12 → 10");
+        assert_eq!(image_place_rows(0, 12, 1, 10), None, "top scrolled off");
+        assert_eq!(image_place_rows(1, 12, 1, 10), Some(10));
+        assert_eq!(image_place_rows(0, 10, 0, 10), Some(10), "exactly window");
+        assert_eq!(image_place_rows(0, 12, 0, 16), Some(12));
+        assert_eq!(image_place_rows(8, 6, 0, 10), Some(2), "clip at bottom");
+        assert_eq!(image_place_rows(4, 6, 0, 10), Some(6));
+        assert_eq!(image_place_rows(10, 6, 0, 10), None, "starts at view end");
+    }
+
+    #[test]
+    fn suppression_never_wipes_other_content() {
+        let small = anchor(1, 12, 4);
+        let mut visible: Vec<Line<'static>> = (0..10)
+            .map(|_| Line::from(Span::raw("real text")))
+            .collect();
+        suppress_partial_image_placeholders(&mut visible, &[(0, small)], 2, 10, 20);
+        for (i, line) in visible.iter().enumerate() {
+            assert_eq!(
+                line.spans[0].content.as_ref(),
+                "real text",
+                "row {i}: unrelated text must survive"
+            );
+        }
+        let mut visible: Vec<Line<'static>> = (0..10)
+            .map(|i| {
+                if i < 2 {
+                    let mut line = Line::from(Span::raw("lead"));
+                    line.spans.extend(placeholder_line(1, 12).spans);
+                    line
+                } else {
+                    Line::from(Span::raw("real text"))
+                }
+            })
+            .collect();
+        suppress_partial_image_placeholders(&mut visible, &[(0, small)], 2, 10, 20);
+        assert_eq!(visible[0].spans[0].content.as_ref(), "lead");
+        assert!(!visible[0].spans[1].content.contains(PLACEHOLDER_CHAR));
+        assert_eq!(visible[0].spans[1].content.chars().count(), 12);
+        assert_eq!(visible[2].spans[0].content.as_ref(), "real text");
     }
 }
