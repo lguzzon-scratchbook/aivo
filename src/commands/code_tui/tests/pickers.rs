@@ -665,6 +665,8 @@ fn preview_chat_message(role: &str, content: &str) -> ChatMessage {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     }
 }
 
@@ -885,6 +887,8 @@ fn test_session_preview_uses_last_user_message() {
                     content: "Hi".to_string(),
                     reasoning_content: None,
                     attachments: vec![],
+                    id: None,
+                    timestamp: None,
                 },
                 ChatMessage {
                     model: None,
@@ -892,6 +896,8 @@ fn test_session_preview_uses_last_user_message() {
                     content: "What is the deployment status for api gateway?".to_string(),
                     reasoning_content: None,
                     attachments: vec![],
+                    id: None,
+                    timestamp: None,
                 },
             ],
             "claude",
@@ -916,6 +922,8 @@ fn test_session_preview_text_uses_two_latest_turns() {
                 content: "hello".to_string(),
                 reasoning_content: None,
                 attachments: vec![],
+                id: None,
+                timestamp: None,
             },
             ChatMessage {
                 model: None,
@@ -923,6 +931,8 @@ fn test_session_preview_text_uses_two_latest_turns() {
                 content: "hi there".to_string(),
                 reasoning_content: None,
                 attachments: vec![],
+                id: None,
+                timestamp: None,
             },
         ],
         "claude",

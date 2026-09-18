@@ -392,6 +392,8 @@ async fn test_copy_rejects_zero_and_reports_range() {
         content: "only reply".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let err = app.copy_reply_to_clipboard(Some(0)).unwrap_err();

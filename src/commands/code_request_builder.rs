@@ -440,19 +440,9 @@ mod tests {
             ("gpt-5.4", "none"),
             ("gpt-5-codex", "low"),
         ] {
-            let body = build_openai_chat_request(
-                model,
-                &[ChatMessage {
-                    model: None,
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                }],
-                false,
-                None,
-            )
-            .unwrap();
+            let body =
+                build_openai_chat_request(model, &[ChatMessage::new("user", "hi")], false, None)
+                    .unwrap();
             assert_eq!(body["reasoning_effort"], expected, "model={model}");
         }
     }
@@ -460,19 +450,9 @@ mod tests {
     #[test]
     fn test_openai_chat_disable_o_series_uses_low() {
         for model in ["o1-mini", "o3", "o4-mini"] {
-            let body = build_openai_chat_request(
-                model,
-                &[ChatMessage {
-                    model: None,
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                }],
-                false,
-                None,
-            )
-            .unwrap();
+            let body =
+                build_openai_chat_request(model, &[ChatMessage::new("user", "hi")], false, None)
+                    .unwrap();
             assert_eq!(body["reasoning_effort"], "low", "model={model}");
         }
     }
@@ -480,19 +460,9 @@ mod tests {
     #[test]
     fn test_openai_chat_omits_reasoning_for_non_reasoning_models() {
         for model in ["gpt-4o", "gpt-4o-mini", "deepseek-chat"] {
-            let body = build_openai_chat_request(
-                model,
-                &[ChatMessage {
-                    model: None,
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                }],
-                false,
-                None,
-            )
-            .unwrap();
+            let body =
+                build_openai_chat_request(model, &[ChatMessage::new("user", "hi")], false, None)
+                    .unwrap();
             assert!(
                 body.get("reasoning_effort").is_none(),
                 "model={model} should not carry reasoning_effort"
@@ -502,32 +472,12 @@ mod tests {
 
     #[test]
     fn test_responses_disable_only_for_reasoning_models() {
-        let gpt5 = build_responses_request(
-            "gpt-5.4",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-            false,
-        )
-        .unwrap();
+        let gpt5 =
+            build_responses_request("gpt-5.4", &[ChatMessage::new("user", "hi")], false).unwrap();
         assert_eq!(gpt5["reasoning"]["effort"], "none"); // 5.1+ off level is none
 
-        let gpt4o = build_responses_request(
-            "gpt-4o",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-            false,
-        )
-        .unwrap();
+        let gpt4o =
+            build_responses_request("gpt-4o", &[ChatMessage::new("user", "hi")], false).unwrap();
         assert!(gpt4o.get("reasoning").is_none());
     }
 
@@ -535,13 +485,7 @@ mod tests {
     fn test_anthropic_never_sets_thinking_field() {
         let body = build_anthropic_request(
             "claude-sonnet-4-6",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
+            &[ChatMessage::new("user", "hi")],
             false,
         )
         .unwrap();
@@ -550,33 +494,15 @@ mod tests {
 
     #[test]
     fn test_google_thinking_budget_only_for_2_5_plus() {
-        let g25 = build_google_request(
-            "gemini-2.5-pro",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-        )
-        .unwrap();
+        let g25 =
+            build_google_request("gemini-2.5-pro", &[ChatMessage::new("user", "hi")]).unwrap();
         assert_eq!(
             g25["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             0
         );
 
-        let g15 = build_google_request(
-            "gemini-1.5-pro",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-        )
-        .unwrap();
+        let g15 =
+            build_google_request("gemini-1.5-pro", &[ChatMessage::new("user", "hi")]).unwrap();
         assert!(g15.get("generationConfig").is_none());
     }
 
@@ -585,10 +511,6 @@ mod tests {
         let request = build_openai_chat_request(
             "gpt-4o",
             &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "Review these".to_string(),
-                reasoning_content: None,
                 attachments: vec![
                     MessageAttachment {
                         name: "notes.md".to_string(),
@@ -605,6 +527,7 @@ mod tests {
                         },
                     },
                 ],
+                ..ChatMessage::new("user", "Review these")
             }],
             true,
             None,
@@ -622,13 +545,7 @@ mod tests {
     fn test_build_openai_chat_request_includes_max_tokens() {
         let with_cap = build_openai_chat_request(
             "deepseek-chat",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
+            &[ChatMessage::new("user", "hi")],
             true,
             Some(8192),
         )
@@ -638,19 +555,9 @@ mod tests {
         // omitted to avoid 400s on strict providers.
         assert!(with_cap.get("reasoning_effort").is_none());
 
-        let without_cap = build_openai_chat_request(
-            "gpt-4o",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-            true,
-            None,
-        )
-        .unwrap();
+        let without_cap =
+            build_openai_chat_request("gpt-4o", &[ChatMessage::new("user", "hi")], true, None)
+                .unwrap();
         assert!(without_cap.get("max_tokens").is_none());
     }
 
@@ -659,10 +566,6 @@ mod tests {
         let request = build_anthropic_request(
             "claude-sonnet-4-5",
             &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: String::new(),
-                reasoning_content: None,
                 attachments: vec![MessageAttachment {
                     name: "diagram.png".to_string(),
                     mime_type: "image/png".to_string(),
@@ -670,6 +573,7 @@ mod tests {
                         data: "YWJj".to_string(),
                     },
                 }],
+                ..ChatMessage::new("user", String::new())
             }],
             false,
         )
@@ -683,18 +587,8 @@ mod tests {
 
     #[test]
     fn test_build_responses_request_basic() {
-        let request = build_responses_request(
-            "gpt-5.4",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hello".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-            true,
-        )
-        .unwrap();
+        let request =
+            build_responses_request("gpt-5.4", &[ChatMessage::new("user", "hello")], true).unwrap();
 
         assert_eq!(request["model"], "gpt-5.4");
         assert_eq!(request["stream"], true);
@@ -709,20 +603,8 @@ mod tests {
         let request = build_responses_request(
             "gpt-5.4",
             &[
-                ChatMessage {
-                    model: None,
-                    role: "system".to_string(),
-                    content: "You are helpful.".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                },
-                ChatMessage {
-                    model: None,
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                },
+                ChatMessage::new("system", "You are helpful."),
+                ChatMessage::new("user", "hi"),
             ],
             false,
         )
@@ -737,10 +619,6 @@ mod tests {
         let request = build_responses_request(
             "gpt-5.4",
             &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "Review this".to_string(),
-                reasoning_content: None,
                 attachments: vec![
                     MessageAttachment {
                         name: "notes.md".to_string(),
@@ -757,6 +635,7 @@ mod tests {
                         },
                     },
                 ],
+                ..ChatMessage::new("user", "Review this")
             }],
             true,
         )
@@ -770,17 +649,8 @@ mod tests {
 
     #[test]
     fn test_build_google_request_basic() {
-        let request = build_google_request(
-            "gemini-1.5-flash",
-            &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "hello".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-        )
-        .unwrap();
+        let request =
+            build_google_request("gemini-1.5-flash", &[ChatMessage::new("user", "hello")]).unwrap();
 
         let contents = request["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 1);
@@ -793,20 +663,8 @@ mod tests {
         let request = build_google_request(
             "gemini-1.5-flash",
             &[
-                ChatMessage {
-                    model: None,
-                    role: "system".to_string(),
-                    content: "You are helpful.".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                },
-                ChatMessage {
-                    model: None,
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                },
+                ChatMessage::new("system", "You are helpful."),
+                ChatMessage::new("user", "hi"),
             ],
         )
         .unwrap();
@@ -824,27 +682,9 @@ mod tests {
         let request = build_google_request(
             "gemini-1.5-flash",
             &[
-                ChatMessage {
-                    model: None,
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                },
-                ChatMessage {
-                    model: None,
-                    role: "assistant".to_string(),
-                    content: "hello!".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                },
-                ChatMessage {
-                    model: None,
-                    role: "user".to_string(),
-                    content: "thanks".to_string(),
-                    reasoning_content: None,
-                    attachments: vec![],
-                },
+                ChatMessage::new("user", "hi"),
+                ChatMessage::new("assistant", "hello!"),
+                ChatMessage::new("user", "thanks"),
             ],
         )
         .unwrap();
@@ -860,10 +700,6 @@ mod tests {
         let request = build_google_request(
             "gemini-1.5-flash",
             &[ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: "describe this".to_string(),
-                reasoning_content: None,
                 attachments: vec![MessageAttachment {
                     name: "photo.png".to_string(),
                     mime_type: "image/png".to_string(),
@@ -871,6 +707,7 @@ mod tests {
                         data: "YWJj".to_string(),
                     },
                 }],
+                ..ChatMessage::new("user", "describe this")
             }],
         )
         .unwrap();

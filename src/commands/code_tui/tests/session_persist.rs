@@ -173,6 +173,8 @@ async fn test_persist_history_writes_session_tokens_to_index() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // A turn folded this much real usage into the session total.
     app.session_tokens = SessionTokens {
@@ -228,6 +230,8 @@ async fn test_log_agent_turn_records_under_real_cwd() {
         content: "do the thing".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -235,10 +239,13 @@ async fn test_log_agent_turn_records_under_real_cwd() {
         content: "done".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     // No provider split (e.g. cursor ACP): transcript total falls back to output.
-    app.log_agent_turn(1234, SessionTokens::default()).await;
+    app.log_agent_turn(1234, SessionTokens::default(), Some(1500))
+        .await;
 
     // The turn shows in `aivo logs` filtered to the real project dir.
     let rows = store
@@ -254,6 +261,7 @@ async fn test_log_agent_turn_records_under_real_cwd() {
     assert_eq!(rows[0].kind, "code_turn");
     assert_eq!(rows[0].session_id.as_deref(), Some("agent-sess"));
     assert_eq!(rows[0].output_tokens, Some(1234));
+    assert_eq!(rows[0].duration_ms, Some(1500));
 
     // With the engine's split, the row carries real input/output/cache columns.
     app.log_agent_turn(
@@ -264,6 +272,7 @@ async fn test_log_agent_turn_records_under_real_cwd() {
             cache_read_tokens: 939_264,
             cache_write_tokens: 128,
         },
+        None,
     )
     .await;
     let rows = store
@@ -308,6 +317,8 @@ async fn test_flush_for_exit_persists_partial_response_when_streaming() {
         content: "tell me a story".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.pending_response = "Once upon a time".to_string();
@@ -350,6 +361,8 @@ async fn test_flush_for_exit_persists_user_only_history() {
         content: "tell me a story".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.flush_for_exit().await;
@@ -389,5 +402,53 @@ async fn test_flush_for_exit_skips_persist_for_empty_history() {
     assert!(
         saved.is_none(),
         "empty history should not produce a session"
+    );
+}
+
+#[tokio::test]
+async fn persist_history_keeps_message_identity_across_saves() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key;
+    app.cwd = "/tmp/demo".to_string();
+    app.session_id = "ident-session".to_string();
+    app.raw_model = "claude".to_string();
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "hello".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+        id: Some("keep-me".to_string()),
+        timestamp: Some("2026-01-02T03:04:05Z".to_string()),
+    });
+    app.persist_history().await.unwrap();
+    app.persist_history().await.unwrap();
+
+    let saved = store
+        .get_code_session("ident-session")
+        .await
+        .unwrap()
+        .expect("session persisted");
+    assert_eq!(saved.messages[0].id.as_deref(), Some("keep-me"));
+    assert_eq!(
+        saved.messages[0].timestamp.as_deref(),
+        Some("2026-01-02T03:04:05Z")
+    );
+
+    let restored = to_chat_messages(saved.messages);
+    assert_eq!(restored[0].id.as_deref(), Some("keep-me"));
+    assert_eq!(
+        restored[0].timestamp.as_deref(),
+        Some("2026-01-02T03:04:05Z")
     );
 }

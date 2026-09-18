@@ -127,6 +127,8 @@ async fn test_mouse_wheel_scrolls_only_inside_transcript_hitbox() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_width = 80;
     app.transcript_view_height = 6;
@@ -236,6 +238,8 @@ fn test_selection_highlight_preserves_rendered_text_and_foreground() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -363,6 +367,8 @@ async fn test_mouse_drag_coordinates_map_to_transcript_rows() {
         content: "x".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_hitbox = Some(TranscriptHitbox::from_rows(
         Rect::new(4, 2, 20, 4),
@@ -509,6 +515,8 @@ async fn jump_to_bottom_pill_shows_when_scrolled_up_and_clicks_to_latest() {
             content: format!("message line {i}"),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
 
@@ -727,6 +735,8 @@ async fn test_drag_to_bottom_edge_arms_and_advances_autoscroll() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_width = 20;
     app.transcript_view_height = 4;
@@ -781,6 +791,8 @@ async fn test_drag_to_top_edge_arms_and_advances_autoscroll() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_width = 20;
     app.transcript_view_height = 4;
@@ -875,6 +887,8 @@ fn test_highlight_does_not_wash_blank_cells_past_text() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // Select well past the two-character "hi" line.
     app.transcript_selection = Some(TranscriptSelection {

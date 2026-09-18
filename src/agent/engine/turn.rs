@@ -122,6 +122,7 @@ impl AgentEngine {
         let mut page_repeats = 0usize;
         // Same-signature tool-failure streaks: hint the schema, then hard-stop a loop.
         let mut failure_guard = guards::FailureGuard::default();
+        let mut stall_guard = guards::StallGuard::default();
         let mut stop_hook_continues = 0usize;
         // Denial ladder (see the DENIAL_* constants).
         let mut denial_batches = 0usize;
@@ -168,6 +169,7 @@ impl AgentEngine {
             let mut message = loop {
                 let mut streamed_any = false;
                 let mut streamed_text = 0usize;
+                let request_started = Instant::now();
                 let result = serve_client::complete(
                     ctx.client,
                     ctx.serve_base,
@@ -185,6 +187,13 @@ impl AgentEngine {
                     },
                 )
                 .await;
+                ui.step_timing(&StepTiming {
+                    kind: StepKind::Request,
+                    name: self.model.clone(),
+                    duration_ms: elapsed_ms(request_started),
+                    ok: result.is_ok(),
+                    exit_code: None,
+                });
                 match result {
                     Ok(m) => break m,
                     Err(e)
@@ -644,6 +653,14 @@ impl AgentEngine {
                     converged = true;
                     break;
                 }
+            } else if stall_guard.observe(
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|c| subagents::normalize_tool_name(&c.name).unwrap_or(c.name.as_str())),
+            ) {
+                ui.notify("still exploring — asking the model to act on what it has");
+                self.fold_into_last_tool_result(STALL_NUDGE.to_string());
             }
 
             // Same-signature tool-failure guard: hint the schema, then hard-stop a loop.

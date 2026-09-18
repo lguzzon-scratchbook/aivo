@@ -345,6 +345,8 @@ async fn web_results_never_queue_url_previews() {
         content,
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
 
     for tool in ["web_fetch", "web_search"] {
@@ -392,6 +394,8 @@ async fn list_dir_results_never_queue_image_previews() {
         content,
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
 
     app.history.push(entry(

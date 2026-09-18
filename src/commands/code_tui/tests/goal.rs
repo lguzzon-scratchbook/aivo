@@ -87,6 +87,8 @@ async fn test_goal_loop_stops_on_marker_and_cap() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
 
     // Marker on its own line → loop ends, complete notice.
@@ -135,6 +137,8 @@ async fn test_goal_marker_tolerates_markdown_wrapping() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
 
     for reply in [
@@ -199,6 +203,8 @@ async fn test_goal_stops_on_errored_turn() {
         content: "partial work".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // What `apply_agent_error` records: the ERROR notice + the durable error row.
     app.history.push(ChatMessage {
@@ -207,6 +213,8 @@ async fn test_goal_stops_on_errored_turn() {
         content: "LLM error: insufficient credits".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.notice = Some((ERROR(), "LLM error: insufficient credits".to_string()));
 
@@ -241,6 +249,8 @@ async fn test_goal_survives_incidental_error_notice() {
         content: "still working".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.notice = Some((ERROR(), "Copy failed: no clipboard".to_string()));
 
@@ -271,6 +281,8 @@ async fn test_goal_ignores_marker_and_error_below_floor() {
             content: "GOAL COMPLETE".to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         // Fresh goal armed after that row; its first turn is in flight.
         app.goal_mode = Some(GoalState {
@@ -375,6 +387,8 @@ async fn test_goal_completion_detected_while_queued_message_runs() {
         content: "done\nGOAL COMPLETE".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // The queued message's user turn is already in flight.
     app.history.push(ChatMessage {
@@ -383,6 +397,8 @@ async fn test_goal_completion_detected_while_queued_message_runs() {
         content: "also rename the module".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
 
@@ -413,6 +429,8 @@ async fn test_goal_continuation_preserves_composer_draft() {
         content: "still working".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.draft = "half-typed reply".to_string();
     app.cursor = 4;
@@ -454,6 +472,8 @@ async fn test_goal_guard_stop_enriches_continuation() {
         content: "still working".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.maybe_continue_goal().await.unwrap();
@@ -501,6 +521,8 @@ async fn test_goal_step_limit_steers_continuation() {
         content: "still working".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.maybe_continue_goal().await.unwrap();

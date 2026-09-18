@@ -11,6 +11,8 @@ fn test_finished_turn_renders_done_marker() {
         content: "fix it".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -18,6 +20,8 @@ fn test_finished_turn_renders_done_marker() {
         content: "done".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.turn_durations.insert(1, 404_000); // stamped on the last entry; 6m 44s
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
@@ -447,6 +451,8 @@ async fn test_cursor_usage_update_survives_turn_end() {
         content: "x".repeat(80_000),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.apply_agent_context(180_000, true);
     assert_eq!(app.footer_status_label().0, "180k/500k");
@@ -487,6 +493,8 @@ async fn test_no_measured_fill_falls_back_to_estimate() {
         content: "hello".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.adopt_turn_context_fill(None).await;
@@ -907,6 +915,8 @@ fn test_done_marker_appends_turn_note() {
         content: "done".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let idx = app.history.len() - 1;
     app.turn_durations.insert(idx, 42_000);
@@ -980,6 +990,8 @@ async fn test_done_marker_skipped_on_errored_turn() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.request_started_at =
@@ -1225,6 +1237,8 @@ fn test_intro_column_stable_from_empty_to_message() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let message_col = aivo_col(&mut app);
 
@@ -1428,6 +1442,8 @@ fn test_footer_is_single_status_row() {
                 .join("\n"),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         configure(&mut app);
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
@@ -1897,6 +1913,8 @@ fn plan_row(content: &str) -> ChatMessage {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     }
 }
 
@@ -1910,6 +1928,8 @@ fn test_paused_marker_over_unfinished_plan() {
         content: "I'll rewrite it after approval.".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let idx = app.history.len() - 1;
     app.turn_durations.insert(idx, 277_000);
@@ -1940,6 +1960,8 @@ async fn finish_over_plan(app: &mut CodeTuiApp, plan: &str) -> Option<TurnPause>
         content: "proposal".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let idx = app.history.len() - 1;
     app.history.push(plan_row(plan));
@@ -2001,6 +2023,8 @@ fn row(role: &str, content: String) -> ChatMessage {
         content,
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     }
 }
 

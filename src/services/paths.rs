@@ -110,6 +110,13 @@ pub fn model_limits(base: &Path) -> PathBuf {
     base.join(CACHE_DIR).join("model_limits.json")
 }
 
+pub fn builtin_skill_cache(base: &Path, name: &str, version: &str) -> PathBuf {
+    base.join(CACHE_DIR)
+        .join("builtin-skills")
+        .join(name)
+        .join(version)
+}
+
 // ── logs/ ─────────────────────────────────────────────────────────────────
 
 pub fn logs_db(base: &Path) -> PathBuf {

@@ -341,6 +341,8 @@ async fn test_skill_turn_renders_compact_not_body() {
         content: expanded,
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

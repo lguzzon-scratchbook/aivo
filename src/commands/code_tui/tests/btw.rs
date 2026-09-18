@@ -58,6 +58,8 @@ fn test_btw_request_trims_oldest_turns_over_budget() {
             content: format!("turn-{i} {}", "x".repeat(30_000)),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     let messages = runtime_impl::btw_request_messages(&app.history, &app.vision_descriptions, "q?");

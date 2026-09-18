@@ -173,6 +173,31 @@ impl CodeTuiApp {
             }
             RuntimeEvent::AgentToolOutput { chunk } => self.push_tool_output(&chunk),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
+            RuntimeEvent::AgentStepTiming {
+                kind,
+                name,
+                duration_ms,
+                ok,
+                exit_code,
+            } => {
+                let logs = self.session_store.logs();
+                let event = crate::services::log_store::LogEvent {
+                    source: "code".to_string(),
+                    kind: "code_step".to_string(),
+                    phase: Some(kind),
+                    tool: Some(name),
+                    model: Some(self.raw_model.clone()),
+                    cwd: Some(self.persist_cwd().to_string()),
+                    session_id: Some(self.session_id.clone()),
+                    status_code: Some(if ok { 0 } else { 1 }),
+                    exit_code: exit_code.map(i64::from),
+                    duration_ms: Some(duration_ms as i64),
+                    ..Default::default()
+                };
+                tokio::spawn(async move {
+                    let _ = logs.append(event).await;
+                });
+            }
             RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
             RuntimeEvent::AgentSessionMail(display) => self.apply_agent_session_mail(display),
             RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
@@ -478,13 +503,8 @@ impl CodeTuiApp {
         if interrupted {
             entry["interrupted"] = serde_json::Value::Bool(true);
         }
-        self.history.push(ChatMessage {
-            model: None,
-            role: "local_command".to_string(),
-            content: entry.to_string(),
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        self.history
+            .push(ChatMessage::new("local_command", entry.to_string()).with_identity());
 
         // Retain only what an expander can show (bounded by `MAX_EXPANDED_OUTPUT_LINES`)
         // — and only when there's more than the fold preview already reveals.
@@ -530,13 +550,14 @@ impl CodeTuiApp {
             .then(|| std::mem::take(&mut self.pending_reasoning));
         let duration_ms = reasoning_content.as_ref().and(self.segment_reasoning_ms());
         if !content.is_empty() || reasoning_content.is_some() {
-            self.history.push(ChatMessage {
-                model: self.turn_model.clone(),
-                role: "assistant".to_string(),
-                content,
-                reasoning_content,
-                attachments: vec![],
-            });
+            self.history.push(
+                ChatMessage {
+                    model: self.turn_model.clone(),
+                    reasoning_content,
+                    ..ChatMessage::new("assistant", content)
+                }
+                .with_identity(),
+            );
             if let Some(ms) = duration_ms {
                 self.reasoning_durations.insert(self.history.len() - 1, ms);
             }
@@ -659,13 +680,8 @@ impl CodeTuiApp {
             obj.insert("old_content".to_string(), serde_json::Value::String(old));
         }
         let content = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(name);
-        self.history.push(ChatMessage {
-            model: None,
-            role: "tool_call".to_string(),
-            content,
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        self.history
+            .push(ChatMessage::new("tool_call", content).with_identity());
         // Don't force-follow: if the user scrolled up to read earlier output,
         // a streamed tool step shouldn't yank the view back to the bottom. The
         // render already follows new output while `follow_output` is set, and
@@ -966,24 +982,14 @@ impl CodeTuiApp {
         }
         let text = reframe_image_input_error(text, &self.model);
         self.notice = Some((ERROR(), text.clone()));
-        self.history.push(ChatMessage {
-            model: None,
-            role: "error".to_string(),
-            content: text,
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        self.history
+            .push(ChatMessage::new("error", text).with_identity());
     }
 
     pub(super) fn apply_agent_tool_result(&mut self, content: String) {
         self.clear_tool_output();
-        self.history.push(ChatMessage {
-            model: None,
-            role: "tool_result".to_string(),
-            content,
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        self.history
+            .push(ChatMessage::new("tool_result", content).with_identity());
         // Same as the tool-call append: leave `follow_output` alone so a user
         // reading scrolled-up output isn't snapped to the bottom each step.
     }
@@ -1023,26 +1029,16 @@ impl CodeTuiApp {
     /// engine order).
     pub(super) fn apply_agent_steered(&mut self, text: String) {
         self.flush_pending_assistant();
-        self.history.push(ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: text,
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        self.history
+            .push(ChatMessage::new("user", text).with_identity());
         self.notice = Some((MUTED(), "Interjection delivered".to_string()));
     }
 
     /// Commit mid-turn peer mail as a ✉ row (otherwise only a folded tool result).
     pub(super) fn apply_agent_session_mail(&mut self, display: String) {
         self.flush_pending_assistant();
-        self.history.push(ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: display,
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        self.history
+            .push(ChatMessage::new("user", display).with_identity());
     }
 
     /// Render an `update_plan` call as a SINGLE checklist card. The model resends
@@ -1056,13 +1052,8 @@ impl CodeTuiApp {
         self.drop_plan_entries();
         // Empty = the engine dropped the plan: nothing replaces the card.
         if items.as_array().is_some_and(|a| !a.is_empty()) {
-            self.history.push(ChatMessage {
-                model: None,
-                role: "plan".to_string(),
-                content: items.to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            });
+            self.history
+                .push(ChatMessage::new("plan", items.to_string()).with_identity());
         }
         // Removing the prior card can leave history length and the last entry
         // unchanged (e.g. a status-only edit), so bump the revision unconditionally
@@ -1153,6 +1144,9 @@ impl CodeTuiApp {
         self.sending = false;
         self.subagent_rows.clear();
         self.clear_tool_output();
+        let elapsed_ms = self
+            .request_started_at
+            .map(|t| t.elapsed().as_millis() as i64);
         self.capture_turn_tps();
         self.request_started_at = None;
         self.response_task = None;
@@ -1222,7 +1216,7 @@ impl CodeTuiApp {
         self.persist_history().await?;
         // A compact adds no user/assistant message; logging would duplicate the prior row.
         if compact_before.is_none() {
-            self.log_agent_turn(tokens, turn_split).await;
+            self.log_agent_turn(tokens, turn_split, elapsed_ms).await;
         }
         // Pick up skills created/edited during the turn (e.g. via `/create-skill`):
         // refresh the `/` menu and, if the set changed, rebuild the engine next turn
@@ -1287,6 +1281,7 @@ impl CodeTuiApp {
         &self,
         tokens: u64,
         split: crate::services::session_store::SessionTokens,
+        duration_ms: Option<i64>,
     ) {
         let Some(user_message) = self
             .history
@@ -1327,6 +1322,7 @@ impl CodeTuiApp {
             &assistant_content,
             None,
             &usage,
+            duration_ms,
         )
         .await;
     }
@@ -1492,6 +1488,9 @@ impl CodeTuiApp {
         self.sending = false;
         self.subagent_rows.clear();
         self.clear_tool_output();
+        let elapsed_ms = self
+            .request_started_at
+            .map(|t| t.elapsed().as_millis() as i64);
         self.capture_turn_tps();
         self.request_started_at = None;
         self.response_task = None;
@@ -1506,7 +1505,7 @@ impl CodeTuiApp {
         }
 
         match result {
-            Ok(turn) => self.finish_successful_response(turn).await?,
+            Ok(turn) => self.finish_successful_response(turn, elapsed_ms).await?,
             Err(err) => self.finish_failed_response(err).await,
         }
 
@@ -1574,7 +1573,11 @@ impl CodeTuiApp {
         }
     }
 
-    async fn finish_successful_response(&mut self, turn: ChatTurnResult) -> Result<()> {
+    async fn finish_successful_response(
+        &mut self,
+        turn: ChatTurnResult,
+        elapsed_ms: Option<i64>,
+    ) -> Result<()> {
         self.persist_chat_route().await;
 
         // History already holds everything sent to the model this turn (the user
@@ -1670,6 +1673,7 @@ impl CodeTuiApp {
                 &assistant_content,
                 None,
                 &usage,
+                elapsed_ms,
             )
             .await;
         }
@@ -1906,13 +1910,13 @@ impl CodeTuiApp {
         if self.sending && !self.pending_response.is_empty() {
             let partial = std::mem::take(&mut self.pending_response);
             self.pending_reasoning.clear();
-            self.history.push(ChatMessage {
-                model: self.turn_model.clone(),
-                role: "assistant".to_string(),
-                content: partial,
-                reasoning_content: None,
-                attachments: vec![],
-            });
+            self.history.push(
+                ChatMessage {
+                    model: self.turn_model.clone(),
+                    ..ChatMessage::new("assistant", partial)
+                }
+                .with_identity(),
+            );
         }
 
         // Persist whatever history we have so /resume can find this session

@@ -83,6 +83,8 @@ pub(super) fn seed_two_exchanges(app: &mut CodeTuiApp) {
             content: content.to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
 }

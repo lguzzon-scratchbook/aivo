@@ -430,13 +430,13 @@ impl CodeTuiApp {
         // A new message starts (possibly) new work — drop a stale plan card so it
         // doesn't linger above the composer into an unrelated task.
         self.clear_stale_plan();
-        self.history.push(ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: display.unwrap_or_else(|| input.clone()),
-            reasoning_content: None,
-            attachments: attachments.clone(),
-        });
+        self.history.push(
+            ChatMessage {
+                attachments: attachments.clone(),
+                ..ChatMessage::new("user", display.unwrap_or_else(|| input.clone()))
+            }
+            .with_identity(),
+        );
         // A new turn rebuilds the transcript rows and snaps to the bottom, so any
         // prior selection would point at the wrong content — drop it.
         self.clear_transcript_selection();
@@ -1156,11 +1156,8 @@ impl CodeTuiApp {
             None
         } else {
             let msg = ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: input.clone(),
-                reasoning_content: None,
                 attachments,
+                ..ChatMessage::new("user", input.clone())
             };
             match crate::commands::code_request_builder::build_openai_message(&msg) {
                 Ok(v) => v.get("content").cloned(),
@@ -4259,13 +4256,14 @@ and keep each turn's work small"
         self.sending = false;
         self.request_started_at = None;
         self.follow_output = true;
-        self.history.push(ChatMessage {
-            model: self.turn_model.clone(),
-            role: "assistant".to_string(),
-            content: partial,
-            reasoning_content,
-            attachments: vec![],
-        });
+        self.history.push(
+            ChatMessage {
+                model: self.turn_model.clone(),
+                reasoning_content,
+                ..ChatMessage::new("assistant", partial)
+            }
+            .with_identity(),
+        );
         self.context_tokens = self.estimated_context_used().await;
         self.context_is_estimate = true;
         self.last_usage = None;
@@ -4824,6 +4822,19 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             Err(e) => format!("error: {e}"),
         };
         self.tx.send(RuntimeEvent::AgentToolResult { content }).ok();
+    }
+
+    fn step_timing(&mut self, timing: &crate::agent::engine::StepTiming) {
+        let kind = timing.kind.as_str().to_string();
+        self.tx
+            .send(RuntimeEvent::AgentStepTiming {
+                kind,
+                name: timing.name.clone(),
+                duration_ms: timing.duration_ms,
+                ok: timing.ok,
+                exit_code: timing.exit_code,
+            })
+            .ok();
     }
 
     fn notify(&mut self, text: &str) {

@@ -127,6 +127,8 @@ async fn covering_surfaces_hide_only_overlapped_placements() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // Filler pushes the composer (and the menu anchored to it) to the bottom,
     // clear of the image — the composer floats up under short transcripts.
@@ -137,6 +139,8 @@ async fn covering_surfaces_hide_only_overlapped_placements() {
             content: format!("filler {i}"),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     let key = 42;

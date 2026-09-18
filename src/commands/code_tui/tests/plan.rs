@@ -13,6 +13,8 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
         content: "first task".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -20,6 +22,8 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
         content: "the reply".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -27,6 +31,8 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
         content: r#"[{"step":"a","status":"completed"}]"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.turn_durations.insert(1, 78_000);
 
@@ -38,6 +44,8 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
         content: "second task".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let plain = app.build_transcript().plain_lines();
@@ -60,6 +68,8 @@ fn test_clear_completed_plan_shifts_index_maps() {
         content: "a".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -67,6 +77,8 @@ fn test_clear_completed_plan_shifts_index_maps() {
         content: r#"[{"step":"a","status":"completed"}]"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -74,6 +86,8 @@ fn test_clear_completed_plan_shifts_index_maps() {
         content: "b".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // Markers keyed to the entry AFTER the plan (idx 2) must slide to idx 1.
     app.turn_durations.insert(2, 5_000);
@@ -104,6 +118,8 @@ fn test_plan_renders_in_pinned_panel_not_inline() {
         content: r#"[{"step":"scan code","status":"completed"},{"step":"write fix","status":"in_progress"},{"step":"run tests","status":"pending"}]"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     // The plan is pinned in its own panel above the composer — it must NOT render
@@ -155,6 +171,8 @@ fn test_completed_plan_hidden_from_panel() {
         content: r#"[{"step":"scan code","status":"completed"},{"step":"write fix","status":"completed"}]"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let screen = render_screen(&mut app, 80, 20);
     assert!(
@@ -183,6 +201,8 @@ fn test_long_plan_windows_to_five_with_more_marker() {
         content: serde_json::Value::Array(plan).to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let screen = render_screen(&mut app, 80, 24);
     assert!(
@@ -267,6 +287,8 @@ fn test_apply_agent_plan_keeps_single_card() {
         content: "{}".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.apply_agent_plan(serde_json::json!([{"step": "a", "status": "completed"}]));
     assert_eq!(count_plans(&app), 1, "plan after work stays a single card");
@@ -316,6 +338,8 @@ async fn test_plan_card_idx_shifts_on_removal() {
         content: c.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
     app.history.clear();
     app.history.push(msg("user", "hi")); // 0
@@ -345,6 +369,8 @@ async fn test_plan_capture_discard_and_status() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
 
     // Bare `/plan` in the mode with nothing drafted points at the composer.
@@ -571,6 +597,8 @@ async fn test_cursor_plan_auto_continue_guards() {
         content: "boom".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.cursor_plan_go_pending = true;
     app.maybe_continue_cursor_plan().await.unwrap();
@@ -825,6 +853,8 @@ fn test_exit_plan_mode_call_renders_plan_card() {
                 .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let lines = app.build_transcript().lines;
     assert!(
@@ -931,6 +961,8 @@ async fn test_plan_bare_with_interrupted_checklist_points_at_resume() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.run_plan_command(None).await;
@@ -1316,6 +1348,8 @@ async fn test_persist_plan_state_tracks_execution_checklist() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.persist_plan_state().await;
@@ -1361,6 +1395,8 @@ async fn test_new_chat_hands_off_leftover_plan() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.start_new_chat().await;
@@ -1385,6 +1421,8 @@ async fn test_new_chat_draft_hints_instead_of_auto() {
         content: "plan something".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.plan_mode = true;
     app.pending_plan = Some("1. draft".to_string());
@@ -1412,6 +1450,8 @@ async fn test_new_keeps_plan_and_hints() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.execute_slash_command(SlashCommand::New).await.unwrap();
@@ -1452,6 +1492,8 @@ async fn seed_prior_plan_session(app: &mut super::super::CodeTuiApp) {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.persist_plan_state().await;
     app.session_id = "s-new".to_string();
@@ -1574,6 +1616,8 @@ async fn test_plan_save_writes_markdown() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.run_plan_command(Some("save".to_string())).await;
@@ -1683,6 +1727,8 @@ async fn test_new_esc_then_plan_resume_recovers_unpersisted_plan() {
         content: "build the blog".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -1691,6 +1737,8 @@ async fn test_new_esc_then_plan_resume_recovers_unpersisted_plan() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.execute_slash_command(SlashCommand::New).await.unwrap();
@@ -1728,6 +1776,8 @@ async fn test_plan_resume_continues_interrupted_plan_here() {
             .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.run_plan_command(Some("resume".to_string())).await;

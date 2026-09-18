@@ -189,6 +189,8 @@ async fn test_interrupt_drains_queued_messages() {
         content: "first".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_response = "partial".to_string();
     app.sending = true;
@@ -221,6 +223,8 @@ async fn test_interrupt_reclaims_steering_then_drains() {
         content: "first".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_response = "partial".to_string();
     app.sending = true;
@@ -251,6 +255,8 @@ async fn test_interrupt_empty_unsends_then_drains_queue() {
         content: "first message".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "first message".to_string(),

@@ -47,6 +47,8 @@ fn test_streams_thinking_window_during_thinking_only_phase() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_reasoning = "Working out the approach".to_string();
     assert!(app.pending_response.is_empty(), "no answer text yet");
@@ -104,6 +106,8 @@ directory. I should check git status and recent git log."
                 .to_string(),
         ),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let full = app.build_transcript();
@@ -147,6 +151,8 @@ fn test_cjk_thinking_wraps_with_hang_indent() {
         content: "你好！很高兴见到你。".to_string(),
         reasoning_content: Some("思".repeat(50)),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let full = app.build_transcript();
@@ -243,6 +249,8 @@ fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let base = app.volatile_tail_fp();
@@ -276,6 +284,8 @@ fn test_thinking_block_has_distinct_bar_color() {
         content: "the answer".to_string(),
         reasoning_content: Some("the reasoning".to_string()),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
 
@@ -311,6 +321,8 @@ fn test_history_reasoning_windows_when_thinking_enabled() {
                 .to_string(),
         ),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     // On: a bounded window shows the most recent lines behind the `▸` expand
@@ -362,6 +374,8 @@ fn test_click_thinking_header_toggles_inline_expansion() {
             content: content.to_string(),
             reasoning_content: Some(reasoning.to_string()),
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     // Simulate the rendered rows: each assistant turn is an answer line preceded
@@ -426,6 +440,8 @@ fn test_committed_thinking_windows_and_expands_on_click() {
         content: "answer".to_string(),
         reasoning_content: Some("line one\nline two".to_string()),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("✻"), "thinking marker present: {plain}");
@@ -442,6 +458,8 @@ fn test_committed_thinking_windows_and_expands_on_click() {
         content: "answer2".to_string(),
         reasoning_content: Some("alpha\nbeta\ngamma\ndelta\nepsilon".to_string()),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let plain = app.build_transcript().plain_lines().join("\n");
@@ -502,6 +520,8 @@ fn test_composer_placeholder_stays_plain_when_history_has_reasoning() {
         content: "answer".to_string(),
         reasoning_content: Some("private reasoning".to_string()),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let line = app.render_composer_text().lines[0].clone();
@@ -529,6 +549,8 @@ fn test_punctuation_only_reasoning_renders_no_thought_row() {
         content: "the answer".to_string(),
         reasoning_content: Some("...".to_string()),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let plain = app.build_transcript().plain_lines().join("\n");
     assert!(!plain.contains("▸ thought"), "{plain}");

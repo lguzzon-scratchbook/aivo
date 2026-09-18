@@ -104,6 +104,45 @@ impl FailureGuard {
     }
 }
 
+fn is_progress_tool(name: &str) -> bool {
+    crate::agent::file_tracker::is_write_tool(name)
+        || matches!(
+            name,
+            "update_plan" | "finish_turn" | "generate_image" | "subagent"
+        )
+}
+
+pub(crate) const STALL_HINT_AT: usize = 8;
+pub(crate) const STALL_HINT_AGAIN_AT: usize = 16;
+
+#[derive(Default)]
+pub(crate) struct StallGuard {
+    explore_batches: usize,
+    hints: usize,
+}
+
+impl StallGuard {
+    pub(crate) fn observe(&mut self, names: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+        if names.into_iter().any(|n| is_progress_tool(n.as_ref())) {
+            self.explore_batches = 0;
+            self.hints = 0;
+            return false;
+        }
+        self.explore_batches = self.explore_batches.saturating_add(1);
+        let due = match self.hints {
+            0 => self.explore_batches >= STALL_HINT_AT,
+            1 => self.explore_batches >= STALL_HINT_AGAIN_AT,
+            _ => false,
+        };
+        if due {
+            self.hints += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Whether a final (tool-less) answer admits the task ISN'T done — used only for
 /// unattended `-e` runs to nudge the model to continue rather than stop short.
 /// Deliberately narrow (first-person inability to *complete/finish*) and it excludes
@@ -284,5 +323,27 @@ mod tests {
         assert!(!ends_with_continuation_cue(
             "Fixed the bug and verified the tests pass."
         ));
+    }
+
+    #[test]
+    fn stall_guard_nudges_on_long_exploration_not_writes() {
+        let mut g = StallGuard::default();
+        for _ in 0..STALL_HINT_AT - 1 {
+            assert!(!g.observe(["read_file", "grep"]));
+        }
+        assert!(g.observe(["run_bash"]));
+        assert!(!g.observe(["read_file"]));
+        assert!(!g.observe(["edit_file"]));
+        assert_eq!(g.hints, 0);
+        let mut g = StallGuard::default();
+        assert!(!g.observe(["read_file"]));
+        assert!(!g.observe(["edit_file"]));
+        for _ in 0..STALL_HINT_AT - 1 {
+            assert!(!g.observe(["web_fetch"]));
+        }
+        assert!(g.observe(["skill"]));
+        while !g.observe(["run_bash"]) {}
+        assert_eq!(g.hints, 2);
+        assert!(!g.observe(["run_bash"]));
     }
 }

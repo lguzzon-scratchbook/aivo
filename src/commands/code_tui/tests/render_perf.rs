@@ -28,6 +28,8 @@ fn seed_large_history(app: &mut CodeTuiApp, exchanges: usize) {
             content: format!("question {i}: how does the provider router pick a route?"),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         app.history.push(ChatMessage {
             model: None,
@@ -35,6 +37,8 @@ fn seed_large_history(app: &mut CodeTuiApp, exchanges: usize) {
             content: reply_block(i),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
 }
@@ -190,6 +194,8 @@ fn bench_real_session() {
             content: field(m, "content").unwrap_or_default(),
             reasoning_content: field(m, "reasoning_content"),
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     println!(

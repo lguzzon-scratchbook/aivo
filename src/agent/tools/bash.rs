@@ -14,6 +14,11 @@ pub struct BashOutcome {
     /// A denial line named a protected root — the escalated re-run would fail
     /// identically, so the engine skips it.
     pub blocked_protected: bool,
+    pub exit_code: Option<i32>,
+}
+
+pub(crate) fn process_exit_tag(code: i32) -> String {
+    format!("[process exit_code={code}]")
 }
 
 /// Live `run_bash` output chunks for the UI; never changes the final result.
@@ -59,10 +64,8 @@ pub async fn run_bash_unconfined(
     args: &Value,
     cwd: &Path,
     progress: Option<BashProgress>,
-) -> Result<String, String> {
-    run_bash_inner(args, cwd, BashConfinement::None, progress)
-        .await
-        .result
+) -> BashOutcome {
+    run_bash_inner(args, cwd, BashConfinement::None, progress).await
 }
 
 pub(super) fn is_shell_operator(tok: &str) -> bool {
@@ -396,6 +399,7 @@ pub(super) async fn run_bash_inner(
         result,
         sandbox_blocked: false,
         blocked_protected: false,
+        exit_code: None,
     };
     let command = match arg_str(args, "command") {
         Ok(c) => c,
@@ -536,7 +540,7 @@ don't fall back to telling the user to run it by hand. Relaunching with `--add-d
     if out.is_empty() {
         out.push_str("(no output)");
     }
-    let result = if out.len() > MAX_OUTPUT || out.lines().count() > MAX_OUTPUT_LINES {
+    let mut result = if out.len() > MAX_OUTPUT || out.lines().count() > MAX_OUTPUT_LINES {
         let spilled = spill_full_output(&out);
         let mut capped = cap_tail(out);
         if let Some(path) = spilled {
@@ -546,10 +550,12 @@ don't fall back to telling the user to run it by hand. Relaunching with `--add-d
     } else {
         out
     };
+    result.push_str(&format!("\n{}", process_exit_tag(code)));
     BashOutcome {
         result: Ok(result),
         sandbox_blocked,
         blocked_protected,
+        exit_code: Some(code),
     }
 }
 

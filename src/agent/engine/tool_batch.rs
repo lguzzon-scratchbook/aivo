@@ -62,6 +62,8 @@ impl AgentEngine {
         // (tool, error) per failed call, for the same-signature failure guard.
         let mut failures: Vec<(String, String)> = Vec::new();
         let mut outcomes: Vec<Option<Result<String, String>>> = vec![None; tool_calls.len()];
+        let mut durations: Vec<Option<u64>> = vec![None; tool_calls.len()];
+        let mut exit_codes: Vec<Option<i32>> = vec![None; tool_calls.len()];
         let mut batch_images: Vec<(String, Vec<crate::agent::engine::ToolImage>)> = Vec::new();
         let mut parallel_idx: Vec<usize> = Vec::new();
         let mut sequential_idx: Vec<usize> = Vec::new();
@@ -264,9 +266,13 @@ Investigate, or call `exit_plan_mode` with your plan."
             let cwd = ctx.cwd;
             let runs = parallel_idx.iter().map(|&i| {
                 let call = &tool_calls[i];
-                async move { (i, tools::execute(&call.name, &call.arguments, cwd).await) }
+                async move {
+                    let started = Instant::now();
+                    let result = tools::execute(&call.name, &call.arguments, cwd).await;
+                    (i, result, elapsed_ms(started))
+                }
             });
-            for (i, result) in futures::future::join_all(runs).await {
+            for (i, result, duration_ms) in futures::future::join_all(runs).await {
                 // Anchor a read baseline as soon as the read succeeds, before the
                 // sequential pass runs — so a same-batch edit is checked against what
                 // was just read, not a stale prior-turn snapshot.
@@ -281,6 +287,7 @@ Investigate, or call `exit_plan_mode` with your plan."
                     self.model_reads_images,
                     &mut batch_images,
                 ));
+                durations[i] = Some(duration_ms);
             }
         }
 
@@ -322,7 +329,7 @@ Investigate, or call `exit_plan_mode` with your plan."
             // worker set avoids buffer_unordered's Send bound on the sub-engine future.
             let cursor = std::sync::atomic::AtomicUsize::new(0);
             // Mutex (not RefCell): the turn future must stay Send; locked only between awaits.
-            type DelegateOutcome = (usize, Result<String, String>, u64, SessionTokens);
+            type DelegateOutcome = (usize, Result<String, String>, u64, SessionTokens, u64);
             let done: std::sync::Mutex<Vec<DelegateOutcome>> =
                 std::sync::Mutex::new(Vec::with_capacity(subagent_idx.len()));
             let workers = (0..SUBAGENT_PARALLEL_CAP.min(subagent_idx.len())).map(|_| {
@@ -335,6 +342,7 @@ Investigate, or call `exit_plan_mode` with your plan."
                             break;
                         };
                         let s = sink.clone().map(|s| (s, slot));
+                        let started = Instant::now();
                         let (res, toks, split) = this
                             .run_subagent(
                                 ctx,
@@ -346,17 +354,20 @@ Investigate, or call `exit_plan_mode` with your plan."
                                 subagent_idx.len(),
                             )
                             .await;
-                        done.lock().unwrap().push((i, res, toks, split));
+                        done.lock()
+                            .unwrap()
+                            .push((i, res, toks, split, elapsed_ms(started)));
                     }
                 }
             });
             futures::future::join_all(workers).await;
             let mut sub_tokens_total = 0u64;
             let mut sub_usage = SessionTokens::default();
-            for (i, res, toks, split) in done.into_inner().unwrap() {
+            for (i, res, toks, split, duration_ms) in done.into_inner().unwrap() {
                 sub_tokens_total = sub_tokens_total.saturating_add(toks);
                 sub_usage = sub_usage.merge(split);
                 outcomes[i] = Some(res);
+                durations[i] = Some(duration_ms);
             }
             if let Some(s) = &sink {
                 s.finish();
@@ -380,6 +391,7 @@ Investigate, or call `exit_plan_mode` with your plan."
                 outcomes[i] = Some(Err(msg));
                 continue;
             }
+            let started = Instant::now();
             let result = if n == "skill" {
                 // Resolved from the engine's discovered skills, not tools::execute.
                 let name = call
@@ -498,8 +510,11 @@ command in the foreground (drop `background`)."
                 }
             } else if n == "run_bash" {
                 // Run confined; a sandbox write-block offers an in-session escape hatch instead of a dead-end error.
-                self.run_bash_with_escalation(ctx, ui, &call.arguments)
-                    .await
+                let outcome = self
+                    .run_bash_with_escalation(ctx, ui, &call.arguments)
+                    .await;
+                exit_codes[i] = outcome.exit_code;
+                outcome.result
             } else if crate::agent::file_tracker::is_write_tool(n) {
                 // Same escape hatch as bash for an out-of-workspace target.
                 self.run_write_with_escalation(ctx, ui, n, &call.arguments)
@@ -525,10 +540,16 @@ command in the foreground (drop `background`)."
                             .unwrap_or(false)
                         {
                             t.kill(id).await
-                        } else if wait > 0 {
-                            t.check_wait(id, wait).await
                         } else {
-                            t.check(id)
+                            let text = if wait > 0 {
+                                t.check_wait(id, wait).await
+                            } else {
+                                t.check(id)
+                            };
+                            if text.is_ok() {
+                                exit_codes[i] = t.exit_code(id);
+                            }
+                            text
                         }
                     }
                     None => Err("no background jobs in this run mode.".into()),
@@ -546,6 +567,7 @@ command in the foreground (drop `background`)."
             if result.is_ok() {
                 self.file_tracker.record(n, &call.arguments, ctx.cwd);
             }
+            durations[i] = Some(elapsed_ms(started));
             outcomes[i] = Some(result);
         }
 
@@ -610,6 +632,15 @@ command in the foreground (drop `background`)."
                 .unwrap_or_else(|| Err("tool produced no result".to_string()));
             // update_plan already surfaced via plan_updated. Normalized name so the label matches and aliased reads/writes track.
             if n != "update_plan" {
+                if let Some(ms) = durations[i] {
+                    ui.step_timing(&StepTiming {
+                        kind: StepKind::Tool,
+                        name: n.to_string(),
+                        duration_ms: ms,
+                        ok: result.is_ok(),
+                        exit_code: exit_codes[i],
+                    });
+                }
                 ui.tool_result(n, &result);
             }
             if result.is_ok() {
@@ -802,12 +833,12 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
         ctx: &TurnCtx<'_>,
         ui: &mut dyn AgentUi,
         args: &Value,
-    ) -> Result<String, String> {
+    ) -> tools::BashOutcome {
         let mut outcome =
             Self::pump_bash_progress(ui, |tx| tools::run_bash_confined(args, ctx.cwd, Some(tx)))
                 .await;
         if !outcome.sandbox_blocked {
-            return outcome.result;
+            return outcome;
         }
         let command = args
             .get("command")
@@ -841,7 +872,7 @@ command with no sandbox confinement?"
                 preview: Some(preview),
             };
             if !self.resolve_permission(ctx, ui, action).await.allowed() {
-                return outcome.result;
+                return outcome;
             }
             ui.notify(SANDBOX_ESCALATION_NOTICE);
             return Self::pump_bash_progress(ui, |tx| {
@@ -861,14 +892,14 @@ outside {cwd}. Add {root} to this session's writable roots and re-run?",
                 cwd = ctx.cwd.display()
             );
             if !self.offer_add_write_root(ctx, ui, &root, preview).await {
-                return outcome.result;
+                return outcome;
             }
             let rerun = Self::pump_bash_progress(ui, |tx| {
                 tools::run_bash_confined(args, ctx.cwd, Some(tx))
             })
             .await;
             if !rerun.sandbox_blocked {
-                return rerun.result;
+                return rerun;
             }
             outcome = rerun; // the derived root wasn't (all of) it
         }
@@ -884,18 +915,18 @@ Re-run the full command without write confinement?",
         };
         if !self.resolve_permission(ctx, ui, action).await.allowed() {
             // Keep the blocked output + hint so the model sees the escalation was declined.
-            return outcome.result;
+            return outcome;
         }
         ui.notify(SANDBOX_ESCALATION_NOTICE);
         let escalated =
             Self::pump_bash_progress(ui, |tx| tools::run_bash_escalated(args, ctx.cwd, Some(tx)))
                 .await;
         if !escalated.sandbox_blocked {
-            return escalated.result;
+            return escalated;
         }
         // No protected evidence = a misread of the command's own output, not the floor.
         if !escalated.blocked_protected && !tools::command_mentions_protected_path(command) {
-            return escalated.result;
+            return escalated;
         }
         // The floor — confirm per call, even under auto-approve.
         let action = PermissionAction::Once {
@@ -906,7 +937,7 @@ Re-run the full command without write confinement?",
             )),
         };
         if !self.resolve_permission(ctx, ui, action).await.allowed() {
-            return escalated.result;
+            return escalated;
         }
         ui.notify(SANDBOX_ESCALATION_NOTICE);
         Self::pump_bash_progress(ui, |tx| tools::run_bash_unconfined(args, ctx.cwd, Some(tx))).await

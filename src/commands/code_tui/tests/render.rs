@@ -358,6 +358,8 @@ fn test_long_reply_scrolls_to_show_last_line() {
         content: body,
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     assert!(app.follow_output);
 
@@ -421,6 +423,8 @@ fn test_notice_renders_when_turn_ended_on_a_tool_step() {
             content: content.to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     assert!(app.pending_response.is_empty());
@@ -459,6 +463,8 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
         content: "# Heading\n\nSome **markdown** reply.".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
@@ -507,6 +513,8 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
         content: "another turn".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     draw(&mut app, &mut terminal);
     assert_ne!(
@@ -529,6 +537,8 @@ fn test_spinner_animation_does_not_invalidate_transcript_cache() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
 
@@ -592,6 +602,8 @@ fn test_streaming_tokens_do_not_invalidate_history_body_cache() {
         content: "# Heading\n\nSome **markdown** reply.".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.pending_response = "Stream".to_string();
@@ -663,6 +675,8 @@ fn test_in_flight_tool_call_does_not_invalidate_history_body_cache() {
         content: "please inspect src/main.rs".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -670,6 +684,8 @@ fn test_in_flight_tool_call_does_not_invalidate_history_body_cache() {
         content: "I'll read the file.".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.request_started_at = Some(std::time::Instant::now());
@@ -737,6 +753,8 @@ fn test_streaming_composed_render_matches_full_transcript() {
         content: "explain the plan in detail please".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -746,6 +764,8 @@ fn test_streaming_composed_render_matches_full_transcript() {
                 .to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // Mid-stream: a partial reply (the volatile tail) + a notice, plus the
     // spinner. No turn clock: the spinner re-reads `elapsed()` per render, so a
@@ -798,6 +818,8 @@ fn streaming_reply_cache_invalidates_on_change() {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     // No turn clock — see `test_streaming_composed_render_matches_full_transcript`.
@@ -982,6 +1004,8 @@ async fn test_finish_deferred_until_typewriter_drains() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // A chunk arrived but hasn't been revealed yet.
     app.incoming_buffer = "the full reply".to_string();
@@ -1035,6 +1059,8 @@ fn test_render_main_omits_accent_gutter_bars() {
         content: "ping".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // Long enough to wrap across several rows at width 24.
     app.history.push(ChatMessage {
@@ -1043,6 +1069,8 @@ fn test_render_main_omits_accent_gutter_bars() {
         content: "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let backend = TestBackend::new(24, 16);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1111,6 +1139,8 @@ fn test_render_main_uses_full_height_for_long_transcript() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let backend = TestBackend::new(80, 12);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1174,6 +1204,8 @@ fn test_inline_image_preview_rows_reserved_and_anchored() {
                 data: "iVBORtestpayload".to_string(),
             },
         }],
+        id: None,
+        timestamp: None,
     });
     let key = match &app.history[0].attachments[0].storage {
         AttachmentStorage::Inline { data } => hash_inline(data),
@@ -1274,6 +1306,8 @@ fn test_user_named_image_previews_under_the_reply() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -1452,6 +1486,8 @@ fn test_ask_card_keeps_inline_placements() {
             content: "show shot.png".to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         app.inline_images
             .pinned
@@ -1627,6 +1663,8 @@ async fn test_inline_image_previews_pin_to_mention_time_state() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: Vec::new(),
+        id: None,
+        timestamp: None,
     };
     app.history.push(user_msg("show shape.svg"));
     app.queue_missing_previews();
@@ -1675,6 +1713,8 @@ fn test_inline_image_dedup_is_by_content_not_source_key() {
         content: "two copies of one picture".to_string(),
         reasoning_content: None,
         attachments: vec![make_att("iVBORaaaa"), make_att("iVBORbbbb")],
+        id: None,
+        timestamp: None,
     });
     let ready = |hash: u64| {
         PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
@@ -1732,6 +1772,8 @@ fn test_consecutive_portrait_attachments_pack_on_one_band() {
         content: "three portraits".to_string(),
         reasoning_content: None,
         attachments: vec![make_att("p1"), make_att("p2"), make_att("p3")],
+        id: None,
+        timestamp: None,
     });
     let ready = |hash: u64| {
         PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {

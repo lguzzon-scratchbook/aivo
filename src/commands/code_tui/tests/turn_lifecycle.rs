@@ -53,6 +53,8 @@ fn test_restore_cancelled_submission_puts_prompt_back() {
         content: "draft".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     }];
     let mut draft = String::new();
     let mut draft_attachments = Vec::new();
@@ -84,6 +86,8 @@ async fn test_cancel_keeps_user_turn_for_in_process_agent_turn() {
         content: "edit the config".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "edit the config".to_string(),
@@ -135,6 +139,8 @@ async fn test_esc_unsend_removes_agent_engine_user_turn() {
         content: "hello".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "hello".to_string(),
@@ -183,6 +189,8 @@ async fn test_interrupt_inflight_request_keeps_partial_response() {
         content: "draft".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "draft".to_string(),
@@ -252,6 +260,8 @@ async fn test_interrupt_empty_restores_draft() {
         content: "first message".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "first message".to_string(),
@@ -289,6 +299,8 @@ async fn test_interrupt_empty_keeps_typed_draft() {
         content: "first message".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "first message".to_string(),
@@ -322,6 +334,8 @@ async fn test_interrupt_empty_agent_turn_restores_draft() {
         content: "edit the config".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "edit the config".to_string(),
@@ -355,6 +369,8 @@ async fn test_interrupt_empty_agent_turn_with_tool_keeps_turn() {
         content: "edit the config".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -362,6 +378,8 @@ async fn test_interrupt_empty_agent_turn_with_tool_keeps_turn() {
         content: "{\"name\":\"edit_file\"}".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "edit the config".to_string(),
@@ -397,6 +415,8 @@ async fn test_recover_dead_response_task_resets_stuck_turn() {
         content: "do it".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_response = "partial".to_string();
     app.sending = true;
@@ -481,6 +501,8 @@ async fn test_history_has_image_detects_image_attachment() {
                 data: "abc".to_string(),
             },
         }],
+        id: None,
+        timestamp: None,
     });
     assert!(
         !app.history_has_image(),
@@ -499,6 +521,8 @@ async fn test_history_has_image_detects_image_attachment() {
                 data: "iVBOR".to_string(),
             },
         }],
+        id: None,
+        timestamp: None,
     });
     assert!(app.history_has_image(), "image attachment detected");
 }

@@ -317,6 +317,8 @@ async fn test_open_model_picker_keeps_inflight_turn() {
         content: "draft".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_response = "partial".to_string();
     app.sending = true;
@@ -973,6 +975,8 @@ fn model_switch_stamps_turns_and_renders_divider() {
         content: "first question".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.turn_model = Some("model-a".to_string());
     // Mid-turn switch: the running turn must keep its dispatch-time stamp.
@@ -991,6 +995,8 @@ fn model_switch_stamps_turns_and_renders_divider() {
         content: "second question".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.turn_model = Some("model-b".to_string());
     app.pending_response = "answer two".to_string();
@@ -1036,6 +1042,8 @@ fn unstamped_history_renders_no_model_divider() {
             content: content.to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     let body = app.build_transcript_history_body(80);

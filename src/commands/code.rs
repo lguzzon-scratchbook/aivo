@@ -7,7 +7,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::constants::CONTENT_TYPE_JSON;
 use anyhow::{Context, Result};
@@ -88,6 +88,34 @@ pub struct ChatMessage {
     /// Producing model (assistant turns only); `None` on pre-feature sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub timestamp: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            reasoning_content: None,
+            attachments: vec![],
+            model: None,
+            id: None,
+            timestamp: None,
+        }
+    }
+
+    pub fn with_identity(mut self) -> Self {
+        if self.id.is_none() {
+            self.id = Some(new_code_session_id());
+        }
+        if self.timestamp.is_none() {
+            self.timestamp = Some(Utc::now().to_rfc3339());
+        }
+        self
+    }
 }
 
 /// Which API format the provider speaks
@@ -801,13 +829,13 @@ impl CodeCommand {
             };
 
             let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
-            let history = vec![ChatMessage {
-                model: None,
-                role: "user".to_string(),
-                content: one_shot_input,
-                reasoning_content: None,
-                attachments: one_shot_attachments,
-            }];
+            let history = vec![
+                ChatMessage {
+                    attachments: one_shot_attachments,
+                    ..ChatMessage::new("user", one_shot_input)
+                }
+                .with_identity(),
+            ];
             let mut format = seeded_chat_format(&key, &raw_model);
             self.session_store
                 .record_selection(&key.id, "code", Some(&raw_model))
@@ -838,6 +866,7 @@ impl CodeCommand {
             // connection before the process exits. Without this branch the
             // default SIGINT terminates the process abruptly, leaving the
             // server to keep generating.
+            let turn_started = Instant::now();
             let result = if key.is_cursor_acp() {
                 let prompt_text = history[0].content.clone();
                 let attachments = history[0].attachments.clone();
@@ -944,6 +973,7 @@ impl CodeCommand {
                         &turn.content,
                         None,
                         &usage,
+                        Some(turn_started.elapsed().as_millis() as i64),
                     )
                     .await;
                     let (stored, title, preview) = build_one_shot_persist_inputs(
@@ -1661,13 +1691,14 @@ fn build_one_shot_persist_inputs(
     raw_model: &str,
 ) -> (Vec<StoredChatMessage>, String, String) {
     let mut full_history = user_history.to_vec();
-    full_history.push(ChatMessage {
-        model: (!raw_model.is_empty()).then(|| raw_model.to_string()),
-        role: "assistant".to_string(),
-        content: assistant_content,
-        reasoning_content: assistant_reasoning.and_then(normalize_reasoning_content),
-        attachments: vec![],
-    });
+    full_history.push(
+        ChatMessage {
+            model: (!raw_model.is_empty()).then(|| raw_model.to_string()),
+            reasoning_content: assistant_reasoning.and_then(normalize_reasoning_content),
+            ..ChatMessage::new("assistant", assistant_content)
+        }
+        .with_identity(),
+    );
     let stored = to_stored_messages(&full_history);
     let title = code_tui::session_title_from_messages(&full_history, raw_model);
     let preview = code_tui::session_preview_text_from_messages(&full_history, raw_model);
@@ -1682,8 +1713,8 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
             role: message.role.clone(),
             content: message.content.clone(),
             reasoning_content: message.reasoning_content.clone(),
-            id: Some(new_code_session_id()),
-            timestamp: Some(Utc::now().to_rfc3339()),
+            id: message.id.clone(),
+            timestamp: message.timestamp.clone(),
             attachments: (!message.attachments.is_empty()).then(|| message.attachments.clone()),
         })
         .collect()
@@ -1736,6 +1767,7 @@ async fn log_chat_turn(
     assistant_content: &str,
     reasoning_content: Option<&str>,
     usage: &TokenUsage,
+    duration_ms: Option<i64>,
 ) -> Result<()> {
     let attachments = user_message
         .attachments
@@ -1765,6 +1797,7 @@ async fn log_chat_turn(
             output_tokens: Some(usage.completion_tokens as i64),
             cache_read_input_tokens: Some(usage.cache_read_input_tokens as i64),
             cache_creation_input_tokens: Some(usage.cache_creation_input_tokens as i64),
+            duration_ms,
             // A skill invocation's content is the whole inlined SKILL.md body;
             // log the compact `/name args` the user typed (so `aivo logs` shows
             // the real input, e.g. `/baidu-search 歌曲`) and keep the full
@@ -3124,13 +3157,7 @@ mod tests {
 
     #[test]
     fn build_one_shot_persist_inputs_includes_assistant_turn() {
-        let user_history = vec![ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: "hello world".to_string(),
-            reasoning_content: None,
-            attachments: vec![],
-        }];
+        let user_history = vec![ChatMessage::new("user", "hello world")];
         let (stored, title, preview) = build_one_shot_persist_inputs(
             &user_history,
             "hi there".to_string(),
@@ -3160,13 +3187,7 @@ mod tests {
 
     #[test]
     fn build_one_shot_persist_inputs_drops_empty_reasoning() {
-        let user_history = vec![ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: "ping".to_string(),
-            reasoning_content: None,
-            attachments: vec![],
-        }];
+        let user_history = vec![ChatMessage::new("user", "ping")];
         let (stored, _, _) = build_one_shot_persist_inputs(
             &user_history,
             "pong".to_string(),
@@ -3291,13 +3312,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}],\"usage\":{\"prompt_to
         );
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let spinning = Arc::new(AtomicBool::new(false));
-        let messages = [ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: "hi".to_string(),
-            reasoning_content: None,
-            attachments: vec![],
-        }];
+        let messages = [ChatMessage::new("user", "hi")];
         let mut streamed = String::new();
         let result = send_chat_request(
             &client,
@@ -3363,13 +3378,7 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
         );
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let spinning = Arc::new(AtomicBool::new(false));
-        let messages = [ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: "hi".to_string(),
-            reasoning_content: None,
-            attachments: vec![],
-        }];
+        let messages = [ChatMessage::new("user", "hi")];
         let result = send_anthropic_request(
             &client,
             &key,
@@ -3391,11 +3400,8 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
     #[test]
     fn test_chat_message_serialization() {
         let msg = ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: "hello".to_string(),
             reasoning_content: Some("hidden".to_string()),
-            attachments: vec![],
+            ..ChatMessage::new("user", "hello")
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"role\":\"user\""));
@@ -3696,5 +3702,40 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
         assert!(err.to_string().contains("/new"), "got: {err}");
         unsafe { std::env::remove_var(crate::constants::CODE_ACTIVE_ENV) };
         assert!(refuse_nested_tui().is_ok());
+    }
+
+    #[test]
+    fn stored_messages_keep_identity_across_conversions() {
+        let msg = ChatMessage {
+            id: Some("abc".to_string()),
+            timestamp: Some("2026-01-01T00:00:00Z".to_string()),
+            ..ChatMessage::new("user", "hi")
+        };
+        let first = to_stored_messages(std::slice::from_ref(&msg));
+        let second = to_stored_messages(std::slice::from_ref(&msg));
+        assert_eq!(first[0].id.as_deref(), Some("abc"));
+        assert_eq!(first[0].timestamp.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(first[0].id, second[0].id);
+        assert_eq!(first[0].timestamp, second[0].timestamp);
+    }
+
+    #[test]
+    fn with_identity_stamps_once() {
+        let first = ChatMessage::new("user", "hi").with_identity();
+        let id = first.id.clone();
+        let ts = first.timestamp.clone();
+        assert!(id.is_some());
+        assert!(ts.is_some());
+        let again = first.with_identity();
+        assert_eq!(again.id, id);
+        assert_eq!(again.timestamp, ts);
+    }
+
+    #[test]
+    fn missing_identity_stays_missing_on_persist() {
+        let msg = ChatMessage::new("user", "legacy");
+        let stored = to_stored_messages(&[msg]);
+        assert!(stored[0].id.is_none());
+        assert!(stored[0].timestamp.is_none());
     }
 }

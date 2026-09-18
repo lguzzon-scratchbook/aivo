@@ -66,6 +66,8 @@ fn assert_stream_matches(reply: &str, width: u16, step: usize) {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     // No turn clock on purpose: the spinner re-reads `elapsed()` per render, so
@@ -115,6 +117,8 @@ fn streamed_reply_with_reasoning_and_notice_matches() {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     // No turn clock — see `assert_stream_matches`.
@@ -156,6 +160,8 @@ fn shrunken_reply_resets_settled_sections() {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     // No turn clock — see `assert_stream_matches`.
@@ -180,6 +186,8 @@ async fn discarded_reply_replaced_at_same_length_rebuilds_tail() {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.pending_response = "stale reply".to_string();
@@ -212,6 +220,8 @@ async fn discarded_reasoning_replaced_at_same_length_rebuilds_tail() {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.thinking_enabled = true;
@@ -244,6 +254,8 @@ fn growing_reasoning_keeps_settled_reply_sections() {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.thinking_enabled = true;
@@ -290,6 +302,8 @@ fn thought_commit_matches_single_pass() {
             content: format!("q{i}"),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         app.history.push(ChatMessage {
             model: None,
@@ -297,6 +311,8 @@ fn thought_commit_matches_single_pass() {
             content: format!("answer {i} with enough prose to wrap at this width"),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
@@ -320,6 +336,8 @@ fn streaming_tool_tail_height_never_decreases() {
         content: "go".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.sending = true;
     app.request_started_at = Some(Instant::now());

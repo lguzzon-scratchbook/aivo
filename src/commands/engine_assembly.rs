@@ -32,7 +32,7 @@ impl EngineAssembly<'_> {
         let cwd_path = Path::new(self.cwd);
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let guides = crate::agent::system_prompt::discover_project_guides(cwd_path);
-        // Discovered skills minus `/skills`-disabled, plus the create-agent builtin.
+        // Discovered skills minus `/skills`-disabled, plus injected builtins.
         let disabled: std::collections::HashSet<String> = self
             .session_store
             .get_disabled_skills()

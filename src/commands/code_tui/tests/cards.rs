@@ -13,6 +13,8 @@ fn test_permission_card_anchored_above_composer() {
             content: "working on it".to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::protocol::Decision>();
@@ -582,6 +584,8 @@ fn test_ask_card_renders_question_and_options() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(
@@ -627,6 +631,8 @@ fn test_ask_card_long_description_wraps() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let (screen, _rows) = render_full_screen(&mut app, 70, 24);
     // the tail only fits on a wrapped continuation row
@@ -669,6 +675,8 @@ fn test_ask_card_long_description_compact_fallback() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // 14 rows can't hold 4 options × 3 wrapped rows → compact form, trimmed
     let (screen, _rows) = render_full_screen(&mut app, 60, 14);
@@ -756,6 +764,8 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
             .join("\n"),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(screen.contains("[ ]"), "unchecked boxes render:\n{screen}");

@@ -20,6 +20,8 @@ fn test_resumable_session_id_skips_empty_history() {
         content: "hi".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     assert_eq!(app.resumable_session_id(), Some("abc-123"));
 }
@@ -130,6 +132,8 @@ async fn test_rewind_picker_ignores_non_agent_row_with_identical_text() {
             content: content.to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     // Only the FIRST "continue" went through the engine.
@@ -202,6 +206,8 @@ async fn test_rewind_picker_boundary_reverts_newer_turns_for_conversation_only_r
             content: content.to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     app.agent_turn_indices.insert(2);
@@ -297,6 +303,8 @@ async fn test_rewind_boundary_reverts_files_then_drops_engine() {
             content: content.to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     app.agent_turn_indices.insert(2);
@@ -458,6 +466,8 @@ async fn test_rewind_acp_reverts_files() {
             content: content.to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     app.acp_checkpoints.push(AcpCheckpoint {
@@ -634,6 +644,8 @@ async fn test_conversation_only_rewind_drops_pending_transcript() {
         content: "first ask".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_agent_messages = Some(vec![
         serde_json::json!({"role": "user", "content": "first ask"}),
@@ -804,6 +816,8 @@ async fn test_resume_restores_unfinished_plan() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
     let session = LoadedSession {
         key_id: app.key.id.clone(),
@@ -917,6 +931,8 @@ async fn test_begin_resume_load_clears_transcript_before_result() {
         content: "old".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.pending_response = "pending".to_string();
     app.draft = "draft".to_string();
@@ -1056,6 +1072,8 @@ async fn test_resume_last_in_session_skips_current_chat() {
         content: "live conversation".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.open_resume_picker(Some("last".to_string()))
@@ -1094,6 +1112,8 @@ async fn test_open_resume_picker_saves_current_unsaved_session() {
         content: "hello from a new chat".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     app.open_resume_picker(None).await.unwrap();
@@ -1378,6 +1398,8 @@ async fn test_resume_loaded_failure_restores_previous_state() {
         content: "old".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let preview = SessionPreview {
         key_id: app.key.id.clone(),
@@ -1446,6 +1468,8 @@ async fn test_resume_resets_agent_engine() {
             content: "earlier turn".to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         }],
         // A durable transcript on the resumed session is stashed for the next
         // engine build to restore verbatim (exact tool history).
@@ -1503,6 +1527,8 @@ async fn test_resume_footer_estimate_uses_durable_transcript() {
             content: "earlier turn".to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         }],
         engine_messages: Some(vec![
             serde_json::json!({"role": "user", "content": "earlier turn"}),
@@ -1608,6 +1634,8 @@ async fn test_resume_does_not_overwrite_persisted_default_model() {
             content: "earlier turn".to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         }],
         engine_messages: None,
         pristine_import: false,
@@ -1696,6 +1724,8 @@ async fn test_resume_snapshots_scope_by_cwd() {
         content: "remember me".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     assert_eq!(app.persist_cwd(), "/home/me/project"); // logs key on real dir
     app.persist_history().await.unwrap();

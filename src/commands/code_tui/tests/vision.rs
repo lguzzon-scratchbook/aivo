@@ -422,6 +422,8 @@ async fn image_rejection_learns_text_only_for_the_session() {
         content: "what's in this".to_string(),
         reasoning_content: None,
         attachments: vec![image_attachment()],
+        id: None,
+        timestamp: None,
     });
     app.pending_submit = Some(PendingSubmission {
         content: "what's in this".to_string(),
@@ -789,6 +791,8 @@ fn seed_turns_carry_descriptions_or_placeholders() {
             content: "what's in this".to_string(),
             reasoning_content: None,
             attachments: vec![image_attachment()],
+            id: None,
+            timestamp: None,
         },
         ChatMessage {
             model: None,
@@ -802,6 +806,8 @@ fn seed_turns_carry_descriptions_or_placeholders() {
                     data: "b3RoZXI=".to_string(),
                 },
             }],
+            id: None,
+            timestamp: None,
         },
     ];
     let mut cache = std::collections::HashMap::new();
@@ -832,6 +838,8 @@ async fn describe_failed_restores_composer_and_resets_turn() {
         content: "what's in this".to_string(),
         reasoning_content: None,
         attachments: vec![image_attachment()],
+        id: None,
+        timestamp: None,
     });
     app.agent_turn_indices.insert(0);
     app.pending_submit = Some(PendingSubmission {
@@ -867,6 +875,8 @@ fn image_history_session(b64: String) -> LoadedSession {
             content: "look".to_string(),
             reasoning_content: None,
             attachments: vec![image_attachment_with(b64)],
+            id: None,
+            timestamp: None,
         }],
         engine_messages: None,
         pristine_import: false,

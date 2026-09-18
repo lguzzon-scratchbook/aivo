@@ -469,11 +469,8 @@ async fn run_agent_captured(
         Value::String(prompt.clone())
     } else {
         let msg = crate::commands::code::ChatMessage {
-            model: None,
-            role: "user".to_string(),
-            content: prompt.clone(),
-            reasoning_content: None,
             attachments: opts.attachments.clone(),
+            ..crate::commands::code::ChatMessage::new("user", prompt.clone())
         };
         crate::commands::code_request_builder::build_openai_message(&msg)?
             .get("content")
@@ -1505,6 +1502,21 @@ impl AgentUi for HeadlessAgentUi {
                 self.emit("tool_result", ev);
             }
         }
+    }
+    fn step_timing(&mut self, timing: &crate::agent::engine::StepTiming) {
+        if self.silent || !matches!(self.format, OutputFormat::StreamJson) {
+            return;
+        }
+        self.emit(
+            "timing",
+            json!({
+                "kind": timing.kind.as_str(),
+                "name": timing.name,
+                "durationMs": timing.duration_ms,
+                "ok": timing.ok,
+                "exitCode": timing.exit_code,
+            }),
+        );
     }
     fn notify(&mut self, text: &str) {
         if self.silent {

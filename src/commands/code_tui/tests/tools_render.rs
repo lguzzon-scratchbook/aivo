@@ -262,6 +262,8 @@ fn test_edit_diff_rows_carry_add_remove_tints() {
         content: r#"{"name":"edit_file","args":{"path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let lines = app.build_transcript().lines;
@@ -293,6 +295,8 @@ fn test_edit_diff_word_highlight_brightens_only_changed_tokens() {
         content: r#"{"name":"edit_file","args":{"path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let lines = app.build_transcript().lines;
     // Background of the span carrying exactly `text`, on the line containing `needle`.
@@ -339,6 +343,8 @@ fn test_edit_diff_numbers_rows_from_line_starts() {
         content: r#"{"name":"edit_file","args":{"path":"a.rs","old_string":"a\nb\nc","new_string":"a\nB\nc"},"line_starts":[10]}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
@@ -370,6 +376,8 @@ fn test_edit_diff_shows_context_only_marks_changed_lines() {
         content: r#"{"name":"edit_file","args":{"path":"src/a.rs","old_string":"fn a() {\n    let y = 2;\n}","new_string":"fn a() {\n    let y = 20;\n}"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let lines = app.build_transcript().lines;
@@ -417,6 +425,8 @@ fn test_edit_diff_trims_context_and_collapses_gap() {
         content: r#"{"name":"edit_file","args":{"path":"x.rs","old_string":"A\nc1\nc2\nc3\nMID\nc5\nc6\nc7\nB","new_string":"A2\nc1\nc2\nc3\nMID\nc5\nc6\nc7\nB2"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let plain = app.build_transcript().plain_lines().join("\n");
     // Both edited lines are flagged; the deep-interior context collapses.
@@ -1065,6 +1075,8 @@ fn thinking_only_assistants_do_not_split_step_folds() {
             content: String::new(),
             reasoning_content: Some(format!("thinking about step {i}")),
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         app.apply_agent_tool_call(
             None,
@@ -1329,6 +1341,8 @@ fn consecutive_edits_with_diffs_do_not_coalesce() {
             .to_string(),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     let plain = app.build_transcript().plain_lines().join("\n");
@@ -1351,6 +1365,8 @@ fn consecutive_path_only_edits_still_coalesce() {
             content: format!(r#"{{"name":"edit_file","args":{{"path":"{path}"}}}}"#),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     let plain = app.build_transcript().plain_lines().join("\n");
@@ -1500,6 +1516,8 @@ async fn test_cursor_turn_ending_on_tool_does_not_duplicate_prose() {
         content: "fix it".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     // Cursor streams prose, runs a tool, and ends with no trailing text — the
@@ -1545,6 +1563,8 @@ fn test_build_transcript_renders_tool_steps() {
         content: "fix it".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -1552,6 +1572,8 @@ fn test_build_transcript_renders_tool_steps() {
         content: r#"{"name":"read_file","args":{"path":"src/parser.rs"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -1560,6 +1582,8 @@ fn test_build_transcript_renders_tool_steps() {
         content: "     1\t/**\n     2\t * sum\n     3\t */".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let transcript = app.build_transcript();
@@ -1593,6 +1617,8 @@ fn test_agent_seed_turns_folds_tool_steps() {
         content: content.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     };
     let history = vec![
         msg("user", "what's in a.rs?"),
@@ -1633,6 +1659,8 @@ fn test_build_transcript_renders_edit_diff() {
         content: r#"{"name":"edit_file","args":{"path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -1640,6 +1668,8 @@ fn test_build_transcript_renders_edit_diff() {
         content: "edited src/a.rs".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let plain = app.build_transcript().plain_lines().join("\n");
@@ -1672,6 +1702,8 @@ fn test_build_transcript_prettifies_mcp_tool_name() {
         content: r#"{"name":"mcp__filesystem__read_file","args":{}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let plain = app.build_transcript().plain_lines().join("\n");
     assert!(
@@ -1691,6 +1723,8 @@ fn test_build_transcript_coalesces_consecutive_tool_calls() {
         content: "study the sidebar".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     // Cursor-style: a run of read_file calls with no interleaved results.
     for path in ["src/sidebar.rs", "src/session.rs", "src/time.rs"] {
@@ -1700,6 +1734,8 @@ fn test_build_transcript_coalesces_consecutive_tool_calls() {
             content: format!(r#"{{"name":"read_file","args":{{"path":"{path}"}}}}"#),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
     }
     // A different kind right after starts a new run (not merged with the reads).
@@ -1709,6 +1745,8 @@ fn test_build_transcript_coalesces_consecutive_tool_calls() {
         content: r#"{"name":"grep","args":{"pattern":"hover"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let plain = app.build_transcript().plain_lines().join("\n");
@@ -1741,6 +1779,8 @@ fn thought_header_click_skips_done_and_tip_rows() {
             content: format!("ask {i}"),
             reasoning_content: None,
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         let reasoning: String = (1..=8)
             .map(|n| format!("turn{i} thought line {n}\n"))
@@ -1751,6 +1791,8 @@ fn thought_header_click_skips_done_and_tip_rows() {
             content: format!("reply {i}"),
             reasoning_content: Some(reasoning),
             attachments: vec![],
+            id: None,
+            timestamp: None,
         });
         let idx = app.history.len() - 1;
         app.turn_durations.insert(idx, 1000 + i as u64);
@@ -1796,6 +1838,8 @@ fn merged_marker_clicks_map_to_their_own_blocks() {
         content: "do things".to_string(),
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -1805,6 +1849,8 @@ fn merged_marker_clicks_map_to_their_own_blocks() {
             "thinking about the task at length and considering many options".to_string(),
         ),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     let long_cmd = "printf '%s\\n' '--- local agy ---'; if command -v agy >/dev/null; then echo yes; fi && ls -la /tmp";
     for (cmd, n) in [
@@ -1834,6 +1880,8 @@ fn merged_marker_clicks_map_to_their_own_blocks() {
             "we should double check the docs before proceeding further".to_string(),
         ),
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
     app.apply_agent_tool_call(
         None,

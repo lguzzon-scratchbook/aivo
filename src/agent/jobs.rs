@@ -37,6 +37,16 @@ pub enum JobStatus {
     Killed,
 }
 
+impl JobStatus {
+    fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Exited(c) => Some(c.unwrap_or(-1)),
+            Self::Killed => Some(-1),
+            Self::Running => None,
+        }
+    }
+}
+
 struct Job {
     id: String,
     command: String,
@@ -266,6 +276,15 @@ can be up before its startup line flushes. Probe it directly, e.g. curl the port
             out.push_str(&tail);
         }
         Ok(out)
+    }
+
+    pub fn exit_code(&self, id: &str) -> Option<i32> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .and_then(|j| j.status.exit_code())
     }
 
     /// [`Self::check`] after blocking until the job finishes or `wait_secs` elapses.
@@ -547,9 +566,17 @@ fn status_word(s: &JobStatus) -> String {
     }
 }
 
+fn process_tag(s: &JobStatus) -> String {
+    match s {
+        JobStatus::Running => "[process status=running]".to_string(),
+        JobStatus::Exited(c) => crate::agent::tools::process_exit_tag(c.unwrap_or(-1)),
+        JobStatus::Killed => "[process status=killed]".to_string(),
+    }
+}
+
 fn status_line(job: &Job) -> String {
     let ran = fmt_dur(job.runtime());
-    match &job.status {
+    let line = match &job.status {
         JobStatus::Running => format!(
             "job {}: running ({ran}, pid {}): {}",
             job.id, job.pid, job.command
@@ -567,7 +594,8 @@ fn status_line(job: &Job) -> String {
             )
         }
         JobStatus::Killed => format!("job {}: killed (ran {ran}): {}", job.id, job.command),
-    }
+    };
+    format!("{line}\n{}", process_tag(&job.status))
 }
 
 /// Compact duration: `12s`, `2m14s`, `1h3m`.
@@ -637,6 +665,11 @@ mod tests {
         jobs.spawn("exit 7", &dir).unwrap();
         let check = wait_for(&jobs, "j1", "exited with code").await;
         assert!(check.contains("exited with code 7"), "got: {check}");
+        assert!(
+            check.contains("[process exit_code=7]"),
+            "structured status missing: {check}"
+        );
+        assert_eq!(jobs.exit_code("j1"), Some(7));
     }
 
     #[cfg(unix)]

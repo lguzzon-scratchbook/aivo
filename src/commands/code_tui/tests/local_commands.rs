@@ -262,6 +262,8 @@ fn test_local_command_long_line_wraps_in_full() {
         content,
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let width: u16 = 58;
@@ -319,6 +321,8 @@ fn test_render_main_local_command_no_clip() {
         content,
         reasoning_content: None,
         attachments: vec![],
+        id: None,
+        timestamp: None,
     });
 
     let (w, h) = (60u16, 20u16);

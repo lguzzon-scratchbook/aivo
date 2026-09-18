@@ -84,6 +84,10 @@ const STRATEGY_RESET: &str = "[no-progress guard] You are repeating actions with
 information. Stop and reset: record what you tried and what it showed (take_note the dead ends), \
 then take a genuinely different approach — a different tool, target, or strategy. If no \
 alternative exists, state exactly what's blocking you and finish (finish_turn status \"blocked\").";
+const STALL_NUDGE: &str = "[stall] You've been exploring for a while without changing files \
+or closing the task. If you already have enough evidence, make the edit and verify it now. \
+If this is investigation-only, say what you know and finish. Do not keep rewriting the same \
+kind of probe (new scripts, new flags, new selectors) unless each one answers a new question.";
 /// Guard-stop notice text (display only — drivers get the typed [`TurnStop`]).
 pub(crate) const STOP_NO_PROGRESS: &str =
     "stopping: the model repeated the same action with no progress";
@@ -235,6 +239,34 @@ pub trait SubagentSink: Send + Sync {
     fn finish(&self);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    Request,
+    Tool,
+}
+
+impl StepKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StepTiming {
+    pub kind: StepKind,
+    pub name: String,
+    pub duration_ms: u64,
+    pub ok: bool,
+    pub exit_code: Option<i32>,
+}
+
+pub(crate) fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
+
 /// Side-effects the engine delegates: rendering and the permission prompt.
 /// `ask_permission` fires only for mutating tools that aren't pre-approved; a
 /// non-TTY impl must fail closed (Deny). `Send` so the chat TUI can drive it on a task.
@@ -278,6 +310,7 @@ pub trait AgentUi: Send {
     /// pre-redaction like `tool_result`). Default no-op.
     fn tool_output(&mut self, _name: &str, _chunk: &str) {}
     fn tool_result(&mut self, name: &str, result: &Result<String, String>);
+    fn step_timing(&mut self, _timing: &StepTiming) {}
     fn notify(&mut self, text: &str);
     /// The turn ended early for `stop` (also announced via `notify` for display).
     /// Default no-op.

@@ -9,6 +9,13 @@ async fn run_bash_captures_output_and_exit() {
     assert!(ok.contains("hi"));
     let bad = run_bash(&json!({"command":"exit 3"}), &dir).await.unwrap();
     assert!(bad.contains("[exit 3]"));
+    assert!(bad.contains("[process exit_code=3]"));
+    let outcome = run_bash_confined(&json!({"command":"exit 3"}), &dir, None).await;
+    assert!(outcome.result.is_ok(), "nonzero exit is not a tool error");
+    assert_eq!(outcome.exit_code, Some(3));
+    let zero = run_bash_confined(&json!({"command":"exit 0"}), &dir, None).await;
+    assert_eq!(zero.exit_code, Some(0));
+    assert!(zero.result.unwrap().contains("[process exit_code=0]"));
 }
 
 /// The first chunk arrives before the command completes; result unchanged.
@@ -134,7 +141,7 @@ async fn confined_flags_block_then_unconfined_succeeds() {
     assert!(confined.result.unwrap().contains("write-sandbox"));
 
     // Unconfined: same command, write lands, no sandbox hint.
-    let out = run_bash_unconfined(&cmd, &dir, None).await.unwrap();
+    let out = run_bash_unconfined(&cmd, &dir, None).await.result.unwrap();
     let existed = outside.exists();
     let _ = std::fs::remove_file(&outside);
     assert!(existed, "unconfined write was still blocked");
@@ -427,6 +434,7 @@ async fn run_bash_runs_in_its_own_process_group() {
     // Unconfined: macOS seatbelt denies `ps`; the spawn builder is shared.
     let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir, None)
         .await
+        .result
         .unwrap();
     let child_pgid: i32 = out
         .lines()

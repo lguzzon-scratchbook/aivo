@@ -444,13 +444,8 @@ impl CodeTuiApp {
             ("tool_call", call.to_string()),
             ("tool_result", result.to_string()),
         ] {
-            self.history.push(ChatMessage {
-                model: None,
-                role: role.to_string(),
-                content,
-                reasoning_content: None,
-                attachments: vec![],
-            });
+            self.history
+                .push(ChatMessage::new(role, content).with_identity());
         }
     }
 

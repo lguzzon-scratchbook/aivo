@@ -813,6 +813,8 @@ pub(super) fn to_chat_messages(
             content: m.content,
             reasoning_content: m.reasoning_content,
             attachments: m.attachments.unwrap_or_default(),
+            id: m.id,
+            timestamp: m.timestamp,
         })
         .collect()
 }
@@ -2905,6 +2907,13 @@ pub(super) enum RuntimeEvent {
     /// The agent engine's tool returned — render the `⎿ result` step.
     AgentToolResult {
         content: String,
+    },
+    AgentStepTiming {
+        kind: String,
+        name: String,
+        duration_ms: u64,
+        ok: bool,
+        exit_code: Option<i32>,
     },
     /// The agent's just-streamed output was a tool call written as text: drop the
     /// uncommitted segment so the markup never reaches the scrollback.
