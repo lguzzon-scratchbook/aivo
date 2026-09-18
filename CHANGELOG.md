@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.49.8
+
+The code TUI keeps the composer docked on a full transcript, lays out image previews cleanly, preserves turn timing and identity, and treats a bare `exit` draft as `/exit`. Provider catalog support now reads live ChatGPT OAuth models and Copilot's current id/name listings; Gemini API-key sessions are pinned to their isolated CLI home. The key/model shorthand accepts `-k`, Cursor idle timeouts surface instead of failing silently, and Ctrl+X Ctrl+E continues to open `$EDITOR` after typing an attachment.
+
+- fix(code): keep the composer docked after the transcript fills (538847ea)
+- remove(code): drop the always-on browser-check builtin skill (2f427ff4)
+- fix(models): read Copilot's id+name entries, hide internal builds (37ca1d05)
+- fix(code): keep the footer fill inside the context window (89cf8ca4)
+- feat(code): keep turn identity, time steps, and nudge exploration stalls (6fb54da1)
+- fix(models): read name-keyed model listings, keep the real error (3a044a3b)
+- fix(code): pack image previews side by side without shearing (cb54c40a)
+- fix(gemini): pin api-key auth via GEMINI_CLI_HOME for CLI 0.60 (8a60627f)
+- fix(codex): list OAuth models from the live ChatGPT catalog (6c7045df)
+- fix(code): keep footer stats for Cursor (e54d30e7)
+- improve(ux): Mix `-k` with the `key::model` shorthand (77248a95)
+- fix(cursor): do not silent fail for idle timeout (8ed61107)
+- feat(code): quit on a bare `exit` draft like `/exit` (d53c2570)
+- chore(deps): bump rustls 0.23.37 -> 0.23.45 (RUSTSEC-2026-0285) (d4751b6e)
+- fix(code): open $EDITOR on Ctrl+X Ctrl+E even after typing @ (1791e807)
+
 ## v0.49.7
 
 The code TUI stops burning CPU on long turns — spinner redraws, streaming wrap, and Thinking-wait JSON parse no longer run every frame. Esc sends queued follow-ups instead of dropping them, empty keep-planning no longer re-shows the same plan, and `read_file` can send PNG/JPEG to vision models.
