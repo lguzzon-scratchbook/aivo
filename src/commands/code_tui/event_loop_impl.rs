@@ -579,7 +579,10 @@ impl CodeTuiApp {
     /// Result usage, else Cursor `usage_update` occupancy, else chars/4.
     pub(super) async fn adopt_turn_context_fill(&mut self, turn_usage: Option<TokenUsage>) {
         let live = self.live_usage.take();
-        if let Some(usage) = turn_usage.or(live) {
+        if let Some(usage) = turn_usage
+            .or(live)
+            .filter(|u| self.is_prompt_occupancy(u.total_tokens()))
+        {
             self.context_tokens = usage.total_tokens();
             self.context_is_estimate = false;
             self.last_usage = Some(usage);
@@ -597,6 +600,9 @@ impl CodeTuiApp {
     /// prompt + tool schemas), not just the visible transcript.
     pub(super) fn apply_agent_context(&mut self, tokens: u64, measured: bool) {
         if measured {
+            if !self.is_prompt_occupancy(tokens) {
+                return;
+            }
             self.live_usage = Some(TokenUsage {
                 prompt_tokens: tokens,
                 ..Default::default()
@@ -605,6 +611,11 @@ impl CodeTuiApp {
             self.live_usage = None;
             self.context_tokens = tokens;
         }
+    }
+
+    /// Non-zero and, when the window is known, not larger than it.
+    fn is_prompt_occupancy(&self, tokens: u64) -> bool {
+        tokens > 0 && (self.context_window == 0 || tokens <= self.context_window)
     }
 
     /// Drop the sandbox-escalation ack on the agent's next output. Scoped to
@@ -1351,7 +1362,9 @@ impl CodeTuiApp {
                 // Plain chat is a single round, so its completion IS the turn output.
                 self.turn_output_tokens = usage.completion_tokens;
                 self.turn_stream_chars_measured = self.turn_stream_chars;
-                self.live_usage = Some(usage);
+                if self.is_prompt_occupancy(usage.total_tokens()) {
+                    self.live_usage = Some(usage);
+                }
             }
             // Accumulate the model's reasoning unconditionally; `thinking_enabled`
             // gates only the *render* (so toggling /config reveals/hides it

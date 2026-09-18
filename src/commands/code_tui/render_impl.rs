@@ -4111,26 +4111,26 @@ impl CodeTuiApp {
     /// Tokens to show in the footer fill right now, and whether the figure is a
     /// chars/4 estimate rather than provider-measured. During an in-flight turn we
     /// prefer the live measured usage (Anthropic streams it from `message_start`);
-    /// until that lands we grow a chars/4 estimate of the transcript plus the text
-    /// streamed so far, so the fill still moves for providers that only report
-    /// usage at the end of the turn. Idle: the last turn's measured total.
+    /// until that lands we grow from the engine/prior fill plus streamed text.
     pub(super) fn context_fill(&self) -> (u64, bool) {
         if self.sending {
             if let Some(usage) = self.live_usage {
                 return (usage.total_tokens(), false);
             }
-            // No measured usage yet this turn: grow from the best known baseline —
-            // the prior turn's fill, or the transcript estimate when larger (a fresh
-            // chat with no prior turn) — plus the text streamed so far. Taking the
-            // max avoids the footer dropping at turn start when the prior fill was a
-            // measured total (which exceeds the chars/4 transcript estimate).
             let streamed = (self.pending_response.len()
                 + self.incoming_buffer.len()
                 + self.pending_reasoning.len()) as u64
                 / 4;
-            let baseline = self
-                .context_tokens
-                .max(self.cached_history_context_tokens());
+            let baseline = if self.context_tokens > 0 {
+                self.context_tokens
+            } else {
+                let history = self.cached_history_context_tokens();
+                if self.context_window == 0 {
+                    history
+                } else {
+                    history.min(self.context_window)
+                }
+            };
             return (baseline + streamed, true);
         }
         match self.last_usage {

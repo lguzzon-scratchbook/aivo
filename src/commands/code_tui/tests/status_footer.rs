@@ -509,6 +509,50 @@ async fn test_no_measured_fill_falls_back_to_estimate() {
 }
 
 #[test]
+fn test_working_set_usage_update_is_ignored() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.context_window = 500_000;
+    app.sending = true;
+    app.apply_agent_context(80_000, true);
+    assert_eq!(app.footer_status_label().0, "80k/500k");
+
+    app.apply_agent_context(7_700_000, true);
+    assert_eq!(app.footer_status_label().0, "80k/500k");
+    assert_eq!(app.live_usage.map(|u| u.prompt_tokens), Some(80_000));
+}
+
+#[test]
+fn test_fat_tool_history_does_not_inflate_live_footer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.context_window = 500_000;
+    app.context_tokens = 40_000;
+    app.sending = true;
+    app.history
+        .push(ChatMessage::new("tool_call", "x".repeat(200_000)));
+    assert_eq!(app.footer_status_label().0, "~40k/500k");
+}
+
+#[tokio::test]
+async fn test_adopt_drops_over_window_live_usage() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.context_window = 500_000;
+    app.context_tokens = 40_000;
+
+    app.adopt_turn_context_fill(Some(TokenUsage {
+        prompt_tokens: 7_700_000,
+        ..Default::default()
+    }))
+    .await;
+
+    assert!(app.live_usage.is_none());
+    assert!(app.last_usage.is_none());
+    assert!(app.context_tokens <= 500_000);
+}
+
+#[test]
 fn test_current_action_label_reflects_phase() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
