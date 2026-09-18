@@ -921,13 +921,6 @@ fn test_create_agent_has_no_slash_command() {
     let sc = crate::agent::skills::create_agent_builtin();
     assert_eq!(sc.name, "create-agent");
     assert!(!sc.body.is_empty());
-
-    assert!(
-        !SLASH_COMMANDS.iter().any(|c| c.name == "browser-check"),
-        "browser-check is a skill, not a slash command"
-    );
-    let bc = crate::agent::skills::browser_check_builtin();
-    assert_eq!(bc.name, "browser-check");
 }
 
 /// `/agents`: registered as a typeable command; bare opens the overlay, `rm`

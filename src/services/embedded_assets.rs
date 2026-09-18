@@ -24,8 +24,6 @@ embedded_asset!(providers_json, "providers.json.z");
 embedded_asset!(aivo_guide_md, "aivo_guide.md.z");
 embedded_asset!(create_skill_md, "create-skill.md.z");
 embedded_asset!(create_agent_md, "create-agent.md.z");
-embedded_asset!(browser_check_skill_md, "browser-check-skill.md.z");
-embedded_asset!(browser_check_mjs, "browser-check.mjs.z");
 embedded_asset!(agent_explorer_md, "agent-explorer.md.z");
 embedded_asset!(agent_aivo_guide_md, "agent-aivo-guide.md.z");
 embedded_asset!(agent_verification_md, "agent-verification.md.z");

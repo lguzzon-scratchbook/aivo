@@ -71,8 +71,6 @@ pub fn create_skill_builtin() -> Skill {
 /// Name of the create-agent builtin — used to dedup against discovered skills
 /// and to keep it out of sub-engines (which can't delegate, so can't test one).
 pub const CREATE_AGENT_SKILL_NAME: &str = "create-agent";
-pub const BROWSER_CHECK_SKILL_NAME: &str = "browser-check";
-const BROWSER_CHECK_SKILL_VERSION: &str = "1";
 
 /// The built-in **create-agent** instructions: the guided workflow for authoring
 /// a named specialist subagent (`~/.config/aivo/agents/<name>.md`). There is no
@@ -94,9 +92,8 @@ pub fn create_agent_builtin() -> Skill {
 /// live send path, the `/context` preview, and headless one-shot.
 ///
 /// [`create_skill_builtin`] is deliberately NOT injected: it's reached only
-/// via the user-typed `/create-skill`, while create-agent and browser-check
-/// have no slash command by design, so this injection is their only route
-/// to the model.
+/// via the user-typed `/create-skill`, while create-agent has no slash
+/// command by design, so this injection is its only route to the model.
 pub fn engine_skills(cwd: &Path, disabled: &std::collections::HashSet<String>) -> Vec<Skill> {
     with_builtins(discover_skills(cwd), disabled)
 }
@@ -107,17 +104,15 @@ fn with_builtins(
     disabled: &std::collections::HashSet<String>,
 ) -> Vec<Skill> {
     skills.retain(|s| !disabled.contains(&s.name));
-    ensure_builtin(&mut skills, CREATE_AGENT_SKILL_NAME, create_agent_builtin);
-    ensure_builtin(&mut skills, BROWSER_CHECK_SKILL_NAME, browser_check_builtin);
+    if !skills.iter().any(|s| s.name == CREATE_AGENT_SKILL_NAME) {
+        skills.push(create_agent_builtin());
+    }
     skills
 }
 
-fn ensure_builtin(skills: &mut Vec<Skill>, name: &str, make: fn() -> Skill) {
-    if !skills.iter().any(|s| s.name == name) {
-        skills.push(make());
-    }
-}
-
+/// Parse an embedded `SKILL.md` into a folderless [`Skill`] (name from
+/// frontmatter, falling back to `default_name`; description falls back to the
+/// first non-empty body line). Shared by the built-in create-* skills.
 fn builtin_skill_from(src: &str, default_name: &str) -> Skill {
     let (front, body) = split_frontmatter(src);
     let name = front
@@ -134,45 +129,6 @@ fn builtin_skill_from(src: &str, default_name: &str) -> Skill {
         body: body.trim().to_string(),
         dir: PathBuf::new(),
     }
-}
-
-pub fn browser_check_builtin() -> Skill {
-    materialize_browser_check().unwrap_or_else(|| {
-        builtin_skill_from(
-            crate::services::embedded_assets::browser_check_skill_md(),
-            BROWSER_CHECK_SKILL_NAME,
-        )
-    })
-}
-
-fn materialize_browser_check() -> Option<Skill> {
-    let dest = crate::services::paths::builtin_skill_cache(
-        &crate::services::paths::config_dir(),
-        BROWSER_CHECK_SKILL_NAME,
-        BROWSER_CHECK_SKILL_VERSION,
-    );
-    let skill_md = dest.join("SKILL.md");
-    let script = dest.join("scripts").join("browser-check.mjs");
-    if !skill_md.is_file() || !script.is_file() {
-        std::fs::create_dir_all(script.parent()?).ok()?;
-        std::fs::write(
-            &skill_md,
-            crate::services::embedded_assets::browser_check_skill_md(),
-        )
-        .ok()?;
-        std::fs::write(
-            &script,
-            crate::services::embedded_assets::browser_check_mjs(),
-        )
-        .ok()?;
-    }
-    let mut skill = builtin_skill_from(
-        crate::services::embedded_assets::browser_check_skill_md(),
-        BROWSER_CHECK_SKILL_NAME,
-    );
-    skill.body.clear();
-    skill.dir = dest;
-    Some(skill)
 }
 
 /// Which tier a discovered skill lives in. The `/skills` overlay only scaffolds
@@ -1683,29 +1639,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_check_builtin_materializes_helper() {
-        let sc = browser_check_builtin();
-        assert_eq!(sc.name, BROWSER_CHECK_SKILL_NAME);
-        assert!(!sc.description.is_empty());
-        assert!(advert_description(&sc.description).len() <= 161);
-        assert!(
-            sc.dir.join("scripts").join("browser-check.mjs").is_file(),
-            "helper must be on disk so Folder: is runnable: {}",
-            sc.dir.display()
-        );
-        let loaded =
-            load_skill_result(std::slice::from_ref(&sc), BROWSER_CHECK_SKILL_NAME).unwrap();
-        assert!(
-            loaded.contains(&sc.dir.display().to_string()),
-            "skill result must surface the materialized folder:\n{loaded}"
-        );
-        assert!(
-            loaded.contains("browser-check.mjs") || loaded.contains("bundled helper"),
-            "instructions should point at the helper:\n{loaded}"
-        );
-    }
-
+    /// `engine_skills` assembly: the builtin is appended exactly once, an on-disk
+    /// skill of the same name wins (no duplicate tool-enum values), and the
+    /// disabled filter applies to discovered skills but can't remove the builtin.
     #[test]
     fn engine_skills_dedups_builtin_and_filters_disabled() {
         let mk = |name: &str| Skill {
@@ -1716,10 +1652,14 @@ mod tests {
         };
         let none = std::collections::HashSet::new();
 
+        // No discovered skills → just the builtin.
         let out = with_builtins(Vec::new(), &none);
-        let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, [CREATE_AGENT_SKILL_NAME, BROWSER_CHECK_SKILL_NAME]);
+        assert_eq!(
+            out.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            [CREATE_AGENT_SKILL_NAME]
+        );
 
+        // An on-disk create-agent shadows the builtin: name appears once.
         let out = with_builtins(vec![mk(CREATE_AGENT_SKILL_NAME), mk("other")], &none);
         assert_eq!(
             out.iter()
@@ -1729,18 +1669,16 @@ mod tests {
         );
         assert!(!out[0].dir.as_os_str().is_empty(), "on-disk one wins");
 
-        // Injected builtins never appear in `/skills`, so they can't be disabled.
-        let disabled: std::collections::HashSet<String> = [
-            "other".to_string(),
-            CREATE_AGENT_SKILL_NAME.to_string(),
-            BROWSER_CHECK_SKILL_NAME.to_string(),
-        ]
-        .into_iter()
-        .collect();
+        // Disabled removes a discovered skill; the builtin is still advertised
+        // (it never appears in `/skills`, so it can't be disabled).
+        let disabled: std::collections::HashSet<String> =
+            ["other".to_string(), CREATE_AGENT_SKILL_NAME.to_string()]
+                .into_iter()
+                .collect();
         let out = with_builtins(vec![mk("other")], &disabled);
         assert_eq!(
             out.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            [CREATE_AGENT_SKILL_NAME, BROWSER_CHECK_SKILL_NAME]
+            [CREATE_AGENT_SKILL_NAME]
         );
     }
 

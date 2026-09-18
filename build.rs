@@ -18,14 +18,6 @@ const ASSETS: &[(&str, &str)] = &[
         "create-agent.md.z",
     ),
     (
-        "src/agent/builtin_skills/browser-check/SKILL.md",
-        "browser-check-skill.md.z",
-    ),
-    (
-        "src/agent/builtin_skills/browser-check/scripts/browser-check.mjs",
-        "browser-check.mjs.z",
-    ),
-    (
         "src/agent/builtin_agents/explorer.md",
         "agent-explorer.md.z",
     ),
