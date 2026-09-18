@@ -78,20 +78,25 @@ struct OpenAIModelsResponse {
     data: Vec<OpenAIModel>,
 }
 
-/// Loosely-parsed model entry. Only `id` is required; everything else is
-/// extracted by searching field names for known patterns so we adapt to
-/// any provider's response shape (OpenRouter, Vercel, OpenAI, etc.).
+/// Loosely-parsed model entry, adapted to any provider's response shape: every
+/// field beyond the id is probed by name.
 #[derive(Deserialize)]
 struct OpenAIModel {
-    // TypeSafe-style listings name models instead of id-ing them.
-    #[serde(alias = "name")]
-    id: String,
+    // Not an alias onto `id`: Copilot sends both keys per entry, which an alias
+    // reads as a duplicate field and rejects the whole listing.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
 }
 
 impl OpenAIModel {
-    fn into_model_info(self, price_scale: f64) -> ModelInfo {
+    /// The `id`, or the `name` TypeSafe-style listings key by; `None` when the
+    /// entry has neither.
+    fn into_model_info(self, price_scale: f64) -> Option<ModelInfo> {
+        let id = self.id.as_deref().or(self.name.as_deref())?.to_string();
         let context_tokens = self.find_context();
         let context = context_tokens.map(format_token_count);
         let max_output_tokens = self.find_max_output();
@@ -100,8 +105,8 @@ impl OpenAIModel {
         let multiplier = self.find_multiplier();
         let reasoning_efforts = self.find_reasoning_efforts();
         let image_input = self.find_image_input();
-        ModelInfo {
-            id: self.id,
+        Some(ModelInfo {
+            id,
             context,
             context_tokens,
             max_output,
@@ -112,7 +117,7 @@ impl OpenAIModel {
             deprecated: false,
             reasoning_efforts,
             image_input,
-        }
+        })
     }
 
     /// Levels from a `reasoning_efforts` string array (exact key), lowercased;
@@ -311,10 +316,15 @@ pub(crate) fn is_text_chat_model(id: &str) -> bool {
     crate::services::model_compat::text_chat_incompat_reason(id).is_none()
 }
 
-/// Copilot's Claude/OpenAI chat routing uses the chat completions API.
-/// Exclude clearly responses-only Codex models that the endpoint rejects.
-fn is_copilot_chat_model(id: &str) -> bool {
-    is_text_chat_model(id) && !id.to_lowercase().contains("codex")
+/// Copilot's internal routing builds: hidden from its picker *and* declaring
+/// endpoints. Legacy chat models are picker-hidden too, but declare none.
+fn is_copilot_pseudo_model(model: &OpenAIModel) -> bool {
+    let picker_hidden = model
+        .extra
+        .get("model_picker_enabled")
+        .and_then(Value::as_bool)
+        == Some(false);
+    picker_hidden && model.extra.contains_key("supported_endpoints")
 }
 
 fn cloudflare_model_name(model: CloudflareModel) -> String {
@@ -827,7 +837,7 @@ pub(crate) async fn fetch_models_detailed_filtered(
         let mut models: Vec<ModelInfo> = resp
             .data
             .into_iter()
-            .map(|m| m.into_model_info(scale))
+            .filter_map(|m| m.into_model_info(scale))
             .collect();
         if chat_only {
             models.retain(|m| is_text_chat_model(&m.id));
@@ -867,7 +877,7 @@ pub(crate) async fn fetch_models_detailed_filtered(
             Ok::<_, anyhow::Error>(
                 resp.data
                     .into_iter()
-                    .map(|m| m.into_model_info(scale))
+                    .filter_map(|m| m.into_model_info(scale))
                     .collect(),
             )
         }
@@ -900,8 +910,9 @@ pub(crate) async fn fetch_models_detailed_filtered(
             Ok(resp
                 .data
                 .into_iter()
-                .filter(|m| is_copilot_chat_model(&m.id))
-                .map(|m| m.into_model_info(scale))
+                .filter(|m| !is_copilot_pseudo_model(m))
+                .filter_map(|m| m.into_model_info(scale))
+                .filter(|m| is_text_chat_model(&m.id))
                 .collect())
         }
         ModelListingStrategy::CursorAcp => {
@@ -973,7 +984,7 @@ pub(crate) async fn fetch_models_detailed_filtered(
             Ok(resp
                 .data
                 .into_iter()
-                .map(|m| m.into_model_info(scale))
+                .filter_map(|m| m.into_model_info(scale))
                 .collect())
         }
         ModelListingStrategy::CloudflareSearch => {
@@ -1063,7 +1074,7 @@ pub(crate) async fn fetch_models_detailed_filtered(
                         success = Some(
                             resp.data
                                 .into_iter()
-                                .map(|m| m.into_model_info(scale))
+                                .filter_map(|m| m.into_model_info(scale))
                                 .collect(),
                         );
                         break;
@@ -1240,7 +1251,23 @@ mod tests {
     fn models_response_accepts_named_envelope() {
         let resp: OpenAIModelsResponse =
             serde_json::from_str(r#"{"models":[{"name":"jev-latest"}]}"#).unwrap();
-        assert_eq!(resp.data[0].id, "jev-latest");
+        assert_eq!(resp.data[0].name.as_deref(), Some("jev-latest"));
+    }
+
+    #[test]
+    fn models_response_reads_one_entry_carrying_both_keys() {
+        let resp: OpenAIModelsResponse =
+            serde_json::from_str(r#"{"data":[{"id":"gpt-4o","name":"GPT-4o"}]}"#).unwrap();
+        let info = resp.data.into_iter().next().unwrap().into_model_info(1.0);
+        assert_eq!(info.unwrap().id, "gpt-4o");
+    }
+
+    #[test]
+    fn models_response_skips_entries_with_no_id_key() {
+        let resp: OpenAIModelsResponse =
+            serde_json::from_str(r#"{"data":[{"vendor":"openai"}]}"#).unwrap();
+        let info = resp.data.into_iter().next().unwrap().into_model_info(1.0);
+        assert!(info.is_none());
     }
 
     #[test]
@@ -1535,12 +1562,27 @@ mod tests {
     }
 
     #[test]
-    fn test_is_copilot_chat_model_filters_codex_models() {
-        assert!(is_copilot_chat_model("gpt-4o"));
-        assert!(is_copilot_chat_model("claude-sonnet-4"));
-        assert!(!is_copilot_chat_model("gpt-5.1-codex-mini"));
-        assert!(!is_copilot_chat_model("gpt-5.3-codex"));
-        assert!(!is_copilot_chat_model("openai/gpt-5.1-codex-mini"));
+    fn copilot_hides_picker_disabled_endpoint_models() {
+        let parse = |raw: &str| serde_json::from_str::<OpenAIModel>(raw).unwrap();
+
+        // Codex is /responses-only, which the copilot request path falls back to.
+        let codex = parse(
+            r#"{"id":"gpt-5.3-codex","model_picker_enabled":true,"supported_endpoints":["/responses"]}"#,
+        );
+        assert!(!is_copilot_pseudo_model(&codex));
+        assert!(is_text_chat_model(codex.id.as_deref().unwrap()));
+
+        for raw in [
+            r#"{"id":"copilot-search-a","model_picker_enabled":false,"supported_endpoints":["/chat/completions"]}"#,
+            r#"{"id":"trajectory-compaction","model_picker_enabled":false,"supported_endpoints":["/chat/completions"]}"#,
+            r#"{"id":"mai-code-1-flash-secondary","model_picker_enabled":false,"supported_endpoints":["/responses"]}"#,
+        ] {
+            assert!(is_copilot_pseudo_model(&parse(raw)), "{raw}");
+        }
+
+        assert!(!is_copilot_pseudo_model(&parse(
+            r#"{"id":"gpt-4o","model_picker_enabled":false}"#
+        )));
     }
 
     #[test]
@@ -1942,7 +1984,7 @@ mod tests {
         let infos: Vec<ModelInfo> = resp
             .data
             .into_iter()
-            .map(|m| m.into_model_info(1.0))
+            .filter_map(|m| m.into_model_info(1.0))
             .collect();
         assert_eq!(infos[0].image_input, Some(false));
         assert_eq!(infos[1].image_input, Some(true));
