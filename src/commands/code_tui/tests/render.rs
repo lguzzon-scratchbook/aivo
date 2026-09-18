@@ -1181,6 +1181,58 @@ fn test_render_main_uses_full_height_for_long_transcript() {
 }
 
 #[test]
+fn test_render_main_keeps_composer_docked_after_content_folds() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: (0..40)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        reasoning_content: None,
+        attachments: vec![],
+        id: None,
+        timestamp: None,
+    });
+    let backend = TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut composer_area = Rect::default();
+
+    terminal
+        .draw(|frame| {
+            composer_area = app.render_main(frame, frame.area());
+        })
+        .unwrap();
+    assert_eq!(composer_area.y + composer_area.height, 10);
+    assert!(app.composer_docked);
+
+    app.history.last_mut().unwrap().content = "short".to_string();
+    app.bump_transcript_revision();
+    terminal
+        .draw(|frame| {
+            composer_area = app.render_main(frame, frame.area());
+        })
+        .unwrap();
+    assert_eq!(composer_area.y + composer_area.height, 10);
+    assert!(app.composer_docked);
+
+    app.history.clear();
+    app.bump_transcript_revision();
+    terminal
+        .draw(|frame| {
+            composer_area = app.render_main(frame, frame.area());
+        })
+        .unwrap();
+    assert!(composer_area.y + composer_area.height < 10);
+    assert!(!app.composer_docked);
+}
+
+#[test]
 fn test_inline_image_preview_rows_reserved_and_anchored() {
     use crate::services::terminal_graphics::{
         EncodedPreview, GraphicsCaps, PLACEHOLDER_CHAR, PixelFormat, Protocol,

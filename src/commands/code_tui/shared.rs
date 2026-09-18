@@ -3353,6 +3353,8 @@ pub(super) struct CodeTuiApp {
     /// True → `context_tokens` is chars/4 (footer `~`). Cursor `usage_update` is measured.
     pub(super) context_is_estimate: bool,
     pub(super) follow_output: bool,
+    /// Latch full-pane composer dock; empty transcript releases it.
+    pub(super) composer_docked: bool,
     /// Bumped on any in-place edit of a history entry (cursor tool-call
     /// enrichment) so the transcript cache fingerprint invalidates — the
     /// fingerprint otherwise assumes entries are only appended/cleared.
@@ -3988,6 +3990,7 @@ impl CodeTuiApp {
             injected_context_summary: None,
             context_is_estimate: true,
             follow_output: true,
+            composer_docked: false,
             transcript_revision: 0,
             transcript_scroll: 0,
             transcript_width: 0,

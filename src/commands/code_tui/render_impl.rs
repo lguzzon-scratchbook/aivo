@@ -2740,8 +2740,12 @@ impl CodeTuiApp {
         let min_transcript_height = self
             .empty_state_height(area.width.max(1))
             .clamp(1, max_transcript_height);
+        self.composer_docked =
+            !is_empty && (self.composer_docked || (prepass_rows as u16) >= max_transcript_height);
         let transcript_height = if is_empty {
             min_transcript_height
+        } else if self.composer_docked {
+            max_transcript_height
         } else {
             (prepass_rows as u16).clamp(min_transcript_height, max_transcript_height)
         };
