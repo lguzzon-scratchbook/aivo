@@ -400,42 +400,6 @@ fn simple_command_is_readonly(tokens: &[&str]) -> bool {
     }
 }
 
-/// The distinct non-read-only program basenames a command runs — the scope an
-/// ask-mode "always allow" remembers. `None` when the command carries
-/// write-capable syntax (substitution, file redirects) or an unparseable head:
-/// those stay exact-grant, never broadened.
-pub fn bash_nonreadonly_programs(args: &Value) -> Option<Vec<String>> {
-    let cmd = args.get("command").and_then(|c| c.as_str())?.trim();
-    if cmd.is_empty()
-        || cmd.contains("$(")
-        || cmd.contains('`')
-        || cmd.contains("<(")
-        || cmd.contains(">(")
-        || has_file_write_redirect(cmd)
-    {
-        return None;
-    }
-    let scrubbed = scrub_fd_dups(cmd);
-    let mut programs: Vec<String> = Vec::new();
-    let unparseable = for_each_simple_command(&scrubbed, |_, tokens| {
-        if simple_command_is_readonly(tokens) {
-            return None;
-        }
-        let Some(rest) = strip_env_prefix(tokens) else {
-            return Some(());
-        };
-        programs.push(command_basename(rest[0]).to_ascii_lowercase());
-        None
-    })
-    .is_some();
-    if unparseable || programs.is_empty() {
-        return None;
-    }
-    programs.sort();
-    programs.dedup();
-    Some(programs)
-}
-
 /// A leading `VAR=value` word whose variable is known-inert: it tweaks
 /// timezone/locale/formatting but can't redirect which binary runs or inject code
 /// (unlike `PATH=`, `LD_PRELOAD=`, `GIT_DIR=`). The value is literal — substitution

@@ -342,9 +342,6 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         }
     }
 
-    /// Reversible read-only ask (research/learning) mode: plan mode's stash
-    /// mechanics with a different directive and NO exit tool — only the user
-    /// leaves it. Entering leaves plan mode first (mutually exclusive).
     pub fn set_ask_mode(&mut self, on: bool) {
         if on == self.ask_mode {
             return;
@@ -354,30 +351,9 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         }
         self.ask_mode = on;
         self.read_only = on;
-        if on {
-            let (stashed, kept) = std::mem::take(&mut self.tools_openai)
-                .into_iter()
-                .partition(|t| {
-                    let name = t["function"]["name"].as_str().unwrap_or("");
-                    tools::hidden_in_plan_mode(name)
-                });
-            self.plan_mode_stash = stashed;
-            self.tools_openai = kept;
-        } else {
-            self.tools_openai
-                .extend(std::mem::take(&mut self.plan_mode_stash));
+        if !on {
             // An ask-mode deny often means "not in this mode" — exiting reverses it.
             self.denied_sigs.clear();
-        }
-        let directive = format!("\n\n{}", crate::agent::ask_mode::ASK_MODE_DIRECTIVE);
-        if let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content"))
-            && let Some(s) = content.as_str()
-        {
-            *content = Value::String(if on {
-                format!("{s}{directive}")
-            } else {
-                s.replacen(&directive, "", 1)
-            });
         }
     }
 
@@ -485,14 +461,14 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         self.preview_supported = on;
     }
 
-    /// Add a tool spec — into the read-only stash when plan/ask mode hides it. The
-    /// TUI re-runs these setters every turn AFTER the mode setters, so a live push
-    /// would leak the tool into a read-only mode and duplicate it on exit.
+    /// Add a tool spec — into the stash when plan mode hides it. The TUI re-runs
+    /// these setters every turn AFTER the mode setters, so a live push would leak
+    /// the tool into plan mode and duplicate it on exit.
     pub(super) fn advertise_tool(&mut self, spec: Value) {
         let hidden = spec["function"]["name"]
             .as_str()
             .is_some_and(tools::hidden_in_plan_mode);
-        if self.read_only && hidden {
+        if self.plan_mode_on() && hidden {
             self.plan_mode_stash.push(spec);
         } else {
             self.tools_openai.push(spec);

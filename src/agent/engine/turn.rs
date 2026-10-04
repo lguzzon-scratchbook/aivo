@@ -143,7 +143,7 @@ impl AgentEngine {
             }
             self.write_thinking_extra(&mut extra);
             let tools = if self.agent_tools_enabled {
-                self.tools_openai.clone()
+                self.request_tools()
             } else {
                 Vec::new()
             };

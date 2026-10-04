@@ -620,7 +620,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "ask",
         help_label: "/ask [question]",
-        description: "research and learn, read-only",
+        description: "general Q&A with web search, no project context",
         takes_argument: true,
     },
     SlashCommandSpec {

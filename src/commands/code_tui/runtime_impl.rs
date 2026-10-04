@@ -3084,7 +3084,7 @@ and keep each turn's work small"
         true
     }
 
-    /// Leave ask mode, restoring the engine's tools in place (no rebuild). Mid-turn
+    /// Leave ask mode (no rebuild). Mid-turn
     /// the turn task holds the lock, so the exit rides the live flag instead.
     pub(super) async fn leave_ask_mode(&mut self) {
         self.ask_mode = false;
@@ -3173,9 +3173,9 @@ and keep each turn's work small"
                 self.notice = Some((
                     MUTED(),
                     if self.ask_web_search_missing() {
-                        "Ask mode — web search is off (/config to enable); repo and knowledge questions still work"
+                        "Ask mode — web search is off (/config to enable); answers come from the model's own knowledge"
                     } else {
-                        "Ask mode — I'll read code and search the web to answer with sources (/ask exit to leave)"
+                        "Ask mode — general Q&A with web search, no project context (/ask exit to leave)"
                     }
                     .to_string(),
                 ));

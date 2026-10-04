@@ -3614,6 +3614,11 @@ impl CodeTuiApp {
                     "Describe what to plan · read-only until approved",
                     Style::default().fg(FAINT()),
                 )
+            } else if self.ask_mode {
+                Span::styled(
+                    "Ask anything · answered from knowledge and the web",
+                    Style::default().fg(FAINT()),
+                )
             } else if self.in_ask_mode() {
                 Span::styled(
                     "Ask anything · concepts, docs, code, the web",

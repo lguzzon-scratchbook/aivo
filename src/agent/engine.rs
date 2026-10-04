@@ -668,8 +668,7 @@ pub struct AgentEngine {
     read_only: bool,
     /// Which read-only mode owns `read_only`: `true` = ask mode, else plan mode.
     ask_mode: bool,
-    /// Tool specs stripped on read-only entry, restored verbatim on exit; plan
-    /// and ask mode share it because they're mutually exclusive.
+    /// Tool specs stripped on plan-mode entry, restored verbatim on exit.
     plan_mode_stash: Vec<Value>,
     /// Unattended `-e` only: reject a text turn that admits it isn't done (or trails
     /// off mid-step) and nudge to continue, rather than accept it as the final answer.

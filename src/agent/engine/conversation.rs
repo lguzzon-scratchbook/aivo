@@ -313,8 +313,13 @@ impl AgentEngine {
         let calib = |tokens: usize| (tokens as f64 * cal) as u64;
 
         // `messages[0]` is the system message, with the `-c` block folded in.
-        let sys_full = estimate_tokens(&self.messages[..self.messages.len().min(1)]);
-        let injected = self.injected_context_tokens.min(sys_full);
+        let sys_stored = estimate_tokens(&self.messages[..self.messages.len().min(1)]);
+        let (sys_full, injected) = if self.ask_mode_on() {
+            (estimate_tokens(&[self.request_system()]), 0)
+        } else {
+            (sys_stored, self.injected_context_tokens.min(sys_stored))
+        };
+        let tools = self.request_tools();
 
         // Count the external specs actually advertised (deferred ones cost nothing).
         let is_external = |t: &Value| {
@@ -322,27 +327,36 @@ impl AgentEngine {
                 .as_ref()
                 .is_some_and(|e| t["function"]["name"].as_str().is_some_and(|n| e.handles(n)))
         };
-        let (mcp_tok, mcp_tool_count) = self.tools_openai.iter().filter(|t| is_external(t)).fold(
-            (0usize, 0usize),
-            |(tok, n), t| {
-                (
-                    tok + crate::agent::tokens::estimate_message_tokens(t),
-                    n + 1,
-                )
-            },
-        );
-        let tools_full = self.estimate_tools();
+        let (mcp_tok, mcp_tool_count) =
+            tools
+                .iter()
+                .filter(|t| is_external(t))
+                .fold((0usize, 0usize), |(tok, n), t| {
+                    (
+                        tok + crate::agent::tokens::estimate_message_tokens(t),
+                        n + 1,
+                    )
+                });
+        let tools_full = if self.ask_mode_on() {
+            estimate_tokens(&tools)
+        } else {
+            self.estimate_tools()
+        };
 
         ContextReport {
             context_window: self.context_window,
             system_prompt: calib(sys_full.saturating_sub(injected)),
             injected_context: calib(injected),
             tools: calib(tools_full.saturating_sub(mcp_tok)),
-            tool_count: self.tools_openai.len().saturating_sub(mcp_tool_count),
+            tool_count: tools.len().saturating_sub(mcp_tool_count),
             mcp_tools: calib(mcp_tok),
             mcp_tool_count,
-            mcp_deferred_count: self.deferred_tools.len(),
-            messages: calib(self.estimate_messages().saturating_sub(sys_full)),
+            mcp_deferred_count: if self.ask_mode_on() {
+                0
+            } else {
+                self.deferred_tools.len()
+            },
+            messages: calib(self.estimate_messages().saturating_sub(sys_stored)),
             message_count: self.messages.len().saturating_sub(1),
             calibration: cal,
         }
@@ -353,7 +367,7 @@ impl AgentEngine {
         if std::env::var("AIVO_DEBUG").as_deref() != Ok("1") {
             return;
         }
-        let fp = tool_repair::prefix_fingerprint(&self.messages[0], &self.tools_openai);
+        let fp = tool_repair::prefix_fingerprint(&self.request_system(), &self.request_tools());
         if let Some(prev) = self.prefix_fp
             && prev != fp
         {
@@ -383,13 +397,40 @@ impl AgentEngine {
             })
     }
 
+    pub(super) fn request_tools(&self) -> Vec<Value> {
+        if self.ask_mode_on() {
+            crate::agent::ask_mode::filter_tools(&self.tools_openai)
+        } else {
+            self.tools_openai.clone()
+        }
+    }
+
+    fn request_system(&self) -> Value {
+        if self.ask_mode_on() {
+            let can_search = self.tools_openai.iter().any(|t| {
+                t["type"].as_str() == Some("web_search")
+                    || t["function"]["name"].as_str() == Some("web_search")
+            });
+            json!({
+                "role": "system",
+                "content": crate::agent::ask_mode::system_prompt(&self.model, &self.date, can_search),
+            })
+        } else {
+            self.messages[0].clone()
+        }
+    }
+
     /// Cloned per step; strips the leading system prompt in plain-chat mode, so the
     /// single-system-message invariant `restore_conversation` relies on stays intact.
-    /// In plan/ask mode the read-only reminder rides the copy's latest user message —
+    /// In plan mode the read-only reminder rides the copy's latest user message —
     /// ephemeral (never in `self.messages`), so it vanishes on mode exit.
     pub(super) fn outgoing_messages(&self) -> Vec<Value> {
         let mut out: Vec<Value> = if self.agent_tools_enabled {
-            self.messages.clone()
+            let mut out = self.messages.clone();
+            if self.ask_mode_on() && out.first().is_some_and(|m| role(m) == "system") {
+                out[0] = self.request_system();
+            }
+            out
         } else {
             self.messages
                 .iter()
@@ -407,15 +448,8 @@ impl AgentEngine {
         // the tail: folded in behind this turn's own output, the next request's
         // prefix diverges there and re-bills every tool result uncached.
         let mut reminders: Vec<String> = Vec::new();
-        if self.read_only {
-            reminders.push(
-                if self.ask_mode_on() {
-                    crate::agent::ask_mode::ASK_TURN_REMINDER
-                } else {
-                    plan_mode::PLAN_TURN_REMINDER
-                }
-                .to_string(),
-            );
+        if self.plan_mode_on() {
+            reminders.push(plan_mode::PLAN_TURN_REMINDER.to_string());
         }
         if self.plan_interrupted {
             reminders.push(PLAN_INTERRUPTED_REMINDER.to_string());

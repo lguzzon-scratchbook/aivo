@@ -92,6 +92,11 @@ impl AgentEngine {
                 self.set_ask_mode(true);
             }
             let n = names[i];
+            if self.ask_mode_on() && !crate::agent::ask_mode::tool_allowed(n) {
+                ui.tool_start(n, &call.arguments);
+                outcomes[i] = Some(Err(crate::agent::ask_mode::TOOL_REFUSED.to_string()));
+                continue;
+            }
             // The plan tool renders as a checklist card and never needs permission —
             // resolve it up front; its result still joins history (call↔result invariant).
             if n == "update_plan" {
@@ -130,16 +135,11 @@ exact action this turn.)"
             // Backstop for a hallucinated state-changing tool (also hidden from the
             // schema); `subagent` has its own refusal below.
             if self.read_only && tools::hidden_in_plan_mode(n) && n != "subagent" {
-                outcomes[i] = Some(Err(if self.ask_mode_on() {
-                    "Ask mode is read-only — do not modify files or write artifacts. \
-Answer from investigation; the user must leave ask mode (/ask exit or Shift+Tab) \
-before edits are possible."
-                        .to_string()
-                } else {
+                outcomes[i] = Some(Err(
                     "Plan mode is read-only — do not modify files or write artifacts. \
 Investigate, or call `exit_plan_mode` with your plan."
-                        .to_string()
-                }));
+                        .to_string(),
+                ));
                 continue;
             }
             // PreToolUse veto runs before the permission tiers — a veto never
@@ -150,12 +150,6 @@ Investigate, or call `exit_plan_mode` with your plan."
                 outcomes[i] = Some(Err(format!("blocked by PreToolUse hook: {reason}")));
                 continue;
             }
-            // Its own tier (`PermissionAction::AskBash`): plan's Once floor would
-            // nag a research session on every variation of the same fetch/inspect
-            // command. Risky/remote calls below still take their stricter gates.
-            let ask_bash = self.ask_mode_on()
-                && n == "run_bash"
-                && !tools::is_readonly_command(&call.arguments);
             // Confirm only genuinely risky actions: destructive command, blind
             // overwrite of an unread file, or an untrusted external tool.
             let needs_confirm = tools::is_dangerous(n, &call.arguments)
@@ -224,18 +218,6 @@ Investigate, or call `exit_plan_mode` with your plan."
                             PermissionAction::Confirm {
                                 name: n,
                                 args: &call.arguments,
-                            },
-                        )
-                        .await
-                        .allowed(),
-                    Resolution::Covered if ask_bash => self
-                        .resolve_permission(
-                            ctx,
-                            ui,
-                            PermissionAction::AskBash {
-                                name: n,
-                                args: &call.arguments,
-                                programs: tools::bash_nonreadonly_programs(&call.arguments),
                             },
                         )
                         .await
@@ -402,13 +384,10 @@ Investigate, or call `exit_plan_mode` with your plan."
                 skills::load_skill_result(&self.skills, name)
             } else if n == "subagent" && self.read_only {
                 // A sub-engine wouldn't inherit the read-only floor.
-                Err(if self.ask_mode_on() {
-                    "Ask mode is read-only — cannot delegate to a subagent; investigate directly."
-                        .to_string()
-                } else {
+                Err(
                     "Plan mode is read-only — cannot delegate to a subagent while planning."
-                        .to_string()
-                })
+                        .to_string(),
+                )
             } else if n == "subagent" {
                 // Fresh sub-engine on the same serve/cwd; tokens fold in even on failure.
                 let base = self.turn_usage.completion_tokens;

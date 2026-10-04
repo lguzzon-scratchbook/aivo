@@ -170,7 +170,7 @@ fn test_placeholder_follows_the_mode() {
 
     app.ask_mode = true;
     let p = placeholder(&app);
-    assert!(p.contains("concepts, docs, code"), "{p}");
+    assert!(p.contains("knowledge and the web"), "{p}");
 
     app.ask_mode = false;
     app.plan_mode = true;
