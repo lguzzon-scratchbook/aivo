@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.49.12
+
+Ask mode is now general Q&A rather than project-aware: it sends a lean research
+prompt with only web_search and web_fetch, so the working directory, convention
+files, skills, and coding-agent rules no longer reach the model. The stored
+prompt and tools are untouched, so leaving ask mode is a flag flip, other tool
+calls are refused, and the ask-mode bash permission tier is gone. Claude
+launches now route through `/v1/messages` before falling back to chat
+completions.
+
+- improve(code): route Claude through /v1/messages before chat completions (835cfb06)
+- feat(code): make ask mode general Q&A without project context (f3d2c191)
+
 ## v0.49.11
 
 Serve failover keeps the primary error instead of masking it, and model
