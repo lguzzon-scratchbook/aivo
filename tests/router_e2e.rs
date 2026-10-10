@@ -60,6 +60,7 @@ enum Mode {
     SemanticReject,
     /// 429 rate limit — a failover-worthy status for `aivo serve --failover`.
     RateLimited,
+    RejectsCacheControl,
 }
 
 #[derive(Clone)]
@@ -202,11 +203,22 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
             let Ok(mut stream) = stream else { continue };
             let head = read_request_head(&mut stream);
             let endpoint = request_endpoint(&head);
+            let has_cache_control = head.contains("cache_control");
             hits_writer.lock().unwrap().push(endpoint);
             heads_writer.lock().unwrap().push(head);
 
             let (status, reason, content_type, body) = match modes.get(&endpoint) {
                 Some(Mode::Ok) => (200, "OK", "application/json", success_body(endpoint)),
+                Some(Mode::RejectsCacheControl) if has_cache_control => (
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    r#"{"error":{"type":"invalid_request_error","message":"Unknown field: cache_control"}}"#
+                        .to_string(),
+                ),
+                Some(Mode::RejectsCacheControl) => {
+                    (200, "OK", "application/json", success_body(endpoint))
+                }
                 Some(Mode::OkSse) => (200, "OK", "text/event-stream", sse_body(endpoint)),
                 Some(Mode::SemanticReject) => (
                     400,
@@ -1119,6 +1131,201 @@ async fn serve_router_learns_routes_per_model() {
         chat_probes_after_first + 1,
         "second model must run its own probe: {:?}",
         fake.hits()
+    );
+}
+
+const CLAUDE_CHAT_REQ: &str = r#"{"model":"anthropic/claude-opus-5","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#;
+const CLAUDE_MODEL: &str = "anthropic/claude-opus-5";
+
+fn code_route_cache() -> Arc<aivo::services::route_cache::RouteCache> {
+    Arc::new(aivo::services::route_cache::RouteCache::new(
+        "code",
+        ProviderProtocol::Openai,
+        BTreeMap::new(),
+    ))
+}
+
+async fn start_serve_with_config(fake: &FakeProvider, config: ServeRouterConfig) -> u16 {
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+    let router = ServeRouter::new(config, test_key(&fake.base_url()), log_store);
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+    port
+}
+
+fn sent_bodies(fake: &FakeProvider, endpoint: Endpoint) -> Vec<Value> {
+    fake.heads()
+        .into_iter()
+        .filter(|h| request_endpoint(h) == endpoint)
+        .map(|h| serde_json::from_str(&h[h.find("\r\n\r\n").unwrap() + 4..]).unwrap())
+        .collect()
+}
+
+fn last_part_has_cache_control(message: &Value) -> bool {
+    message["content"]
+        .as_array()
+        .and_then(|parts| parts.last())
+        .is_some_and(|part| part.get("cache_control").is_some())
+}
+
+#[tokio::test]
+async fn serve_routes_claude_to_messages_when_upstream_speaks_both() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok), (Endpoint::Messages, Mode::Ok)]);
+    let cache = code_route_cache();
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache.clone())).await;
+
+    for _ in 0..2 {
+        let resp = raw_post(port, "/v1/chat/completions", CLAUDE_CHAT_REQ).await;
+        assert_eq!(response_status(&resp), 200, "{resp}");
+        assert_eq!(
+            response_json(&resp)["choices"][0]["message"]["content"],
+            "hello from anthropic"
+        );
+    }
+    assert_eq!(
+        fake.hits(),
+        vec![Endpoint::Messages, Endpoint::Messages],
+        "chat must never be probed"
+    );
+    let dirty = cache.dirty_routes();
+    assert_eq!(dirty.len(), 1, "{dirty:?}");
+    assert_eq!(dirty[0].0, CLAUDE_MODEL);
+    assert_eq!(dirty[0].1.protocol, "anthropic");
+}
+
+#[tokio::test]
+async fn serve_claude_on_chat_only_upstream_pays_one_messages_probe() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let cache = code_route_cache();
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache.clone())).await;
+
+    for _ in 0..2 {
+        let resp = raw_post(port, "/v1/chat/completions", CLAUDE_CHAT_REQ).await;
+        assert_eq!(response_status(&resp), 200, "{resp}");
+    }
+    assert_eq!(
+        fake.hits(),
+        vec![Endpoint::Messages, Endpoint::Chat, Endpoint::Chat]
+    );
+    let dirty = cache.dirty_routes();
+    assert_eq!(dirty.len(), 1, "{dirty:?}");
+    assert_eq!(dirty[0].1.protocol, "openai");
+}
+
+#[tokio::test]
+async fn serve_failed_native_guess_falls_back_without_pinning() {
+    no_proxy();
+    let fake = spawn_fake(&[
+        (Endpoint::Chat, Mode::Ok),
+        (Endpoint::Messages, Mode::SemanticReject),
+    ]);
+    let cache = code_route_cache();
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache.clone())).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CLAUDE_CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert_eq!(
+        response_json(&resp)["choices"][0]["message"]["content"],
+        "hello from openai"
+    );
+    assert_eq!(fake.hits(), vec![Endpoint::Messages, Endpoint::Chat]);
+    let slot = cache.resolve(CLAUDE_MODEL);
+    assert_eq!(slot.current().0, ProviderProtocol::Openai);
+    assert!(slot.is_confirmed());
+}
+
+#[tokio::test]
+async fn serve_seeded_chat_route_for_claude_skips_native_probe() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok), (Endpoint::Messages, Mode::Ok)]);
+    let mut seed = BTreeMap::new();
+    seed.insert(
+        CLAUDE_MODEL.to_string(),
+        aivo::services::route_cache::PersistedRoute {
+            protocol: "openai".to_string(),
+            path_variant: String::new(),
+        },
+    );
+    let cache = Arc::new(aivo::services::route_cache::RouteCache::new(
+        "code",
+        ProviderProtocol::Openai,
+        seed,
+    ));
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache)).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CLAUDE_CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert_eq!(fake.hits(), vec![Endpoint::Chat]);
+}
+
+#[tokio::test]
+async fn serve_non_claude_model_keeps_provider_default_order() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok), (Endpoint::Messages, Mode::Ok)]);
+    let port = start_serve(&fake, ProviderProtocol::Openai).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert_eq!(fake.hits(), vec![Endpoint::Chat]);
+}
+
+#[tokio::test]
+async fn serve_marks_claude_chat_requests_for_prompt_cache() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok), (Endpoint::Messages, Mode::Ok)]);
+    let mut config = serve_config(fake.base_url(), ProviderProtocol::Openai);
+    config.is_openrouter = true;
+    let port = start_serve_with_config(&fake, config).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CLAUDE_CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let other = r#"{"model":"openai/gpt-5.4","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#;
+    let resp = raw_post(port, "/v1/chat/completions", other).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+
+    assert_eq!(fake.hits(), vec![Endpoint::Chat, Endpoint::Chat]);
+    let bodies = sent_bodies(&fake, Endpoint::Chat);
+    let claude = bodies[0]["messages"].as_array().unwrap();
+    assert!(
+        last_part_has_cache_control(&claude[0]),
+        "system: {}",
+        claude[0]
+    );
+    assert!(
+        last_part_has_cache_control(&claude[1]),
+        "user: {}",
+        claude[1]
+    );
+    assert!(
+        !bodies[1].to_string().contains("cache_control"),
+        "{}",
+        bodies[1]
+    );
+}
+
+#[tokio::test]
+async fn serve_resends_claude_chat_unmarked_when_gateway_rejects_cache_control() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::RejectsCacheControl)]);
+    let mut config = serve_config(fake.base_url(), ProviderProtocol::Openai);
+    config.is_openrouter = true;
+    let port = start_serve_with_config(&fake, config).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CLAUDE_CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let bodies = sent_bodies(&fake, Endpoint::Chat);
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0].to_string().contains("cache_control"));
+    assert!(
+        !bodies[1].to_string().contains("cache_control"),
+        "{}",
+        bodies[1]
     );
 }
 

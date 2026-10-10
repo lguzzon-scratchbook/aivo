@@ -26,7 +26,7 @@ use crate::services::usage_stats_store::UsageStatsStore;
 ///   2: replace the per-(tool, key) scalar route pins with the per-(tool, key,
 ///      model) `protocol_routes` map. The old scalars are folded into per-tool
 ///      `""` defaults (lossless under per-tool keying) and then dropped.
-pub const CURRENT_ROUTING_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_ROUTING_SCHEMA_VERSION: u32 = 3;
 
 /// Serde module for serializing/deserializing Zeroizing<String> as regular String
 mod zeroizing_string {
@@ -1822,16 +1822,8 @@ impl SessionStore {
         self.api_keys.merge_routes(id, tool, routes).await
     }
 
-    /// See [`ApiKeyStore::migrate_key_to_routes_v2`].
-    pub async fn migrate_key_to_routes_v2(
-        &self,
-        id: &str,
-        migrated: BTreeMap<String, BTreeMap<String, PersistedRoute>>,
-        version: u32,
-    ) -> Result<bool> {
-        self.api_keys
-            .migrate_key_to_routes_v2(id, migrated, version)
-            .await
+    pub async fn migrate_key_routing(&self, id: &str, migrate: fn(&mut ApiKey)) -> Result<bool> {
+        self.api_keys.migrate_key_routing(id, migrate).await
     }
 
     pub async fn set_key_codex_mode(

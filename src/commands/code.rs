@@ -33,7 +33,7 @@ use crate::services::provider_protocol::{PathVariant, ProviderProtocol};
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, forward_chat_completions_with_fallback,
 };
-use crate::services::route_cache::{PersistedRoute, canonical_model};
+use crate::services::route_cache::{PersistedRoute, RouteCache, canonical_model};
 use crate::services::session_store::{
     ApiKey, AttachmentStorage, MessageAttachment, SessionStore, SessionTokens, StoredChatMessage,
 };
@@ -200,6 +200,14 @@ fn seeded_chat_format(key: &ApiKey, raw_model: &str) -> ChatFormat {
     }
 }
 
+pub(crate) fn agent_route_cache(key: &ApiKey) -> RouteCache {
+    RouteCache::new(
+        "code",
+        provider_profile_for_key(key).default_protocol,
+        key.routes_for_tool("code"),
+    )
+}
+
 fn persisted_chat_protocol(key: &ApiKey, raw_model: &str) -> Option<ProviderProtocol> {
     if raw_model.trim().is_empty() {
         return None;
@@ -223,8 +231,12 @@ fn chat_route_to_persist(
     if raw_model.trim().is_empty() || key.is_cursor_acp() {
         return None;
     }
+    let protocol = chat_format_protocol(format);
+    if protocol != ProviderProtocol::Anthropic && model_names::is_claude_model(raw_model) {
+        return None;
+    }
     let model = canonical_model(raw_model);
-    let route = PersistedRoute::from_route(chat_format_protocol(format), PathVariant::Default);
+    let route = PersistedRoute::from_route(protocol, PathVariant::Default);
     // Compare packed bytes so a default variant ("" vs "default") isn't a false diff.
     if key
         .routes_for_tool("code")
@@ -598,6 +610,12 @@ impl CodeCommand {
                 None => return Ok(ExitCode::UserError),
             };
         }
+
+        crate::services::launch_runtime::migrate_routing_schema_for_key(
+            &self.session_store,
+            &mut key,
+        )
+        .await;
 
         if !hf_active
             && key.is_cursor_acp()
@@ -3613,6 +3631,15 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
     fn persist_emits_first_route_for_new_model() {
         let key = key_with_chat_route("gpt-oss", "anthropic");
         assert!(chat_route_to_persist(&key, "claude-3", &ChatFormat::Anthropic).is_some());
+    }
+
+    #[test]
+    fn persist_skips_unprobed_chat_route_for_claude() {
+        let key = key_with_chat_route("gpt-oss", "anthropic");
+        assert!(
+            chat_route_to_persist(&key, "anthropic/claude-opus-5", &ChatFormat::OpenAI).is_none()
+        );
+        assert!(chat_route_to_persist(&key, "gpt-5.4", &ChatFormat::OpenAI).is_some());
     }
 
     #[test]

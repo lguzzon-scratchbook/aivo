@@ -379,6 +379,11 @@ is preserved."
             ));
         }
 
+        crate::services::launch_runtime::migrate_routing_schema_for_key(
+            &self.session_store,
+            &mut key,
+        )
+        .await;
         self.key = key;
         self.raw_model = raw_model.clone();
         self.model = CodeCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
@@ -430,11 +435,16 @@ conversation is preserved."
 
     pub(super) async fn complete_key_switch(
         &mut self,
-        key: ApiKey,
+        mut key: ApiKey,
         raw_model: String,
     ) -> Result<()> {
         let cross_provider = !same_wire_provider(&self.key.base_url, &key.base_url);
 
+        crate::services::launch_runtime::migrate_routing_schema_for_key(
+            &self.session_store,
+            &mut key,
+        )
+        .await;
         self.key = key;
         self.raw_model = raw_model.clone();
         self.model = CodeCommand::transform_model_for_provider(&self.key.base_url, &raw_model);

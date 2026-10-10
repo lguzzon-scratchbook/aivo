@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use zeroize::Zeroizing;
 
 use crate::errors::{CLIError, ErrorCategory};
@@ -593,30 +593,12 @@ impl ApiKeyStore {
             .await
     }
 
-    /// One-shot schema-v2 write under one lock: install the caller's migrated
-    /// per-tool routes (existing entries win), drop the scalar pins, stamp the
-    /// version.
-    pub(crate) async fn migrate_key_to_routes_v2(
+    pub(crate) async fn migrate_key_routing(
         &self,
         id: &str,
-        migrated: BTreeMap<String, BTreeMap<String, PersistedRoute>>,
-        version: u32,
+        migrate: fn(&mut ApiKey),
     ) -> Result<bool> {
-        self.update_key_field(id, |entry| {
-            for (tool, models) in migrated {
-                let dst = entry.protocol_routes.entry(tool).or_default();
-                for (model, route) in models {
-                    dst.entry(model).or_insert(route);
-                }
-            }
-            entry.claude_protocol = None;
-            entry.gemini_protocol = None;
-            entry.responses_api_supported = None;
-            entry.claude_path_variant = None;
-            entry.gemini_path_variant = None;
-            entry.routing_schema_version = version;
-        })
-        .await
+        self.update_key_field(id, migrate).await
     }
 
     pub(crate) async fn set_key_codex_mode(

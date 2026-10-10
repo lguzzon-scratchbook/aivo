@@ -119,6 +119,11 @@ pub fn transform_model_for_provider(
     }
 }
 
+pub fn is_claude_model(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    name.trim_start().to_ascii_lowercase().starts_with("claude")
+}
+
 pub fn google_native_model_name(model: &str) -> &str {
     model.strip_prefix("google/").unwrap_or(model)
 }
@@ -427,6 +432,17 @@ mod tests {
     use super::*;
 
     const PLAIN_ENDPOINT: &str = "https://api.acme.example/v1";
+
+    #[test]
+    fn is_claude_model_matches_bare_and_vendor_prefixed_ids() {
+        assert!(is_claude_model("claude-sonnet-4-6"));
+        assert!(is_claude_model("anthropic/claude-opus-5.5"));
+        assert!(is_claude_model("Claude-Haiku-4-5"));
+        assert!(!is_claude_model("gpt-5.4"));
+        assert!(!is_claude_model("qwen/qwen3-coder"));
+        assert!(!is_claude_model("kimi-claude-distill"));
+        assert!(!is_claude_model(""));
+    }
 
     #[test]
     fn test_normalize_claude_version_basic() {

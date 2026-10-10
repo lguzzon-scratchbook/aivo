@@ -844,11 +844,22 @@ pub(crate) async fn migrate_routing_schema_for_key(session_store: &SessionStore,
     if key.routing_schema_version >= CURRENT_ROUTING_SCHEMA_VERSION {
         return;
     }
+    migrate_routing_fields(key);
+    let _ = session_store
+        .migrate_key_routing(&key.id, migrate_routing_fields)
+        .await;
+}
 
-    let mut migrated: BTreeMap<String, BTreeMap<String, PersistedRoute>> = BTreeMap::new();
+fn migrate_routing_fields(key: &mut ApiKey) {
+    use crate::services::session_store::CURRENT_ROUTING_SCHEMA_VERSION;
+    if key.routing_schema_version >= CURRENT_ROUTING_SCHEMA_VERSION {
+        return;
+    }
+
+    let mut migrated: Vec<(&str, PersistedRoute)> = Vec::new();
     if let Some(p) = key.claude_protocol {
-        migrated.entry("claude".to_string()).or_default().insert(
-            String::new(),
+        migrated.push((
+            "claude",
             PersistedRoute {
                 protocol: p.as_str().to_string(),
                 path_variant: key
@@ -856,11 +867,11 @@ pub(crate) async fn migrate_routing_schema_for_key(session_store: &SessionStore,
                     .clone()
                     .unwrap_or_else(|| "default".to_string()),
             },
-        );
+        ));
     }
     if let Some(p) = key.gemini_protocol {
-        migrated.entry("gemini".to_string()).or_default().insert(
-            String::new(),
+        migrated.push((
+            "gemini",
             PersistedRoute {
                 protocol: p.as_str().to_string(),
                 path_variant: key
@@ -868,36 +879,42 @@ pub(crate) async fn migrate_routing_schema_for_key(session_store: &SessionStore,
                     .clone()
                     .unwrap_or_else(|| "default".to_string()),
             },
-        );
+        ));
     }
     if let Some(supported) = key.responses_api_supported {
-        migrated.entry("codex".to_string()).or_default().insert(
-            String::new(),
+        migrated.push((
+            "codex",
             PersistedRoute {
                 protocol: if supported { "responses" } else { "openai" }.to_string(),
                 path_variant: "default".to_string(),
             },
-        );
+        ));
     }
-
-    // Mirror into the in-memory key so this launch seeds the routers correctly,
-    // then drop the legacy scalars (existing routes win over migrated defaults).
-    for (tool, models) in &migrated {
-        let dst = key.protocol_routes.entry(tool.clone()).or_default();
-        for (model, route) in models {
-            dst.entry(model.clone()).or_insert_with(|| route.clone());
-        }
+    for (tool, route) in migrated {
+        key.protocol_routes
+            .entry(tool.to_string())
+            .or_default()
+            .entry(String::new())
+            .or_insert(route);
     }
     key.claude_protocol = None;
     key.gemini_protocol = None;
     key.responses_api_supported = None;
     key.claude_path_variant = None;
     key.gemini_path_variant = None;
-    key.routing_schema_version = CURRENT_ROUTING_SCHEMA_VERSION;
 
-    let _ = session_store
-        .migrate_key_to_routes_v2(&key.id, migrated, CURRENT_ROUTING_SCHEMA_VERSION)
-        .await;
+    for tool in ["code", "chat"] {
+        if let Some(routes) = key.protocol_routes.get_mut(tool) {
+            routes.retain(|model, route| {
+                !crate::services::model_names::is_claude_model(model)
+                    || ProviderProtocol::parse(&route.protocol) == Some(ProviderProtocol::Anthropic)
+            });
+            if routes.is_empty() {
+                key.protocol_routes.remove(tool);
+            }
+        }
+    }
+    key.routing_schema_version = CURRENT_ROUTING_SCHEMA_VERSION;
 }
 
 pub(crate) async fn persist_runtime_discoveries(
@@ -2721,6 +2738,64 @@ mod tests {
         assert_eq!(key.routing_schema_version, CURRENT_ROUTING_SCHEMA_VERSION);
         super::migrate_routing_schema_for_key(&store, &mut key).await;
         assert!(key.protocol_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn migrate_v3_drops_chat_first_claude_routes_from_code() {
+        use crate::services::route_cache::PersistedRoute;
+        use crate::services::session_store::{CURRENT_ROUTING_SCHEMA_VERSION, SessionStore};
+
+        let route = |p: &str| PersistedRoute {
+            protocol: p.to_string(),
+            path_variant: String::new(),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol("test", "https://gateway.example/v1", None, "sk")
+            .await
+            .unwrap();
+        for (tool, routes) in [
+            (
+                "code",
+                vec![
+                    ("anthropic/claude-opus-5".to_string(), route("openai")),
+                    ("claude-sonnet-4-6".to_string(), route("anthropic")),
+                    ("gpt-5.4".to_string(), route("openai")),
+                ],
+            ),
+            (
+                "chat",
+                vec![("claude-haiku-4-5".to_string(), route("openai"))],
+            ),
+            (
+                "claude",
+                vec![("anthropic/claude-opus-5".to_string(), route("openai"))],
+            ),
+        ] {
+            store.merge_routes(&key_id, tool, &routes).await.unwrap();
+        }
+        store
+            .set_key_routing_schema_version(&key_id, 2)
+            .await
+            .unwrap();
+        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+        super::migrate_routing_schema_for_key(&store, &mut key).await;
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        for k in [&key, &reloaded] {
+            let code = &k.protocol_routes["code"];
+            assert!(!code.contains_key("anthropic/claude-opus-5"));
+            assert_eq!(code["claude-sonnet-4-6"].protocol, "anthropic");
+            assert_eq!(code["gpt-5.4"].protocol, "openai");
+            assert!(!k.protocol_routes.contains_key("chat"));
+            assert_eq!(
+                k.protocol_routes["claude"]["anthropic/claude-opus-5"].protocol,
+                "openai"
+            );
+            assert_eq!(k.routing_schema_version, CURRENT_ROUTING_SCHEMA_VERSION);
+        }
     }
 
     #[tokio::test]

@@ -14,21 +14,23 @@ use crate::services::anthropic_chat_request::{
     AnthropicToOpenAIConfig, ensure_assistant_reasoning_content_in_chat_request,
 };
 use crate::services::anthropic_chat_response::{OpenAIToAnthropicConfig, UsageValueMode};
+use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_streaming_client};
 use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::model_catalog::fetch_models;
 use crate::services::model_list_response;
-use crate::services::model_names::strip_context_suffix;
+use crate::services::model_names::{is_claude_model, strip_context_suffix};
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::convert_openai_chat_to_gemini_sse;
 use crate::services::protocol_fallback::{
     FirstError, MismatchDirective, commit_protocol_switch, mismatch_directive, protocol_candidates,
     record_request_outcome,
 };
+use crate::services::provider_profile::ProviderQuirks;
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, classify_failed_attempt, is_model_not_found_error,
-    is_protocol_mismatch, is_quota_error,
+    PathVariant, ProviderProtocol, classify_failed_attempt, encode_route, is_model_not_found_error,
+    is_protocol_mismatch, is_quota_error, quirk_hint_for_error_body,
 };
 use crate::services::request_log::RequestLogger;
 use crate::services::responses_to_chat_router::{
@@ -1543,6 +1545,19 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         return send_codex_responses(&body, client_wants_stream, &upstream_context(state)).await;
     }
 
+    let native_guess = !slot.is_confirmed()
+        && slot.seed_route().0 != ProviderProtocol::Anthropic
+        && body
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(is_claude_model);
+    if native_guess {
+        slot.route_atom().store(
+            encode_route(ProviderProtocol::Anthropic, PathVariant::Default),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     // Protocol-only candidates: serve's upstream senders own their URLs, so
     // path variants don't apply, and ResponsesApi shares the OpenAI chat
     // handler — keep only the first candidate per handler family.
@@ -1598,6 +1613,9 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
             RouterResponse::Streaming { .. } => String::new(),
         };
         let classification = classify_failed_attempt(status, &body_text);
+        if native_guess && attempt == 0 && !classification.is_rate_limited {
+            continue;
+        }
         first_error.record_with(&classification, || response);
         match mismatch_directive(
             attempt,
@@ -1876,7 +1894,26 @@ async fn handle_chat_openai(
     if state.config.requires_reasoning_content {
         ensure_assistant_reasoning_content_in_chat_request(body);
     }
-    send_openai_chat(body, client_wants_stream, &upstream_context(state)).await
+    let ctx = upstream_context(state);
+    let marks_cache = !state.config.is_copilot
+        && body
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(is_claude_model)
+        && !ProviderQuirks::for_base_url(&state.config.upstream_base_url).strips_cache_control;
+    if !marks_cache {
+        return send_openai_chat(body, client_wants_stream, &ctx).await;
+    }
+    let unmarked = body.clone();
+    inject_chat_completions_cache_control(body);
+    let response = send_openai_chat(body, client_wants_stream, &ctx).await?;
+    let rejected = matches!(&response, RouterResponse::Buffered { status: 400, body: e, .. }
+        if quirk_hint_for_error_body(&String::from_utf8_lossy(e)) == Some("strips_cache_control"));
+    if !rejected {
+        return Ok(response);
+    }
+    *body = unmarked;
+    send_openai_chat(body, client_wants_stream, &ctx).await
 }
 
 async fn write_router_response(

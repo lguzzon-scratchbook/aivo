@@ -15,6 +15,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
@@ -423,9 +424,11 @@ async fn run_agent_captured(
             std::collections::HashMap::new(),
         )
         .with_grok_fallback(grok_fallback);
+        let route_cache = Arc::new(crate::commands::code::agent_route_cache(key));
         let mut router = ServeRouter::new(config, key.clone(), session_store.logs())
             .with_oauth_persist(session_store.clone())
             .with_usage_accounting(session_store.clone(), "code".to_string())
+            .with_route_cache(route_cache.clone())
             .quiet(true);
         // Only an own-key generator needs an upstream; the gateway is direct.
         if let Some(GeneratorSource::OwnKey {
@@ -439,7 +442,7 @@ async fn run_agent_captured(
         (
             format!("http://127.0.0.1:{port}"),
             Some(auth),
-            Some((handle, shutdown)),
+            Some((handle, shutdown, route_cache)),
         )
     };
 
@@ -538,9 +541,16 @@ no prose, no markdown fences, nothing else."
     let usage = engine.take_turn_usage();
     let conversation = engine.export_conversation();
     // Shut the router down now so a best-of-n fleet doesn't hold N open through selection.
-    if let Some((handle, shutdown)) = router_cleanup {
+    if let Some((handle, shutdown, route_cache)) = router_cleanup {
         shutdown.notify_one();
         handle.abort();
+        crate::services::launch_runtime::persist_runtime_discoveries(
+            session_store,
+            key,
+            Some(route_cache),
+            None,
+        )
+        .await;
     }
     Ok(CapturedRun {
         ui,

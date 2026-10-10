@@ -911,13 +911,7 @@ impl CodeTuiApp {
         {
             return cache.clone();
         }
-        let protocol =
-            crate::services::provider_profile::provider_profile_for_key(&self.key).default_protocol;
-        let cache = std::sync::Arc::new(crate::services::route_cache::RouteCache::new(
-            "code",
-            protocol,
-            self.key.routes_for_tool("code"),
-        ));
+        let cache = std::sync::Arc::new(crate::commands::code::agent_route_cache(&self.key));
         self.agent_route_cache = Some((self.key.id.clone(), cache.clone()));
         cache
     }
