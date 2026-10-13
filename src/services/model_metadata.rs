@@ -193,6 +193,9 @@ fn fold_rows(rows: std::collections::BTreeMap<String, LimitRow>) -> HashMap<Stri
                 // The loser may know prices the winner lacks — a zero-priced
                 // ':free' pool must not shadow the vendor's list price.
                 merge_pricing(prev, limits.pricing);
+                if prev.reasoning_efforts.is_empty() {
+                    prev.reasoning_efforts = std::mem::take(&mut limits.reasoning_efforts);
+                }
                 prev.temperature &= limits.temperature;
             }
             Some(prev) => {
