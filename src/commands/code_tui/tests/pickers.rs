@@ -956,7 +956,12 @@ fn test_resume_metadata_spans_drop_labels_and_id() {
     };
 
     let plain = plain_text_from_spans(&resume_metadata_spans(&preview, 40));
-    assert!(plain.contains("2h"));
+    let expected = chrono::DateTime::parse_from_rfc3339(&preview.updated_at)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
+    assert!(plain.contains(&expected), "plain: {plain:?}");
     assert!(plain.contains("prod"));
     assert!(plain.contains("claude"));
     assert!(!plain.contains("time"));

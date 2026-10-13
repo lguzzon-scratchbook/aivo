@@ -288,6 +288,17 @@ pub(super) fn format_session_time(updated_at: &str) -> String {
         .unwrap_or_else(|_| updated_at.to_string())
 }
 
+pub(super) fn format_session_datetime(updated_at: &str) -> String {
+    DateTime::parse_from_rfc3339(updated_at)
+        .map(|value| {
+            value
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| updated_at.to_string())
+}
+
 pub(super) fn format_session_match_count(filtered: usize, total: usize) -> String {
     if total == 0 {
         return "0 sessions".to_string();

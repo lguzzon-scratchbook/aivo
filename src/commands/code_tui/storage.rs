@@ -338,7 +338,7 @@ pub(super) fn resume_metadata_values(
 ) -> (String, String, Option<String>) {
     const SEPARATOR_LEN: usize = 3;
 
-    let time_value = format_time_ago_short(&preview.updated_at);
+    let time_value = format_session_datetime(&preview.updated_at);
     let key_value = preview.key_name.clone();
     let available = usize::from(width.max(1));
 

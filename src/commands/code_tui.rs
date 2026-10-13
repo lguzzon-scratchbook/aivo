@@ -33,9 +33,10 @@ use crate::tui::matches_fuzzy;
 use super::code_tui_format::{
     display_width, estimate_context_tokens, footer_engine_labels, footer_host_label,
     footer_session_label, footer_workspace_candidates, format_picker_match_count,
-    format_request_elapsed, format_session_group_label, format_session_match_count,
-    format_session_time, format_time_ago_short, format_token_count, format_token_count_value,
-    format_tps, format_usd, git_branch_for, truncate_for_display_width, truncate_for_width,
+    format_request_elapsed, format_session_datetime, format_session_group_label,
+    format_session_match_count, format_session_time, format_time_ago_short, format_token_count,
+    format_token_count_value, format_tps, format_usd, git_branch_for, truncate_for_display_width,
+    truncate_for_width,
 };
 use super::*;
 
