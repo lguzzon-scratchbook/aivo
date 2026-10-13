@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.49.13
+
+Serve escalates a chat request to the Responses API only when the upstream
+actually demands it, and now does so for plain OpenAI-compatible keys rather
+than Copilot alone: the OpenAI-family route tries `/v1/responses`, falls back
+to chat completions when the endpoint is missing, and escalates back when the
+model rejects chat there, so gpt-5.4+ reasoning-with-tools and responses-only
+codex models work through either shape. The `/resume` picker header shows an
+exact `YYYY-MM-DD HH:MM` timestamp instead of a relative time.
+
+- improve(code): show exact timestamp in /resume preview header (feda259a)
+- fix(models): keep the known effort dial across a fold-equivalent alias (f1cecced)
+- fix(serve): escalate chat to /v1/responses when the upstream demands it (b060f578)
+
 ## v0.49.12
 
 Ask mode is now general Q&A rather than project-aware: it sends a lean research
