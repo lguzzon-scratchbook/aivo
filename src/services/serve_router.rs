@@ -29,8 +29,8 @@ use crate::services::protocol_fallback::{
 };
 use crate::services::provider_profile::ProviderQuirks;
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, classify_failed_attempt, encode_route, is_model_not_found_error,
-    is_protocol_mismatch, is_quota_error, quirk_hint_for_error_body,
+    PathVariant, ProviderProtocol, classify_failed_attempt, encode_route, is_endpoint_missing,
+    is_model_not_found_error, is_protocol_mismatch, is_quota_error, quirk_hint_for_error_body,
 };
 use crate::services::request_log::RequestLogger;
 use crate::services::responses_to_chat_router::{
@@ -40,10 +40,10 @@ use crate::services::responses_to_chat_router::{
 use crate::services::route_cache::{RouteCache, RouteSlot};
 use crate::services::serve_responses::convert_chat_sse_to_responses_sse;
 use crate::services::serve_upstream::{
-    RouterResponse, StreamingBody, UpstreamRequestContext, copilot_requires_responses_api,
+    RouterResponse, StreamingBody, UpstreamRequestContext, requires_responses_api,
     send_anthropic_chat, send_anthropic_native, send_claude_oauth_passthrough,
     send_codex_responses, send_copilot_responses, send_gemini_chat, send_gemini_native,
-    send_openai_chat, send_openai_embeddings,
+    send_openai_chat, send_openai_embeddings, send_openai_responses,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::services::token_usage::{StreamUsageSniffer, TokenUsage, parse_token_usage};
@@ -1504,7 +1504,7 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         }
         let result = handle_chat_openai(&mut body, client_wants_stream, state).await?;
         let redirected = matches!(&result, RouterResponse::Buffered { status: 400, body: e, .. }
-            if copilot_requires_responses_api(e));
+            if requires_responses_api(e));
         if redirected {
             commit_protocol_switch(
                 slot.route_atom(),
@@ -1559,8 +1559,8 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
     }
 
     // Protocol-only candidates: serve's upstream senders own their URLs, so
-    // path variants don't apply, and ResponsesApi shares the OpenAI chat
-    // handler — keep only the first candidate per handler family.
+    // path variants don't apply, and Openai/ResponsesApi share one handler
+    // that switches between them — keep only the first candidate per family.
     let mut seen_openai_family = false;
     let candidates: Vec<ProviderProtocol> = protocol_candidates(slot.route_atom())
         .into_iter()
@@ -1577,17 +1577,20 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
 
     let mut first_error: FirstError<RouterResponse> = FirstError::new();
     let mut success: Option<RouterResponse> = None;
-    for (attempt, protocol) in candidates.into_iter().enumerate() {
+    for (attempt, candidate) in candidates.into_iter().enumerate() {
         let mut body_clone = body.clone();
-        let response = match protocol {
-            ProviderProtocol::Anthropic => {
-                handle_chat_anthropic(&body_clone, client_wants_stream, state).await?
-            }
-            ProviderProtocol::Google => {
-                handle_chat_gemini(&mut body_clone, client_wants_stream, state).await?
-            }
+        let (response, protocol) = match candidate {
+            ProviderProtocol::Anthropic => (
+                handle_chat_anthropic(&body_clone, client_wants_stream, state).await?,
+                candidate,
+            ),
+            ProviderProtocol::Google => (
+                handle_chat_gemini(&mut body_clone, client_wants_stream, state).await?,
+                candidate,
+            ),
             ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
-                handle_chat_openai(&mut body_clone, client_wants_stream, state).await?
+                handle_chat_openai_family(&mut body_clone, candidate, client_wants_stream, state)
+                    .await?
             }
         };
 
@@ -1599,6 +1602,7 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         };
 
         if !is_protocol_mismatch(status) {
+            let attempt = if protocol == candidate { attempt } else { 1 };
             commit_protocol_switch(slot.route_atom(), protocol, PathVariant::Default, attempt);
             slot.confirm();
             if attempt > 0 && !state.quiet {
@@ -1882,6 +1886,36 @@ async fn handle_chat_gemini(
     state: &ServeState,
 ) -> Result<RouterResponse> {
     send_gemini_chat(body, client_wants_stream, &upstream_context(state)).await
+}
+
+async fn handle_chat_openai_family(
+    body: &mut Value,
+    candidate: ProviderProtocol,
+    client_wants_stream: bool,
+    state: &ServeState,
+) -> Result<(RouterResponse, ProviderProtocol)> {
+    let ctx = upstream_context(state);
+    if candidate == ProviderProtocol::ResponsesApi {
+        let response = send_openai_responses(body, client_wants_stream, &ctx).await?;
+        if !endpoint_missing(&response) {
+            return Ok((response, ProviderProtocol::ResponsesApi));
+        }
+    }
+    let response = handle_chat_openai(body, client_wants_stream, state).await?;
+    let redirected = matches!(&response, RouterResponse::Buffered { status: 400, body: e, .. }
+        if requires_responses_api(e));
+    if !redirected {
+        return Ok((response, ProviderProtocol::Openai));
+    }
+    let escalated = send_openai_responses(body, client_wants_stream, &ctx).await?;
+    if endpoint_missing(&escalated) {
+        return Ok((response, ProviderProtocol::Openai));
+    }
+    Ok((escalated, ProviderProtocol::ResponsesApi))
+}
+
+fn endpoint_missing(response: &RouterResponse) -> bool {
+    matches!(response, RouterResponse::Buffered { status, .. } if is_endpoint_missing(*status))
 }
 
 async fn handle_chat_openai(

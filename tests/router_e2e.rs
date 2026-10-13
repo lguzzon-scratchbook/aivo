@@ -61,6 +61,7 @@ enum Mode {
     /// 429 rate limit — a failover-worthy status for `aivo serve --failover`.
     RateLimited,
     RejectsCacheControl,
+    RequiresResponses,
 }
 
 #[derive(Clone)]
@@ -134,6 +135,17 @@ fn sse_body(endpoint: Endpoint) -> String {
             "\n\n",
         )
         .to_string(),
+        Endpoint::Responses => format!(
+            concat!(
+                "event: response.output_text.delta\n",
+                r#"data: {{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello from responses"}}"#,
+                "\n\n",
+                "event: response.completed\n",
+                r#"data: {{"type":"response.completed","response":{}}}"#,
+                "\n\n",
+            ),
+            success_body(endpoint)
+        ),
         // Gemini streams bare JSON candidates as data lines.
         _ => format!("data: {}\n\n", success_body(endpoint)),
     }
@@ -225,6 +237,13 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
                     "Bad Request",
                     "application/json",
                     r#"{"error":{"type":"invalid_request_error","message":"bad request body"}}"#
+                        .to_string(),
+                ),
+                Some(Mode::RequiresResponses) => (
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    r#"{"error":{"message":"Function tools with reasoning_effort are not supported for test-model in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.","type":"invalid_request_error","param":"reasoning_effort","code":null}}"#
                         .to_string(),
                 ),
                 Some(Mode::RateLimited) => (
@@ -751,6 +770,97 @@ async fn serve_router_seeded_route_skips_probe() {
         0,
         "seeded route must skip the chat probe: {:?}",
         fake.hits()
+    );
+}
+
+const TOOLS_EFFORT_REQ: &str = r#"{"model":"test-model","stream":true,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]}"#;
+
+fn confirmed_route_cache(protocol: &str) -> Arc<aivo::services::route_cache::RouteCache> {
+    let mut seed = BTreeMap::new();
+    seed.insert(
+        "test-model".to_string(),
+        aivo::services::route_cache::PersistedRoute {
+            protocol: protocol.to_string(),
+            path_variant: String::new(),
+        },
+    );
+    Arc::new(aivo::services::route_cache::RouteCache::new(
+        "code",
+        ProviderProtocol::Openai,
+        seed,
+    ))
+}
+
+#[tokio::test]
+async fn serve_escalates_chat_to_responses_when_upstream_demands_it() {
+    no_proxy();
+    let fake = spawn_fake(&[
+        (Endpoint::Chat, Mode::RequiresResponses),
+        (Endpoint::Responses, Mode::OkSse),
+    ]);
+    let cache = confirmed_route_cache("openai");
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache.clone())).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", TOOLS_EFFORT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let body = response_body(&resp);
+    assert!(body.contains("chat.completion.chunk"), "{body}");
+    assert!(body.contains("hello from responses"), "{body}");
+    assert_eq!(fake.hits(), vec![Endpoint::Chat, Endpoint::Responses]);
+    let forwarded = fake.heads().last().cloned().unwrap_or_default();
+    assert!(
+        forwarded.contains(r#""reasoning":{"effort":"high"}"#),
+        "effort must survive the escalation: {forwarded}"
+    );
+
+    let slot = cache.resolve("test-model");
+    assert_eq!(slot.current().0, ProviderProtocol::ResponsesApi);
+    assert!(slot.is_confirmed());
+    let dirty = cache.dirty_routes();
+    assert_eq!(dirty.len(), 1, "dirty routes: {dirty:?}");
+    assert_eq!(dirty[0].1.protocol, "responses");
+
+    let resp = raw_post(port, "/v1/chat/completions", TOOLS_EFFORT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert_eq!(
+        fake.hit_count(Endpoint::Chat),
+        1,
+        "pinned route must skip chat: {:?}",
+        fake.hits()
+    );
+}
+
+#[tokio::test]
+async fn serve_surfaces_chat_refusal_when_responses_missing() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::RequiresResponses)]);
+    let cache = confirmed_route_cache("openai");
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache.clone())).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", TOOLS_EFFORT_REQ).await;
+    assert_eq!(response_status(&resp), 400, "{resp}");
+    assert!(response_body(&resp).contains("use /v1/responses"), "{resp}");
+    assert_eq!(fake.hits(), vec![Endpoint::Chat, Endpoint::Responses]);
+    assert_eq!(
+        cache.resolve("test-model").current().0,
+        ProviderProtocol::Openai
+    );
+    assert!(cache.dirty_routes().is_empty());
+}
+
+#[tokio::test]
+async fn serve_responses_pin_falls_back_to_chat_when_missing() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let cache = confirmed_route_cache("responses");
+    let port = start_serve_opt(&fake, ProviderProtocol::Openai, Some(cache.clone())).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert_eq!(fake.hits(), vec![Endpoint::Responses, Endpoint::Chat]);
+    assert_eq!(
+        cache.resolve("test-model").current().0,
+        ProviderProtocol::Openai
     );
 }
 

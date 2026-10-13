@@ -431,8 +431,9 @@ fn inject_include_usage_for_accounting(body: &mut Value, accounting: bool) {
     }
 }
 
-/// True when a Copilot `/chat/completions` error demands the Responses API.
-pub(crate) fn copilot_requires_responses_api(body: &[u8]) -> bool {
+/// True when a `/chat/completions` error demands the Responses API (gpt-5.4+
+/// reasoning + tools, Copilot's responses-only codex models).
+pub(crate) fn requires_responses_api(body: &[u8]) -> bool {
     let s = String::from_utf8_lossy(body).to_lowercase();
     s.contains("unsupported_api_for_model")
         || (s.contains("/responses") && s.contains("chat/completions"))
@@ -485,6 +486,92 @@ pub(crate) async fn send_copilot_responses(
     }
 
     let responses_json: Value = serde_json::from_str(&text)?;
+    let chat_json = translate_response(&responses_json, &ResponseOptions::ChatToResponses)?;
+    if client_wants_stream {
+        return Ok(RouterResponse::buffered(
+            200,
+            "text/event-stream",
+            convert_openai_chat_response_to_sse(&chat_json)?.into_bytes(),
+        ));
+    }
+    Ok(RouterResponse::buffered(
+        200,
+        CONTENT_TYPE_JSON,
+        serde_json::to_vec(&chat_json)?,
+    ))
+}
+
+pub(crate) async fn send_openai_responses(
+    chat_body: &Value,
+    client_wants_stream: bool,
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
+    let mut chat_body = chat_body.clone();
+    normalize_openai_request_model(&mut chat_body, context.is_openrouter, false);
+    strip_non_function_tools(&mut chat_body);
+    let model = chat_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let include_usage = context.accounting
+        || chat_body
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+    let mut responses_body = serde_json::to_value(translate_request(
+        &chat_body,
+        &RequestOptions::ChatToResponses,
+    ))?;
+    responses_body["stream"] = json!(client_wants_stream);
+    if let Some(key) = chat_body.get("prompt_cache_key") {
+        responses_body["prompt_cache_key"] = key.clone();
+    }
+
+    let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/responses");
+    let req = http_utils::authorized_openai_post(
+        &context.client,
+        &url,
+        context.upstream_api_key.as_str(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let req = opencode_session::with_session_header(req, &url, Some(&responses_body));
+    let response = context
+        .with_device_headers(req)
+        .json(&responses_body)
+        .send_logged()
+        .await?;
+    let status = response.status().as_u16();
+    let content_type = http_utils::response_content_type(&response);
+    if status >= 400 {
+        return Ok(RouterResponse::buffered(
+            status,
+            &content_type,
+            response.bytes().await?.to_vec(),
+        ));
+    }
+
+    if client_wants_stream && content_type.contains("text/event-stream") {
+        return Ok(RouterResponse::Streaming {
+            status: 200,
+            content_type: "text/event-stream".to_string(),
+            body: Box::new(StreamingBody::Converted {
+                upstream: response,
+                adapter: stream_adapter(StreamOptions::ChatToResponses {
+                    model: &model,
+                    include_usage,
+                }),
+            }),
+        });
+    }
+
+    let text = response.text().await?;
+    let responses_json = responses_object_from_body(&text)?;
     let chat_json = translate_response(&responses_json, &ResponseOptions::ChatToResponses)?;
     if client_wants_stream {
         return Ok(RouterResponse::buffered(
@@ -1064,18 +1151,18 @@ mod tests {
     }
 
     #[test]
-    fn copilot_requires_responses_api_detects_gpt5_and_codex_redirects() {
+    fn requires_responses_api_detects_gpt5_and_codex_redirects() {
         // Exact gpt-5.4 tools + reasoning_effort rejection from Copilot.
         let gpt5 = br#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-5.4 in /v1/chat/completions. Please use /v1/responses instead.","code":"invalid_request_body"}}"#;
-        assert!(copilot_requires_responses_api(gpt5));
+        assert!(requires_responses_api(gpt5));
         // Codex-family "not accessible" / unsupported_api_for_model.
         let codex = br#"{"error":{"message":"model 'gpt-5.3-codex' is not accessible via the /chat/completions endpoint","code":"unsupported_api_for_model"}}"#;
-        assert!(copilot_requires_responses_api(codex));
+        assert!(requires_responses_api(codex));
         // Unrelated 400s must not trigger the fallback.
-        assert!(!copilot_requires_responses_api(
+        assert!(!requires_responses_api(
             br#"{"error":{"message":"invalid request: missing model"}}"#
         ));
-        assert!(!copilot_requires_responses_api(b"model not found"));
+        assert!(!requires_responses_api(b"model not found"));
     }
 
     fn sample_openai_chat_response() -> String {
