@@ -15,7 +15,7 @@ use crate::services::environment_injector::{ClaudeModelOverrides, EnvironmentInj
 pub use crate::services::launch_args::CodexSlotModels;
 use crate::services::launch_args::{
     build_preview_notes, build_runtime_args, inject_codex_provider_config, inject_codex_root_model,
-    merge_preview_env, preview_args, rewrite_codex_preview_env,
+    inject_opencode_standalone, merge_preview_env, preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
     cleanup_runtime_artifacts, finalize_codex_oauth, persist_runtime_discoveries,
@@ -466,7 +466,6 @@ impl AILauncher {
 
         let event_group_id = new_log_id();
         let cwd = crate::services::system_env::current_dir_string();
-        let log_args = runtime_args.args.clone();
 
         // Check if the tool binary is available on PATH before attempting to spawn.
         // When found, pin `tool_config.command` to the full resolved path so the
@@ -609,6 +608,13 @@ impl AILauncher {
                 );
             }
         }
+
+        if options.tool == AIToolType::Opencode
+            && opencode_needs_standalone(&resolved.tool_config.command).await
+        {
+            runtime_args.args = inject_opencode_standalone(&runtime_args.args);
+        }
+        let log_args = runtime_args.args.clone();
 
         let base_event = || LogEvent {
             source: "run".to_string(),
@@ -778,6 +784,15 @@ impl AILauncher {
             options.codex_effort.as_deref(),
             &options.codex_slots,
         );
+
+        if options.tool == AIToolType::Opencode {
+            let bin = find_in_dirs(&resolved.tool_config.command, &collect_path_dirs());
+            if let Some(bin) = bin
+                && opencode_needs_standalone(&bin.to_string_lossy()).await
+            {
+                args = inject_opencode_standalone(&args);
+            }
+        }
 
         if options.tool.is_codex_family() {
             rewrite_codex_preview_env(&mut env_vars);
@@ -1467,6 +1482,31 @@ fn warn_codex_app_cache(msg: impl AsRef<str>) {
         crate::style::yellow("aivo:"),
         msg.as_ref()
     );
+}
+
+async fn opencode_needs_standalone(command: &str) -> bool {
+    let mut cmd = Command::new(command);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await
+    else {
+        return false;
+    };
+    out.status.success()
+        && parse_opencode_major(&String::from_utf8_lossy(&out.stdout)).is_some_and(|m| m >= 2)
+}
+
+fn parse_opencode_major(version_output: &str) -> Option<u32> {
+    version_output.split_whitespace().find_map(|token| {
+        let token = token.strip_prefix('v').unwrap_or(token);
+        if !version_token(token) {
+            return None;
+        }
+        token.split('.').next()?.parse().ok()
+    })
 }
 
 /// Probes `<Codex.app>/Contents/Resources/codex --version` and returns the
@@ -2229,6 +2269,14 @@ fn is_opencode_zen_base(base_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_major_parses_both_version_formats() {
+        assert_eq!(parse_opencode_major("opencode v2.0.29\n"), Some(2));
+        assert_eq!(parse_opencode_major("1.2.27\n"), Some(1));
+        assert_eq!(parse_opencode_major("0.15.8"), Some(0));
+        assert_eq!(parse_opencode_major("opencode dev"), None);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

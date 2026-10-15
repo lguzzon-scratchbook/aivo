@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::services::context_ingest::paths_match;
 use crate::services::device_fingerprint::hex_sha256;
+use crate::services::opencode_db;
 use crate::services::session_store::{
     AttachmentStorage, CodeSessionState, MessageAttachment, StoredChatMessage,
 };
@@ -1375,16 +1376,8 @@ fn opencode_tool_blocks(part: &Value) -> Vec<ContentBlock> {
     }];
 
     let Some(state) = state else { return blocks };
-    let error = state
-        .get("error")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let output = state
-        .get("output")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let error = opencode_db::tool_error(state);
+    let output = opencode_db::tool_output(state);
     if error.is_none() && output.is_empty() {
         return blocks;
     }
@@ -1407,76 +1400,50 @@ fn opencode_query_one(
             .with_context(|| format!("opening opencode db {}", db_path.display()))?;
 
     // Verify the session exists and pull its updated timestamp.
-    let updated_ms: Option<i64> = conn
-        .query_row(
-            "SELECT time_updated FROM session WHERE id = ?1 LIMIT 1",
+    let updated_ms: Option<i64> = opencode_db::sessions_source(&conn).and_then(|src| {
+        conn.query_row(
+            &format!("SELECT time_updated FROM {src} WHERE id = ?1 LIMIT 1"),
             [session_id],
             |row| row.get::<_, i64>(0),
         )
-        .ok();
+        .ok()
+    });
     if updated_ms.is_none() {
         return Err(anyhow!("opencode session '{session_id}' not found"));
     }
 
-    // Join messages → parts in order; group parts by message_id into one message.
-    let mut stmt = conn.prepare(
-        "SELECT m.id,
-                json_extract(m.data, '$.role') AS role,
-                m.time_created,
-                p.data
-           FROM message m
-           JOIN part p ON p.message_id = m.id
-          WHERE m.session_id = ?1
-          ORDER BY m.time_created ASC, p.time_created ASC",
-    )?;
-    let rows = stmt.query_map([session_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,                             // message id
-            row.get::<_, Option<String>>(1)?.unwrap_or_default(), // role
-            row.get::<_, i64>(2)?,                                // time_created (ms)
-            row.get::<_, String>(3)?,                             // part.data JSON
-        ))
-    })?;
-
     let mut messages: Vec<ShareMessage> = Vec::new();
-    let mut current_msg_id: Option<String> = None;
-    for row in rows.flatten() {
-        let (msg_id, role, time_ms, part_json) = row;
-        let part: Value = match serde_json::from_str(&part_json) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let blocks = match part.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "text" => part
-                .get("text")
-                .and_then(|t| t.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    vec![ContentBlock::Text {
-                        text: s.to_string(),
-                    }]
-                })
-                .unwrap_or_default(),
-            "tool" | "tool_call" | "tool_use" => opencode_tool_blocks(&part),
-            _ => Vec::new(),
-        };
-        if blocks.is_empty() {
+    for msg in opencode_db::session_messages(&conn, session_id) {
+        let content: Vec<ContentBlock> = msg
+            .parts
+            .iter()
+            .flat_map(
+                |part| match part.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                    "text" => part
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            vec![ContentBlock::Text {
+                                text: s.to_string(),
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    "tool" | "tool_call" | "tool_use" => opencode_tool_blocks(part),
+                    _ => Vec::new(),
+                },
+            )
+            .collect();
+        if content.is_empty() {
             continue;
         }
-
-        let timestamp = chrono::DateTime::<Utc>::from_timestamp_millis(time_ms);
-        if Some(&msg_id) != current_msg_id.as_ref() {
-            messages.push(ShareMessage {
-                role: role.clone(),
-                timestamp,
-                model: None,
-                reasoning: None,
-                content: blocks,
-            });
-            current_msg_id = Some(msg_id);
-        } else if let Some(last) = messages.last_mut() {
-            last.content.extend(blocks);
-        }
+        messages.push(ShareMessage {
+            role: msg.role,
+            timestamp: chrono::DateTime::<Utc>::from_timestamp_millis(msg.time_created),
+            model: None,
+            reasoning: None,
+            content,
+        });
     }
     let messages = split_ask_user_answers(messages, &OPENCODE_ASK);
 
@@ -2382,6 +2349,53 @@ You can now continue with the user's answers in mind.",
         match &payload.messages[1].content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "step one"),
             other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_opencode_full_reads_v2_inline_content() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, time_updated INTEGER);
+               CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT,
+                                             seq INTEGER, time_created INTEGER, data TEXT);
+               INSERT INTO session_v2 VALUES ('ses_1', 'proj-1', 3000);
+               INSERT INTO session_message VALUES
+                 ('m1', 'ses_1', 'user', 1, 1000, '{"text":"edit it","files":[]}'),
+                 ('m2', 'ses_1', 'assistant', 2, 2000, '{"content":[
+                    {"type":"reasoning","text":"thinking"},
+                    {"type":"tool","id":"call_1","name":"edit","state":{"status":"error",
+                     "input":{"path":"a.rs"},"error":{"type":"tool.execution","message":"no match"}}},
+                    {"type":"tool","id":"call_2","name":"read","state":{"status":"completed",
+                     "input":{"path":"a.rs"},"content":[{"type":"text","text":"fn main() {}"}]}},
+                    {"type":"text","text":"done"}]}'),
+                 ('m3', 'ses_1', 'idle', 3, 3000, '{"outcome":"succeeded"}');"#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let payload = extract_opencode_full(&db_path, "ses_1", None)
+            .await
+            .unwrap();
+        assert_eq!(payload.messages.len(), 2);
+        assert_eq!(payload.messages[0].role, "user");
+        let blocks = &payload.messages[1].content;
+        assert_eq!(blocks.len(), 5, "{blocks:?}");
+        match &blocks[1] {
+            ContentBlock::ToolResult { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.as_deref(), Some("no match"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+        match &blocks[3] {
+            ContentBlock::ToolResult { ok, output, .. } => {
+                assert!(ok);
+                assert_eq!(output, "fn main() {}");
+            }
+            other => panic!("expected tool result, got {other:?}"),
         }
     }
 

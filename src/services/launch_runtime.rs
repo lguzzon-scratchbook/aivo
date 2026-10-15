@@ -192,6 +192,10 @@ pub(crate) async fn prepare_runtime_env(
         }
     }
 
+    if tool == AIToolType::Opencode {
+        ensure_loopback_no_proxy(&mut env);
+    }
+
     if tool == AIToolType::Grok {
         // Unconditional: cursor-key launches (routed above) need the home too.
         prepare_grok_home(&mut env).await;

@@ -81,6 +81,7 @@ pub mod ollama;
 pub mod openai_anthropic_bridge;
 pub mod openai_gemini_bridge;
 pub mod openai_models;
+pub mod opencode_db;
 pub mod opencode_session;
 pub mod os_keyring;
 pub mod path_search;

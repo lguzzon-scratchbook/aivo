@@ -980,25 +980,14 @@ async fn collect_opencode(
     .await?
 }
 
-/// Sum tokens from opencode's `message` table. `time_created` is epoch
-/// milliseconds; `COALESCE(?1, time_created)` lets the caller skip the
-/// cutoff by binding NULL.
 fn aggregate_opencode_messages(
     conn: &rusqlite::Connection,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> rusqlite::Result<GlobalToolStats> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id,
-                json_extract(data, '$.modelID'),
-                json_extract(data, '$.tokens.input'),
-                json_extract(data, '$.tokens.output'),
-                json_extract(data, '$.tokens.cache.read'),
-                json_extract(data, '$.tokens.cache.write')
-         FROM message
-         WHERE json_extract(data, '$.role') = 'assistant'
-           AND json_extract(data, '$.tokens') IS NOT NULL
-           AND time_created >= COALESCE(?1, time_created)",
-    )?;
+    let Some(sql) = crate::services::opencode_db::assistant_usage_query(conn) else {
+        return Ok(GlobalToolStats::default());
+    };
+    let mut stmt = conn.prepare(&sql)?;
     let cutoff_ms: Option<i64> = cutoff.map(|c| c.timestamp_millis());
     let rows = stmt.query_map([cutoff_ms], |row| {
         Ok((

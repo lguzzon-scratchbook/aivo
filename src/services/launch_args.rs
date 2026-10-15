@@ -750,6 +750,95 @@ fn inject_codex_no_daemon(tool: AIToolType, args: &[String]) -> Vec<String> {
     new_args
 }
 
+const OPENCODE_SUBCOMMANDS: &[&str] = &[
+    "upgrade",
+    "update",
+    "uninstall",
+    "acp",
+    "api",
+    "debug",
+    "auth",
+    "mcp",
+    "plugin",
+    "models",
+    "stats",
+    "mini",
+    "run",
+    "session",
+    "service",
+    "reload",
+    "pair",
+    "serve",
+];
+
+const OPENCODE_STANDALONE_COMMANDS: &[&[&str]] = &[
+    &["run"],
+    &["mini"],
+    &["models"],
+    &["stats"],
+    &["api"],
+    &["reload"],
+    &["session", "list"],
+    &["session", "delete"],
+    &["session", "export"],
+    &["session", "import"],
+];
+
+const OPENCODE_ROOT_VALUE_FLAGS: &[&str] = &[
+    "--server",
+    "--session",
+    "-s",
+    "--prompt",
+    "--log-level",
+    "--completions",
+];
+
+pub(crate) fn inject_opencode_standalone(args: &[String]) -> Vec<String> {
+    let user_args = args.iter().take_while(|a| *a != "--");
+    if user_args
+        .clone()
+        .any(|a| a == "--standalone" || a == "--server" || a.starts_with("--server="))
+    {
+        return args.to_vec();
+    }
+
+    let mut positionals: Vec<usize> = Vec::new();
+    let mut skip_value = false;
+    for (i, arg) in user_args.enumerate() {
+        if skip_value {
+            skip_value = false;
+        } else if arg.starts_with('-') {
+            skip_value = OPENCODE_ROOT_VALUE_FLAGS.contains(&arg.as_str());
+        } else {
+            positionals.push(i);
+            if positionals.len() == 2 {
+                break;
+            }
+        }
+    }
+
+    let mut out = args.to_vec();
+    let Some(&first) = positionals.first() else {
+        out.insert(0, "--standalone".to_string());
+        return out;
+    };
+    for path in OPENCODE_STANDALONE_COMMANDS {
+        let matches = path
+            .iter()
+            .enumerate()
+            .all(|(depth, name)| positionals.get(depth).is_some_and(|&i| args[i] == *name));
+        if matches {
+            out.insert(positionals[path.len() - 1] + 1, "--standalone".to_string());
+            return out;
+        }
+    }
+    let is_subcommand = OPENCODE_SUBCOMMANDS.contains(&args[first].as_str());
+    if !is_subcommand && std::path::Path::new(&args[first]).is_dir() {
+        out.insert(0, "--standalone".to_string());
+    }
+    out
+}
+
 /// Prepended so a user-supplied `-c <key>=...` parses later and wins; for
 /// codex-app the pairs ride the global prefix into the wrapper.
 fn inject_codex_slot_models(
@@ -1145,6 +1234,54 @@ mod tests {
     fn inject_codex_no_daemon_skips_codex_app() {
         let args = vec!["prompt".to_string()];
         assert_eq!(inject_codex_no_daemon(AIToolType::CodexApp, &args), args);
+    }
+
+    fn standalone(args: &[&str]) -> Vec<String> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        inject_opencode_standalone(&args)
+    }
+
+    #[test]
+    fn opencode_standalone_leads_the_tui_launch() {
+        assert_eq!(standalone(&[]), ["--standalone"]);
+        assert_eq!(
+            standalone(&["--session", "ses_1", "--prompt", "run"]),
+            ["--standalone", "--session", "ses_1", "--prompt", "run"]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_str().unwrap();
+        assert_eq!(standalone(&[dir]), ["--standalone", dir]);
+    }
+
+    #[test]
+    fn opencode_standalone_follows_the_subcommand_path() {
+        assert_eq!(
+            standalone(&["--log-level", "debug", "run", "hi there"]),
+            ["--log-level", "debug", "run", "--standalone", "hi there"]
+        );
+        assert_eq!(standalone(&["models"]), ["models", "--standalone"]);
+        assert_eq!(
+            standalone(&["session", "list", "-n", "5"]),
+            ["session", "list", "--standalone", "-n", "5"]
+        );
+    }
+
+    #[test]
+    fn opencode_standalone_skips_commands_without_the_flag() {
+        for args in [
+            &["session", "fork", "ses_1"][..],
+            &["upgrade"],
+            &["acp"],
+            &["not-a-dir-or-command"],
+            &["run", "--server", "http://127.0.0.1:4096", "hi"],
+            &["--standalone"],
+        ] {
+            assert_eq!(standalone(args), args, "{args:?}");
+        }
+        assert_eq!(
+            standalone(&["run", "--", "--server"]),
+            ["run", "--standalone", "--", "--server"]
+        );
     }
 
     #[test]

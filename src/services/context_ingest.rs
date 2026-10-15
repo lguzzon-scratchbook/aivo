@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::services::ansi;
 use crate::services::device_fingerprint::hex_sha256;
+use crate::services::opencode_db;
 use crate::services::project_id::{DEFAULT_THREAD_MAX_AGE_DAYS, Thread};
 use crate::services::session_store::{SessionIndexEntry, SessionStore};
 use crate::services::system_env;
@@ -632,15 +633,18 @@ fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64) -> Vec<Thread>
         }
     };
 
+    let Some(src) = opencode_db::sessions_source(&conn) else {
+        return Vec::new();
+    };
     // Pull every project's recent sessions ordered globally by recency.
-    let mut stmt = match conn.prepare(
+    let mut stmt = match conn.prepare(&format!(
         "SELECT s.id, s.time_updated, p.worktree
-           FROM session s
+           FROM {src} s
            JOIN project p ON p.id = s.project_id
            WHERE s.time_updated >= ?2
            ORDER BY s.time_updated DESC
-           LIMIT ?1",
-    ) {
+           LIMIT ?1"
+    )) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -2067,13 +2071,16 @@ fn opencode_query(db_path: &Path, project_root: &str, cap: i64) -> Vec<Thread> {
         None => return Vec::new(),
     };
 
+    let Some(src) = opencode_db::sessions_source(&conn) else {
+        return Vec::new();
+    };
     // Pull the N most-recent sessions.
-    let mut stmt = match conn.prepare(
-        "SELECT id, time_updated FROM session
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, time_updated FROM {src}
            WHERE project_id = ?1
            ORDER BY time_updated DESC
-           LIMIT ?2",
-    ) {
+           LIMIT ?2"
+    )) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -2106,46 +2113,26 @@ fn opencode_extract_session(
     time_updated_ms: i64,
     worktree: Option<String>,
 ) -> Option<Thread> {
-    // Join messages to their text parts, ordered chronologically. First
-    // `role=user` → topic; last `role=assistant` → last_response.
-    let mut stmt = conn
-        .prepare(
-            "SELECT json_extract(m.data, '$.role') AS role, p.data
-               FROM message m
-               JOIN part p ON p.message_id = m.id
-              WHERE m.session_id = ?1
-                AND json_extract(p.data, '$.type') = 'text'
-              ORDER BY m.time_created ASC, p.time_created ASC",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map([session_id], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                row.get::<_, String>(1)?,
-            ))
-        })
-        .ok()?;
-
     let mut first_user: Option<String> = None;
     let mut last_assistant: Option<String> = None;
-    for row in rows.flatten() {
-        let (role, part_json) = row;
-        let v: Value = match serde_json::from_str(&part_json) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let raw = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
-        match role.as_str() {
-            "user" if first_user.is_none() => {
-                first_user = pick_first_user_turn(raw);
-            }
-            "assistant" => {
-                if let Some(t) = sanitize_turn(raw) {
-                    last_assistant = Some(t);
+    for msg in opencode_db::session_messages(conn, session_id) {
+        let texts = msg
+            .parts
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(Value::as_str));
+        for raw in texts {
+            match msg.role.as_str() {
+                "user" if first_user.is_none() => {
+                    first_user = pick_first_user_turn(raw);
                 }
+                "assistant" => {
+                    if let Some(t) = sanitize_turn(raw) {
+                        last_assistant = Some(t);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -2162,10 +2149,6 @@ fn opencode_extract_session(
     })
 }
 
-/// Stub enumerator for the share resolver: one `Thread` per `session` row whose
-/// `project_id` matches, skipping the `message`/`part` join that
-/// `opencode_extract_session` uses for `topic`/`last_response`. The resolver
-/// only needs `session_id` + `updated_at` for its closest-mtime pick.
 pub async fn list_opencode_sessions_for_cwd(db_path: &Path, project_root: &Path) -> Vec<Thread> {
     if !db_path.exists() {
         return Vec::new();
@@ -2197,11 +2180,14 @@ fn opencode_list_stubs(db_path: &Path, project_root: &str) -> Vec<Thread> {
     let Some(project_id) = project_id else {
         return Vec::new();
     };
-    let mut stmt = match conn.prepare(
-        "SELECT id, time_updated FROM session
+    let Some(src) = opencode_db::sessions_source(&conn) else {
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, time_updated FROM {src}
            WHERE project_id = ?1
-           ORDER BY time_updated DESC",
-    ) {
+           ORDER BY time_updated DESC"
+    )) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };

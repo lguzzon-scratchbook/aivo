@@ -23,7 +23,6 @@
 //!   codex    ~/.codex/sessions/YYYY/MM/DD/rollout-...-<uuid>.jsonl
 //!   gemini   ~/.gemini/tmp/<sha256-cwd>/chats/session-*.json{,l}
 //!   pi       ~/.pi/agent/sessions/<encoded-cwd>/<ts>_<uuid>.jsonl
-//!   opencode ~/.local/share/opencode/opencode.db (sqlite `session` table)
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -379,11 +378,15 @@ fn opencode_query(db_path: &Path, cutoff_ms: i64) -> Vec<(SystemTime, String)> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut stmt =
-        match conn.prepare("SELECT id, time_updated FROM session WHERE time_updated >= ?") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+    let Some(src) = crate::services::opencode_db::sessions_source(&conn) else {
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT id, time_updated FROM {src} WHERE time_updated >= ?"
+    )) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
     let rows = stmt
         .query_map([cutoff_ms], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))

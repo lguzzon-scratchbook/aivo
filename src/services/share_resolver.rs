@@ -614,13 +614,16 @@ async fn find_opencode(db_path: &Path, session_id: &str) -> Vec<Match> {
         // Match either the dashed input or its dashes-stripped form against
         // both the raw id and the dashes-stripped id, so the listing's
         // compact display id round-trips back to the right session.
-        let stmt = conn.prepare(
-            "SELECT id FROM session
+        let Some(src) = crate::services::opencode_db::sessions_source(&conn) else {
+            return Vec::new();
+        };
+        let stmt = conn.prepare(&format!(
+            "SELECT id FROM {src}
               WHERE id LIKE ?1
                  OR id LIKE ?2
                  OR replace(id, '-', '') LIKE ?2
-              ORDER BY id LIMIT 5",
-        );
+              ORDER BY id LIMIT 5"
+        ));
         let mut stmt = match stmt {
             Ok(s) => s,
             Err(_) => return Vec::new(),
