@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.49.14
+
+MCP servers now connect at launch instead of lazily on the first tool call, and
+a trusted server's own instructions ride into the system prompt (capped at 2 KB
+per server, ordered by name) so the model sees its usage guidance up front.
+OpenCode 2.0 is supported: 2.x attaches to a shared background service that
+never sees aivo's injected config, so aivo passes `--standalone` — placed after
+the subcommand, and only on 2.x since 1.x rejects the flag — to make OpenCode
+start a private server that inherits it; aivo also reads 2.0's split session and
+message tables for stats and session resume.
+
+- feat(mcp): carry server instructions into the system prompt, connect at launch (f4b04e95)
+- fix(opencode): support OpenCode 2.0 (2770739c)
+- chore(deps): bump rustls to 0.23.46 (6a18ccc9)
+
 ## v0.49.13
 
 Serve escalates a chat request to the Responses API only when the upstream
