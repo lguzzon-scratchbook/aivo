@@ -49,6 +49,8 @@ const MAX_SKIPPED_MESSAGES: usize = 256;
 /// Cap on an MCP tool result's character length (matches the built-in tools'
 /// bounded output) so one big result can't swamp the conversation context.
 const MAX_MCP_RESULT_CHARS: usize = 30_000;
+const MAX_MCP_INSTRUCTIONS_CHARS: usize = 2048;
+const MCP_DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on one image block's base64 (~10 MiB decoded).
 const MAX_MCP_IMAGE_B64_CHARS: usize = 14 * 1024 * 1024;
 /// Hard cap on a single MCP response line (bytes), so a server can't OOM us with
@@ -172,6 +174,7 @@ struct McpServer {
     io: Mutex<ServerIo>,
     /// Mirrors `ServerConfig::trust`; `false` → gate this server's tool calls.
     trust: bool,
+    instructions: Option<String>,
     /// Set once a call hits a transport failure (timeout / closed pipe / desync).
     /// A hung request's late reply would corrupt the next call's read stream, so
     /// the server is disabled for the rest of the session and further calls
@@ -1107,6 +1110,16 @@ impl ExternalTools for McpClient {
         self.lookup(name).is_some_and(|(s, _)| !s.trust)
     }
 
+    fn instructions(&self) -> Vec<(String, String)> {
+        let mut servers: Vec<_> = self.servers.iter().collect();
+        servers.sort_by_key(|(name, _)| name.as_str());
+        servers
+            .into_iter()
+            .filter(|(_, s)| s.trust && !s.tools.is_empty())
+            .filter_map(|(name, s)| Some((name.clone(), s.instructions.clone()?)))
+            .collect()
+    }
+
     fn call<'a>(
         &'a self,
         name: &'a str,
@@ -1262,6 +1275,22 @@ impl ExternalTools for FilteredTools {
         // A disabled tool is refused in `call` without user involvement — a
         // permission card here could even persist an AlwaysAllow grant for it.
         !self.disabled.contains(name) && self.inner.requires_approval(name)
+    }
+
+    fn instructions(&self) -> Vec<(String, String)> {
+        let specs = self.specs();
+        self.inner
+            .instructions()
+            .into_iter()
+            .filter(|(server, _)| {
+                let prefix = qualified_name(server, "");
+                specs.iter().any(|s| {
+                    s["function"]["name"]
+                        .as_str()
+                        .is_some_and(|n| n.starts_with(&prefix))
+                })
+            })
+            .collect()
     }
 
     fn call<'a>(
@@ -1490,11 +1519,23 @@ async fn connect_server(
             // connect; otherwise fall through to the legacy handshake.
             if let Some(list) = http_stateless_probe(&mut http, handshake_timeout).await? {
                 let (tools, tool_warnings) = parse_tools_stateless(&list);
+                let discover_timeout = handshake_timeout.min(MCP_DISCOVER_TIMEOUT);
+                let instructions = http_request(
+                    &mut http,
+                    "server/discover",
+                    json!({}),
+                    &[],
+                    discover_timeout,
+                )
+                .await
+                .ok()
+                .and_then(|result| parse_instructions(&result));
                 return Ok(McpServer {
                     tools,
                     tool_warnings,
                     io: Mutex::new(ServerIo::Http(http)),
                     trust: cfg.trust,
+                    instructions,
                     dead: AtomicBool::new(false),
                 });
             }
@@ -1502,16 +1543,17 @@ async fn connect_server(
         }
     };
 
-    io.request(
-        "initialize",
-        json!({
-            "protocolVersion": protocol_version,
-            "capabilities": {},
-            "clientInfo": {"name": "aivo", "version": env!("CARGO_PKG_VERSION")}
-        }),
-        handshake_timeout,
-    )
-    .await?;
+    let init = io
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "aivo", "version": env!("CARGO_PKG_VERSION")}
+            }),
+            handshake_timeout,
+        )
+        .await?;
     io.notify("notifications/initialized").await?;
     let list = io
         .request("tools/list", json!({}), handshake_timeout)
@@ -1523,7 +1565,19 @@ async fn connect_server(
         tool_warnings: Vec::new(),
         io: Mutex::new(io),
         trust: cfg.trust,
+        instructions: parse_instructions(&init),
         dead: AtomicBool::new(false),
+    })
+}
+
+fn parse_instructions(result: &Value) -> Option<String> {
+    let text = result.get("instructions")?.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(match text.char_indices().nth(MAX_MCP_INSTRUCTIONS_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
     })
 }
 
@@ -4324,6 +4378,83 @@ for line in sys.stdin:
         assert_eq!(parse_tools(&list).len(), 3);
     }
 
+    #[test]
+    fn parse_instructions_trims_drops_blank_and_caps() {
+        assert_eq!(
+            parse_instructions(&json!({"instructions": "  use get_guide first \n"})).as_deref(),
+            Some("use get_guide first")
+        );
+        assert!(parse_instructions(&json!({"instructions": "  \n"})).is_none());
+        assert!(parse_instructions(&json!({"instructions": 3})).is_none());
+        assert!(parse_instructions(&json!({})).is_none());
+        let long = "é".repeat(MAX_MCP_INSTRUCTIONS_CHARS + 5);
+        let capped = parse_instructions(&json!({ "instructions": long })).unwrap();
+        assert_eq!(capped.chars().count(), MAX_MCP_INSTRUCTIONS_CHARS + 1);
+        assert!(capped.ends_with('…'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_server_instructions_from_initialize() {
+        if tokio::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("aivo-mcp-instr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = r#"
+import sys, json
+def send(o):
+    sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    m=json.loads(line)
+    method=m.get("method")
+    if method=="initialize":
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"},"instructions":"Call guide before writing code."}})
+    elif method=="tools/list":
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"tools":[{"name":"guide","description":"g","inputSchema":{"type":"object"}}]}})
+"#;
+        let config = json!({"mcpServers":{
+            "docs":{"command":"python3","args":["-c", script]},
+            "gated":{"command":"python3","args":["-c", script],"trust":false}
+        }});
+        std::fs::write(dir.join(".mcp.json"), config.to_string()).unwrap();
+
+        let client = Arc::new(McpClient::connect_isolated(&dir, &HashSet::new()).await);
+        assert_eq!(
+            client.tool_count("gated"),
+            Some(1),
+            "errors: {:?}",
+            client.errors()
+        );
+        assert_eq!(
+            client.instructions(),
+            vec![(
+                "docs".to_string(),
+                "Call guide before writing code.".to_string()
+            )],
+            "the untrusted server's instructions are left out"
+        );
+        let filtered = FilteredTools::new(
+            client.clone(),
+            HashSet::from([qualified_name("docs", "guide")]),
+        );
+        assert!(
+            filtered.instructions().is_empty(),
+            "a server with every tool disabled gives no instructions"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- Stateless (2026-07-28) HTTP transport: mock-server e2e ----
 
     /// A scripted HTTP MCP server: `respond(seq, raw_request)` returns
@@ -4332,6 +4463,8 @@ for line in sys.stdin:
         requests: std::sync::Mutex<Vec<String>>,
         #[allow(clippy::type_complexity)]
         respond: Box<dyn Fn(usize, &str) -> (u16, String, String) + Send + Sync>,
+        discover: Option<Value>,
+        discovers: std::sync::Mutex<Vec<String>>,
     }
 
     impl MockMcp {
@@ -4357,23 +4490,48 @@ for line in sys.stdin:
     async fn spawn_mock_mcp(
         respond: impl Fn(usize, &str) -> (u16, String, String) + Send + Sync + 'static,
     ) -> (String, Arc<MockMcp>) {
+        spawn_mock_mcp_with_discover(None, respond).await
+    }
+
+    async fn spawn_mock_mcp_with_discover(
+        discover: Option<Value>,
+        respond: impl Fn(usize, &str) -> (u16, String, String) + Send + Sync + 'static,
+    ) -> (String, Arc<MockMcp>) {
         use crate::services::http_utils::{bind_local_listener, http_response_head_with_extra};
         let (listener, port) = bind_local_listener().await.unwrap();
         let state = Arc::new(MockMcp {
             requests: std::sync::Mutex::new(Vec::new()),
             respond: Box::new(respond),
+            discover,
+            discovers: std::sync::Mutex::new(Vec::new()),
         });
         let server_state = Arc::clone(&state);
         tokio::spawn(crate::services::http_utils::run_streaming_router(
             listener,
             server_state,
             |request, state: Arc<MockMcp>, mut socket| async move {
-                let seq = {
-                    let mut reqs = state.requests.lock().unwrap();
-                    reqs.push(request.clone());
-                    reqs.len() - 1
+                let method = crate::services::http_utils::extract_request_body(&request)
+                    .ok()
+                    .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                    .and_then(|v| v["method"].as_str().map(str::to_string));
+                let (status, extra, body) = if method.as_deref() == Some("server/discover") {
+                    state.discovers.lock().unwrap().push(request.clone());
+                    match &state.discover {
+                        Some(result) => (200, String::new(), json_rpc_ok(&request, result.clone())),
+                        None => (
+                            404,
+                            String::new(),
+                            json_rpc_err(&request, -32601, "Method not found"),
+                        ),
+                    }
+                } else {
+                    let seq = {
+                        let mut reqs = state.requests.lock().unwrap();
+                        reqs.push(request.clone());
+                        reqs.len() - 1
+                    };
+                    (state.respond)(seq, &request)
                 };
-                let (status, extra, body) = (state.respond)(seq, &request);
                 let head =
                     http_response_head_with_extra(status, "application/json", body.len(), &extra);
                 use tokio::io::AsyncWriteExt as _;
@@ -4408,6 +4566,15 @@ for line in sys.stdin:
         json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
     }
 
+    fn json_rpc_err(raw_request: &str, code: i64, message: &str) -> String {
+        let id = crate::services::http_utils::extract_request_body(raw_request)
+            .ok()
+            .and_then(|b| serde_json::from_str::<Value>(b).ok())
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(Value::Null);
+        json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
+    }
+
     fn tools_result(tools: Value) -> Value {
         json!({"resultType": "complete", "ttlMs": 60000, "cacheScope": "private", "tools": tools})
     }
@@ -4435,7 +4602,16 @@ for line in sys.stdin:
             "errors: {:?}",
             client.errors()
         );
-        assert_eq!(mock.count(), 1, "stateless connect is exactly one request");
+        assert_eq!(mock.count(), 1, "stateless connect is one tools/list…");
+        assert_eq!(
+            mock.discovers.lock().unwrap().len(),
+            1,
+            "…plus one server/discover, for instructions"
+        );
+        assert!(
+            client.instructions().is_empty(),
+            "a server without server/discover gives no instructions"
+        );
         assert!(
             !mock.saw_method("initialize"),
             "no handshake in stateless mode"
@@ -4453,6 +4629,54 @@ for line in sys.stdin:
         );
         assert_eq!(meta["io.modelcontextprotocol/clientInfo"]["name"], "aivo");
         assert!(meta["io.modelcontextprotocol/clientCapabilities"].is_object());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stateless_server_instructions_from_discover() {
+        let discover = json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "instructions": "The current release is 1.2.3.",
+        });
+        let (url, mock) = spawn_mock_mcp_with_discover(Some(discover), |_seq, req| {
+            (
+                200,
+                String::new(),
+                json_rpc_ok(
+                    req,
+                    tools_result(
+                        json!([{"name":"echo","description":"e","inputSchema":{"type":"object"}}]),
+                    ),
+                ),
+            )
+        })
+        .await;
+        let (client, dir) = connect_mock(&url).await;
+
+        assert_eq!(
+            client.tool_count("m"),
+            Some(1),
+            "errors: {:?}",
+            client.errors()
+        );
+        assert_eq!(
+            client.instructions(),
+            vec![("m".to_string(), "The current release is 1.2.3.".to_string())]
+        );
+        let discovers = mock.discovers.lock().unwrap().clone();
+        assert_eq!(discovers.len(), 1);
+        let head = discovers[0]
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(
+            crate::services::http_utils::header_value(&head, "Mcp-Method"),
+            Some("server/discover"),
+            "discover is a stateless request like the probe"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1278,3 +1278,32 @@ async fn project_mcp_preapproved_restarts_held_cursor_prewarm() {
     abort_cursor_prewarm(&mut app);
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+#[tokio::test]
+async fn prewarm_mcp_connect_starts_at_launch() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let repo = crate::test_sandbox::tmp("aivo-mcp-prewarm");
+    app.real_cwd = repo.to_string_lossy().into_owned();
+    app.prewarm_mcp_connect().await;
+    assert!(
+        app.mcp_connecting,
+        "the connect is in flight before any send"
+    );
+}
+
+#[tokio::test]
+async fn prewarm_mcp_connect_leaves_unconsented_project_servers_to_first_send() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let repo = crate::test_sandbox::tmp("aivo-mcp-prewarm-gated");
+    std::fs::write(
+        repo.join(".mcp.json"),
+        r#"{"mcpServers":{"local":{"command":"echo","args":["hi"]}}}"#,
+    )
+    .unwrap();
+    app.real_cwd = repo.to_string_lossy().into_owned();
+    app.prewarm_mcp_connect().await;
+    assert!(!app.mcp_connecting, "no connect before consent");
+    assert!(app.cards.mcp_consent.is_none(), "no card at launch");
+}

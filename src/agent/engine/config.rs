@@ -644,6 +644,14 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
             }
         }
         self.refresh_search_tools();
+        let section = mcp_instructions_section(&ext.instructions());
+        if !section.is_empty()
+            && let Some(sys) = self.messages.first_mut()
+            && let Some(cur) = sys.get("content").and_then(|c| c.as_str())
+            && !cur.contains(&section)
+        {
+            sys["content"] = json!(format!("{cur}{section}"));
+        }
         self.external = Some(ext);
     }
 

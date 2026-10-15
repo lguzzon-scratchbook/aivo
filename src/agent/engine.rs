@@ -29,7 +29,7 @@ use crate::agent::retry::{
 use crate::agent::secrets_guard;
 use crate::agent::skills::{self, Skill};
 use crate::agent::subagents::{self, Subagent};
-use crate::agent::system_prompt::system_prompt;
+use crate::agent::system_prompt::{mcp_instructions_section, system_prompt};
 use crate::agent::tokens::{content_to_parts, estimate_str_tokens, estimate_tokens, usage_tokens};
 use crate::agent::{serve_client, tool_repair, tool_search, tools, verify};
 use crate::services::session_store::SessionTokens;
@@ -444,6 +444,9 @@ pub trait ExternalTools: Send + Sync {
     /// Default `false` — configured sources are trusted.
     fn requires_approval(&self, _name: &str) -> bool {
         false
+    }
+    fn instructions(&self) -> Vec<(String, String)> {
+        Vec::new()
     }
     /// Execute one tool call; `text` is fed back as the tool result (Err continues the loop).
     fn call<'a>(

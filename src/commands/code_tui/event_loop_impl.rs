@@ -2032,6 +2032,7 @@ impl CodeTuiApp {
         // Open the cursor session now (no-op for other keys) so its connect
         // overlaps the user typing their first message.
         self.prepare_and_prewarm_cursor_session().await;
+        self.prewarm_mcp_connect().await;
         // Repaint only on change; an idle chat draws nothing.
         let mut needs_redraw = true;
         let mut was_streaming = false;

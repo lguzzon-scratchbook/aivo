@@ -122,6 +122,22 @@ fn partition_guides(cwd: &str, guides: &[String]) -> (InlinedGuides, Vec<String>
     (inlined, pointers)
 }
 
+pub(crate) fn mcp_instructions_section(notes: &[(String, String)]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nThe connected MCP servers' notes on how to use their tools (`mcp__<server>__…`) \
+follow. Use them when you work with those tools or the subject they cover.",
+    );
+    for (server, text) in notes {
+        out.push_str(&format!(
+            "\n\n<mcp_instructions server=\"{server}\">\n{text}\n</mcp_instructions>"
+        ));
+    }
+    out
+}
+
 pub(crate) fn system_prompt(cwd: &str, date: &str, guides: &[String], skills: &[Skill]) -> String {
     let mut p = format!(
         "You are the coding agent built into the aivo CLI. You work in `{cwd}` and have file \

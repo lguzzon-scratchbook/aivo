@@ -62,6 +62,82 @@ async fn external_tools_are_offered_and_routed() {
     );
 }
 
+#[test]
+fn external_instructions_join_the_system_prompt() {
+    struct NotedExt;
+    impl crate::agent::engine::ExternalTools for NotedExt {
+        fn specs(&self) -> Vec<Value> {
+            vec![json!({
+                "type": "function",
+                "function": {"name": "mcp__docs__guide", "description": "d", "parameters": {"type": "object"}}
+            })]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name == "mcp__docs__guide"
+        }
+        fn instructions(&self) -> Vec<(String, String)> {
+            vec![(
+                "docs".to_string(),
+                "Read the guide before writing code.".to_string(),
+            )]
+        }
+        fn call<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            Box::pin(async { Ok("ok".to_string().into()) })
+        }
+    }
+
+    let dir = tmp();
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let before = content_str(&engine.messages[0]).to_string();
+    assert!(!before.contains("<mcp_instructions"));
+    let ext: std::sync::Arc<dyn crate::agent::engine::ExternalTools> =
+        std::sync::Arc::new(NotedExt);
+    engine.set_external_tools(ext.clone());
+    engine.set_external_tools(ext);
+    let system = content_str(&engine.messages[0]).to_string();
+    assert!(
+        system.starts_with(&before),
+        "appended, the prompt before it untouched"
+    );
+    assert!(system.ends_with(
+        "<mcp_instructions server=\"docs\">\nRead the guide before writing code.\n</mcp_instructions>"
+    ));
+    assert_eq!(
+        system.matches("<mcp_instructions").count(),
+        1,
+        "a repeat attach adds nothing"
+    );
+}
+
+#[test]
+fn no_external_instructions_no_section() {
+    struct PlainExt;
+    impl crate::agent::engine::ExternalTools for PlainExt {
+        fn specs(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn handles(&self, _name: &str) -> bool {
+            false
+        }
+        fn call<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            Box::pin(async { Err("none".to_string()) })
+        }
+    }
+    let dir = tmp();
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let before = content_str(&engine.messages[0]).to_string();
+    engine.set_external_tools(std::sync::Arc::new(PlainExt));
+    assert_eq!(content_str(&engine.messages[0]), before);
+}
+
 /// 80 filler tools + one distinctive `alpha_sync` (~16k est tokens — defers).
 struct BigExt;
 

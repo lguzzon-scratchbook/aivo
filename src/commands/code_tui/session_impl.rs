@@ -2265,6 +2265,25 @@ conversation is preserved."
         });
     }
 
+    pub(super) async fn prewarm_mcp_connect(&mut self) {
+        if !self.agent_capable() || self.mcp_client.is_some() || self.mcp_connecting {
+            return;
+        }
+        let cwd = if self.real_cwd.is_empty() {
+            ".".to_string()
+        } else {
+            self.real_cwd.clone()
+        };
+        if !crate::agent::mcp::project_gated_servers(std::path::Path::new(&cwd)).is_empty() {
+            self.seed_project_mcp_consent(&cwd).await;
+            if self.project_mcp_consent == ProjectMcpConsent::Unknown {
+                return;
+            }
+        }
+        let disabled = self.effective_disabled_mcp_servers().await;
+        self.connect_mcp_with_consent(cwd, disabled).await;
+    }
+
     /// Connect MCP, gating a repo's project `.mcp.json` servers behind a one-time
     /// consent — stdio spawns local commands, `url` hands the conversation to a
     /// repo-picked endpoint. User-scope servers connect freely. Until the user
