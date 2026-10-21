@@ -11,12 +11,6 @@ targets = [
 
 [advisories]
 yanked = "deny"
-ignore = [
-    # `paste` was archived by its author. Pulled in transitively by ratatui
-    # 0.29; no safe upgrade exists until ratatui swaps to `pastey` upstream.
-    # Not a security vulnerability — purely a maintenance signal.
-    "RUSTSEC-2024-0436",
-]
 
 [licenses]
 allow = [
