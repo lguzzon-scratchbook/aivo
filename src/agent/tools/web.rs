@@ -136,28 +136,25 @@ const HTML_SEARCH_PROVIDERS: &[HtmlSearchProvider] = &[
     },
 ];
 
-/// Per-provider dead bitmask, so a network that blocks one backend doesn't pay
-/// its timeout on every later search.
-static HTML_DEAD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const HTML_SEARCH_COOLDOWN_SECS: u64 = 60;
 
-/// Latched when every HTML backend failed — search can't recover this session.
-pub(super) static HTML_EXHAUSTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static HTML_COOLDOWN_UNTIL: [std::sync::atomic::AtomicU64; HTML_SEARCH_PROVIDERS.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; HTML_SEARCH_PROVIDERS.len()];
 
-fn all_html_providers_dead() -> u8 {
-    (1u8 << HTML_SEARCH_PROVIDERS.len()) - 1
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn cooling_down(i: usize) -> bool {
+    HTML_COOLDOWN_UNTIL[i].load(std::sync::atomic::Ordering::Relaxed) > unix_secs()
 }
 
 pub(super) async fn web_search(args: &Value) -> Result<String, String> {
-    use std::sync::atomic::Ordering::Relaxed;
     let query = arg_str(args, "query")?.trim();
     if query.is_empty() {
         return Err("web_search: empty query".to_string());
-    }
-    if HTML_EXHAUSTED.load(Relaxed) {
-        return Err(search_exhausted(
-            "Web search is unavailable for the rest of this session",
-        ));
     }
     let max_results = arg_u64(args, "max_results")
         .map(|n| n as usize)
@@ -179,19 +176,19 @@ fn render_hits(query: &str, hits: Vec<SearchHit>) -> String {
     wrap_untrusted("web_search", &render_search_results(query, &hits))
 }
 
-/// Keyless HTML chain. First provider with results wins; a failed provider is
-/// masked out and every masked-out provider latches `HTML_EXHAUSTED`.
 async fn html_search(query: &str, max_results: usize) -> Result<Vec<SearchHit>, String> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut reasons: Vec<String> = Vec::new();
     let mut saw_response = false;
+    let mut tried = false;
     for (i, provider) in HTML_SEARCH_PROVIDERS.iter().enumerate() {
-        let bit = 1u8 << i;
-        if HTML_DEAD.load(Relaxed) & bit != 0 {
+        if cooling_down(i) {
             continue;
         }
+        tried = true;
         match fetch_html_results(provider, query).await {
             Ok(hits) => {
+                HTML_COOLDOWN_UNTIL[i].store(0, Relaxed);
                 saw_response = true;
                 if !hits.is_empty() {
                     return Ok(hits.into_iter().take(max_results).collect());
@@ -199,13 +196,13 @@ async fn html_search(query: &str, max_results: usize) -> Result<Vec<SearchHit>, 
                 reasons.push(format!("{}: no results", provider.name));
             }
             Err(reason) => {
-                HTML_DEAD.fetch_or(bit, Relaxed);
+                HTML_COOLDOWN_UNTIL[i].store(unix_secs() + HTML_SEARCH_COOLDOWN_SECS, Relaxed);
                 reasons.push(format!("{}: {reason}", provider.name));
             }
         }
     }
-    if HTML_DEAD.load(Relaxed) & all_html_providers_dead() == all_html_providers_dead() {
-        HTML_EXHAUSTED.store(true, Relaxed);
+    if !tried {
+        return Err("every search backend failed recently — try again in a minute".to_string());
     }
     if reasons.is_empty() {
         reasons.push("no reachable search backend".to_string());
@@ -315,6 +312,9 @@ pub(super) fn parse_duckduckgo_results(html: &str, max: usize) -> Vec<SearchHit>
         let Some(open_end) = html[pos..].find('>').map(|e| pos + e) else {
             continue;
         };
+        if open_end >= end {
+            continue;
+        }
         let Some(url) = attr_value(&html[tag_start..open_end], "href") else {
             continue;
         };
@@ -323,7 +323,7 @@ pub(super) fn parse_duckduckgo_results(html: &str, max: usize) -> Vec<SearchHit>
             .iter()
             .find_map(|needle| {
                 let sp = html[pos..end].find(needle)? + pos;
-                let oe = sp + html[sp..].find('>')?;
+                let oe = sp + html[sp..end].find('>')?;
                 let tail = &html[oe + 1..end];
                 let close = tail
                     .find("</a>")
@@ -368,15 +368,6 @@ fn decode_result_url(raw: &str) -> String {
         return target;
     }
     full
-}
-
-/// Persistent unavailability — tell the model to STOP retrying (the engine also
-/// short-circuits later calls via `HTML_EXHAUSTED`).
-pub(super) fn search_exhausted(reason: &str) -> String {
-    format!(
-        "{reason}. Don't call web_search again this session — answer from what you already \
-know (say plainly you couldn't search) or web_fetch a known URL; don't invent results."
-    )
 }
 
 /// Transient unavailability — the model may proceed without search, but a later

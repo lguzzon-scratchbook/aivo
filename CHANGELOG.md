@@ -16,7 +16,7 @@ describer/generator on one of your own keys.
 
 - feat!: remove live sharing; stop auto-creating the starter key (da093fc0)
 - feat!: remove the aivo account and bundled starter provider (030cbf3b)
-- feat(code): own-key fallbacks for web search, vision, and image generation
+- feat!: drop the aivo gateway from web search, vision, and image gen (8df9897c)
 
 ## v0.49.14
 

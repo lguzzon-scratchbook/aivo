@@ -47,6 +47,10 @@ pub struct ExportFilterReport {
 /// provider. Kept only to filter dead rows out of exports/imports.
 pub(crate) const LEGACY_STARTER_BASE_URL: &str = "aivo-starter";
 
+fn is_legacy_starter_row(key: &ApiKey) -> bool {
+    key.base_url == LEGACY_STARTER_BASE_URL
+}
+
 pub(crate) const KEY_ID_LENGTH: usize = 3;
 pub(crate) const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
 
@@ -192,7 +196,7 @@ impl ApiKeyStore {
 
         // Migrate existing keys too so a version bump doesn't leave a mixed store.
         if migrate_keys_in_place(&mut config.api_keys) {
-            self.backup_before_encryption_rewrite().await;
+            self.backup_before_migration().await;
         }
 
         let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
@@ -287,7 +291,7 @@ impl ApiKeyStore {
         refuse_masked_lockout(&config.api_keys)?;
         // Same as add: migrate existing keys while we hold the lock anyway.
         if migrate_keys_in_place(&mut config.api_keys) {
-            self.backup_before_encryption_rewrite().await;
+            self.backup_before_migration().await;
         }
         let mut report = ImportReport::default();
 
@@ -350,9 +354,46 @@ impl ApiKeyStore {
 
     /// Gets all API keys without decrypting secrets.
     pub(crate) async fn get_keys(&self) -> Result<Vec<ApiKey>> {
-        let config = self.ctx.load().await?;
+        let config = self.load_live_config().await?;
         self.maybe_migrate_encryption(&config.api_keys).await;
         Ok(config.api_keys)
+    }
+
+    async fn load_live_config(&self) -> Result<StoredConfig> {
+        let mut config = self.ctx.load().await?;
+        self.drop_legacy_starter_keys(&config.api_keys).await;
+        config.api_keys.retain(|k| !is_legacy_starter_row(k));
+        Ok(config)
+    }
+
+    async fn drop_legacy_starter_keys(&self, keys: &[ApiKey]) {
+        if !keys.iter().any(is_legacy_starter_row) {
+            return;
+        }
+        let Ok(_lock) = self.ctx.acquire_config_lock() else {
+            return;
+        };
+        let Ok(mut config) = self.ctx.load().await else {
+            return;
+        };
+        let dead: Vec<String> = config
+            .api_keys
+            .iter()
+            .filter(|k| is_legacy_starter_row(k))
+            .map(|k| k.id.clone())
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        config.api_keys.retain(|k| !is_legacy_starter_row(k));
+        for id in &dead {
+            if config.active_key_id.as_deref() == Some(id.as_str()) {
+                config.active_key_id = None;
+            }
+            remove_runtime_state_for_key(&mut config, id);
+        }
+        self.backup_before_migration().await;
+        let _ = self.ctx.save_raw(&config).await;
     }
 
     /// Re-encrypts any keys still using an older encryption version to the
@@ -380,16 +421,12 @@ impl ApiKeyStore {
         }
 
         if migrate_keys_in_place(&mut config.api_keys) {
-            self.backup_before_encryption_rewrite().await;
+            self.backup_before_migration().await;
             let _ = self.ctx.save_raw(&config).await;
         }
     }
 
-    /// Snapshots config.json beside itself before a whole-store re-encryption
-    /// is saved over it. Callers hold the config lock with the rewrite still
-    /// unsaved, so the on-disk file is the pre-migration store. Non-fatal:
-    /// the migration matters more than its safety net.
-    async fn backup_before_encryption_rewrite(&self) {
+    async fn backup_before_migration(&self) {
         let src = &self.ctx.config_path;
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let dst = src.with_file_name(format!("config.json.pre-migration-{stamp}.bak"));
@@ -689,7 +726,7 @@ impl ApiKeyStore {
     }
 
     pub(crate) async fn get_active_key(&self) -> Result<Option<ApiKey>> {
-        let config = self.ctx.load().await?;
+        let config = self.load_live_config().await?;
 
         match config.active_key_id {
             Some(ref id) => {
@@ -707,12 +744,12 @@ impl ApiKeyStore {
     pub(crate) async fn get_keys_and_active_id_info(
         &self,
     ) -> Result<(Vec<ApiKey>, Option<String>)> {
-        let config = self.ctx.load().await?;
+        let config = self.load_live_config().await?;
         Ok((config.api_keys, config.active_key_id))
     }
 
     pub(crate) async fn get_active_key_info(&self) -> Result<Option<ApiKey>> {
-        let config = self.ctx.load().await?;
+        let config = self.load_live_config().await?;
 
         match config.active_key_id {
             Some(ref id) => Ok(config.api_keys.into_iter().find(|k| k.id == *id)),
@@ -780,6 +817,34 @@ mod tests {
             .add_key_with_protocol("third", "https://api.example.com/v1", None, "sk-third")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_starter_keys_are_dropped_on_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        os_keyring::test_state::set(false, None);
+
+        let dead_id = store
+            .add_key_with_protocol("aivo", LEGACY_STARTER_BASE_URL, None, "sk-legacy")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("work", "https://api.example.com/v1", None, "sk-work")
+            .await
+            .unwrap();
+        store.set_active_key(&dead_id).await.unwrap();
+
+        let keys = store.get_keys().await.unwrap();
+        assert_eq!(keys.len(), 1, "only the live key survives: {keys:?}");
+        assert!(store.get_key_by_id_info(&dead_id).await.unwrap().is_none());
+        assert!(
+            store.get_active_key_info().await.unwrap().is_none(),
+            "the dead row must not stay active"
+        );
+
+        let raw = std::fs::read_to_string(temp_dir.path().join("config.json")).unwrap();
+        assert!(!raw.contains(LEGACY_STARTER_BASE_URL), "{raw}");
     }
 
     #[tokio::test]
@@ -1022,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_always_skips_aivo_starter() {
+    async fn export_never_ships_the_legacy_starter_row() {
         let temp_dir = TempDir::new().unwrap();
         let store = make_store(&temp_dir);
 
@@ -1038,16 +1103,17 @@ mod tests {
         let (exported, report) = store.export_keys(None).await.unwrap();
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].name, "alpha");
-        assert_eq!(report.skipped_starter, 1);
+        assert_eq!(
+            report.skipped_starter, 0,
+            "the row is deleted before export sees it"
+        );
 
-        // Even an explicit --ids selection drops the starter row.
-        let (by_id, report) = store
+        let err = store
             .export_keys(Some(&["aivo".to_string(), "alpha".to_string()]))
             .await
-            .unwrap();
-        assert_eq!(by_id.len(), 1);
-        assert_eq!(by_id[0].name, "alpha");
-        assert_eq!(report.skipped_starter, 1);
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unknown key id or name"), "{err}");
     }
 
     #[tokio::test]
