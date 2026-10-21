@@ -31,6 +31,6 @@ npm/*.tgz
 
 memory/
 
-# Python cache (canary fake provider)
+# Python cache
 __pycache__/
 eval
