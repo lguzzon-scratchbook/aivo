@@ -42,9 +42,11 @@ irm https://getaivo.dev/install.ps1 | iex
 
 ## Quick start
 
-The built-in `aivo/starter` provider works on first run, so you can try Aivo without an API key:
+Link a device with `aivo login` to use the built-in `aivo/starter` provider, or add your own key
+with `aivo keys add`:
 
 ```bash
+aivo login
 aivo "tell me a short story"
 aivo claude
 ```

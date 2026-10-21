@@ -2481,15 +2481,10 @@ impl KeysCommand {
             KimiOAuth,
             Cursor,
             Ollama,
-            Starter,
             Custom,
         }
 
         let providers = crate::services::known_providers::all();
-        let existing_keys = self.session_store.get_keys().await?;
-        let has_starter = existing_keys
-            .iter()
-            .any(|k| is_aivo_starter_base(&k.base_url));
 
         let ollama_base_url = crate::services::ollama::ollama_openai_base_url();
 
@@ -2521,7 +2516,6 @@ impl KeysCommand {
                     "device login — any coding agent".to_string(),
                 ),
                 ProviderChoice::Cursor => ("Cursor", "cursor-agent login/API key".to_string()),
-                ProviderChoice::Starter => ("aivo starter", "free".to_string()),
                 ProviderChoice::Custom => ("Custom URL", "enter manually".to_string()),
             }
         };
@@ -2601,11 +2595,6 @@ impl KeysCommand {
             push(&mut choices, &mut labels, choice);
         }
 
-        // Starter is a singleton — hide the picker entry once one is already set up.
-        if !has_starter {
-            push(&mut choices, &mut labels, ProviderChoice::Starter);
-        }
-
         keys_ui::step_header(2, 3, "Provider", "preset or custom URL");
 
         let selection = FuzzySelect::new()
@@ -2648,7 +2637,6 @@ impl KeysCommand {
             ProviderChoice::KimiOAuth => self.add_kimi_oauth_interactive(name).await,
             ProviderChoice::Cursor => self.add_cursor_interactive(name, None).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
-            ProviderChoice::Starter => self.add_starter_interactive(name).await,
             ProviderChoice::Custom => self.add_custom_interactive(name).await,
         }
     }
@@ -3133,35 +3121,6 @@ impl KeysCommand {
             name,
             "Provider: Ollama (local)",
             Some(("aivo models", "(list local models)")),
-        )
-        .await?;
-        Ok(ExitCode::Success)
-    }
-
-    async fn add_starter_interactive(&self, name: &str) -> Result<ExitCode> {
-        keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
-
-        if let Some(code) = self.notify_if_starter_already_added().await? {
-            return Ok(code);
-        }
-
-        let _ = self.session_store.set_starter_key_dismissed(false).await;
-
-        let (starter, _) = self
-            .session_store
-            .ensure_starter_key()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Failed to create aivo starter key"))?;
-        let display_name = if name.is_empty() {
-            "aivo-starter"
-        } else {
-            name
-        };
-        self.finalize_add(
-            &starter.id,
-            display_name,
-            "Provider: aivo starter (free)",
-            Some(("aivo code", "(start coding)")),
         )
         .await?;
         Ok(ExitCode::Success)

@@ -770,52 +770,6 @@ impl CodeTuiApp {
         render_detail_lines(frame, inner, lines, scroll)
     }
 
-    /// The footer `● sharing` badge's modal: the live share's URL and controls.
-    pub(super) fn render_share_overlay(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        scroll: u16,
-    ) -> (u16, Option<ScrollbarHit>) {
-        let inner = overlay_shell(
-            frame,
-            area,
-            "Sharing",
-            Some(("c copy · s stop · Esc".to_string(), MUTED())),
-        );
-        let width = usize::from(inner.width).max(1);
-        let mut lines: Vec<Line> = Vec::new();
-        match &self.share.handle {
-            Some(handle) => {
-                lines.push(Line::from(vec![
-                    Span::styled("● ", Style::default().fg(LIVE())),
-                    Span::styled("live", Style::default().fg(TEXT())),
-                ]));
-                lines.push(Line::from(""));
-                for wrapped in wrap_chars(handle.url(), width) {
-                    lines.push(Line::from(Span::styled(
-                        wrapped,
-                        Style::default().fg(LINK()).add_modifier(Modifier::BOLD),
-                    )));
-                }
-                lines.push(Line::from(""));
-                for wrapped in
-                    wrap_chars("Anyone with the link can watch this session live.", width)
-                {
-                    lines.push(Line::from(Span::styled(
-                        wrapped,
-                        Style::default().fg(MUTED()),
-                    )));
-                }
-            }
-            None => lines.push(Line::from(Span::styled(
-                "Not currently sharing.",
-                Style::default().fg(MUTED()),
-            ))),
-        }
-        render_detail_lines(frame, inner, lines, scroll)
-    }
-
     /// `/skills` overlay: a checkbox toggle list of the discovered skills. Split
     /// shows the highlighted skill's full text in the right pane; narrow keeps
     /// the Tab drill-in. Chrome shared with `/mcp`.
@@ -3067,8 +3021,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Session",
         &[
-            "new", "resume", "session", "rewind", "copy", "config", "effort", "share", "help",
-            "exit",
+            "new", "resume", "session", "rewind", "copy", "config", "effort", "help", "exit",
         ],
     ),
     ("Model & key", &["model", "key"]),

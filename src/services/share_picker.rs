@@ -1,4 +1,4 @@
-//! Inline session picker for `aivo logs share` / `aivo logs show` (no id passed).
+//! Inline session picker for `aivo logs show` (no id passed).
 //!
 //! Draws straight from `fetch_unified_rows`, which already excludes `[run]`
 //! launch records and `[serve]` HTTP events from its default output — the
@@ -122,9 +122,6 @@ fn build_logs_args(project_root: &Path, all: bool) -> LogsArgs {
         since: None,
         until: None,
         errors: false,
-        no_redact: false,
-        open: false,
-        debug_local_only: false,
         yes: false,
     }
 }

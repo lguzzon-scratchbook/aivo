@@ -70,8 +70,6 @@ mod inline_images;
 mod input_impl;
 #[path = "code_tui/key_handler_impl.rs"]
 mod key_handler_impl;
-#[path = "code_tui/live_impl.rs"]
-mod live_impl;
 #[path = "code_tui/preview_pane.rs"]
 mod preview_pane;
 #[path = "code_tui/queue_impl.rs"]
@@ -479,7 +477,6 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
             format!("{prompt} {}", mentions.trim_end())
         }
     });
-    let share = params.share;
     let vision_picker_at_start = match params.vision_model.as_deref().map(parse_vision_flag) {
         Some(VisionFlag::KeyPicker(query)) => Some(Some(query)),
         Some(VisionFlag::Picker) => Some(None),
@@ -527,15 +524,10 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     {
         app.notice = Some((ERROR(), format!("Failed to send: {err:#}")));
     }
-    // The event loop starts the share once the session settles (an async
-    // `--resume` could still be loading a different session id here).
-    app.share.requested = share;
     let result = app.run().await;
     // Presence off before anything else — a peer must not message a closed
     // session. (A hard kill skips this; readers sweep by pid.)
     app.mail_presence = None;
-    // The public link dies with the chat.
-    app.stop_live_share();
     app.persist_draft_history();
     // Remember the auto-approve toggle for next time (best-effort) — the STANDING
     // mode, so quitting from inside plan/ask doesn't demote it to default.

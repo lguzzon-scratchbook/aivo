@@ -52,7 +52,7 @@ pub fn maybe_with_starter_headers(
 }
 
 /// Device-identity headers as `(name, value)` pairs, for callers that build
-/// requests by hand (the `share_tunnel` WS upgrade). [`with_starter_headers`] wraps this.
+/// requests by hand. [`with_starter_headers`] wraps this.
 pub fn starter_header_pairs() -> [(&'static str, String); 5] {
     let did = device_id();
     let ts = current_unix_ts();

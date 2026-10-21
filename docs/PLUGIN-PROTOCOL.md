@@ -4,7 +4,7 @@
 
 A plugin is a standalone executable `aivo-<name>`, in **any language**, that aivo runs as
 `aivo <name>`. The only hard requirement is that the file exists and is executable; metadata, the
-key handoff, and transcript sharing are all opt-in via a [manifest](#manifest).
+key handoff, and transcript export are all opt-in via a [manifest](#manifest).
 
 ```bash
 aivo plugins install ./aivo-hello   # add (path | URL | github: | npm: | cargo:)
@@ -309,10 +309,10 @@ bearer-gated Cursor ACP router instead of handing over Cursor credentials or spa
 `cursor-agent` from plugin code. Other plugin types still run on their own auth when a Cursor key is
 selected.
 
-## Transcripts (sharing)
+## Transcripts (resume)
 
 aivo records *that* a plugin ran (`aivo logs`/`aivo stats`), never the conversation. A plugin opts
-into `aivo share <run-id>` by declaring a `transcripts` source, in one of two modes.
+into resuming its runs by declaring a `transcripts` source, in one of two modes.
 
 **Built-in format** — the plugin's sessions already use a format aivo reads:
 
@@ -335,13 +335,13 @@ aivo-<name> --aivo-export-transcript --cwd <run-cwd> --ts <run-ts-rfc3339>
 The plugin picks the run's conversation (match on `--ts`, the run's start time, and/or `--cwd`) and
 prints **one `SharePayload` JSON** to stdout, exit `0` — owning every field, including `source_cli`
 and the full message/tool shape. Best-effort, **10s** timeout; a missing binary, non-zero exit,
-timeout, or unparseable output becomes a clear share error.
+timeout, or unparseable output becomes a clear resume error.
 
-`SharePayload` is the schema aivo serves over the tunnel: `source_cli`, `session_id`, `project`,
+`SharePayload` is the schema aivo reads: `source_cli`, `session_id`, `project`,
 `model`, `created_at`/`updated_at`, `meta`, and `messages[]` of `{role, content[], reasoning?}` —
-each content block one of `text` / `code` / `tool_call` / `tool_result` / `attachment`. aivo re-runs
-redaction and overrides `model` from the logged run, so both can be approximate. An undeclared or
-unknown format stays un-shareable.
+each content block one of `text` / `code` / `tool_call` / `tool_result` / `attachment`. aivo
+overrides `model` from the logged run, so it can be approximate. An undeclared or unknown format
+can't be resumed.
 
 ## Requirements
 

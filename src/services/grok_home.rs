@@ -428,7 +428,7 @@ pub fn migrate_legacy_homes(config_dir: &Path) -> Option<usize> {
 
 // ── GC ────────────────────────────────────────────────────────────────────
 
-/// Best-effort sweep: legacy homes (kept a week so `aivo share` can still
+/// Best-effort sweep: legacy homes (kept a week so `aivo logs` can still
 /// read a recent run) and orphaned leader sockets. Never touches the managed
 /// home's own content.
 pub fn gc_stale_state(config_dir: &Path, now: SystemTime) {

@@ -414,9 +414,6 @@ impl CodeTuiApp {
                 self.apply_skill_install_pick(source, project, staged)
                     .await?
             }
-            RuntimeEvent::LiveShareReady { share_gen, result } => {
-                self.apply_live_share_ready(share_gen, result)
-            }
             RuntimeEvent::AccountLoginPrompt {
                 account_gen,
                 result,
@@ -2045,11 +2042,6 @@ impl CodeTuiApp {
                 Err(err) => break Err(err),
             }
 
-            // Deferred `--share` start, once the session has settled.
-            if self.maybe_start_live_share().await {
-                needs_redraw = true;
-            }
-
             // Keep the selection growing while a drag rests on the top/bottom edge.
             if self.tick_drag_autoscroll() {
                 needs_redraw = true;
@@ -2724,14 +2716,6 @@ impl CodeTuiApp {
                     && rect_contains(hit, (mouse.column, mouse.row))
                 {
                     self.open_session_overlay();
-                    return Ok(false);
-                }
-                // Clicking the footer share badge opens the share modal.
-                if !self.overlay.blocks_input()
-                    && let Some(hit) = self.share_badge_hit
-                    && rect_contains(hit, (mouse.column, mouse.row))
-                {
-                    self.open_share_overlay();
                     return Ok(false);
                 }
                 // Clicking the footer effort badge opens /config on the Thinking row.
@@ -3459,14 +3443,6 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Btw { .. }, _) => Ok(Some(false)),
-            (Overlay::Share { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
-                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-                if let Overlay::Share { scroll } = &mut self.overlay {
-                    *scroll = wheel_scroll(*scroll, up);
-                }
-                Ok(Some(false))
-            }
-            (Overlay::Share { .. }, _) => Ok(Some(false)),
             // Wheel: detail scroll in a drill-in or over the split's right pane,
             // else selection move; add-input ignores it.
             (Overlay::Skills(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
@@ -3619,8 +3595,7 @@ impl CodeTuiApp {
             }
             Overlay::Help { scroll }
             | Overlay::Context { scroll, .. }
-            | Overlay::Session { scroll }
-            | Overlay::Share { scroll } => *scroll = start.min(usize::from(u16::MAX)) as u16,
+            | Overlay::Session { scroll } => *scroll = start.min(usize::from(u16::MAX)) as u16,
             _ => {}
         }
     }

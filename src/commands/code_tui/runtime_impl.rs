@@ -2153,10 +2153,6 @@ impl CodeTuiApp {
                 self.open_session_overlay();
                 Ok(false)
             }
-            SlashCommand::Share(arg) => {
-                self.run_share_command(arg).await;
-                Ok(false)
-            }
             SlashCommand::Login => {
                 self.run_login_command().await;
                 Ok(false)
@@ -4066,8 +4062,6 @@ and keep each turn's work small"
         let draft_hint =
             handoff_steps.is_none() && !self.history.is_empty() && self.pending_plan.is_some();
         self.discard_resume_state();
-        // The share is pinned to the current session; a new chat swaps it out.
-        self.stop_live_share();
         self.discard_queued_input();
         self.cancel_inflight_request(CancelKind::Discard);
         // /new abandons this conversation — persist it first so `/resume` and

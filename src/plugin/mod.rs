@@ -179,8 +179,8 @@ pub fn installed_plugin_names() -> Vec<String> {
 }
 
 /// `(plugin_name, transcript_format, sessions_dir)` for every installed plugin
-/// that declares a transcript source in its manifest — so `aivo share` can read
-/// a plugin run with a built-in reader. Plain strings (no type leak into the
+/// that declares a transcript source in its manifest — so the resume ladder can
+/// read a plugin run with a built-in reader. Plain strings (no type leak into the
 /// share resolver); the caller validates the format and expands `~`.
 pub fn installed_transcript_sources() -> Vec<(String, String, String)> {
     registry::load()

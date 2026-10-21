@@ -1025,8 +1025,27 @@ pub(crate) async fn try_plugin_run_resume(
     let entry = plugin_run_log_entry(store, selector).await?;
     let tool = entry.tool.clone().unwrap_or_default();
     // Registry read + binary discovery aren't free — load only after the gate.
-    let sources = crate::commands::share::plugin_transcript_sources();
+    let sources = plugin_transcript_sources();
     Some(plugin_run_resolution(store, &entry, &tool, selector.trim(), sources.get(&tool)).await)
+}
+
+/// `(plugin_name, transcript_format, sessions_dir)` → the resolver's plain
+/// struct, expanding `~`. Resolved here, where plugin discovery is reachable.
+fn plugin_transcript_sources() -> HashMap<String, PluginTranscript> {
+    crate::plugin::installed_transcript_sources()
+        .into_iter()
+        .map(|(name, format, dir)| {
+            let bin = crate::plugin::discover(&name);
+            (
+                name,
+                PluginTranscript {
+                    format,
+                    dir: system_env::expand_tilde(&dir),
+                    bin,
+                },
+            )
+        })
+        .collect()
 }
 
 /// The logs.db row for `selector`, when it names a plugin run record — the
@@ -1134,7 +1153,7 @@ pub(crate) async fn resolve_context_thread(
                 // instead of the generic miss. An ambiguous global prefix
                 // surfaces its own message.
                 SelectOutcome::Err(_) if global.is_empty() => {
-                    let plugin_sources = crate::commands::share::plugin_transcript_sources();
+                    let plugin_sources = plugin_transcript_sources();
                     match explain_log_entry_id(store, &threads, id, &plugin_sources).await {
                         LogIdExplanation::Redirected(t) => ContextResolution::Selected(t),
                         LogIdExplanation::Explained(reason) => {

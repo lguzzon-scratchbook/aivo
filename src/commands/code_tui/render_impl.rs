@@ -529,7 +529,7 @@ impl CodeTuiApp {
                 push_message_spacing(&mut lines);
                 bars.resize(lines.len(), None);
             }
-            // Model-switch divider; mirrors the share viewer's phase divider.
+            // Model-switch divider.
             if message.role == "assistant"
                 && let Some(model) = message.model.as_deref()
             {
@@ -1789,7 +1789,6 @@ impl CodeTuiApp {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
         self.tick_selection_flash();
         self.refresh_git_branch();
-        self.check_live_share_health();
         let outer = frame.area();
         if let Some(canvas) = palette().canvas {
             frame.render_widget(Block::default().style(Style::default().bg(canvas)), outer);
@@ -1870,15 +1869,6 @@ impl CodeTuiApp {
                 let (clamped, bar) = self.render_btw_overlay(frame, area, lines, scroll, follow);
                 self.scrollbar_hit = bar;
                 if let Overlay::Btw { scroll, .. } = &mut self.overlay {
-                    *scroll = clamped;
-                }
-            }
-            Overlay::Share { scroll } => {
-                let area = centered_rect_fixed(64, 9, body);
-                self.set_overlay_regions(area);
-                let (clamped, bar) = self.render_share_overlay(frame, area, scroll);
-                self.scrollbar_hit = bar;
-                if let Overlay::Share { scroll } = &mut self.overlay {
                     *scroll = clamped;
                 }
             }
@@ -3762,7 +3752,6 @@ impl CodeTuiApp {
         // Cleared so a frame that omits the id/badge leaves no stale click
         // target; re-armed below when shown.
         self.session_id_hit = None;
-        self.share_badge_hit = None;
         self.effort_badge_hit = None;
         let width = usize::from(area.width);
         let glue_w = 3usize; // " · "
@@ -3806,15 +3795,12 @@ impl CodeTuiApp {
         tail.push(Span::styled(" · ", Style::default().fg(FAINT())));
         tail.push(Span::styled(meter_label, Style::default().fg(meter_color)));
         let tail_w: usize = tail.iter().map(|s| display_width(s.content.as_ref())).sum();
-        let live = self.share.handle.is_some();
         let plain_chat = !self.agent_tools_enabled;
-        let live_badge_w = display_width(LIVE_BADGE);
-        let badge_w = if live { live_badge_w + glue_w } else { 0 }
-            + if plain_chat {
-                display_width(PLAIN_CODE_BADGE) + glue_w
-            } else {
-                0
-            };
+        let badge_w = if plain_chat {
+            display_width(PLAIN_CODE_BADGE) + glue_w
+        } else {
+            0
+        };
         // The host segment is the first thing dropped, then the model itself
         // truncates, so the meter never leaves the corner.
         let host = host_label.filter(|h| {
@@ -3831,16 +3817,6 @@ impl CodeTuiApp {
         let mut right_spans: Vec<Span<'static>> = Vec::new();
         right_spans.push(Span::styled(model_shown, Style::default().fg(MUTED())));
         // Badges sit right after the model they qualify.
-        let mut live_badge_rel = 0usize;
-        if live {
-            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
-            // Taken at the push site so a span reorder can't drift the click target.
-            live_badge_rel = right_spans
-                .iter()
-                .map(|s| display_width(s.content.as_ref()))
-                .sum();
-            right_spans.push(Span::styled(LIVE_BADGE, Style::default().fg(LIVE())));
-        }
         if plain_chat {
             right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
             right_spans.push(Span::styled(PLAIN_CODE_BADGE, Style::default().fg(MUTED())));
@@ -3906,14 +3882,6 @@ impl CodeTuiApp {
             " ".repeat(width.saturating_sub(left_w + right_w)),
         ));
         spans.extend(right_spans);
-        if live {
-            self.share_badge_hit = Some(Rect {
-                x: area.x + (width.saturating_sub(right_w) + live_badge_rel) as u16,
-                y: area.y,
-                width: live_badge_w as u16,
-                height: area.height.max(1),
-            });
-        }
         if let Some((rel, effort_w)) = effort_rel_in_tail {
             let tail_origin = width.saturating_sub(tail_w.saturating_sub(rel));
             self.effort_badge_hit = Some(Rect {

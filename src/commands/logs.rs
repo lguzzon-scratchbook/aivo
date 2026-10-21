@@ -32,7 +32,7 @@ pub(crate) enum UnifiedRow {
 }
 
 impl UnifiedRow {
-    /// Stable identifier suitable for the share resolver. For `Log/run` this
+    /// Stable identifier suitable for the native-session resolver. For `Log/run` this
     /// is the event group id (matches what `aivo logs` prints), otherwise the
     /// native session_id / logs row id.
     pub(crate) fn id(&self) -> String {
@@ -262,11 +262,10 @@ impl LogsCommand {
         validate_args(&args)?;
         match args.action.as_deref() {
             Some("show") => self.show_entry(&args).await,
-            Some("share") => self.share_session(args).await,
             Some("prune") => self.prune_orphans(&args).await,
             None | Some("list" | "ls") => self.list_entries(&args).await,
             Some(other) => anyhow::bail!(
-                "Unknown action '{other}'. Valid actions: list, show, share, prune.\nRun `aivo logs --help` for details (use -s <query> to search)."
+                "Unknown action '{other}'. Valid actions: list, show, prune.\nRun `aivo logs --help` for details (use -s <query> to search)."
             ),
         }
     }
@@ -312,23 +311,8 @@ impl LogsCommand {
         Ok(ExitCode::Success)
     }
 
-    async fn share_session(&self, args: LogsArgs) -> Result<ExitCode> {
-        use crate::cli::ShareArgs;
-        use crate::commands::ShareCommand;
-
-        let share_args = ShareArgs {
-            session_id: args.target,
-            no_redact: args.no_redact,
-            all: args.all,
-            open: args.open,
-            debug_local_only: args.debug_local_only,
-        };
-        let cmd = ShareCommand::new(self.session_store.clone());
-        Ok(cmd.execute(share_args).await)
-    }
-
     async fn show_entry(&self, args: &LogsArgs) -> Result<ExitCode> {
-        // No id passed → open the picker, same UX as `aivo logs share`.
+        // No id passed → open the picker.
         // Honors --all so users can scope to the current project or every
         // project. Clean cancel exits quietly.
         let picked;
@@ -354,8 +338,8 @@ impl LogsCommand {
             }
         };
 
-        // logs.db first — don't auto-drill into chat sessions, that's
-        // `aivo logs share`'s job; `show` is the row-level inspector.
+        // logs.db first — `show` is the row-level inspector, so don't auto-drill
+        // into chat sessions.
         let logs_hits = self.session_store.logs().find_by_id_prefix(id, 5).await?;
         if logs_hits.len() > 1 {
             if let Some(entry) = pick_ambiguous_log_hit(id, &logs_hits, args.json).await? {
@@ -376,7 +360,7 @@ impl LogsCommand {
             return Ok(ExitCode::Success);
         }
 
-        // 2. Fall back to native CLI via the share resolver, which
+        // 2. Fall back to native CLI via the native-session resolver, which
         //    already does prefix-matching across all sources and surfaces
         //    cross-source ambiguity. We don't need the full payload — the
         //    metadata + first/last messages from `Thread`-style summaries
@@ -484,8 +468,7 @@ impl LogsCommand {
 
     /// Pulls rows from all three data sources concurrently, then k-way-merges
     /// the already-newest-first streams to take only `--limit` rows. Thin
-    /// wrapper around the free `fetch_unified_rows` so `aivo share`'s picker
-    /// can reuse the same pipeline without going through `LogsCommand`.
+    /// wrapper around the free `fetch_unified_rows`.
     async fn fetch_unified_rows(&self, args: &LogsArgs) -> Result<(Vec<UnifiedRow>, RunMetaIndex)> {
         fetch_unified_rows(&self.session_store, args).await
     }
@@ -493,7 +476,6 @@ impl LogsCommand {
     pub fn print_help(action: Option<&str>) {
         match action {
             Some("show") => print_help_show(),
-            Some("share") => print_help_share(),
             Some("prune") => print_help_prune(),
             _ => print_help_overview(),
         }
@@ -521,10 +503,6 @@ fn print_help_overview() {
     println!("{}", style::bold("Commands:"));
     logs_help_row("list", "Recent rows, newest first (default)");
     logs_help_row("show [id]", "Show one row in detail (omit id → picker)");
-    logs_help_row(
-        "share [id]",
-        "Share a session via viewer URL (omit id → picker)",
-    );
     logs_help_row("prune", "Remove logs.db events whose session file is gone");
     println!();
     println!("{}", style::bold("Filters:"));
@@ -579,29 +557,6 @@ fn print_help_show() {
     println!("  {}", style::dim("aivo logs show 1335c631"));
 }
 
-fn print_help_share() {
-    println!("{} aivo logs share [ID] [OPTIONS]", style::bold("Usage:"));
-    println!();
-    println!(
-        "{}",
-        style::dim(
-            "Share a session via a tunneled, live viewer URL (secrets and $HOME redacted). Omit the id to open the picker; `aivo share` is an alias."
-        )
-    );
-    println!();
-    println!("{}", style::bold("Options:"));
-    logs_help_row(
-        "--no-redact",
-        "Skip redaction of keys, tokens, $HOME, secrets",
-    );
-    logs_help_row("--all", "Pick from every project (default: current cwd)");
-    logs_help_row("--open", "Open the share URL in the browser when ready");
-    println!();
-    println!("{}", style::bold("Examples:"));
-    println!("  {}", style::dim("aivo logs share"));
-    println!("  {}", style::dim("aivo logs share 1335c631"));
-}
-
 fn print_help_prune() {
     println!("{} aivo logs prune [OPTIONS]", style::bold("Usage:"));
     println!();
@@ -633,10 +588,6 @@ fn validate_args(args: &LogsArgs) -> Result<()> {
     let is_list = matches!(args.action.as_deref(), None | Some("list" | "ls"));
     if args.watch && !is_list {
         anyhow::bail!("--watch is only supported for `aivo logs` list output");
-    }
-    let is_share = args.action.as_deref() == Some("share");
-    if !is_share && (args.no_redact || args.open || args.debug_local_only) {
-        anyhow::bail!("--no-redact, --open, --debug-local-only only apply to `aivo logs share`");
     }
     Ok(())
 }
@@ -998,7 +949,7 @@ fn display_id(entry: &LogEntry) -> &str {
         return group_id;
     }
     // Chat events: prefer the chat session UUID so a row's id matches what
-    // `aivo share`'s resolver expects and what the chat picker / session
+    // the native-session resolver expects and what the chat picker / session
     // files use. Falls back to the logs.db row id for legacy events that
     // pre-date the `session_id` linkage column.
     if is_code_source(&entry.source)
@@ -1447,8 +1398,8 @@ async fn fetch_native_rows(
 
 /// Compute the set of chat `session_id`s referenced by logs.db that no
 /// longer have a session file on disk. Used to tag stale rows in the
-/// listing and to refuse `aivo logs share` with a useful pointer. Returns
-/// an empty set on any error — orphan tagging is decoration, not safety.
+/// listing. Returns an empty set on any error — orphan tagging is decoration,
+/// not safety.
 pub(crate) async fn compute_orphan_code_ids(store: &SessionStore) -> HashSet<String> {
     let log_ids = match store.logs().distinct_code_session_ids().await {
         Ok(ids) => ids,
@@ -1470,7 +1421,7 @@ pub(crate) async fn compute_orphan_code_ids(store: &SessionStore) -> HashSet<Str
 pub(crate) type RunMetaIndex = HashMap<String, RunMeta>;
 
 /// Free-function counterpart of `LogsCommand::fetch_unified_rows`. Shared
-/// with the `aivo share` picker so both surfaces draw from the same merged
+/// with the `logs show` picker so both surfaces draw from the same merged
 /// stream (same ids, same ordering, same filters). Returns the merged rows
 /// plus a side-table of `[run]` metadata keyed by the native session_id
 /// each launch produced — renderers join on it to show the key/exit on
@@ -2010,8 +1961,7 @@ fn print_share_payload(p: &crate::services::share_payload::SharePayload) {
     }
 
     // Surface tool activity at a glance: how many tool calls were made and
-    // what tools were used. Doesn't dump payloads — `aivo logs share` is for
-    // the full view.
+    // what tools were used. Doesn't dump full payloads; `--json` carries them.
     let tool_calls: Vec<&str> = p
         .messages
         .iter()
@@ -2038,7 +1988,7 @@ fn print_share_payload(p: &crate::services::share_payload::SharePayload) {
     println!();
     println!(
         "{}",
-        style::dim("(use `aivo logs share <id>` to open a full viewer)")
+        style::dim("(use `aivo logs show <id> --json` for the full payload)")
     );
 }
 
@@ -2130,9 +2080,6 @@ mod tests {
             since: None,
             until: None,
             errors: false,
-            no_redact: false,
-            open: false,
-            debug_local_only: false,
             yes: false,
         }
     }
@@ -2361,9 +2308,6 @@ mod tests {
             since: None,
             until: None,
             errors: false,
-            no_redact: false,
-            open: false,
-            debug_local_only: false,
             yes: false,
         }
     }

@@ -69,7 +69,6 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "mcp",
     "mcp-serve",
     "skills",
-    "share",
     "hf",
     "plugins",
     "plugin",

@@ -665,7 +665,6 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         }),
         "context" => Ok(SlashCommand::Context),
         "session" => Ok(SlashCommand::Session),
-        "share" => Ok(SlashCommand::Share(argument)),
         "login" => Ok(SlashCommand::Login),
         "logout" => Ok(SlashCommand::Logout),
         "usage" => Ok(SlashCommand::Usage),

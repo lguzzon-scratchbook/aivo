@@ -100,10 +100,6 @@ pub enum Commands {
     #[command(name = "code skills", hide = true)]
     Skills(SkillsArgs),
 
-    /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
-    /// Both forms accept the same flags.
-    Share(ShareArgs),
-
     /// Print a concise guide to using aivo (also read by the built-in code agent)
     Guide,
 }
@@ -177,31 +173,6 @@ pub struct AccountUsageArgs {
     /// Output usage as JSON (verbatim gateway shape)
     #[arg(long)]
     pub json: bool,
-}
-
-/// Arguments for `aivo logs share` (and the hidden top-level `aivo share` alias).
-#[derive(Args, Debug, Clone)]
-pub struct ShareArgs {
-    /// Session id from `aivo logs` (claude / codex / gemini / pi / opencode / grok / code).
-    #[arg(value_name = "SESSION_ID")]
-    pub session_id: Option<String>,
-
-    /// Skip redaction. Default scrubs API keys, OAuth tokens, $HOME paths,
-    /// and secret-shaped env values.
-    #[arg(long)]
-    pub no_redact: bool,
-
-    /// Show sessions from all projects, not just the current directory.
-    #[arg(long)]
-    pub all: bool,
-
-    /// Open the share URL in the default browser once the link is ready.
-    #[arg(long)]
-    pub open: bool,
-
-    /// Bind only on 127.0.0.1 — local debugging without the public tunnel.
-    #[arg(long, hide = true)]
-    pub debug_local_only: bool,
 }
 
 /// Arguments for `aivo hf`. No subcommand → defaults to `list`. Real clap
@@ -860,7 +831,7 @@ pub struct InfoArgs {
 /// Arguments for the logs command
 #[derive(Args, Debug, Clone)]
 pub struct LogsArgs {
-    /// Action: list (default), show, share, or prune
+    /// Action: list (default), show, or prune
     #[arg(value_name = "ACTION")]
     pub action: Option<String>,
 
@@ -921,19 +892,6 @@ pub struct LogsArgs {
     /// Only show errors (HTTP >= 400 or exit_code != 0)
     #[arg(long)]
     pub errors: bool,
-
-    // `logs share` only — guarded by validate_args() for non-share actions.
-    /// `logs share`: skip redaction (default: scrub API keys, OAuth, $HOME, secret env).
-    #[arg(long)]
-    pub no_redact: bool,
-
-    /// `logs share`: open the share URL in the default browser once ready.
-    #[arg(long)]
-    pub open: bool,
-
-    /// `logs share`: bind only on 127.0.0.1 — local debugging without the public tunnel.
-    #[arg(long, hide = true)]
-    pub debug_local_only: bool,
 
     /// `logs prune`: skip the confirmation and delete.
     #[arg(short = 'y', long)]
@@ -1110,11 +1068,6 @@ pub struct CodeArgs {
     /// Print the resolved key, model, and endpoint without connecting
     #[arg(long)]
     pub dry_run: bool,
-
-    /// Publish a live, redacted view of this session to a viewer URL (shown in the
-    /// TUI). Needs a linked account (`aivo login`); toggle in-session with `/share`.
-    #[arg(long)]
-    pub share: bool,
 
     /// Start in auto-approve mode: everything runs without a prompt, remote
     /// mutations included; catastrophic commands still confirm.

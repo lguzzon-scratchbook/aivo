@@ -13,7 +13,7 @@ use crate::cli_args::{
 use crate::commands::{
     self, AccountCommand, AliasCommand, CodeCommand, InfoCommand, KeysCommand, LoginCommand,
     LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand,
-    ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
@@ -250,18 +250,9 @@ pub async fn run() -> ! {
             Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Mcp(_) => crate::commands::mcp::McpCommand::print_help(),
             Commands::Skills(_) => crate::commands::skills::SkillsCommand::print_help(),
-            Commands::Share(_) => ShareCommand::print_help(),
             Commands::Guide => commands::guide::print_guide(),
         }
         process::exit(0);
-    }
-
-    // Ensure the free starter key exists for all users.
-    // For new users (no keys), also activate it.
-    if let Some((starter, is_new_user)) = session_store.ensure_starter_key().await
-        && is_new_user
-    {
-        let _ = session_store.set_active_key(&starter.id).await;
     }
 
     if args.help {
@@ -356,11 +347,6 @@ pub async fn run() -> ! {
         Commands::Skills(skills_args) => {
             let command = crate::commands::skills::SkillsCommand::new();
             command.execute(skills_args).await
-        }
-
-        Commands::Share(share_args) => {
-            let command = ShareCommand::new(session_store);
-            command.execute(share_args).await
         }
 
         Commands::Guide => {
@@ -563,7 +549,6 @@ async fn dispatch_code(
                 .or_else(|| code_args.one_m.then(|| "1m".to_string()))
                 .or_else(|| code_args.two_m.then(|| "2m".to_string())),
             code_args.dry_run,
-            code_args.share,
             agent_mode,
             code_args.output_format,
             code_args.max_steps,
@@ -1197,7 +1182,6 @@ fn print_help() {
     let shortcuts: &[(&str, &str, &str)] = &[
         ("use", "keys use", "aivo keys use --help"),
         ("ping", "keys ping", "aivo keys ping --help"),
-        ("share", "logs share", "aivo logs share --help"),
         (
             "\"text\"",
             "code -p",
@@ -1341,7 +1325,6 @@ fn print_help_json() {
         "shortcuts": [
             { "alias": "use", "expands_to": ["keys", "use"] },
             { "alias": "ping", "expands_to": ["keys", "ping"] },
-            { "alias": "share", "expands_to": ["logs", "share"] },
             { "alias": "code mcp", "expands_to": ["code mcp"], "note": "MCP servers are managed under `aivo code`; resolves to the hidden command named \"code mcp\"" },
             { "alias": "code skills", "expands_to": ["code skills"], "note": "Skills are managed under `aivo code`; resolves to the hidden command named \"code skills\"" },
             { "alias": "-p", "expands_to": ["code", "-p"] },
@@ -1362,7 +1345,6 @@ fn print_help_json() {
             { "name": "AIVO_CODE_SCROLL_SPEED", "desc": "Lines scrolled per wheel tick in code TUI (default 3; legacy AIVO_CHAT_SCROLL_SPEED still honored)" },
             { "name": "AIVO_CODE_SWIPE_SCROLL", "desc": "Up/Down arrows scroll the transcript instead of draft history (=1; auto-on under Termux for touch swipes, =0 disables; legacy AIVO_CHAT_SWIPE_SCROLL still honored)" },
             { "name": "AIVO_PATH", "desc": "Override the install path detected by `aivo update`" },
-            { "name": "AIVO_SHARE_BASE_URL", "desc": "Override the public tunnel endpoint used by `aivo logs share`" },
             { "name": "AIVO_DEBUG", "desc": "Surface upstream HTTP request/response detail in some flows (=1)" }
         ],
         "plugins": plugins,

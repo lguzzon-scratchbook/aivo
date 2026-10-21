@@ -2,7 +2,7 @@
 //!
 //! aivo can see six distinct conversation sources (aivo code,
 //! claude / codex / gemini / pi / opencode). The user passes a single session
-//! id to `aivo logs share`; this resolver fans out across the sources to figure
+//! id to `aivo logs show`; this resolver fans out across the sources to figure
 //! out which one it belongs to, then runs the source-specific extractor.
 //!
 //! Cross-source collisions are surfaced as a hard error so a user with the
@@ -38,7 +38,7 @@ use crate::services::system_env;
 
 /// A plugin tool's transcript source: a built-in `format` aivo reads from `dir`,
 /// or `format == "native"` (the plugin emits its own via `bin
-/// --aivo-export-transcript`). Lets `aivo share` resolve a plugin run.
+/// --aivo-export-transcript`). Lets the resume ladder resolve a plugin run.
 pub struct PluginTranscript {
     pub format: String,
     pub dir: PathBuf,
@@ -189,7 +189,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
             }
             "serve" => {
                 return Err(anyhow!(
-                    "'{}' is a 'serve' event (one HTTP request) — not a shareable conversation.",
+                    "'{}' is a 'serve' event (one HTTP request) — not a conversation that can be opened.",
                     session_id
                 ));
             }
@@ -650,9 +650,9 @@ async fn find_opencode(db_path: &Path, session_id: &str) -> Vec<Match> {
         .collect()
 }
 
-/// Session formats `aivo share` can read, so a plugin declaring one of these is
-/// shareable. The `match` in `resolve_run_event` dispatches each to its reader.
-const SHAREABLE_PLUGIN_FORMATS: &[&str] = &["pi", "codex", "gemini", "opencode"];
+/// Session formats aivo can read, so a plugin declaring one of these is
+/// `resume`-readable. The `match` in `resolve_run_event` dispatches each to its reader.
+const READABLE_PLUGIN_FORMATS: &[&str] = &["pi", "codex", "gemini", "opencode"];
 
 /// Sentinel `format` for a plugin that emits its own transcript (via
 /// `--aivo-export-transcript`) instead of using a built-in reader.
@@ -706,11 +706,11 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
                 )
                 .await;
             }
-            Some(src) if !SHAREABLE_PLUGIN_FORMATS.contains(&src.format.as_str()) => {
+            Some(src) if !READABLE_PLUGIN_FORMATS.contains(&src.format.as_str()) => {
                 return Err(anyhow!(
-                    "'{tool}' declares transcript format '{}', which aivo can't read — shareable plugin formats: {}",
+                    "'{tool}' declares transcript format '{}', which aivo can't read — readable plugin formats: {}",
                     src.format,
-                    SHAREABLE_PLUGIN_FORMATS.join(", ")
+                    READABLE_PLUGIN_FORMATS.join(", ")
                 ));
             }
             _ => {}
@@ -721,7 +721,7 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     // the matching cli. Each cli uses a dedicated stub enumerator rather than
     // `ingest_project`, whose extractors drop sessions with no extractable user
     // turn (brand-new or boilerplate-only) — those would otherwise be
-    // un-shareable and the resolver would fall back to a stale older session in
+    // unreadable and the resolver would fall back to a stale older session in
     // the same cwd. An unknown tool falls back to `ingest_project`, which
     // yields a clean "no session found" error.
     let run_path = std::path::Path::new(&run_cwd);
@@ -845,14 +845,14 @@ pub async fn resolve_plugin_run_thread(
 
     let payload = if src.format == NATIVE_TRANSCRIPT_FORMAT {
         export_native_plugin_transcript(src, tool, &run_cwd, &entry.ts_utc, config_dir).await?
-    } else if SHAREABLE_PLUGIN_FORMATS.contains(&src.format.as_str()) {
+    } else if READABLE_PLUGIN_FORMATS.contains(&src.format.as_str()) {
         let run_path = Path::new(&run_cwd);
         let threads: Vec<Thread> = match src.format.as_str() {
             "codex" => context_ingest::list_codex_sessions_for_cwd(&src.dir, run_path).await,
             "pi" => context_ingest::list_pi_sessions_for_cwd(&src.dir, run_path).await,
             "gemini" => context_ingest::list_gemini_sessions_for_cwd(&src.dir, run_path).await,
             "opencode" => context_ingest::list_opencode_sessions_for_cwd(&src.dir, run_path).await,
-            _ => unreachable!("gated by SHAREABLE_PLUGIN_FORMATS"),
+            _ => unreachable!("gated by READABLE_PLUGIN_FORMATS"),
         };
         let mut candidates: Vec<&Thread> = threads.iter().collect();
         if candidates.is_empty() {
@@ -868,7 +868,7 @@ pub async fn resolve_plugin_run_thread(
         return Err(anyhow!(
             "'{tool}' declares transcript format '{}', which aivo can't read (readable formats: {})",
             src.format,
-            SHAREABLE_PLUGIN_FORMATS.join(", ")
+            READABLE_PLUGIN_FORMATS.join(", ")
         ));
     };
     thread_from_share_payload(payload, tool, entry)
@@ -1226,7 +1226,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_plugin_run_event_via_declared_pi_transcript() {
         // A plugin tool (`omp`) that declares a pi-format transcript source is
-        // shareable: the run event routes to the pi reader pointed at the
+        // readable: the run event routes to the pi reader pointed at the
         // plugin's own sessions dir, and extracts via the pi pipeline.
         let temp = TempDir::new().unwrap();
         let project_root = temp.path().join("proj");
@@ -1365,7 +1365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_plugin_run_event_without_transcript_source_is_unshareable() {
+    async fn resolve_plugin_run_event_without_transcript_source_is_unreadable() {
         let temp = TempDir::new().unwrap();
         let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
         let event_id = append_run_event(&ctx, "mystery", &temp.path().to_string_lossy()).await;
@@ -1376,7 +1376,7 @@ mod tests {
 
     /// A `native`-format plugin run is resolved by invoking the plugin's
     /// `--aivo-export-transcript` subcommand and parsing the `SharePayload` it
-    /// prints — so the share carries the plugin's own `source_cli`, not a
+    /// prints — so the resolved thread carries the plugin's own `source_cli`, not a
     /// borrowed format label. Uses a fake plugin binary (a shell script).
     #[cfg(unix)]
     #[tokio::test]

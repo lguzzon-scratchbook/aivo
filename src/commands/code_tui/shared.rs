@@ -55,7 +55,6 @@ pub(super) struct Palette {
     pub error: Color,
     pub warning: Color,
     pub info: Color,
-    pub live: Color,
     pub diff_add_bg: Color,
     pub diff_del_bg: Color,
     pub diff_add_fg: Color,
@@ -103,7 +102,6 @@ impl Palette {
         error: Color::Rgb(228, 128, 114),
         warning: Color::Rgb(224, 180, 104),
         info: Color::Rgb(126, 184, 212),
-        live: Color::Rgb(232, 96, 92),
         // Diff backgrounds use ANSI 256-color indexes rather than RGB. Some
         // older Terminal.app/tmux combinations misparse `48;2;r;g;b` and
         // leave the entire row with a green background.
@@ -149,7 +147,6 @@ impl Palette {
         error: Color::Rgb(185, 72, 46),   // --code-flag
         warning: Color::Rgb(122, 90, 30), // --code-string
         info: Color::Rgb(50, 105, 160),
-        live: Color::Rgb(200, 60, 55),
         // Keep diff fills in the indexed palette too; this avoids truecolor
         // parsing bugs on the same terminal path in light mode.
         diff_add_bg: Color::Indexed(253),
@@ -276,11 +273,6 @@ pub(super) fn INFO() -> Color {
 }
 #[allow(non_snake_case)]
 #[inline]
-pub(super) fn LIVE() -> Color {
-    palette().live
-}
-#[allow(non_snake_case)]
-#[inline]
 pub(super) fn DIFF_ADD_BG() -> Color {
     palette().diff_add_bg
 }
@@ -360,14 +352,10 @@ pub(super) fn DELETE_ACCENT() -> Color {
     palette().delete_accent
 }
 
-/// Share URL notice prefix; `notice_spans` matches it to color the line.
-pub(super) const LIVE_NOTICE_PREFIX: &str = "● Sharing: ";
 /// Informational notice; `notice_display` adds the `ⓘ` marker at render time.
 pub(super) fn info_notice(text: impl Into<String>) -> (Color, String) {
     (INFO(), text.into())
 }
-/// Footer badge shown while sharing.
-pub(super) const LIVE_BADGE: &str = "● sharing";
 /// Footer badge shown when `/config` "Agent tools" is off (plain-chat mode).
 pub(super) const PLAIN_CODE_BADGE: &str = "plain chat";
 pub(super) const EMPTY_STATE_TOP_GAP: u16 = 1;
@@ -392,7 +380,6 @@ pub(super) const WELCOME_ADVANCED_TIPS: &[&str] = &[
     "/rewind undoes the agent's file edits",
     "/goal <task> keeps working on its own until it's done",
     "Esc interrupts the agent mid-turn — in /goal mode, press Esc twice",
-    "/share creates a live web link to this session",
     "Ctrl+T changes how hard the model thinks",
     "/skills and /mcp manage the agent's extra tools",
     "ask the agent to create a subagent for a task — a reviewer, an architect …",
@@ -659,12 +646,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "show this session's id, source, and resume command",
         takes_argument: false,
     },
-    SlashCommandSpec {
-        name: "share",
-        help_label: "/share [stop]",
-        description: "share a live viewer link",
-        takes_argument: true,
-    },
     // aivo-provider only — hidden on BYOK keys (see `slash_command_visible`).
     SlashCommandSpec {
         name: "login",
@@ -709,7 +690,6 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "plan" => Some("[objective] | list | exit"),
         "ask" => Some("[question] | exit"),
         "btw" => Some("[question]"),
-        "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
         "key" => Some("[id|name]"),
@@ -776,8 +756,6 @@ pub(crate) struct CodeTuiParams {
     pub injected_context_summary: Option<String>,
     /// `--max-context <SIZE>` manual context-window override (tokens). Session-only.
     pub max_context: Option<u64>,
-    /// `--share`: start live sharing at launch (device-link verified beforehand).
-    pub share: bool,
     /// `--auto-approve`: pre-set the toggle at launch (session-only; Shift+Tab reverts).
     pub auto_approve: bool,
     /// `--vision-model [key::]model`: session-only describer, not persisted.
@@ -1756,10 +1734,6 @@ pub(super) enum Overlay {
     /// `/session` (or clicking the footer id) — this session's id, provenance,
     /// model, key, and resume command. `scroll` for tiny terminals.
     Session {
-        scroll: u16,
-    },
-    /// Clicking the footer `● sharing` badge — the live share's URL and controls.
-    Share {
         scroll: u16,
     },
     /// `/btw` — the side-question answer panel, over `self.btw`.
@@ -2760,9 +2734,6 @@ pub(super) enum SlashCommand {
     Context,
     /// `/session` — this session's id, provenance, model, key, and resume command.
     Session,
-    /// Share this chat: bare/`start` opens a viewer URL (re-shown if already
-    /// live); `stop` ends it.
-    Share(Option<String>),
     /// aivo account flows (aivo provider only).
     Login,
     Logout,
@@ -3126,12 +3097,6 @@ pub(super) enum RuntimeEvent {
         project: bool,
         staged: crate::agent::skills::StagedInstall,
     },
-    /// A `/share` (or `--share`) start finished: `Ok` the handle, `Err` the reason.
-    LiveShareReady {
-        /// `live_share_gen` at start time; stale (dropped) after a stop//new//resume.
-        share_gen: u64,
-        result: std::result::Result<crate::services::share_live::LiveShareHandle, String>,
-    },
     /// `/login`: device code + verification URL, or failure to start.
     AccountLoginPrompt {
         account_gen: u64,
@@ -3391,8 +3356,6 @@ pub(super) struct CodeTuiApp {
     /// opens the session-detail overlay. `None` when the id isn't shown (narrow
     /// terminal or empty id).
     pub(super) session_id_hit: Option<Rect>,
-    /// Footer `● sharing` badge click region; `None` while not sharing.
-    pub(super) share_badge_hit: Option<Rect>,
     /// Footer effort badge click region — opens `/config` on the Thinking row.
     /// `None` when no effort badge is shown (or it's Cursor's model-id tier).
     pub(super) effort_badge_hit: Option<Rect>,
@@ -3737,9 +3700,6 @@ pub(super) struct CodeTuiApp {
     /// Held here, not in the (cloned-every-render) overlay, so the temp tree is
     /// deleted exactly once. The bool is the pick's `-p/--project` destination.
     pub(super) staged_skill_install: Option<(crate::agent::skills::StagedInstall, bool)>,
-    /// `/share` live-share state; only `live_impl.rs` drives it (the footer
-    /// badge reads `handle` presence).
-    pub(super) share: LiveShareState,
     /// `/login`–`/logout` flow state; only `account_impl.rs` drives it.
     pub(super) account: AccountFlow,
     /// One-shot: the next draw clears first, healing emulator-corrupted cells
@@ -3892,28 +3852,12 @@ pub(super) struct SessionPreviewState {
     pub(super) task: Option<(String, JoinHandle<()>)>,
 }
 
-/// `/share` live-share state, extracted so the one impl file that drives it
-/// (`live_impl.rs`) owns a named cluster instead of loose fields.
-#[derive(Default)]
-pub(super) struct LiveShareState {
-    /// Active share, `None` when not sharing; its presence drives the footer
-    /// `● sharing` badge. Stopped on `/share stop`, `/new`, resume, and exit.
-    pub(super) handle: Option<crate::services::share_live::LiveShareHandle>,
-    /// True between a start and its `LiveShareReady` event; blocks a second start.
-    pub(super) starting: bool,
-    /// Bumped by `stop_live_share` so an in-flight start's result reads as stale.
-    pub(super) generation: u64,
-    /// `--share` requested but not yet started — `maybe_start_live_share` defers it
-    /// until the session settles so it pins the final session id.
-    pub(super) requested: bool,
-}
-
 /// `/login`–`/logout` account-flow state, extracted so the one impl file that
 /// drives it (`account_impl.rs`) owns a named cluster instead of loose fields.
 #[derive(Default)]
 pub(super) struct AccountFlow {
     /// Generation — bumped on start/cancel so a superseded flow's late result
-    /// is dropped (mirrors `live_share_gen`).
+    /// is dropped.
     pub(super) generation: u64,
     /// In-flight login poll / unlink, aborted on cancel so an escaped login
     /// can't write `account.json` after the user walked away.
@@ -4017,7 +3961,6 @@ impl CodeTuiApp {
             scrollbar_drag: None,
             preview_close_hits: Vec::new(),
             session_id_hit: None,
-            share_badge_hit: None,
             effort_badge_hit: None,
             composer_text_area: None,
             composer_scroll: 0,
@@ -4143,7 +4086,6 @@ impl CodeTuiApp {
             reasoning_elapsed_ms: None,
             installing_skill: None,
             staged_skill_install: None,
-            share: LiveShareState::default(),
             account: AccountFlow::default(),
             pending_full_repaint: false,
         }

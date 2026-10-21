@@ -1022,24 +1022,20 @@ fn test_screen_surface_capture_keeps_wide_chars_contiguous() {
 
 #[test]
 fn test_empty_state_notice_selects_via_screen_surface() {
-    use crate::services::share_live::LiveShareHandle;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // `--share` launch state: empty transcript, share-URL notice (the notice draws
-    // the URL line; the handle just drives the badge).
+    // An empty transcript can still draw a notice (e.g. a startup hint); the
+    // selection must target the screen surface, not the empty transcript hitbox.
     assert!(app.is_transcript_empty());
-    app.share.handle = Some(LiveShareHandle::for_test(
-        "https://s.getaivo.dev/s/uniqueurlzz",
-    ));
     app.notice = Some((
-        LIVE(),
-        format!("{LIVE_NOTICE_PREFIX}https://s.getaivo.dev/s/uniqueurlzz"),
+        ACCENT(),
+        "See https://s.getaivo.dev/s/uniqueurlzz".to_string(),
     ));
     let (_, rows) = render_full_screen(&mut app, 80, 16);
     let url_row = rows
         .iter()
         .position(|r| r.contains("uniqueurlzz"))
-        .expect("live URL rendered in the empty state") as u16;
+        .expect("notice rendered in the empty state") as u16;
 
     // The press must target the screen surface, not the empty transcript hitbox.
     let mouse = MouseEvent {

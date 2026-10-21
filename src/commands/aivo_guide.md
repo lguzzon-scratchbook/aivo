@@ -1,9 +1,9 @@
 # aivo — complete usage guide
 
 aivo is a CLI that connects your existing coding agents (and its own built-in agent) to whatever
-model you want, with local encrypted API-key management. It ships free `aivo/starter` models, so
-you can use it with no key. Config lives in `~/.config/aivo/` — API keys are AES-256-GCM encrypted
-in `config.json`.
+model you want, with local encrypted API-key management. Link a device with `aivo login` to use
+the bundled `aivo/starter` models, or add your own key. Config lives in `~/.config/aivo/` — API
+keys are AES-256-GCM encrypted in `config.json`.
 
 Machine-readable command structure: `aivo --help-json`. Per-command help: `aivo <command> --help`.
 
@@ -32,14 +32,14 @@ aivo run                      # pick a tool
 | `aivo hf:… ` / `aivo https://…` | `aivo code <ref>` | open code on a local HuggingFace GGUF |
 | `aivo use` | `aivo keys use` | switch active key |
 | `aivo ping` | `aivo keys ping` | health-check keys |
-| `aivo share` | `aivo logs share` | share a session |
 
 ## Providers & keys — `aivo keys`
 
 A key is a saved provider credential (id, name, base URL, secret). The **active** key is what
 commands use by default. Any OpenAI-compatible base URL works; native Anthropic/Gemini, GitHub
 Copilot, and Ollama are also supported (the sentinel base URLs `copilot` and `ollama` select those
-provider types). `aivo/starter` is the bundled first-party provider — no key required.
+provider types). `aivo/starter` is the bundled first-party provider; `aivo login` links a device
+to use it.
 
 ```bash
 aivo keys                       # list all keys (active marked) — same as `aivo keys list`
@@ -168,7 +168,6 @@ aivo code "<text>"            # TUI with the text sent as the first message
 --resume [last|id]            resume a saved session, or another agent's session by id
                               (claude/codex/pi — see `aivo logs`; imported and continued
                               here; other sources inject as a context digest; TUI and -e)
---share                       share this session live (needs `aivo login`)
 --attach <path>               attach a file or image
 --json                        raw provider JSON (with -p)
 --output-format <fmt>         -e output: text (default), json (one final result
@@ -198,7 +197,7 @@ back for a fix. `AIVO_AGENT_SELF_CORRECT=0` opts out.
 
 Type `/help` for the full list. Slash commands:
 
-- Session: `/new`, `/resume [query]`, `/rewind` (undo edits), `/copy [n]`, `/config`, `/share [stop]`, `/help`, `/exit`
+- Session: `/new`, `/resume [query]`, `/rewind` (undo edits), `/copy [n]`, `/config`, `/help`, `/exit`
 - Model & key: `/model [name]`, `/key [id|name]`
 - Context: `/compact [fast]`, `/context`, `/memory`
 - Skills & tools: `/skills`, `/create-skill`, `/mcp` (CLI twins: `aivo code skills`, `aivo code mcp`)
@@ -342,7 +341,7 @@ aivo serve --host 0.0.0.0 -p 8080
 aivo serve hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF   # serve a local model
 ```
 
-## Logs & sharing — `aivo logs`
+## Logs — `aivo logs`
 
 Unified session list across aivo code + native CLI sessions (claude, codex, gemini, pi,
 opencode); `--by run`/`--by serve` show launch events. Defaults to the current project's cwd.
@@ -350,16 +349,11 @@ opencode); `--by run`/`--by serve` show launch events. Defaults to the current p
 ```
 aivo logs                      # recent rows, newest first  (list)
 aivo logs show [id]            # one row in detail (omit id → picker)
-aivo logs share [id]           # share via a tunneled viewer URL (omit id → picker)
 aivo logs prune                # drop logs.db events whose session file is gone
 ```
 
 Filters: `-n/--limit`, `--by <source|plugin>`, `-s/--search`, `-a/--all` (or `--cwd <path>`),
 `--since`/`--until`, `--model`, `-k`, `--errors`, `--json`, `--watch` (`--jsonl` to stream).
-
-Sharing (`aivo logs share`, alias `aivo share`) creates an ephemeral, tunneled viewer URL that
-dies when the process exits. Redacts keys/tokens/`$HOME`/secrets by default (`--no-redact` to
-skip); `--all` picks from every project, `--open` opens the browser.
 
 ## Usage stats — `aivo stats`
 

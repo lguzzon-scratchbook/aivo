@@ -1,18 +1,13 @@
-//! Redaction pipeline for `aivo logs share`.
+//! Redaction pipeline for secret-shaped text.
 //!
 //! Hand-rolled (no regex crate — house style). Each category is one pass;
 //! the order matters: more specific patterns run first so a token that
 //! could match multiple categories gets the most precise label.
 //!
-//! Walks the entire `SharePayload`, applying redaction to every text-bearing
-//! field including `tool_call.arguments` JSON (recursive). Returns the
-//! redacted payload plus a per-category hit count for the preview.
+//! `scan_text` is the entry point; callers own the walk over whatever text
+//! they want scrubbed and aggregate the per-category hit counts.
 
 use std::collections::HashMap;
-
-use serde_json::Value;
-
-use crate::services::share_payload::{ContentBlock, RedactionHit, ShareMessage, SharePayload};
 
 /// Context for one redaction run. Currently just the user's `$HOME` so paths
 /// can be replaced with `~`. Injected explicitly (rather than read from the
@@ -56,92 +51,6 @@ pub fn scan_text(input: &str, ctx: &RedactCtx, hits: &mut HashMap<String, usize>
     let s = pass_secret_env(&s, hits);
     let s = pass_generic_secret(&s, hits);
     pass_home_path(&s, ctx, hits)
-}
-
-/// Walk `payload` recursively and apply `scan_text` to every text-bearing
-/// field. Mutates a copy and returns it alongside a sorted hit list.
-pub fn redact(mut payload: SharePayload, ctx: &RedactCtx) -> (SharePayload, Vec<RedactionHit>) {
-    let mut hits: HashMap<String, usize> = HashMap::new();
-
-    if let Some(root) = payload.project.root.take() {
-        payload.project.root = Some(scan_text(&root, ctx, &mut hits));
-    }
-    if let Some(name) = payload.project.name.take() {
-        payload.project.name = Some(scan_text(&name, ctx, &mut hits));
-    }
-
-    for msg in &mut payload.messages {
-        redact_message(msg, ctx, &mut hits);
-    }
-
-    let mut report: Vec<RedactionHit> = hits
-        .into_iter()
-        .map(|(category, count)| RedactionHit { category, count })
-        .collect();
-    report.sort_by(|a, b| a.category.cmp(&b.category));
-
-    payload.meta.redacted = !report.is_empty();
-    payload.meta.redaction_summary = if report.is_empty() {
-        None
-    } else {
-        Some(report.clone())
-    };
-
-    (payload, report)
-}
-
-fn redact_message(msg: &mut ShareMessage, ctx: &RedactCtx, hits: &mut HashMap<String, usize>) {
-    if let Some(reasoning) = msg.reasoning.take() {
-        msg.reasoning = Some(scan_text(&reasoning, ctx, hits));
-    }
-    for block in &mut msg.content {
-        redact_block(block, ctx, hits);
-    }
-}
-
-fn redact_block(block: &mut ContentBlock, ctx: &RedactCtx, hits: &mut HashMap<String, usize>) {
-    match block {
-        ContentBlock::Text { text } | ContentBlock::Code { text, .. } => {
-            *text = scan_text(text, ctx, hits);
-        }
-        ContentBlock::ToolCall { arguments, .. } => {
-            scan_value(arguments, ctx, hits);
-        }
-        ContentBlock::ToolResult { output, error, .. } => {
-            *output = scan_text(output, ctx, hits);
-            if let Some(err) = error.take() {
-                *error = Some(scan_text(&err, ctx, hits));
-            }
-        }
-        ContentBlock::Attachment { .. } => {}
-    }
-}
-
-/// Skipped by value walkers: a chance key-shaped match inside a base64 body
-/// would corrupt the media.
-pub fn is_base64_data_url(s: &str) -> bool {
-    s.starts_with("data:") && s.find(";base64,").is_some_and(|i| i < 256)
-}
-
-pub fn scan_value(v: &mut Value, ctx: &RedactCtx, hits: &mut HashMap<String, usize>) {
-    match v {
-        Value::String(s) => {
-            if !is_base64_data_url(s) {
-                *s = scan_text(s, ctx, hits);
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                scan_value(item, ctx, hits);
-            }
-        }
-        Value::Object(map) => {
-            for (_, val) in map.iter_mut() {
-                scan_value(val, ctx, hits);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn bump(hits: &mut HashMap<String, usize>, category: &str) {
@@ -588,8 +497,6 @@ fn pass_home_path(input: &str, ctx: &RedactCtx, hits: &mut HashMap<String, usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::share_payload::{ProjectInfo, SHARE_SCHEMA_VERSION};
-    use serde_json::json;
 
     fn ctx_with_home(home: &str) -> RedactCtx {
         RedactCtx {
@@ -819,109 +726,5 @@ literal sk-1 should pass
         let (out, _) = scan(input, &ctx);
         assert_eq!(out, input);
         assert_eq!(out.len(), input.len());
-    }
-
-    #[test]
-    fn scan_value_masks_strings_but_skips_base64_data_urls() {
-        let ctx = RedactCtx::default();
-        let mut hits = HashMap::new();
-        let data_url = "data:image/png;base64,sk-BBBBBBBBBBBBBBBBBBBBBBBB";
-        let mut v = json!({
-            "text": "key sk-AAAAAAAAAAAAAAAAAAAAAAAA here",
-            "image_url": {"url": data_url},
-        });
-        scan_value(&mut v, &ctx, &mut hits);
-        assert!(v["text"].as_str().unwrap().contains("<redacted:api_key>"));
-        assert_eq!(v["image_url"]["url"], data_url, "media payload mangled");
-        assert_eq!(hits.get(CAT_API_KEY), Some(&1));
-    }
-
-    #[test]
-    fn redact_payload_walks_messages_and_tool_args_and_writes_summary() {
-        let payload = SharePayload {
-            schema_version: SHARE_SCHEMA_VERSION.into(),
-            source_cli: "claude".into(),
-            session_id: "T-x".into(),
-            project: ProjectInfo {
-                root: Some("/Users/alice/project/aivo".into()),
-                name: Some("aivo".into()),
-            },
-            model: None,
-            created_at: None,
-            updated_at: None,
-            messages: vec![ShareMessage {
-                role: "assistant".into(),
-                timestamp: None,
-                model: None,
-                reasoning: Some("thought about /Users/alice/secret".into()),
-                content: vec![
-                    ContentBlock::Text {
-                        text: "see /Users/alice/code".into(),
-                    },
-                    ContentBlock::ToolCall {
-                        id: None,
-                        name: "Bash".into(),
-                        arguments: json!({"cmd": "echo sk-AAAAAAAAAAAAAAAAAAAAAAAA"}),
-                    },
-                    ContentBlock::ToolResult {
-                        id: None,
-                        ok: true,
-                        output: "Authorization: Bearer abcdefghijklmn".into(),
-                        error: None,
-                    },
-                ],
-            }],
-            meta: SharePayload::new_meta(false),
-        };
-        // Pre-redaction sanity.
-        assert!(!payload.meta.redacted);
-
-        let ctx = ctx_with_home("/Users/alice");
-        let (red, report) = redact(payload, &ctx);
-
-        // Project root is normalized.
-        assert_eq!(red.project.root.as_deref(), Some("~/project/aivo"));
-        // Reasoning + text walk.
-        assert!(
-            red.messages[0]
-                .reasoning
-                .as_deref()
-                .unwrap()
-                .contains("~/secret")
-        );
-        if let ContentBlock::Text { text } = &red.messages[0].content[0] {
-            assert_eq!(text, "see ~/code");
-        } else {
-            panic!("expected text");
-        }
-        // Tool arguments JSON walk.
-        if let ContentBlock::ToolCall { arguments, .. } = &red.messages[0].content[1] {
-            assert!(
-                arguments["cmd"]
-                    .as_str()
-                    .unwrap()
-                    .contains("<redacted:api_key>")
-            );
-        } else {
-            panic!("expected tool_call");
-        }
-        // Tool result text walk.
-        if let ContentBlock::ToolResult { output, .. } = &red.messages[0].content[2] {
-            assert!(output.contains("Bearer <redacted>"));
-        } else {
-            panic!("expected tool_result");
-        }
-
-        assert!(red.meta.redacted);
-        let summary = red.meta.redaction_summary.as_ref().unwrap();
-        assert!(!summary.is_empty());
-        // Report mirrors the meta block.
-        assert_eq!(summary, &report);
-        // Sorted by category alphabetically.
-        let mut cats: Vec<&str> = report.iter().map(|h| h.category.as_str()).collect();
-        let mut sorted = cats.clone();
-        sorted.sort();
-        cats.sort();
-        assert_eq!(cats, sorted);
     }
 }

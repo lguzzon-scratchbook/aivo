@@ -18,13 +18,12 @@ pub(crate) fn print_no_model_list_hint() {
     eprintln!("  {} {}", style::dim("note:"), NO_MODEL_LIST_HINT);
 }
 
-/// Call to action for the zero-keys state: how to add a key, including the
-/// free starter (which stays restorable this way after being dismissed).
+/// Call to action for the zero-keys state: how to add a key.
 pub(crate) fn add_key_cta() -> String {
     format!(
-        "Run {} to add one, or {} for the free starter key (no signup needed).",
+        "Run {} to add one, or {} to use the bundled aivo provider.",
         style::cyan("aivo keys add"),
-        style::cyan("aivo keys add aivo-starter")
+        style::cyan("aivo login")
     )
 }
 
@@ -121,7 +120,6 @@ pub mod models;
 pub mod plugins;
 pub mod run;
 pub mod serve;
-pub mod share;
 pub mod skills;
 pub mod start;
 pub mod stats;
@@ -138,7 +136,6 @@ pub use models::ModelsCommand;
 pub use plugins::PluginsCommand;
 pub use run::RunCommand;
 pub use serve::{ServeCommand, ServeParams};
-pub use share::ShareCommand;
 pub use start::{StartCommand, StartFlowArgs};
 pub use stats::StatsCommand;
 pub use update::UpdateCommand;

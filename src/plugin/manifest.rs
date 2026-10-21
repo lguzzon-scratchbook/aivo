@@ -51,7 +51,7 @@ pub(crate) struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
     /// Where the plugin's session transcripts live + their format, so
-    /// `aivo share` can read a plugin run with a built-in reader (the plugin
+    /// `aivo logs`/resume can read a plugin run with a built-in reader (the plugin
     /// stores its own transcript; aivo never sees it otherwise).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcripts: Option<TranscriptSource>,
@@ -100,7 +100,7 @@ impl PluginManifest {
     }
 }
 
-/// A plugin's transcript source for `aivo share`: either a built-in `format`
+/// A plugin's transcript source for resuming its runs: either a built-in `format`
 /// (`pi`/`codex`/`gemini`/`opencode`) aivo reads from `dir`, or `format:
 /// "native"` — the plugin emits its own transcript via `--aivo-export-transcript`
 /// (no `dir`), keeping its own `source_cli`.

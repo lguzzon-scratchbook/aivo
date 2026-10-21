@@ -809,7 +809,6 @@ impl CodeTuiApp {
             Overlay::Help { .. }
             | Overlay::Context { .. }
             | Overlay::Session { .. }
-            | Overlay::Share { .. }
             | Overlay::Btw { .. }
             | Overlay::Config(_)
             | Overlay::None => false,
@@ -863,29 +862,6 @@ impl CodeTuiApp {
                 } else if let Overlay::Session { scroll } = &mut self.overlay {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     apply_detail_scroll(scroll, key, ctrl);
-                }
-                OverlayKeyAction::Handled
-            }
-            Overlay::Share { .. } => {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Enter => self.overlay = Overlay::None,
-                    KeyCode::Char('c') => {
-                        if let Some(url) = self.share.handle.as_ref().map(|h| h.url().to_string()) {
-                            self.copy_share_url(&url);
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        self.overlay = Overlay::None;
-                        if self.stop_live_share() {
-                            self.notice = Some(info_notice("Sharing stopped."));
-                        }
-                    }
-                    _ => {
-                        if let Overlay::Share { scroll } = &mut self.overlay {
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            apply_detail_scroll(scroll, key, ctrl);
-                        }
-                    }
                 }
                 OverlayKeyAction::Handled
             }
