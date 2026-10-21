@@ -110,8 +110,8 @@ pub(crate) fn terminal_error_notice(e: &serve_client::ServeError) -> String {
     } else {
         match e.status {
             Some(401 | 403) if !quota => {
-                "this API key was rejected — check it with `aivo keys ls`, update it with \
-                 `aivo keys edit`, or re-run `aivo login`"
+                "this API key was rejected — check it with `aivo keys ls` or update it with \
+                 `aivo keys edit`"
             }
             Some(402) => "this key is out of credits — top up, or switch keys",
             _ if quota => {

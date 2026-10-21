@@ -137,9 +137,9 @@ fn unknown_bare_word_points_at_oneshot_and_tui() {
 fn nested_unknown_subcommand_keeps_clap_error() {
     let home = TempDir::new().unwrap();
     let output = aivo(&home)
-        .args(["account", "frobnicate"])
+        .args(["plugins", "frobnicate"])
         .output()
-        .expect("spawn aivo account frobnicate");
+        .expect("spawn aivo plugins frobnicate");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -147,7 +147,7 @@ fn nested_unknown_subcommand_keeps_clap_error() {
         "clap's own error must survive:\n{stderr}"
     );
     assert!(
-        !stderr.contains("unknown command `account`"),
+        !stderr.contains("unknown command `plugins`"),
         "intercept must not misfire on a real command:\n{stderr}"
     );
 }

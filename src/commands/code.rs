@@ -28,7 +28,7 @@ use crate::services::http_utils::{SseLineBuffer, sse_data_payload};
 use crate::services::huggingface;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
-use crate::services::provider_profile::{provider_profile_for_key, resolve_starter_base_url};
+use crate::services::provider_profile::{provider_profile_for_key, resolve_provider_base_url};
 use crate::services::provider_protocol::{PathVariant, ProviderProtocol};
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, forward_chat_completions_with_fallback,
@@ -149,15 +149,12 @@ fn chat_sandbox_dir() -> Result<std::path::PathBuf> {
 }
 
 /// Human-readable endpoint for the `--dry-run` preview: the sentinel base URLs
-/// (`copilot`, `ollama`, the aivo-starter sentinel) are resolved to a friendly
-/// label / real URL so the preview doesn't leak internal placeholders.
+/// (`copilot`, `ollama`) are resolved to friendly labels so the preview doesn't
+/// leak internal placeholders.
 fn friendly_base_url(base_url: &str) -> String {
     match base_url {
         "copilot" => "GitHub Copilot".to_string(),
         "ollama" => "Ollama (local)".to_string(),
-        u if u == crate::constants::AIVO_STARTER_SENTINEL => {
-            crate::constants::AIVO_STARTER_REAL_URL.to_string()
-        }
         u => u.to_string(),
     }
 }
@@ -283,41 +280,18 @@ impl CodeCommand {
             }
             None => {
                 if let Some(m) = self.session_store.get_code_model(&key.id).await? {
-                    if self.starter_model_valid(key, &m).await {
-                        return Ok(Some(m));
-                    }
-                    return Ok(None);
+                    return Ok(Some(m));
                 }
                 if let Ok(Some(sel)) = self.session_store.get_last_selection().await
                     && sel.key_id == key.id
                     && let Some(ref m) = sel.model
                     && m != crate::constants::MODEL_DEFAULT_PLACEHOLDER
                 {
-                    if self.starter_model_valid(key, m).await {
-                        return Ok(Some(m.clone()));
-                    }
-                    return Ok(None);
+                    return Ok(Some(m.clone()));
                 }
                 Ok(None)
             }
         }
-    }
-
-    /// Wraps `starter_model_still_available`, printing a notice when the
-    /// persisted model has been removed from the aivo-starter catalog so the
-    /// caller knows why the picker is about to open.
-    async fn starter_model_valid(&self, key: &ApiKey, model: &str) -> bool {
-        if crate::services::model_catalog::starter_model_still_available(key, &self.cache, model)
-            .await
-        {
-            return true;
-        }
-        eprintln!(
-            "{} Model '{}' is no longer available on aivo-starter. Pick another:",
-            style::yellow("Note:"),
-            model
-        );
-        false
     }
 
     /// Transforms model names for OpenRouter compatibility
@@ -710,8 +684,6 @@ impl CodeCommand {
             crate::services::ollama::ensure_ready().await?;
             crate::services::ollama::ensure_model(&raw_model).await?;
             key.base_url = crate::services::ollama::ollama_openai_base_url();
-        } else if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
-            key.base_url = crate::constants::AIVO_STARTER_REAL_URL.to_string();
         }
 
         // Create once so its token cache is reused across messages in the session.
@@ -1426,7 +1398,7 @@ fn shared_chat_fallback_config(
     requires_reasoning_content |= key.requires_reasoning_content == Some(true);
 
     ResponsesToChatRouterConfig {
-        target_base_url: resolve_starter_base_url(&key.base_url),
+        target_base_url: resolve_provider_base_url(&key.base_url),
         api_key: key.key.as_str().to_string(),
         target_protocol: initial_protocol,
         target_path_variant: chat_path_variant_for_protocol(key, initial_protocol),
@@ -1436,8 +1408,6 @@ fn shared_chat_fallback_config(
         actual_model: None,
         max_tokens_cap: profile.quirks.max_tokens_cap,
         responses_api_supported: key.responses_api_supported,
-        is_starter: profile.serve_flags.is_starter,
-        aivo_prefix_models: Vec::new(),
     }
 }
 
@@ -1855,7 +1825,7 @@ fn attachment_storage_label(storage: &AttachmentStorage) -> &'static str {
 }
 
 fn direct_base_url(key: &ApiKey) -> String {
-    let resolved = resolve_starter_base_url(&key.base_url);
+    let resolved = resolve_provider_base_url(&key.base_url);
     normalize_base_url(&resolved).to_string()
 }
 
@@ -1865,36 +1835,20 @@ fn with_session(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::Requ
     crate::services::opencode_session::with_session_header(builder, &key.base_url, None)
 }
 
-/// Conditionally adds auth headers to a request. Skips when the key is empty
-/// (e.g. the free aivo starter provider needs no authentication).
+/// Adds auth headers to a request.
 fn with_auth(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::RequestBuilder {
-    let builder = with_session(builder, key);
-    if key.key.is_empty() {
-        crate::services::device_fingerprint::with_starter_headers(builder)
-    } else {
-        builder.header("Authorization", format!("Bearer {}", key.key.as_str()))
-    }
+    with_session(builder, key).header("Authorization", format!("Bearer {}", key.key.as_str()))
 }
 
 /// Adds native Anthropic auth headers. Some Anthropic-compatible gateways reject
 /// a simultaneous OpenAI-style Authorization bearer, so send only `x-api-key`.
 fn with_auth_anthropic(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::RequestBuilder {
-    let builder = with_session(builder, key);
-    if key.key.is_empty() {
-        crate::services::device_fingerprint::with_starter_headers(builder)
-    } else {
-        builder.header("x-api-key", key.key.as_str())
-    }
+    with_session(builder, key).header("x-api-key", key.key.as_str())
 }
 
 /// Adds the `x-goog-api-key` header for Google Gemini native API.
 fn with_auth_google(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::RequestBuilder {
-    let builder = with_session(builder, key);
-    if key.key.is_empty() {
-        crate::services::device_fingerprint::with_starter_headers(builder)
-    } else {
-        builder.header("x-goog-api-key", key.key.as_str())
-    }
+    with_session(builder, key).header("x-goog-api-key", key.key.as_str())
 }
 
 async fn send_with_retry<F>(mut build_request: F) -> Result<reqwest::Response>
@@ -3215,10 +3169,6 @@ mod tests {
         // Sentinel base URLs must not leak into the --dry-run preview.
         assert_eq!(friendly_base_url("copilot"), "GitHub Copilot");
         assert_eq!(friendly_base_url("ollama"), "Ollama (local)");
-        assert_eq!(
-            friendly_base_url(crate::constants::AIVO_STARTER_SENTINEL),
-            crate::constants::AIVO_STARTER_REAL_URL
-        );
         // A real URL passes through untouched.
         assert_eq!(
             friendly_base_url("https://api.deepseek.com/v1"),
@@ -3539,17 +3489,13 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
     }
 
     #[test]
-    fn direct_base_url_resolves_the_starter_sentinel() {
+    fn direct_base_url_trims_trailing_slash() {
         let mut key = ApiKey::new_with_protocol(
             "id".to_string(),
-            crate::constants::AIVO_STARTER_KEY_NAME.to_string(),
-            crate::constants::AIVO_STARTER_SENTINEL.to_string(),
+            "custom".to_string(),
+            "https://api.example.com/v1".to_string(),
             None,
-            crate::constants::AIVO_STARTER_EMPTY_SECRET.to_string(),
-        );
-        assert_eq!(
-            direct_base_url(&key),
-            crate::constants::AIVO_STARTER_REAL_URL
+            "secret".to_string(),
         );
         key.base_url = "https://api.example.com/v1/".to_string();
         assert_eq!(direct_base_url(&key), "https://api.example.com");

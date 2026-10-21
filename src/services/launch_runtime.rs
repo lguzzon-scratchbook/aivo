@@ -1434,10 +1434,6 @@ async fn start_anthropic_router(
     let config = AnthropicRouterConfig {
         upstream_base_url: base_url,
         upstream_api_key: api_key,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
     };
 
     let mut router = AnthropicRouter::new(config);
@@ -1505,10 +1501,6 @@ async fn start_anthropic_to_openai_router(
         model_prefix,
         requires_reasoning_content,
         max_tokens_cap,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
     };
 
     let mut router = AnthropicToOpenAIRouter::new(config);
@@ -1574,15 +1566,6 @@ async fn start_responses_to_chat_router(
         _ => None,
     };
 
-    let aivo_prefix_models = env
-        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS")
-        .map(|v| {
-            v.split(',')
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
     let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
         target_base_url: base_url,
         api_key,
@@ -1594,11 +1577,6 @@ async fn start_responses_to_chat_router(
         actual_model,
         max_tokens_cap,
         responses_api_supported,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
-        aivo_prefix_models,
     })
     .with_tool(tool_name)
     .with_seed_routes(parse_seed_routes(
@@ -1662,10 +1640,6 @@ async fn start_gemini_router(
         copilot_token_manager: None,
         requires_reasoning_content,
         max_tokens_cap,
-        is_starter: env
-            .get("AIVO_IS_STARTER")
-            .map(|v| v == "1")
-            .unwrap_or(false),
     })
     .with_seed_routes(parse_seed_routes(env, "AIVO_GEMINI_ROUTER_ROUTES_JSON"));
     let router = match env.get("AIVO_GEMINI_ROUTER_KEY_ID") {
@@ -1719,7 +1693,6 @@ async fn start_gemini_copilot_router(
         copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
         requires_reasoning_content: false,
         max_tokens_cap: None,
-        is_starter: false,
     });
     let router = match env.get("AIVO_COPILOT_KEY_ID") {
         Some(key_id) => router
@@ -1889,8 +1862,6 @@ async fn start_responses_to_chat_copilot_router(
         actual_model: None,
         max_tokens_cap: None,
         responses_api_supported: None,
-        is_starter: false,
-        aivo_prefix_models: Vec::new(),
     });
     let router = match env.get("AIVO_COPILOT_KEY_ID") {
         Some(key_id) => router

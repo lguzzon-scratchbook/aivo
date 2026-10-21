@@ -42,19 +42,11 @@ irm https://getaivo.dev/install.ps1 | iex
 
 ## Quick start
 
-Link a device with `aivo login` to use the built-in `aivo/starter` provider, or add your own key
-with `aivo keys add`:
-
-```bash
-aivo login
-aivo "tell me a short story"
-aivo claude
-```
-
-Add a provider to access more models:
+Add a provider key, then launch any supported agent:
 
 ```bash
 aivo keys add
+aivo "tell me a short story"
 aivo claude --model moonshotai/kimi-k2.5
 ```
 

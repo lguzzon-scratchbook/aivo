@@ -16,7 +16,6 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
 use crate::services::anthropic_route_pipeline::inject_anthropic_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self};
 use crate::services::model_list_response;
@@ -85,14 +84,6 @@ pub struct ResponsesToChatRouterConfig {
     /// Persisted Responses API support state: None = unknown, Some(true) = supported,
     /// Some(false) = not supported.  Avoids a wasted probe request on every session.
     pub responses_api_supported: Option<bool>,
-    /// Whether this is the aivo starter provider (requires device fingerprint headers).
-    pub is_starter: bool,
-    /// Bare model ids whose upstream catalog entry has an `aivo/` prefix the
-    /// caller's SDK strips (e.g. opencode's `@ai-sdk/openai-compatible`
-    /// strips the provider name `aivo/` so `aivo/starter` arrives as
-    /// `starter`). When the body's outgoing model matches an entry here,
-    /// the router prepends `aivo/` so the upstream resolves the alias.
-    pub aivo_prefix_models: Vec<String>,
 }
 
 impl ResponsesToChatRouterConfig {
@@ -757,10 +748,7 @@ async fn run_chat_via_responses(
     )
     .await?;
     let req = opencode_session::with_session_header(req, &target_url, Some(&body));
-    let mut response =
-        device_fingerprint::maybe_with_starter_headers(req.json(&body), config.is_starter)
-            .send_logged()
-            .await?;
+    let mut response = req.json(&body).send_logged().await?;
 
     let status = response.status().as_u16();
     let content_type = response
@@ -878,11 +866,7 @@ async fn try_responses_api_passthrough(
     .await
     .ok()?;
     let req = opencode_session::with_session_header(req, &target_url, Some(&body));
-    let mut response =
-        device_fingerprint::maybe_with_starter_headers(req.json(&body), config.is_starter)
-            .send_logged()
-            .await
-            .ok()?;
+    let mut response = req.json(&body).send_logged().await.ok()?;
 
     let status = response.status().as_u16();
     let content_type = response
@@ -1123,10 +1107,7 @@ async fn stream_responses_via_chat(
     )
     .await?;
     let req = opencode_session::with_session_header(req, &target_url, Some(&chat_body));
-    let mut response =
-        device_fingerprint::maybe_with_starter_headers(req.json(&chat_body), config.is_starter)
-            .send_logged()
-            .await?;
+    let mut response = req.json(&chat_body).send_logged().await?;
 
     let status = response.status().as_u16();
     if status != 200 {
@@ -1256,10 +1237,7 @@ async fn stream_chat_completions(
     )
     .await?;
     let req = opencode_session::with_session_header(req, &target_url, Some(&body));
-    let response =
-        device_fingerprint::maybe_with_starter_headers(req.json(&body), config.is_starter)
-            .send_logged()
-            .await?;
+    let response = req.json(&body).send_logged().await?;
 
     let status = response.status().as_u16();
     if status != 200 {
@@ -1373,9 +1351,7 @@ async fn forward_request(
         req = req.body(body_str.to_string());
     }
 
-    let response = device_fingerprint::maybe_with_starter_headers(req, config.is_starter)
-        .send_logged()
-        .await?;
+    let response = req.send_logged().await?;
     http_utils::buffered_reqwest_to_http_response(response).await
 }
 
@@ -1516,10 +1492,7 @@ async fn forward_openai_protocol(
     )
     .await?;
     let req = opencode_session::with_session_header(req, &target_url, Some(body));
-    let response =
-        device_fingerprint::maybe_with_starter_headers(req.json(body), config.is_starter)
-            .send_logged()
-            .await?;
+    let response = req.json(body).send_logged().await?;
 
     let status = response.status().as_u16();
     let body_text = response.text().await?;
@@ -1586,12 +1559,7 @@ async fn try_responses_fallback(
     )
     .await?;
     let req = opencode_session::with_session_header(req, &target_url, Some(&responses_body));
-    let response = device_fingerprint::maybe_with_starter_headers(
-        req.json(&responses_body),
-        config.is_starter,
-    )
-    .send_logged()
-    .await?;
+    let response = req.json(&responses_body).send_logged().await?;
 
     let status = response.status().as_u16();
     let body_text = response.text().await?;
@@ -1640,12 +1608,7 @@ async fn forward_anthropic_protocol(
         &target_url,
         Some(&anthropic_body),
     );
-    let response = device_fingerprint::maybe_with_starter_headers(
-        req.json(&anthropic_body),
-        config.is_starter,
-    )
-    .send_logged()
-    .await?;
+    let response = req.json(&anthropic_body).send_logged().await?;
 
     let status_code = response.status().as_u16();
     let response_text = response.text().await?;
@@ -1702,16 +1665,13 @@ async fn forward_google_protocol(
     );
     let model = openai_chat_model(body, "gemini-2.5-pro");
     let target_url = build_google_generate_content_url(&config.target_base_url, &model);
-    let response = device_fingerprint::maybe_with_starter_headers(
-        client
-            .post(&target_url)
-            .header("x-goog-api-key", config.api_key.as_str())
-            .header("Content-Type", CONTENT_TYPE_JSON)
-            .json(&google_body),
-        config.is_starter,
-    )
-    .send_logged()
-    .await?;
+    let response = client
+        .post(&target_url)
+        .header("x-goog-api-key", config.api_key.as_str())
+        .header("Content-Type", CONTENT_TYPE_JSON)
+        .json(&google_body)
+        .send_logged()
+        .await?;
 
     let status_code = response.status().as_u16();
     let response_text = response.text().await?;
@@ -1814,15 +1774,6 @@ fn apply_selected_model(
         config.actual_model.as_deref(),
         protocol,
     );
-    let selected_model = if config
-        .aivo_prefix_models
-        .iter()
-        .any(|m| m == &selected_model)
-    {
-        format!("aivo/{selected_model}")
-    } else {
-        selected_model
-    };
     body["model"] = Value::String(selected_model);
 
     if protocol == ProviderProtocol::Openai {
@@ -2003,8 +1954,6 @@ mod tests {
             actual_model: None,
             max_tokens_cap: None,
             responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         })
         .with_auth_token("tok".to_string());
         let (router_port, _routes, _learned, handle) = router.start_background().await.unwrap();
@@ -2051,8 +2000,6 @@ mod tests {
             actual_model: None,
             max_tokens_cap: None,
             responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         })
         .with_auth_token("tok".to_string());
         let (router_port, _routes, _learned, handle) = router.start_background().await.unwrap();
@@ -2145,8 +2092,6 @@ mod tests {
             actual_model: None,
             max_tokens_cap: None,
             responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         };
         let body = json!({
             "model": "gpt-4o",
@@ -2177,8 +2122,6 @@ mod tests {
             actual_model: None,
             max_tokens_cap: None,
             responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         };
         let body = json!({
             "model": "gpt-4o",
@@ -2319,10 +2262,7 @@ mod tests {
         assert_eq!(body["model"], "@cf/llama-3.1-8b");
     }
 
-    fn test_router_config(
-        target: &str,
-        aivo_prefix_models: Vec<String>,
-    ) -> ResponsesToChatRouterConfig {
+    fn test_router_config(target: &str) -> ResponsesToChatRouterConfig {
         ResponsesToChatRouterConfig {
             target_base_url: target.to_string(),
             api_key: "sk-test".to_string(),
@@ -2334,37 +2274,23 @@ mod tests {
             actual_model: None,
             max_tokens_cap: None,
             responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models,
         }
     }
 
     #[test]
-    fn apply_selected_model_re_adds_aivo_prefix_when_listed() {
-        // Regression: opencode's SDK strips `aivo/` from `aivo/starter` so
-        // the body arrives as `starter`. Without re-prefix the upstream
-        // returns "model not found: starter".
-        let config = test_router_config("https://api.getaivo.dev", vec!["starter".to_string()]);
-        let mut body = json!({"model": "starter"});
-        apply_selected_model(&mut body, &config, ProviderProtocol::Openai);
-        assert_eq!(body["model"], "aivo/starter");
-    }
-
-    #[test]
-    fn apply_selected_model_passes_through_non_aivo_prefixed_models() {
+    fn apply_selected_model_passes_through_vendor_namespaced_models() {
         // Vendor-namespaced ids (e.g. `minimax/minimax-m2.7`) ride through
-        // unchanged — only the bare names listed in `aivo_prefix_models`
-        // get re-prefixed.
-        let config = test_router_config("https://api.getaivo.dev", vec!["starter".to_string()]);
+        // unchanged.
+        let config = test_router_config("https://api.getaivo.dev");
         let mut body = json!({"model": "minimax/minimax-m2.7"});
         apply_selected_model(&mut body, &config, ProviderProtocol::Openai);
         assert_eq!(body["model"], "minimax/minimax-m2.7");
     }
 
     #[test]
-    fn apply_selected_model_preserves_anthropic_ids_for_starter() {
+    fn apply_selected_model_preserves_anthropic_ids() {
         // Regression: cross-family guard swapped anthropic/* to gpt-4o → gateway 404.
-        let config = test_router_config("https://api.getaivo.dev", vec!["starter".to_string()]);
+        let config = test_router_config("https://api.getaivo.dev");
         let mut body = json!({"model": "anthropic/claude-opus-5"});
         apply_selected_model(&mut body, &config, ProviderProtocol::Openai);
         assert_eq!(body["model"], "anthropic/claude-opus-5");
@@ -2372,7 +2298,7 @@ mod tests {
 
     #[test]
     fn apply_selected_model_noop_without_starter_catalog() {
-        let config = test_router_config("https://api.example.com", vec![]);
+        let config = test_router_config("https://api.example.com");
         let mut body = json!({"model": "starter"});
         apply_selected_model(&mut body, &config, ProviderProtocol::Openai);
         assert_eq!(body["model"], "starter");

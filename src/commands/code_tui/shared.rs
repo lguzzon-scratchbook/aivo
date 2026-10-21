@@ -646,25 +646,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "show this session's id, source, and resume command",
         takes_argument: false,
     },
-    // aivo-provider only — hidden on BYOK keys (see `slash_command_visible`).
-    SlashCommandSpec {
-        name: "login",
-        help_label: "/login",
-        description: "sign in to your aivo account",
-        takes_argument: false,
-    },
-    SlashCommandSpec {
-        name: "logout",
-        help_label: "/logout",
-        description: "sign out of your aivo account",
-        takes_argument: false,
-    },
-    SlashCommandSpec {
-        name: "usage",
-        help_label: "/usage",
-        description: "show your aivo plan and usage",
-        takes_argument: false,
-    },
     SlashCommandSpec {
         name: "help",
         help_label: "/help",
@@ -1600,14 +1581,6 @@ impl ConfigOverlay {
             self.detail_scroll = 0;
         }
     }
-}
-
-/// `/login` waiting for approval: a passive status card (a card, not a modal —
-/// the poll can run for minutes and must not block typing), created only once
-/// the device code arrives.
-pub(super) struct AccountLoginCard {
-    pub(super) user_code: String,
-    pub(super) open_url: String,
 }
 
 /// Filter + rank toggle-overlay rows: name matches (scored by `score_match`:
@@ -2734,10 +2707,6 @@ pub(super) enum SlashCommand {
     Context,
     /// `/session` — this session's id, provenance, model, key, and resume command.
     Session,
-    /// aivo account flows (aivo provider only).
-    Login,
-    Logout,
-    Usage,
     Help,
 }
 
@@ -3096,21 +3065,6 @@ pub(super) enum RuntimeEvent {
         source: String,
         project: bool,
         staged: crate::agent::skills::StagedInstall,
-    },
-    /// `/login`: device code + verification URL, or failure to start.
-    AccountLoginPrompt {
-        account_gen: u64,
-        result: std::result::Result<(String, String), String>,
-    },
-    /// `/login` resolved — `Ok` is the ready-to-show notice.
-    AccountLoginDone {
-        account_gen: u64,
-        result: std::result::Result<String, String>,
-    },
-    /// `/logout`: the server-side unlink resolved.
-    AccountLogoutDone {
-        account_gen: u64,
-        result: std::result::Result<(), String>,
     },
 }
 
@@ -3700,8 +3654,6 @@ pub(super) struct CodeTuiApp {
     /// Held here, not in the (cloned-every-render) overlay, so the temp tree is
     /// deleted exactly once. The bool is the pick's `-p/--project` destination.
     pub(super) staged_skill_install: Option<(crate::agent::skills::StagedInstall, bool)>,
-    /// `/login`–`/logout` flow state; only `account_impl.rs` drives it.
-    pub(super) account: AccountFlow,
     /// One-shot: the next draw clears first, healing emulator-corrupted cells
     /// that diff-only painting would never rewrite (macOS Tahoe Terminal.app).
     pub(super) pending_full_repaint: bool,
@@ -3850,22 +3802,6 @@ pub(super) struct SessionPreviewState {
     pub(super) pending: Option<(String, Instant)>,
     /// In-flight preview load; at most one at a time.
     pub(super) task: Option<(String, JoinHandle<()>)>,
-}
-
-/// `/login`–`/logout` account-flow state, extracted so the one impl file that
-/// drives it (`account_impl.rs`) owns a named cluster instead of loose fields.
-#[derive(Default)]
-pub(super) struct AccountFlow {
-    /// Generation — bumped on start/cancel so a superseded flow's late result
-    /// is dropped.
-    pub(super) generation: u64,
-    /// In-flight login poll / unlink, aborted on cancel so an escaped login
-    /// can't write `account.json` after the user walked away.
-    pub(super) task: Option<JoinHandle<()>>,
-    /// `/login` waiting for approval — the status card.
-    pub(super) login: Option<AccountLoginCard>,
-    /// `/logout` awaiting its y/n confirm; the account display name.
-    pub(super) pending_logout: Option<String>,
 }
 
 impl CodeTuiApp {
@@ -4086,7 +4022,6 @@ impl CodeTuiApp {
             reasoning_elapsed_ms: None,
             installing_skill: None,
             staged_skill_install: None,
-            account: AccountFlow::default(),
             pending_full_repaint: false,
         }
     }

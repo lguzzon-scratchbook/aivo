@@ -1166,7 +1166,7 @@ impl CodeTuiApp {
         // The pane renders through the graphics stack — no protocol, no tool.
         let preview_supported = self.inline_images.caps.enabled();
         // The model's catalog effort levels, so the engine's disable path only sends
-        // a level the provider accepts (e.g. `aivo/starter` has no `none`).
+        // a level the provider accepts.
         let reasoning_efforts = self.model_reasoning_efforts.clone();
         // Build the multimodal message up front so an encoding error surfaces here, not
         // inside the spawned turn. Empty unless the agent-vision path was chosen.
@@ -2151,18 +2151,6 @@ impl CodeTuiApp {
             }
             SlashCommand::Session => {
                 self.open_session_overlay();
-                Ok(false)
-            }
-            SlashCommand::Login => {
-                self.run_login_command().await;
-                Ok(false)
-            }
-            SlashCommand::Logout => {
-                self.run_logout_command().await;
-                Ok(false)
-            }
-            SlashCommand::Usage => {
-                self.run_usage_command().await;
                 Ok(false)
             }
             SlashCommand::Help => {

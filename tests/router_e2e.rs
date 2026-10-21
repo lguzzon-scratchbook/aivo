@@ -484,8 +484,6 @@ fn responses_router_config(base_url: String) -> ResponsesToChatRouterConfig {
         actual_model: None,
         max_tokens_cap: None,
         responses_api_supported: None,
-        is_starter: false,
-        aivo_prefix_models: Vec::new(),
     }
 }
 
@@ -501,7 +499,6 @@ fn serve_config(base_url: String, protocol: ProviderProtocol) -> ServeRouterConf
         is_codex: false,
         is_claude_native_oauth: false,
         is_openrouter: false,
-        is_starter: false,
         requires_reasoning_content: false,
         cors: false,
         timeout: 30,
@@ -527,7 +524,6 @@ async fn claude_router_converges_on_chat_only_upstream_and_learns_route() {
         model_prefix: None,
         requires_reasoning_content: false,
         max_tokens_cap: None,
-        is_starter: false,
     });
     let (port, routes, _learned, handle) = router.start_background().await.unwrap();
 
@@ -567,7 +563,6 @@ async fn claude_router_surfaces_semantic_rejection_without_thrash() {
         model_prefix: None,
         requires_reasoning_content: false,
         max_tokens_cap: None,
-        is_starter: false,
     });
     let (port, _routes, _learned, handle) = router.start_background().await.unwrap();
 
@@ -639,7 +634,6 @@ async fn gemini_router_cascades_to_chat_upstream_and_learns_route() {
         copilot_token_manager: None,
         requires_reasoning_content: false,
         max_tokens_cap: None,
-        is_starter: false,
     });
     let (port, routes, _learned, handle) = router.start_background().await.unwrap();
 
@@ -1460,7 +1454,6 @@ async fn claude_router_enforces_loopback_token() {
         model_prefix: None,
         requires_reasoning_content: false,
         max_tokens_cap: None,
-        is_starter: false,
     })
     .with_auth_token("tok".to_string());
     let (port, _routes, _learned, handle) = router.start_background().await.unwrap();
@@ -1521,7 +1514,6 @@ async fn gemini_router_enforces_loopback_token_in_google_auth_forms() {
         copilot_token_manager: None,
         requires_reasoning_content: false,
         max_tokens_cap: None,
-        is_starter: false,
     })
     .with_auth_token("tok".to_string());
     let (port, _routes, _learned, handle) = router.start_background().await.unwrap();
@@ -1555,7 +1547,6 @@ async fn openrouter_anthropic_router_enforces_loopback_token() {
     let router = AnthropicRouter::new(AnthropicRouterConfig {
         upstream_base_url: fake.base_url(),
         upstream_api_key: "sk-test".to_string(),
-        is_starter: false,
     })
     .with_auth_token("tok".to_string());
     let (port, handle) = router.start_background().await.unwrap();

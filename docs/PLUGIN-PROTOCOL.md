@@ -281,7 +281,7 @@ families** (chat-completions ↔ Anthropic-messages ↔ Gemini). Three engines b
 
 | Key | Engine | Notes |
 |---|---|---|
-| OpenAI-protocol REST (incl. free starter) + Copilot | responses-capable router | the engine native codex uses. **Escalates to upstream `/v1/responses`** when the model requires it (gpt-5.x reasoning + tools) — even for a **Chat Completions** client, converting the reply (streaming included) back to Chat Completions — else uses chat. Learns the working route per `(plugin, key, model)` and persists it to the key config on exit. Copilot's token exchange runs inside this router |
+| OpenAI-protocol REST + Copilot | responses-capable router | the engine native codex uses. **Escalates to upstream `/v1/responses`** when the model requires it (gpt-5.x reasoning + tools) — even for a **Chat Completions** client, converting the reply (streaming included) back to Chat Completions — else uses chat. Learns the working route per `(plugin, key, model)` and persists it to the key config on exit. Copilot's token exchange runs inside this router |
 | Anthropic / Gemini REST | `aivo serve` | wire-family cascade |
 | Ollama | `aivo serve` | |
 | Cursor, for `type: coding-agent` plugins | Cursor ACP router | translates local HTTP requests into `cursor-agent acp` prompts. Requires `cursor-agent` installed and the selected Cursor key authenticated. Generic plugin types cannot use this handoff |

@@ -226,10 +226,6 @@ Fix the repo state or run it alone."
             SUBAGENT_MAX_STEPS,
         );
         sub.drop_subagent_tool();
-        // First-party parent keeps delegates first-party so their output won't disclose the provider.
-        if self.first_party {
-            sub.set_first_party();
-        }
         // Honor the parent's hosted-web-search opt-in/out in delegated work.
         sub.set_web_search_enabled(self.use_web_search_enabled);
         // Pre/PostToolUse guards cover delegated work; Stop hooks don't (they gate

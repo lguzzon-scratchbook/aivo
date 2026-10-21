@@ -147,11 +147,6 @@ impl StartCommand {
                 _ => None, // will trigger picker below
             }
         };
-        let model_arg = if model_explicit || key_explicit {
-            model_arg
-        } else {
-            self.refresh_starter_model_arg(&key.value, model_arg).await
-        };
 
         let model = self
             .resolve_model(model_arg, last_sel.as_ref(), &key, args.refresh, tool.value)
@@ -528,30 +523,6 @@ impl StartCommand {
                 interactive: false,
             }),
         }
-    }
-
-    async fn refresh_starter_model_arg(
-        &self,
-        key: &ApiKey,
-        model_arg: Option<String>,
-    ) -> Option<String> {
-        let model = model_arg?;
-        if model.is_empty() {
-            return Some(model);
-        }
-
-        if crate::services::model_catalog::starter_model_still_available(key, &self.cache, &model)
-            .await
-        {
-            return Some(model);
-        }
-
-        eprintln!(
-            "{} Model '{}' is no longer available on aivo-starter. Pick another:",
-            style::yellow("Note:"),
-            model
-        );
-        Some(String::new())
     }
 
     async fn prompt_select_model(

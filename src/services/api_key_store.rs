@@ -31,7 +31,7 @@ pub struct ImportReport {
     pub overwritten: Vec<String>,
     pub renamed: Vec<(String, String)>,
     pub skipped: Vec<String>,
-    /// Starter rows dropped from the incoming records (device-bound).
+    /// Legacy aivo-starter rows dropped from the incoming records.
     pub skipped_starter: usize,
     /// Login-session rows dropped — old export files may still carry them.
     pub skipped_oauth: usize,
@@ -42,6 +42,10 @@ pub struct ExportFilterReport {
     pub skipped_starter: usize,
     pub skipped_oauth: usize,
 }
+
+/// Base URL written by aivo <= 0.49.x for the since-removed first-party
+/// provider. Kept only to filter dead rows out of exports/imports.
+pub(crate) const LEGACY_STARTER_BASE_URL: &str = "aivo-starter";
 
 pub(crate) const KEY_ID_LENGTH: usize = 3;
 pub(crate) const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
@@ -210,17 +214,15 @@ impl ApiKeyStore {
         Ok(id)
     }
 
-    /// The starter key never exports — the real credential is the
-    /// per-install device key (`secrets/device-key`), so the record is dead
-    /// weight elsewhere. Login sessions never export either (account-bound).
+    /// Legacy starter rows never export — the real credential was the
+    /// per-install device key, so the record is dead weight elsewhere.
+    /// Login sessions never export either (account-bound).
     /// `ids` match by full id, short id, or exact name; ambiguous names
     /// error.
     pub(crate) async fn export_keys(
         &self,
         ids: Option<&[String]>,
     ) -> Result<(Vec<ApiKey>, ExportFilterReport)> {
-        use crate::services::provider_profile::is_aivo_starter_base;
-
         let keys = self.get_keys().await?;
 
         let mut selected: Vec<ApiKey> = if let Some(filter) = ids {
@@ -259,7 +261,7 @@ impl ApiKeyStore {
 
         let mut report = ExportFilterReport::default();
         let before = selected.len();
-        selected.retain(|k| !is_aivo_starter_base(&k.base_url));
+        selected.retain(|k| k.base_url != LEGACY_STARTER_BASE_URL);
         report.skipped_starter = before - selected.len();
         let before = selected.len();
         selected.retain(|key| !is_login_session_record(key));
@@ -280,8 +282,6 @@ impl ApiKeyStore {
         records: Vec<ApiKey>,
         policy: ImportPolicy,
     ) -> Result<ImportReport> {
-        use crate::services::provider_profile::is_aivo_starter_base;
-
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
         refuse_masked_lockout(&config.api_keys)?;
@@ -294,7 +294,7 @@ impl ApiKeyStore {
         for mut incoming in records {
             // Starter rows are dead off their origin machine; old export
             // files may still contain them.
-            if is_aivo_starter_base(&incoming.base_url) {
+            if incoming.base_url == LEGACY_STARTER_BASE_URL {
                 report.skipped_starter += 1;
                 continue;
             }

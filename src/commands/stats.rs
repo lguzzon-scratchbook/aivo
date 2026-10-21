@@ -2026,7 +2026,7 @@ fn resolve_since(arg: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Ut
     }
 }
 
-/// Shared line meter, same as `aivo account usage`. Already styled — don't re-wrap.
+/// Shared line meter. Already styled — don't re-wrap.
 fn bar(value: u64, max_value: u64) -> String {
     style::meter(value, max_value, style::METER_WIDTH)
 }

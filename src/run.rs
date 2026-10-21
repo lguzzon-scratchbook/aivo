@@ -5,15 +5,15 @@ use std::process;
 use clap::{Command, CommandFactory, Parser};
 use serde_json::{Map, Value, json};
 
-use crate::cli::{AccountSubcommand, Cli, CodeArgs, Commands, ModelsArgs, RunArgs, ServeArgs};
+use crate::cli::{Cli, CodeArgs, Commands, ModelsArgs, RunArgs, ServeArgs};
 use crate::cli_args::{
     extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, parse_context_token,
     rewrite_cli_args,
 };
 use crate::commands::{
-    self, AccountCommand, AliasCommand, CodeCommand, InfoCommand, KeysCommand, LoginCommand,
-    LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand,
-    ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    self, AliasCommand, CodeCommand, InfoCommand, KeysCommand, LogsCommand, ModelsCommand,
+    PluginsCommand, RunCommand, ServeCommand, ServeParams, StartCommand, StartFlowArgs,
+    StatsCommand, UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
@@ -191,7 +191,7 @@ pub async fn run() -> ! {
     let args = match Cli::try_parse_from(&rewritten) {
         Ok(args) => args,
         Err(err) => {
-            // Nested `InvalidSubcommand` (`aivo account frobnicate`) shares this
+            // Nested `InvalidSubcommand` (`aivo plugins frobnicate`) shares this
             // kind — only intercept when the rejected token is argv[1].
             if err.kind() == clap::error::ErrorKind::InvalidSubcommand
                 && let Some(name) = rewritten.get(1)
@@ -226,18 +226,6 @@ pub async fn run() -> ! {
         match cmd {
             Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
             Commands::Keys(keys_args) => KeysCommand::print_help(keys_args.action.as_deref()),
-            Commands::Account(a) => {
-                let sub = a.command.as_ref().map(|c| match c {
-                    AccountSubcommand::Login(_) => "login",
-                    AccountSubcommand::Logout(_) => "logout",
-                    AccountSubcommand::Info(_) => "info",
-                    AccountSubcommand::Usage(_) => "usage",
-                    AccountSubcommand::Open(_) => "open",
-                });
-                AccountCommand::print_help(sub)
-            }
-            Commands::Login(_) => LoginCommand::print_help(),
-            Commands::Logout(_) => LogoutCommand::print_help(),
             Commands::Code(_) => CodeCommand::print_help(),
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
@@ -287,21 +275,6 @@ pub async fn run() -> ! {
         Commands::Keys(keys_args) => {
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
-        }
-
-        Commands::Account(account_args) => {
-            let command = AccountCommand::new(session_store);
-            command.execute(account_args).await
-        }
-
-        Commands::Login(login_args) => {
-            let command = LoginCommand::new(session_store);
-            command.execute(login_args).await
-        }
-
-        Commands::Logout(logout_args) => {
-            let command = LogoutCommand::new();
-            command.execute(logout_args).await
         }
 
         Commands::Code(code_args) => dispatch_code(code_args, session_store, models_cache).await,
@@ -857,58 +830,7 @@ async fn dispatch_run(
             .ok()
             .flatten()
             .filter(|sel| key_override.as_ref().is_some_and(|k| k.id == sel.key_id));
-        // First-run-only fallback: when the user has just installed
-        // aivo and hasn't added any of their own keys yet (only the
-        // auto-created `aivo-starter` key exists, and it's active),
-        // skip the model picker and use the seeded chat model
-        // (`aivo/starter` from `ensure_starter_key`). Once the user
-        // adds another key, the fallback no longer applies and the
-        // picker resumes its normal behavior.
-        let persisted_model_for_key =
-            match last_sel_for_key.as_ref().and_then(|sel| sel.model.clone()) {
-                Some(m) => Some(m),
-                None => {
-                    if let Some(k) = key_override.as_ref()
-                        && services::provider_profile::is_aivo_starter_base(&k.base_url)
-                        && session_store
-                            .get_keys()
-                            .await
-                            .map(|keys| keys.len() == 1)
-                            .unwrap_or(false)
-                    {
-                        session_store.get_code_model(&k.id).await.ok().flatten()
-                    } else {
-                        None
-                    }
-                }
-            };
-        // Drop a persisted starter model that's been removed from the
-        // server catalog so the picker reopens with the current list.
-        // Skipped when --model was explicit — we trust what the user
-        // typed and let upstream surface any mismatch.
-        let persisted_model_for_key = if model_flag_explicit {
-            persisted_model_for_key
-        } else {
-            match (persisted_model_for_key, key_override.as_ref()) {
-                (Some(m), Some(k))
-                    if services::provider_profile::is_aivo_starter_base(&k.base_url) =>
-                {
-                    if services::model_catalog::starter_model_still_available(k, &models_cache, &m)
-                        .await
-                    {
-                        Some(m)
-                    } else {
-                        eprintln!(
-                            "{} Model '{}' is no longer available on aivo-starter. Pick another:",
-                            style::yellow("Note:"),
-                            m
-                        );
-                        None
-                    }
-                }
-                (other, _) => other,
-            }
-        };
+        let persisted_model_for_key = last_sel_for_key.as_ref().and_then(|sel| sel.model.clone());
         let model = if model.is_some() {
             model
         } else if dry_run {
@@ -1162,10 +1084,6 @@ fn print_help() {
     };
     print_cmd("run", "Launch an AI tool, or open the tool picker");
     print_cmd("keys", "Manage API keys");
-    print_cmd(
-        "account",
-        "Manage your account (info, usage, login, logout)",
-    );
     print_cmd("code", "Start the interactive coding agent");
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
@@ -1540,14 +1458,14 @@ mod tests {
 
     #[test]
     fn nested_invalid_subcommand_names_the_nested_token() {
-        let err = Cli::try_parse_from(["aivo", "account", "frobnicate"]).unwrap_err();
+        let err = Cli::try_parse_from(["aivo", "plugins", "frobnicate"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert!(
             matches!(
                 err.get(clap::error::ContextKind::InvalidSubcommand),
                 Some(clap::error::ContextValue::String(s)) if s == "frobnicate"
             ),
-            "context names the nested token, not `account`"
+            "context names the nested token, not `plugins`"
         );
     }
 

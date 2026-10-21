@@ -15,7 +15,6 @@ use crate::services::model_catalog::{
     full_catalog_cache_key_for_key, full_catalog_cached, kimi_model_infos, models_from_cache,
 };
 use crate::services::models_cache::ModelsCache;
-use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
@@ -161,32 +160,14 @@ impl ModelsCommand {
         };
 
         // Fill missing limit columns from the embedded models.dev snapshot so
-        // id-only providers (starter, minimax, cloudflare) still show
+        // id-only providers (minimax, cloudflare) still show
         // context/output. Display-only: the cache write above stores what the
         // provider actually returned.
         for model in &mut models {
             enrich_from_snapshot(model);
         }
 
-        let is_starter = is_aivo_starter_base(&key.base_url);
-        // First-party key shows the account plan label, not the raw `aivo-starter` sentinel.
-        let starter_account = is_starter
-            .then(crate::services::account_store::load)
-            .flatten();
-        models.sort_by(|a, b| {
-            if is_starter {
-                let a_s = a.id.ends_with("/starter");
-                let b_s = b.id.ends_with("/starter");
-                if a_s != b_s {
-                    return if a_s {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    };
-                }
-            }
-            a.id.cmp(&b.id)
-        });
+        models.sort_by(|a, b| a.id.cmp(&b.id));
 
         let searching = if let Some(ref query) = search {
             let q = query.trim().to_lowercase();
@@ -200,17 +181,7 @@ impl ModelsCommand {
         };
 
         let label = if searching { "matches" } else { "models" };
-        let provider_cell = if is_starter {
-            let plan_label = crate::commands::starter_provider_label(
-                starter_account.as_ref().and_then(|a| a.plan.as_deref()),
-                starter_account
-                    .as_ref()
-                    .and_then(|a| a.plan_label.as_deref()),
-            );
-            style::dim(&plan_label)
-        } else {
-            style::dim(&key.base_url)
-        };
+        let provider_cell = style::dim(&key.base_url);
         eprintln!(
             "{} {} {} via {}",
             style::success_symbol(),
@@ -220,13 +191,10 @@ impl ModelsCommand {
         );
 
         if json {
-            let mut payload = serde_json::json!({
+            let payload = serde_json::json!({
                 "provider": key.base_url,
                 "models": models,
             });
-            if let Some(plan) = starter_account.as_ref().and_then(|a| a.plan.as_deref()) {
-                payload["plan"] = serde_json::json!(plan);
-            }
             println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
             let widths = ColumnWidths::from_models(&models);

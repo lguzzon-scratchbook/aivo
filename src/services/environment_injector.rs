@@ -4,9 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::constants::{
-    AIVO_STARTER_MODEL, AIVO_STARTER_REAL_URL, AIVO_STARTER_SENTINEL, PLACEHOLDER_LOOPBACK_URL,
-};
+use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::model_names::{anthropic_native_model_name, google_native_model_name};
 use crate::services::ollama::ollama_openai_base_url;
@@ -176,19 +174,8 @@ impl EnvironmentInjector {
         mode: &ConnectionMode,
         profile: &ProviderProfile,
     ) -> HashMap<String, String> {
-        // Resolve sentinel base URLs to real URLs for env injection.
-        let resolved_base_url = if key.base_url == AIVO_STARTER_SENTINEL {
-            AIVO_STARTER_REAL_URL.to_string()
-        } else {
-            key.base_url.to_string()
-        };
-        // Tools require a non-empty API key env var. Use a placeholder for
-        // the aivo starter provider which needs no real authentication.
-        let auth_value = if key.key.is_empty() {
-            AIVO_STARTER_SENTINEL.to_string()
-        } else {
-            key.key.to_string()
-        };
+        let resolved_base_url = key.base_url.to_string();
+        let auth_value = key.key.to_string();
 
         // The child authenticates to aivo's loopback router with a per-launch
         // token; the real key never enters the child env (Direct mode aside).
@@ -244,11 +231,7 @@ impl EnvironmentInjector {
                 env.insert("AIVO_ROUTER_KEY_ID".to_string(), key.id.clone());
             }
             ConnectionMode::Direct { base_url } => {
-                let url = if base_url == AIVO_STARTER_SENTINEL {
-                    AIVO_STARTER_REAL_URL.to_string()
-                } else {
-                    base_url.clone()
-                };
+                let url = base_url.clone();
                 env.insert(cfg.base_url_env.to_string(), url);
                 env.insert(cfg.auth_env.to_string(), auth_value);
             }
@@ -283,9 +266,6 @@ impl EnvironmentInjector {
                 quirks.requires_reasoning_content |= key.requires_reasoning_content == Some(true);
                 quirks.inject(&mut env, cfg.router_prefix);
             }
-        }
-        if profile.serve_flags.is_starter {
-            env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
         }
         env
     }
@@ -794,20 +774,13 @@ impl EnvironmentInjector {
             );
         }
 
-        let gemini_model = model
-            .map(|model| {
-                if matches!(mode, ConnectionMode::Direct { .. }) {
-                    google_native_model_name(model).to_string()
-                } else {
-                    model.to_string()
-                }
-            })
-            .or_else(|| {
-                profile
-                    .serve_flags
-                    .is_starter
-                    .then(|| AIVO_STARTER_MODEL.to_string())
-            });
+        let gemini_model = model.map(|model| {
+            if matches!(mode, ConnectionMode::Direct { .. }) {
+                google_native_model_name(model).to_string()
+            } else {
+                model.to_string()
+            }
+        });
         if let Some(gemini_model) = gemini_model {
             env.insert("GEMINI_MODEL".to_string(), gemini_model.clone());
             env.insert("AIVO_GEMINI_MODEL_CONFIG_MODEL".to_string(), gemini_model);
@@ -837,16 +810,8 @@ impl EnvironmentInjector {
         }
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
-        let resolved_url = if key.base_url == AIVO_STARTER_SENTINEL {
-            AIVO_STARTER_REAL_URL.to_string()
-        } else {
-            key.base_url.clone()
-        };
-        let auth = if key.key.is_empty() {
-            AIVO_STARTER_SENTINEL.to_string()
-        } else {
-            key.key.to_string()
-        };
+        let resolved_url = key.base_url.clone();
+        let auth = key.key.to_string();
 
         // For Ollama, connect directly — OpenCode speaks OpenAI-compatible natively.
         // For GitHub Copilot, the base_url is the magic string "copilot" — not a real URL.
@@ -863,7 +828,7 @@ impl EnvironmentInjector {
             env.insert("AIVO_COPILOT_KEY_ID".to_string(), key.id.clone());
             env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token.clone());
             (PLACEHOLDER_LOOPBACK_URL.to_string(), loopback_token)
-        } else if use_router_for_opencode(key) || profile.serve_flags.is_starter {
+        } else if use_router_for_opencode(key) {
             env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token.clone());
             env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
             env.insert(
@@ -902,30 +867,6 @@ impl EnvironmentInjector {
             profile
                 .quirks
                 .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
-            if profile.serve_flags.is_starter {
-                env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
-                // OpenCode's SDK strips the `aivo/` provider prefix from
-                // outgoing body models, so the upstream sees `starter`
-                // instead of `aivo/starter`. Pass the bare ids of catalog
-                // entries that originally had the `aivo/` prefix so the
-                // local router re-adds it per-request — this preserves
-                // mid-session model switching (each request reflects the
-                // user's current pick rather than a launch-time pin).
-                let aivo_prefix_models: Vec<&str> = discovered_models
-                    .map(|catalog| {
-                        catalog
-                            .iter()
-                            .filter_map(|m| m.strip_prefix("aivo/"))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !aivo_prefix_models.is_empty() {
-                    env.insert(
-                        "AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS".to_string(),
-                        aivo_prefix_models.join(","),
-                    );
-                }
-            }
             (PLACEHOLDER_LOOPBACK_URL.to_string(), loopback_token)
         } else {
             (resolved_url, auth)
@@ -1080,35 +1021,6 @@ impl EnvironmentInjector {
             env.insert("AIVO_USE_PI_COPILOT_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
             env.insert("AIVO_COPILOT_KEY_ID".to_string(), key.id.clone());
-        } else if profile.serve_flags.is_starter {
-            // Starter provider: route through a local router so device fingerprint
-            // headers are attached (Pi's native HTTP client can't add them).
-            let loopback_token = crate::services::serve_router::random_auth_token();
-            let models_json = build_pi_models_json(
-                PLACEHOLDER_LOOPBACK_URL,
-                &loopback_token,
-                "openai-completions",
-                model,
-                catalog,
-                limits,
-                true,
-            );
-            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
-            env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
-            env.insert("AIVO_USE_PI_STARTER_ROUTER".to_string(), "1".to_string());
-            env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
-                AIVO_STARTER_SENTINEL.to_string(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
-                AIVO_STARTER_REAL_URL.to_string(),
-            );
-            env.insert(
-                "AIVO_RESPONSES_TO_CHAT_ROUTER_KEY_ID".to_string(),
-                key.id.clone(),
-            );
         } else if crate::services::transform_mode::is_active()
             || crate::services::http_debug::is_debug_active()
         {
@@ -1162,20 +1074,14 @@ impl EnvironmentInjector {
                 ProviderProtocol::Google => "google-generative-ai",
                 ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => "openai-completions",
             };
-            let resolved_url = if key.base_url == AIVO_STARTER_SENTINEL {
-                AIVO_STARTER_REAL_URL.to_string()
-            } else if pi_api == "google-generative-ai" {
+            let resolved_url = if pi_api == "google-generative-ai" {
                 // Pi sets apiVersion="" when a custom baseUrl is provided,
                 // expecting the version to be part of the URL already.
                 ensure_google_version_suffix(&key.base_url)
             } else {
                 key.base_url.clone()
             };
-            let auth: &str = if key.key.is_empty() {
-                AIVO_STARTER_SENTINEL
-            } else {
-                &key.key
-            };
+            let auth: &str = &key.key;
             let models_json =
                 build_pi_models_json(&resolved_url, auth, pi_api, model, catalog, limits, false);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
@@ -1726,30 +1632,6 @@ mod tests {
         // Cursor routing bypasses the gemini compat router entirely.
         assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
         assert!(!env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER"));
-    }
-
-    #[test]
-    fn test_for_claude_starter_with_anthropic_pin_uses_router_not_direct() {
-        // Regression: if the starter key's claude_protocol pin is Anthropic
-        // (because upstream_protocol_for_cli prefers client-native for
-        // Openai-default hosts), use_direct_anthropic_for_claude returns true
-        // — but Direct mode bypasses device_fingerprint injection, so the
-        // gateway 403s. Force Routed mode for starter regardless.
-        let injector = EnvironmentInjector::new();
-        let mut key = test_key();
-        key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        pin_route(&mut key, "claude", "anthropic");
-        let env = injector.for_claude(&key, None);
-
-        assert_eq!(
-            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
-            Some(&"1".to_string()),
-            "starter must always route through the local router"
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_BASE_URL"),
-            Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
-        );
     }
 
     #[test]
@@ -2976,28 +2858,6 @@ mod tests {
     }
 
     #[test]
-    fn test_for_codex_starter_with_direct_mode_uses_router_not_direct() {
-        // Defense-in-depth: mirrors the Claude/Gemini starter guard. Even if
-        // codex_mode is pinned to Direct, a starter key must route through
-        // the local router so device fingerprint headers attach.
-        let injector = EnvironmentInjector::new();
-        let mut key = test_key();
-        key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        key.codex_mode = Some(OpenAICompatibilityMode::Direct);
-        let env = injector.for_codex(&key, None);
-
-        assert_eq!(
-            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
-            Some(&"1".to_string()),
-            "starter must always route through the local router"
-        );
-        assert_eq!(
-            env.get("OPENAI_BASE_URL"),
-            Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
-        );
-    }
-
-    #[test]
     fn test_for_codex_official_openai_direct() {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
@@ -3107,46 +2967,6 @@ mod tests {
         assert_eq!(
             env.get("GEMINI_MODEL"),
             Some(&"google/gemini-2.0-flash".to_string())
-        );
-    }
-
-    #[test]
-    fn test_for_gemini_starter_with_google_pin_uses_router_not_direct() {
-        // Same regression as Claude: starter must always route through the
-        // Gemini router so device fingerprint headers attach.
-        let injector = EnvironmentInjector::new();
-        let mut key = test_key();
-        key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        pin_route(&mut key, "gemini", "google");
-        let env = injector.for_gemini(&key, None);
-
-        assert_eq!(
-            env.get("AIVO_USE_GEMINI_ROUTER"),
-            Some(&"1".to_string()),
-            "starter must always route through the local Gemini router"
-        );
-        assert_eq!(
-            env.get("GOOGLE_GEMINI_BASE_URL"),
-            Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
-        );
-    }
-
-    #[test]
-    fn test_for_gemini_starter_sets_default_model() {
-        // Gemini CLI's own default can be a Google-only model. Starter must
-        // launch with aivo/starter even when the user did not pass -m.
-        let injector = EnvironmentInjector::new();
-        let mut key = test_key();
-        key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        let env = injector.for_gemini(&key, None);
-
-        assert_eq!(
-            env.get("GEMINI_MODEL"),
-            Some(&AIVO_STARTER_MODEL.to_string())
-        );
-        assert_eq!(
-            env.get("AIVO_GEMINI_MODEL_CONFIG_MODEL"),
-            Some(&AIVO_STARTER_MODEL.to_string())
         );
     }
 
@@ -3549,65 +3369,6 @@ mod tests {
             config["provider"]["aivo"]["models"]["claude-sonnet-4"]["name"],
             "claude-sonnet-4"
         );
-    }
-
-    #[test]
-    fn test_for_opencode_starter_does_not_pin_actual_model() {
-        // Regression: starter+opencode used to hardcode actual_model to
-        // `aivo/starter`, which clobbered the body model on every request.
-        // Now there is no static pin — the body's per-request model is
-        // preserved (then dynamically re-prefixed by the router), which
-        // restores mid-session model switching inside opencode.
-        let injector = EnvironmentInjector::new();
-        let mut key = test_key();
-        key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        let env = injector.for_opencode(&key, Some("minimax/minimax-m2.7"), None, &HashMap::new());
-
-        assert_eq!(env.get("AIVO_IS_STARTER"), Some(&"1".to_string()));
-        assert!(
-            !env.contains_key("AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL"),
-            "starter+opencode must not pin actual_model — let the body's \
-             per-request model flow through so UI model switches take effect",
-        );
-    }
-
-    #[test]
-    fn test_for_opencode_starter_publishes_aivo_prefix_models_for_router() {
-        // The router needs the bare ids of catalog entries that originally
-        // had the `aivo/` prefix so it can re-add the prefix on each
-        // request. Without this, opencode's SDK strips `aivo/starter` to
-        // `starter` and the upstream replies "model not found: starter".
-        let injector = EnvironmentInjector::new();
-        let mut key = test_key();
-        key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        let catalog = vec![
-            "aivo/starter".to_string(),
-            "minimax/minimax-m2.7".to_string(),
-        ];
-
-        let env = injector.for_opencode(&key, Some("starter"), Some(&catalog), &HashMap::new());
-        assert_eq!(
-            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS"),
-            Some(&"starter".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_for_opencode_starter_omits_aivo_prefix_env_when_catalog_has_none() {
-        // No env var if no catalog entry uses the `aivo/` prefix — keeps
-        // the env clean for providers that don't need re-prefixing.
-        let injector = EnvironmentInjector::new();
-        let mut key = test_key();
-        key.base_url = AIVO_STARTER_SENTINEL.to_string();
-        let catalog = vec!["minimax/minimax-m2.7".to_string()];
-
-        let env = injector.for_opencode(
-            &key,
-            Some("minimax/minimax-m2.7"),
-            Some(&catalog),
-            &HashMap::new(),
-        );
-        assert!(!env.contains_key("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS"));
     }
 
     #[test]

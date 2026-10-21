@@ -24,14 +24,12 @@ pub enum ModelListingStrategy {
     Anthropic,
     CloudflareSearch,
     OpenAiCompatible,
-    AivoStarter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServeFlags {
     pub is_copilot: bool,
     pub is_openrouter: bool,
-    pub is_starter: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,11 +131,6 @@ pub fn is_ollama_base(base_url: &str) -> bool {
     base_url == "ollama"
 }
 
-pub fn is_aivo_starter_base(base_url: &str) -> bool {
-    base_url == crate::constants::AIVO_STARTER_SENTINEL
-        || base_url == crate::constants::AIVO_STARTER_REAL_URL
-}
-
 /// Account-bound login sessions (browser/device-flow). Filtered from
 /// exports by default — they grant subscription access, not pay-as-you-go
 /// API quota, so they shouldn't travel silently with an API-key backup.
@@ -149,12 +142,10 @@ pub fn is_oauth_or_copilot_base(base_url: &str) -> bool {
         || base_url == crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL
 }
 
-/// Resolves the aivo-starter sentinel to the real API URL.
+/// Resolves provider sentinels to their real API URLs.
 /// Returns the base_url unchanged for all other providers.
-pub fn resolve_starter_base_url(base_url: &str) -> String {
-    if base_url == crate::constants::AIVO_STARTER_SENTINEL {
-        crate::constants::AIVO_STARTER_REAL_URL.to_string()
-    } else if base_url == crate::services::grok_oauth::GROK_OAUTH_SENTINEL {
+pub fn resolve_provider_base_url(base_url: &str) -> String {
+    if base_url == crate::services::grok_oauth::GROK_OAUTH_SENTINEL {
         // Resolve the grok sentinel to the CLI proxy so base_url-derived URLs
         // stay valid; the token manager still owns the final host per request.
         crate::services::grok_oauth::INFERENCE_BASE_URL.to_string()
@@ -264,7 +255,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: true,
                 is_openrouter: false,
-                is_starter: false,
             },
         };
     }
@@ -278,7 +268,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
-                is_starter: false,
             },
         };
     }
@@ -292,21 +281,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
-                is_starter: false,
-            },
-        };
-    }
-
-    if is_aivo_starter_base(base_url) {
-        return ProviderProfile {
-            kind: ProviderKind::OpenAiCompatible,
-            default_protocol: ProviderProtocol::Openai,
-            quirks,
-            model_listing_strategy: ModelListingStrategy::AivoStarter,
-            serve_flags: ServeFlags {
-                is_copilot: false,
-                is_openrouter: false,
-                is_starter: true,
             },
         };
     }
@@ -320,7 +294,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: true,
-                is_starter: false,
             },
         };
     }
@@ -334,7 +307,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
-                is_starter: false,
             },
         };
     }
@@ -348,7 +320,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
-                is_starter: false,
             },
         },
         ProviderProtocol::Google => ProviderProfile {
@@ -359,7 +330,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
-                is_starter: false,
             },
         },
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => ProviderProfile {
@@ -370,7 +340,6 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,
-                is_starter: false,
             },
         },
     }
@@ -421,39 +390,6 @@ mod tests {
         assert_eq!(profile.model_listing_strategy, ModelListingStrategy::Ollama);
         assert!(!profile.serve_flags.is_copilot);
         assert!(!profile.serve_flags.is_openrouter);
-    }
-
-    #[test]
-    fn classifies_aivo_starter() {
-        let profile = provider_profile_for_base_url("aivo-starter");
-        assert_eq!(profile.kind, ProviderKind::OpenAiCompatible);
-        assert_eq!(profile.default_protocol, ProviderProtocol::Openai);
-        assert_eq!(
-            profile.model_listing_strategy,
-            ModelListingStrategy::AivoStarter
-        );
-    }
-
-    #[test]
-    fn upstream_protocol_forwards_cli_native_for_starter() {
-        let profile = provider_profile_for_base_url("aivo-starter");
-        assert!(profile.serve_flags.is_starter);
-        assert_eq!(
-            profile.upstream_protocol_for_cli(ProviderProtocol::Anthropic),
-            ProviderProtocol::Anthropic,
-        );
-        assert_eq!(
-            profile.upstream_protocol_for_cli(ProviderProtocol::Google),
-            ProviderProtocol::Google,
-        );
-        assert_eq!(
-            profile.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi),
-            ProviderProtocol::ResponsesApi,
-        );
-        assert_eq!(
-            profile.upstream_protocol_for_cli(ProviderProtocol::Openai),
-            ProviderProtocol::Openai,
-        );
     }
 
     #[test]
@@ -583,17 +519,6 @@ mod tests {
         let deepseek = provider_profile_for_base_url("https://api.deepseek.com/v1");
         assert!(deepseek.quirks.requires_reasoning_content);
         assert_eq!(deepseek.quirks.max_tokens_cap, None);
-
-        let starter_url = provider_profile_for_base_url("https://api.getaivo.dev");
-        assert_eq!(starter_url.quirks.max_tokens_cap, None);
-        // Static quirks for aivo/starter intentionally leave
-        // `requires_reasoning_content` unset — the actual value is discovered
-        // per-key from the upstream's error body and persisted to ApiKey.
-        assert!(!starter_url.quirks.requires_reasoning_content);
-
-        let starter_sentinel = provider_profile_for_base_url("aivo-starter");
-        assert_eq!(starter_sentinel.quirks.max_tokens_cap, None);
-        assert!(!starter_sentinel.quirks.requires_reasoning_content);
     }
 
     #[test]

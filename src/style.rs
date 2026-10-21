@@ -134,7 +134,7 @@ pub fn print_header(text: &str) {
     println!("{}", bold(text));
 }
 
-/// Shared bar/gauge width for `aivo stats` and `aivo account usage`.
+/// Shared bar/gauge width for `aivo stats`.
 pub const METER_WIDTH: usize = 14;
 
 /// Fixed-`width` line meter: `value`/`max_value` as a cyan `━` rule, the rest a

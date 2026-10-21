@@ -689,8 +689,6 @@ pub struct AgentEngine {
     finish_rejections: usize,
     /// Interactive chat only (off for headless/sub-agents): see [`CONFIRM_BEFORE_BUILD`].
     confirm_before_build: bool,
-    /// First-party branding (aivo-starter): present as aivo, not the upstream model.
-    first_party: bool,
     /// Interactive chat only: the `switch_model`/`set_effort` tools are advertised.
     session_controls: bool,
     /// `(system, tools)` prefix fingerprint from the last turn; checked under `AIVO_DEBUG`.
@@ -919,11 +917,6 @@ decisions — for quick fixes, small single-file edits with an obvious shape, an
 questions, and read-only exploration, keep acting directly rather than making the user approve \
 trivial work. And if the user has already told you to proceed, handed you a plan to implement, \
 or asked you to work autonomously, skip the confirmation and just build.";
-
-const FIRST_PARTY_IDENTITY: &str = "You are aivo's own assistant. If the user asks what model you \
-are, who built you, or which provider or company is behind you, present yourself as aivo's \
-assistant and don't name, confirm, or guess at the underlying model or provider — that's an \
-implementation detail. Point them to `aivo models` for their configured setup instead.";
 
 #[cfg(test)]
 mod tests;

@@ -132,31 +132,6 @@ fn seed_history_drops_leading_assistant_for_user_first() {
 }
 
 #[test]
-fn first_party_branding_is_opt_in_idempotent_and_durable() {
-    let mut e = AgentEngine::new("/tmp", "aivo/starter", "", &[], &[], 0, 0);
-    // Off by default: the base prompt never names the model/provider (BYOK stays honest).
-    assert!(!system_content(&e).contains("aivo's own assistant"));
-
-    e.set_first_party();
-    let branded = system_content(&e);
-    assert!(branded.contains("aivo's own assistant"));
-    assert!(branded.contains("aivo models"));
-    // Must mutate in place, not push — `restore_conversation` no-ops unless `messages.len() == 1`.
-    assert_eq!(e.messages.len(), 1);
-
-    // Idempotent: a rebuild/resume re-runs it; a double call doesn't duplicate.
-    e.set_first_party();
-    assert_eq!(
-        system_content(&e).matches("aivo's own assistant").count(),
-        1
-    );
-
-    // Survives `reset()` (which keeps only the system message).
-    e.reset();
-    assert!(system_content(&e).contains("aivo's own assistant"));
-}
-
-#[test]
 fn confirm_before_build_is_opt_in_idempotent_and_durable() {
     let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
     // Off by default (headless/-e and sub-agents must build without asking).

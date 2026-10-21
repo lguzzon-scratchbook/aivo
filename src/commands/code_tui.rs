@@ -58,8 +58,6 @@ mod system;
 #[path = "code_tui/shared.rs"]
 mod shared;
 
-#[path = "code_tui/account_impl.rs"]
-mod account_impl;
 #[path = "code_tui/app_state_impl.rs"]
 mod app_state_impl;
 #[path = "code_tui/event_loop_impl.rs"]

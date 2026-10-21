@@ -53,7 +53,6 @@ pub fn key_serves_images_api(key: &ApiKey) -> bool {
         && !key.is_cursor_acp()
         && !key.is_copilot()
         && !profile::is_ollama_base(&key.base_url)
-        && !profile::is_aivo_starter_base(&key.base_url)
         && detect_provider_protocol(&key.base_url) == ProviderProtocol::Openai
 }
 
@@ -149,15 +148,11 @@ async fn generate_via_gateway(prompt: &str) -> Result<(Vec<String>, String), Str
     let client = builder
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
-    let endpoint = override_endpoint.unwrap_or_else(|| {
-        format!(
-            "{}/v1/generate-image",
-            crate::constants::AIVO_STARTER_REAL_URL
-        )
-    });
+    let endpoint = override_endpoint
+        .unwrap_or_else(|| format!("{}/v1/generate-image", crate::constants::AIVO_GATEWAY_URL));
     // Device-signed (same auth as chat); the gateway holds the keys + quota.
     let builder = client.post(endpoint).json(&GatewayBody { prompt });
-    let resp = crate::services::device_fingerprint::with_starter_headers(builder)
+    let resp = crate::services::device_fingerprint::with_device_headers(builder)
         .send()
         .await
         .map_err(|e| format!("couldn't reach image generation ({e})"))?;

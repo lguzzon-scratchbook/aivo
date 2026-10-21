@@ -86,7 +86,6 @@ pub struct ServeRouterConfig {
     /// forward verbatim to the native backend.
     pub is_claude_native_oauth: bool,
     pub is_openrouter: bool,
-    pub is_starter: bool,
     /// Upstream requires `reasoning_content` on assistant turns (deepseek/moonshot);
     /// injected to avoid a 400. From the provider profile at startup.
     pub requires_reasoning_content: bool,
@@ -113,13 +112,13 @@ impl ServeRouterConfig {
         aliases: HashMap<String, String>,
     ) -> Self {
         use crate::services::provider_profile::{
-            provider_profile_for_key, resolve_starter_base_url,
+            provider_profile_for_key, resolve_provider_base_url,
         };
         let profile = provider_profile_for_key(key);
         // The claude-oauth sentinel has no provider profile; force Anthropic.
         let is_claude_native_oauth = key.is_claude_oauth();
         Self {
-            upstream_base_url: resolve_starter_base_url(&key.base_url),
+            upstream_base_url: resolve_provider_base_url(&key.base_url),
             upstream_api_key: key.key.as_str().to_string(),
             upstream_protocol: if is_claude_native_oauth {
                 ProviderProtocol::Anthropic
@@ -133,7 +132,6 @@ impl ServeRouterConfig {
             is_codex: key.is_codex_oauth(),
             is_claude_native_oauth,
             is_openrouter: profile.serve_flags.is_openrouter,
-            is_starter: profile.serve_flags.is_starter,
             requires_reasoning_content: profile.quirks.requires_reasoning_content,
             cors,
             timeout,
@@ -381,7 +379,7 @@ impl ServeRouter {
                 FailoverEntry {
                     config: Arc::new(ServeRouterConfig {
                         upstream_base_url:
-                            crate::services::provider_profile::resolve_starter_base_url(
+                            crate::services::provider_profile::resolve_provider_base_url(
                                 &fk.base_url,
                             ),
                         upstream_api_key: fk.key.as_str().to_string(),
@@ -394,7 +392,6 @@ impl ServeRouter {
                         is_codex: false,
                         is_claude_native_oauth: false,
                         is_openrouter: profile.serve_flags.is_openrouter,
-                        is_starter: profile.serve_flags.is_starter,
                         requires_reasoning_content: profile.quirks.requires_reasoning_content,
                         cors: false,
                         timeout,
@@ -1667,8 +1664,6 @@ fn responses_router_config(
         actual_model: None,
         max_tokens_cap: None,
         responses_api_supported: None,
-        is_starter: state.config.is_starter,
-        aivo_prefix_models: Vec::new(),
     }
 }
 
@@ -1679,7 +1674,6 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
         upstream_api_key: state.config.upstream_api_key.clone(),
         is_copilot: state.config.is_copilot,
         is_openrouter: state.config.is_openrouter,
-        is_starter: state.config.is_starter,
         copilot_tokens: state.copilot_tokens.clone(),
         grok_tokens: state.grok_tokens.clone(),
         kimi_tokens: state.kimi_tokens.clone(),
@@ -2181,7 +2175,6 @@ mod tests {
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: false,
-                is_starter: false,
                 requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,
@@ -2365,7 +2358,6 @@ mod tests {
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: true,
-                is_starter: false,
                 requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,
@@ -2585,7 +2577,6 @@ mod tests {
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: false,
-                is_starter: false,
                 requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,
@@ -2629,7 +2620,6 @@ mod tests {
             is_codex: false,
             is_claude_native_oauth: false,
             is_openrouter: false,
-            is_starter: false,
             requires_reasoning_content: false,
             cors: false,
             timeout: 300,
@@ -2672,7 +2662,6 @@ mod tests {
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: false,
-                is_starter: false,
                 requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,

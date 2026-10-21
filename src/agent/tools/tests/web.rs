@@ -51,10 +51,10 @@ fn web_search_error_messages_are_actionable() {
         assert!(s.contains("web_fetch"), "no next step: {s}");
     };
     // Persistent failures latch the session and tell the model to stop.
-    let (login, login_latch) = classify_search_error(401);
-    assert!(login.contains("aivo login") && login.contains("Don't call web_search"));
-    assert!(login_latch);
-    antifab(&login);
+    let (auth, auth_latch) = classify_search_error(401);
+    assert!(auth.contains("unavailable for this device") && auth.contains("Don't call web_search"));
+    assert!(auth_latch);
+    antifab(&auth);
 
     let (quota, quota_latch) = classify_search_error(429);
     assert!(quota.contains("quota is used up") && quota.contains("Don't call web_search"));

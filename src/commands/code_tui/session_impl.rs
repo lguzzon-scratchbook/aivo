@@ -69,7 +69,7 @@ impl CodeTuiApp {
         } else {
             None
         };
-        // Valid `/effort` levels: live catalog (e.g. aivo/starter) or snapshot.
+        // Valid `/effort` levels: live catalog or snapshot.
         self.model_reasoning_efforts = limits.reasoning_efforts.clone();
         // Reasoning-capable per the snapshot, or implied by advertised levels.
         self.model_supports_thinking =
@@ -3800,8 +3800,8 @@ conversation is preserved."
     /// Preserves the existing launchable tool (so `aivo run` with no tool still
     /// recalls the last *launchable* tool, not "code"), skips the ephemeral HF
     /// synthetic key, and writes the *stored* key's canonical `base_url`: the
-    /// live `self.key` may carry a sentinel resolved to a real URL (ollama,
-    /// aivo-starter), and a resolved URL would fail `get_last_selection`'s
+    /// live `self.key` may carry a sentinel resolved to a real URL (ollama),
+    /// and a resolved URL would fail `get_last_selection`'s
     /// validity check against the saved record and be pruned as stale.
     /// Best-effort — a failed write never aborts the switch.
     async fn update_last_selection(&self, raw_model: &str) {
@@ -4224,11 +4224,11 @@ fn pick_a_model_error(key: &ApiKey, choices: &[ModelChoice]) -> String {
     )
 }
 
-/// Two base URLs resolve to the same provider (same wire protocol). The starter
-/// sentinel resolves to its real URL first; other sentinels compare literally.
+/// Two base URLs resolve to the same provider (same wire protocol); sentinels
+/// resolve to their real URL first.
 pub(super) fn same_wire_provider(a: &str, b: &str) -> bool {
-    use crate::services::provider_profile::resolve_starter_base_url;
-    resolve_starter_base_url(a) == resolve_starter_base_url(b)
+    use crate::services::provider_profile::resolve_provider_base_url;
+    resolve_provider_base_url(a) == resolve_provider_base_url(b)
 }
 
 /// Fetch model metadata for the picker, falling back to cached IDs on error.

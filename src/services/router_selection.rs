@@ -133,10 +133,6 @@ pub(crate) fn transparent_conflict(
             "GitHub Copilot auth (token exchange + headers) lives in the local router".to_string(),
         );
     }
-    // Deliberately reasonless.
-    if profile.serve_flags.is_starter {
-        return Some(String::new());
-    }
     if profile.kind == ProviderKind::Ollama && tool != AIToolType::Opencode {
         return Some(format!(
             "Ollama speaks OpenAI chat only — {} needs the conversion router",
@@ -171,10 +167,7 @@ pub(crate) fn claude_connection_mode(key: &ApiKey, profile: &ProviderProfile) ->
         ConnectionMode::Copilot
     } else if profile.serve_flags.is_openrouter {
         ConnectionMode::OpenRouter
-    } else if use_direct_anthropic_for_claude(key) && !profile.serve_flags.is_starter {
-        // Starter must route through the local router — it's the only
-        // place device_fingerprint::maybe_with_starter_headers runs.
-        // Direct mode would skip the X-Aivo-* headers and 403 at the gateway.
+    } else if use_direct_anthropic_for_claude(key) {
         let base_url = key.base_url.trim_end_matches('/');
         let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
         ConnectionMode::Direct {
@@ -192,9 +185,7 @@ pub(crate) fn codex_connection_mode(key: &ApiKey, profile: &ProviderProfile) -> 
         ConnectionMode::Ollama
     } else if profile.serve_flags.is_copilot {
         ConnectionMode::Copilot
-    } else if !use_direct_openai_for_codex(key) || profile.serve_flags.is_starter {
-        // See claude_connection_mode: starter must route through the local
-        // router so device_fingerprint headers attach.
+    } else if !use_direct_openai_for_codex(key) {
         // Why ResponsesApi: seeds the router's cascade with `/v1/responses`
         // first so codex's native protocol is a pass-through; chat
         // completions remains in the fallback chain for legacy hosts.
@@ -219,9 +210,7 @@ pub(crate) fn gemini_connection_mode(
         ConnectionMode::Ollama
     } else if profile.serve_flags.is_copilot {
         ConnectionMode::Copilot
-    } else if use_google_native_for_gemini(key) && !profile.serve_flags.is_starter {
-        // See claude_connection_mode: starter must route through the local
-        // router so device_fingerprint headers attach.
+    } else if use_google_native_for_gemini(key) {
         ConnectionMode::Direct {
             base_url: direct_base_url.to_string(),
         }
@@ -382,7 +371,6 @@ mod tests {
         };
 
         assert!(reject("copilot", AIToolType::Codex).is_some());
-        assert!(reject("aivo-starter", AIToolType::Claude).is_some());
         assert!(reject("cursor", AIToolType::Claude).is_some());
         assert!(reject("ollama", AIToolType::Codex).is_some());
         assert!(reject("ollama", AIToolType::Claude).is_some());

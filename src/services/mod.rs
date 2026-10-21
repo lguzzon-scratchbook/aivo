@@ -6,9 +6,8 @@
 //! - Provider metadata: known_providers, provider_protocol, provider_profile,
 //!   model_names, model_compat, models_cache. Check these before adding a
 //!   new `base_url.contains(...)` branch.
-//! - Provider glue, optional features (share), utilities.
+//! - Provider glue, optional features, utilities.
 
-pub mod account_store;
 pub mod acp_client;
 pub mod ai_launcher;
 pub mod ansi;
@@ -36,7 +35,6 @@ pub mod copilot_router;
 pub mod cursor_acp;
 pub mod cursor_bridge;
 pub mod cursor_home_shadow;
-pub mod device_auth;
 pub mod device_fingerprint;
 pub mod device_login_ui;
 #[cfg(all(target_env = "musl", target_arch = "aarch64"))]

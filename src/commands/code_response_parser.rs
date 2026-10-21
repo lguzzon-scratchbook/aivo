@@ -50,8 +50,8 @@ pub(crate) struct ChatTurnResult {
     /// Upstream model echoed by the provider's response. `None` when the
     /// response didn't carry a `model` field (e.g. Google streaming, where
     /// the model is in the URL). Stats prefers this over the user-typed
-    /// alias so `aivo/starter` collapses into the upstream `deepseek-v4-flash`
-    /// — same key claude-code records.
+    /// alias so a friendly name collapses into the upstream id — the same key
+    /// claude-code records.
     pub model: Option<String>,
     /// Raw upstream response body, populated for non-streaming handlers.
     /// Surfaced by `aivo code --json` so scripts can consume the

@@ -20,11 +20,7 @@ pub(crate) fn print_no_model_list_hint() {
 
 /// Call to action for the zero-keys state: how to add a key.
 pub(crate) fn add_key_cta() -> String {
-    format!(
-        "Run {} to add one, or {} to use the bundled aivo provider.",
-        style::cyan("aivo keys add"),
-        style::cyan("aivo login")
-    )
+    format!("Run {} to add one.", style::cyan("aivo keys add"))
 }
 
 /// Standard "no key configured" error block for launch paths, to stderr.
@@ -34,15 +30,6 @@ pub(crate) fn print_no_key_error() {
 }
 
 pub(crate) use crate::services::http_utils::normalize_base_url;
-
-/// Runs `fut` under a stderr spinner. No-op off a TTY, so `--json`/pipes stay clean.
-pub(crate) async fn spin<F: std::future::Future>(label: &str, fut: F) -> F::Output {
-    let (spinning, handle) = style::start_spinner(Some(label));
-    let out = fut.await;
-    style::stop_spinner(&spinning);
-    let _ = handle.await;
-    out
-}
 
 /// Truncates `text` to its first line, then to `max_cols` terminal columns
 /// with an ellipsis. Width-aware: CJK chars count as 2 columns so picker
@@ -84,23 +71,6 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     format!("{prefix}…{suffix}")
 }
 
-/// Provider-cell label for the first-party aivo key: the plan label (or slug) when
-/// known, else the free-tier sentinel. One colour for every plan.
-pub(crate) fn starter_provider_label(
-    cached_plan: Option<&str>,
-    cached_label: Option<&str>,
-) -> String {
-    match cached_plan.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(plan) => cached_label
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(plan)
-            .to_string(),
-        None => crate::constants::AIVO_STARTER_SENTINEL.to_string(),
-    }
-}
-
-pub mod account;
 pub mod alias;
 pub mod code;
 pub(crate) mod code_agent_oneshot;
@@ -113,7 +83,6 @@ pub mod hf;
 pub mod info;
 pub mod keys;
 pub(crate) mod keys_ui;
-pub mod login;
 pub mod logs;
 pub mod mcp;
 pub mod models;
@@ -125,12 +94,10 @@ pub mod start;
 pub mod stats;
 pub mod update;
 
-pub use account::AccountCommand;
 pub use alias::AliasCommand;
 pub use code::CodeCommand;
 pub use info::InfoCommand;
 pub use keys::KeysCommand;
-pub use login::{LoginCommand, LogoutCommand};
 pub use logs::LogsCommand;
 pub use models::ModelsCommand;
 pub use plugins::PluginsCommand;
@@ -203,36 +170,7 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{starter_provider_label, truncate_url_for_display};
-
-    #[test]
-    fn starter_provider_label_falls_back_to_sentinel() {
-        assert_eq!(
-            starter_provider_label(None, None),
-            crate::constants::AIVO_STARTER_SENTINEL
-        );
-        assert_eq!(
-            starter_provider_label(Some(""), Some("ignored")),
-            crate::constants::AIVO_STARTER_SENTINEL
-        );
-    }
-
-    #[test]
-    fn starter_provider_label_uses_plan_slug() {
-        assert_eq!(starter_provider_label(Some("aivo-pro"), None), "aivo-pro");
-    }
-
-    #[test]
-    fn starter_provider_label_prefers_server_label() {
-        assert_eq!(
-            starter_provider_label(Some("aivo-friend"), Some("Friend")),
-            "Friend"
-        );
-        assert_eq!(
-            starter_provider_label(Some("aivo-pro"), Some("  ")),
-            "aivo-pro"
-        );
-    }
+    use super::truncate_url_for_display;
 
     #[test]
     fn truncate_url_for_display_preserves_short_urls() {

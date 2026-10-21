@@ -8,7 +8,6 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
 use crate::services::anthropic_route_pipeline::inject_anthropic_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::model_names::select_model_for_provider_attempt;
@@ -45,8 +44,6 @@ pub struct GeminiRouterConfig {
     pub requires_reasoning_content: bool,
     /// Cap applied to `max_tokens` before forwarding to the provider
     pub max_tokens_cap: Option<u64>,
-    /// Whether this is the aivo starter provider (requires device fingerprint headers).
-    pub is_starter: bool,
 }
 
 pub struct GeminiRouter {
@@ -407,17 +404,14 @@ async fn forward_to_provider(
                 // Anthropic /v1/messages uses `x-api-key` only; an extra
                 // `Authorization: Bearer` makes some gateways (opencode-go's
                 // qwen) reject as InvalidApiKey. Mirrors the claude router.
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&target_url)
-                        .header("x-api-key", config.api_key.as_str())
-                        .header("anthropic-version", "2023-06-01")
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&anthropic_req),
-                    config.is_starter,
-                )
-                .send_logged()
-                .await?;
+                let response = client
+                    .post(&target_url)
+                    .header("x-api-key", config.api_key.as_str())
+                    .header("anthropic-version", "2023-06-01")
+                    .header("Content-Type", CONTENT_TYPE_JSON)
+                    .json(&anthropic_req)
+                    .send_logged()
+                    .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
@@ -445,16 +439,13 @@ async fn forward_to_provider(
                 );
                 let model = openai_chat_model(&req_body, "gemini-2.5-pro");
                 let target_url = build_google_generate_content_url(&config.target_base_url, &model);
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&target_url)
-                        .header("x-goog-api-key", config.api_key.as_str())
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&google_body),
-                    config.is_starter,
-                )
-                .send_logged()
-                .await?;
+                let response = client
+                    .post(&target_url)
+                    .header("x-goog-api-key", config.api_key.as_str())
+                    .header("Content-Type", CONTENT_TYPE_JSON)
+                    .json(&google_body)
+                    .send_logged()
+                    .await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
@@ -484,12 +475,7 @@ async fn forward_to_provider(
                 )
                 .await?;
                 let req = opencode_session::with_session_header(req, &target_url, Some(&req_body));
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    req.json(&req_body),
-                    config.is_starter,
-                )
-                .send_logged()
-                .await?;
+                let response = req.json(&req_body).send_logged().await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
@@ -517,12 +503,7 @@ async fn forward_to_provider(
                 .await?;
                 let req =
                     opencode_session::with_session_header(req, &target_url, Some(&responses_body));
-                let response = device_fingerprint::maybe_with_starter_headers(
-                    req.json(&responses_body),
-                    config.is_starter,
-                )
-                .send_logged()
-                .await?;
+                let response = req.json(&responses_body).send_logged().await?;
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
@@ -888,7 +869,6 @@ mod tests {
             copilot_token_manager: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
-            is_starter: false,
         };
         assert_eq!(config.forced_model, Some("gpt-4o".to_string()));
         assert!(config.copilot_token_manager.is_none());
@@ -905,7 +885,6 @@ mod tests {
             copilot_token_manager: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
-            is_starter: false,
         };
         assert!(config.copilot_token_manager.is_none());
         assert!(config.forced_model.is_none());

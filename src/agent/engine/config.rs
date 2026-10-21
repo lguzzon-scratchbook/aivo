@@ -92,7 +92,6 @@ impl AgentEngine {
             finish_report: None,
             finish_rejections: 0,
             confirm_before_build: false,
-            first_party: false,
             session_controls: false,
             prefix_fp: None,
             file_tracker: crate::agent::file_tracker::FileTracker::default(),
@@ -194,23 +193,8 @@ impl AgentEngine {
         }
     }
 
-    /// Append [`FIRST_PARTY_IDENTITY`] to the system prompt in place — keeps the
-    /// single-system-message invariant `restore_conversation` relies on. Idempotent.
-    pub fn set_first_party(&mut self) {
-        if self.first_party {
-            return;
-        }
-        self.first_party = true;
-        let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content")) else {
-            return;
-        };
-        if let Some(s) = content.as_str() {
-            *content = Value::String(format!("{s}\n\n{FIRST_PARTY_IDENTITY}"));
-        }
-    }
-
-    /// Append [`CONFIRM_BEFORE_BUILD`] to the system prompt in place, like
-    /// [`Self::set_first_party`] (single-system-message invariant). Idempotent.
+    /// Append [`CONFIRM_BEFORE_BUILD`] to the system prompt in place, keeping the
+    /// single-system-message invariant. Idempotent.
     pub fn set_confirm_before_build(&mut self) {
         if self.confirm_before_build {
             return;
@@ -225,7 +209,7 @@ impl AgentEngine {
     }
 
     /// Interactive chat only: append the live session facts + switch guidance to the system
-    /// prompt (in place, like [`Self::set_first_party`]) and advertise the session controls.
+    /// prompt in place and advertise the session controls.
     pub fn set_chat_session_context(&mut self, ctx: ChatSessionContext) {
         if self.session_controls {
             return;

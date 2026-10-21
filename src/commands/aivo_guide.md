@@ -1,8 +1,7 @@
 # aivo — complete usage guide
 
 aivo is a CLI that connects your existing coding agents (and its own built-in agent) to whatever
-model you want, with local encrypted API-key management. Link a device with `aivo login` to use
-the bundled `aivo/starter` models, or add your own key. Config lives in `~/.config/aivo/` — API
+model you want, with local encrypted API-key management. Config lives in `~/.config/aivo/` — API
 keys are AES-256-GCM encrypted in `config.json`.
 
 Machine-readable command structure: `aivo --help-json`. Per-command help: `aivo <command> --help`.
@@ -38,8 +37,7 @@ aivo run                      # pick a tool
 A key is a saved provider credential (id, name, base URL, secret). The **active** key is what
 commands use by default. Any OpenAI-compatible base URL works; native Anthropic/Gemini, GitHub
 Copilot, and Ollama are also supported (the sentinel base URLs `copilot` and `ollama` select those
-provider types). `aivo/starter` is the bundled first-party provider; `aivo login` links a device
-to use it.
+provider types).
 
 ```bash
 aivo keys                       # list all keys (active marked) — same as `aivo keys list`
@@ -66,21 +64,6 @@ aivo keys export <file>         # prompts for a password
 aivo keys import <file>         # or a URL; same password on the other machine
 aivo keys export <file> --password-stdin <<< "my password"   # non-interactive
 ```
-
-## Account — `aivo account`
-
-Link this device to your [getaivo.dev](https://getaivo.dev) account for higher `aivo/starter`
-limits, then check plan and usage.
-
-```bash
-aivo account                    # identity, plan, linked-device count (same as `info`)
-aivo account usage              # requests/tokens, daily caps, per-model  (--json for machine form)
-aivo account login              # sign in + link this device  (--label "work laptop" to name it)
-aivo account logout             # sign out + unlink this device
-aivo account open               # open your dashboard in the browser
-```
-
-`login`/`logout` are interactive — run them yourself in a terminal, not headless.
 
 ## Models & aliases
 
@@ -123,7 +106,7 @@ Key flags:
 --env <k=v>                inject an environment variable
 --relogin                  force OAuth re-login (codex / codex-app / claude)
 --dry-run                  print the resolved command + env without launching
---transparent              bypass aivo's local router, talk to the model natively (endpoint must speak the tool's native protocol; copilot/starter/cursor/ollama keys rejected)
+--transparent              bypass aivo's local router, talk to the model natively (endpoint must speak the tool's native protocol; copilot/cursor/ollama keys rejected)
 ```
 
 Claude-only model-slot overrides: `--fable-model`, `--subagent-model`, and

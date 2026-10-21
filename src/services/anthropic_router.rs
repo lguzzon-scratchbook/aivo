@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::hoist_anthropic_system_messages;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
-use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self, router_http_model_client};
 use crate::services::opencode_session;
@@ -23,7 +22,6 @@ use crate::services::token_usage::{
 pub struct AnthropicRouterConfig {
     pub upstream_base_url: String,
     pub upstream_api_key: String,
-    pub is_starter: bool,
 }
 
 pub struct AnthropicRouter {
@@ -314,13 +312,12 @@ async fn forward_request(
     pipeline.patch_headers(route.patch_route(), &mut headers, &ctx)?;
     opencode_session::insert_session_header(&mut headers, &url, Some(&body));
 
-    let is_starter = config.is_starter;
-    let response = device_fingerprint::maybe_with_starter_headers(
-        client.post(&url).headers(headers).json(&body),
-        is_starter,
-    )
-    .send_logged()
-    .await?;
+    let response = client
+        .post(&url)
+        .headers(headers)
+        .json(&body)
+        .send_logged()
+        .await?;
 
     // Detect beta header rejection: on 400, check if the provider rejected
     // anthropic-beta headers, learn to strip them, and retry immediately.
@@ -340,12 +337,12 @@ async fn forward_request(
             pipeline.patch_headers(route.patch_route(), &mut retry_headers, &ctx)?;
             opencode_session::insert_session_header(&mut retry_headers, &url, Some(&body));
 
-            let retry_response = device_fingerprint::maybe_with_starter_headers(
-                client.post(&url).headers(retry_headers).json(&body),
-                is_starter,
-            )
-            .send_logged()
-            .await?;
+            let retry_response = client
+                .post(&url)
+                .headers(retry_headers)
+                .json(&body)
+                .send_logged()
+                .await?;
 
             return classify_upstream_response(retry_response).await;
         }

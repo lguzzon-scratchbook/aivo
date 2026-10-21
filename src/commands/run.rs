@@ -1578,8 +1578,8 @@ async fn resolve_codex_effort(
 /// Default `--max-context` based on the resolved model.
 /// Precedence: explicit flag → limits cascade (live models-cache, then the
 /// embedded models.dev snapshot; ≥2M→2m, ≥1M→1m — see
-/// `services::model_metadata`). `aivo/starter` gets no special default: the
-/// cascade knows real context windows, so an unresolved model means no tag.
+/// `services::model_metadata`). The cascade knows real context windows, so an
+/// unresolved model means no tag.
 async fn resolve_max_context(
     cache: &ModelsCache,
     base_url: Option<&str>,
@@ -2023,54 +2023,6 @@ mod tests {
             )
             .await;
         (dir, cache)
-    }
-
-    #[tokio::test]
-    async fn resolve_max_context_no_blind_default_for_starter_model() {
-        // The cascade is the only source now — an unresolved starter model
-        // gets no tag instead of the old hardcoded "1m".
-        let (_dir, cache) = empty_cache();
-        assert_eq!(
-            resolve_max_context(
-                &cache,
-                None,
-                Some(crate::constants::AIVO_STARTER_MODEL),
-                None
-            )
-            .await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_max_context_starter_model_follows_cache() {
-        let (_dir, cache) =
-            cache_with_context(crate::constants::AIVO_STARTER_MODEL, 1_000_000).await;
-        assert_eq!(
-            resolve_max_context(
-                &cache,
-                Some(TEST_BASE_URL),
-                Some(crate::constants::AIVO_STARTER_MODEL),
-                None
-            )
-            .await,
-            Some("1m".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_max_context_user_override_wins_for_starter_model() {
-        let (_dir, cache) = empty_cache();
-        assert_eq!(
-            resolve_max_context(
-                &cache,
-                None,
-                Some(crate::constants::AIVO_STARTER_MODEL),
-                Some("2m".to_string())
-            )
-            .await,
-            Some("2m".to_string())
-        );
     }
 
     #[tokio::test]

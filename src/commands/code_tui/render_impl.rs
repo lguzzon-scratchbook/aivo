@@ -2121,17 +2121,12 @@ impl CodeTuiApp {
     fn build_slot_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
         if self.cards.mcp_consent.is_some() {
             self.build_mcp_consent_card(max_width, max_total)
-        } else if self.account.pending_logout.is_some() {
-            self.build_logout_confirm_card(max_width)
         } else if self.cards.permission().is_some() {
             self.build_permission_card(max_width, max_total)
         } else if self.cards.ask().is_some() {
             self.build_ask_user_card(max_width, max_total)
         } else if self.cards.plan_approval().is_some() {
             self.build_plan_approval_card(max_width, max_total)
-        } else if self.account.login.is_some() {
-            // Last: passive status — decision cards win the slot.
-            self.build_login_card(max_width)
         } else {
             None
         }
@@ -2207,70 +2202,6 @@ impl CodeTuiApp {
             lines,
             scroll: None,
         })
-    }
-
-    /// The `/logout` y/n confirm card (owns the keyboard, like MCP consent).
-    fn build_logout_confirm_card(&self, max_width: u16) -> Option<SlotCard> {
-        let account = self.account.pending_logout.as_ref()?;
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("Unlink this device from ", Style::default().fg(TEXT())),
-                Span::styled(
-                    account.clone(),
-                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("?", Style::default().fg(TEXT())),
-            ]),
-            Line::from(Span::styled(
-                "This device drops to the free tier until you sign in again.",
-                Style::default().fg(MUTED()),
-            )),
-            Line::from(""),
-            account_keys_line(&[("y", ASSISTANT(), "sign out"), ("n", ERROR(), "cancel")]),
-        ];
-        Some(build_account_card(
-            " sign out of aivo ",
-            WARNING(),
-            lines,
-            max_width,
-        ))
-    }
-
-    /// The `/login` status card: code + URL + waiting state. Passive — it never
-    /// owns the keyboard (see `handle_login_card_key`), so typing stays live.
-    fn build_login_card(&self, max_width: u16) -> Option<SlotCard> {
-        let card = self.account.login.as_ref()?;
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    "Confirm this code in your browser:  ",
-                    Style::default().fg(TEXT()),
-                ),
-                Span::styled(
-                    card.user_code.clone(),
-                    Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                card.open_url.clone(),
-                Style::default().fg(LINK()),
-            )),
-            Line::from(Span::styled(
-                "Waiting for approval…",
-                Style::default().fg(MUTED()),
-            )),
-            Line::from(""),
-            account_keys_line(&[
-                ("Enter", ASSISTANT(), "open browser"),
-                ("Esc", ERROR(), "cancel"),
-            ]),
-        ];
-        Some(build_account_card(
-            " sign in to aivo ",
-            ACCENT(),
-            lines,
-            max_width,
-        ))
     }
 
     /// Card asking the user to approve a mutating agent tool. Sits directly
@@ -4237,25 +4168,6 @@ struct SlotCard {
     scroll: Option<u16>,
 }
 
-fn build_account_card(
-    title: &'static str,
-    border: Color,
-    lines: Vec<Line<'static>>,
-    max_width: u16,
-) -> SlotCard {
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0);
-    let width = (content_w as u16)
-        .saturating_add(4)
-        .clamp(1, max_width.max(1));
-    SlotCard {
-        title,
-        border,
-        width,
-        lines,
-        scroll: None,
-    }
-}
-
 /// Paints a built card into its slot. When even the builder-trimmed card
 /// overflows, spacer rows go first, then rows shed from the top — the
 /// key-hint row is the last thing to disappear.
@@ -4296,28 +4208,6 @@ fn render_slot_card(frame: &mut Frame<'_>, slot: Rect, card: SlotCard) {
     });
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-}
-
-/// Color-coded `key label` hint row for the account cards.
-fn account_keys_line(keys: &[(&'static str, Color, &'static str)]) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (i, (key, color, label)) in keys.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(
-                "    ".to_string(),
-                Style::default().fg(FAINT()),
-            ));
-        }
-        spans.push(Span::styled(
-            key.to_string(),
-            Style::default().fg(*color).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!(" {label}"),
-            Style::default().fg(MUTED()),
-        ));
-    }
-    Line::from(spans)
 }
 
 /// The project-MCP consent choices row: run once / always (this repo) / deny,

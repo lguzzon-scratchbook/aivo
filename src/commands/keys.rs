@@ -8,13 +8,11 @@ use std::time::{Duration, Instant};
 
 use crate::cli::KeysArgs;
 use crate::commands::keys_ui;
-use crate::commands::{starter_provider_label, truncate_url_for_display};
+use crate::commands::truncate_url_for_display;
 use crate::tui::{FuzzyOutcome, FuzzySelect, MultiSelect};
 
 use crate::errors::ExitCode;
-use crate::services::account_store;
 use crate::services::models_cache::ModelsCache;
-use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
@@ -423,18 +421,12 @@ enum ExportPick {
     Stop(ExitCode),
 }
 
-fn print_no_keys_to_export(skipped_oauth: usize, skipped_starter: usize) {
+fn print_no_keys_to_export(skipped_oauth: usize) {
     eprintln!("{} No keys to export.", style::red("Error:"));
     if skipped_oauth > 0 {
         eprintln!(
             "{}",
             style::dim("Login sessions never export — sign in again on the target machine.")
-        );
-    }
-    if skipped_starter > 0 {
-        eprintln!(
-            "{}",
-            style::dim("The aivo-starter key never exports — it only works on this machine.")
         );
     }
 }
@@ -790,7 +782,6 @@ const KIMI_OAUTH_INFO: (&str, &str) = (
     "sign in with your Kimi membership — usable by any coding agent",
 );
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
-const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
 fn format_picker_choice(label: &str, hint: &str) -> String {
     format!(
@@ -811,9 +802,6 @@ fn key_provider_hint(key: &ApiKey) -> String {
     }
     if key.is_cursor_acp() {
         return "Cursor".to_string();
-    }
-    if is_aivo_starter_base(&key.base_url) {
-        return "aivo starter".to_string();
     }
     if let Some(label) = key.credential_label() {
         return label
@@ -1212,21 +1200,6 @@ async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
                 Err(_) => Ok(PingStatus::Unreachable),
             }
         }
-        ModelListingStrategy::AivoStarter => {
-            let url = format!(
-                "{}/v1/models",
-                crate::constants::AIVO_STARTER_REAL_URL.trim_end_matches('/')
-            );
-            let req = crate::services::device_fingerprint::with_starter_headers(
-                client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", key.key.as_str())),
-            );
-            match req.send().await {
-                Ok(r) => Ok(PingStatus::from_http_status(r.status().as_u16())),
-                Err(_) => Ok(PingStatus::Unreachable),
-            }
-        }
         ModelListingStrategy::CloudflareSearch | ModelListingStrategy::OpenAiCompatible => {
             let base = key.base_url.trim_end_matches('/');
             let url = if base.ends_with("/v1") {
@@ -1418,23 +1391,11 @@ impl KeysCommand {
     async fn list_keys(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
-        let cached_account = account_store::load();
-        let cached_plan = cached_account.as_ref().and_then(|a| a.plan.as_deref());
-        let cached_label = cached_account
-            .as_ref()
-            .and_then(|a| a.plan_label.as_deref());
-        let plan_json = serde_json::to_value(cached_plan).unwrap_or(Value::Null);
 
         if json {
             let payload: Vec<Value> = keys
                 .iter()
-                .map(|k| {
-                    let mut obj = key_metadata_json(k, selected_key_id.as_deref());
-                    if is_aivo_starter_base(&k.base_url) {
-                        obj["plan"] = plan_json.clone();
-                    }
-                    obj
-                })
+                .map(|k| key_metadata_json(k, selected_key_id.as_deref()))
                 .collect();
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(ExitCode::Success);
@@ -1457,17 +1418,8 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
-            // First-party aivo key: tint only the name; plan label sits dim in the URL column.
-            let starter = is_aivo_starter_base(&key.base_url)
-                .then(|| starter_provider_label(cached_plan, cached_label));
-            let name_col = match &starter {
-                Some(_) => style::magenta(&name_padded),
-                None => name_padded,
-            };
-            let url_col = match &starter {
-                Some(label) => style::dim(label),
-                None => style::dim(key_provider_hint(key)),
-            };
+            let name_col = name_padded;
+            let url_col = style::dim(key_provider_hint(key));
             println!(
                 "{} {}  {}  {}",
                 active_indicator,
@@ -1484,12 +1436,6 @@ impl KeysCommand {
     async fn list_keys_with_ping(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
-        let cached_account = account_store::load();
-        let cached_plan = cached_account.as_ref().and_then(|a| a.plan.as_deref());
-        let cached_label = cached_account
-            .as_ref()
-            .and_then(|a| a.plan_label.as_deref());
-        let plan_json = serde_json::to_value(cached_plan).unwrap_or(Value::Null);
 
         if json {
             let mut ping_by_id: HashMap<String, Value> = HashMap::new();
@@ -1509,9 +1455,6 @@ impl KeysCommand {
                     let mut obj = key_metadata_json(k, selected_key_id.as_deref());
                     if let Some(p) = ping_by_id.remove(&k.id) {
                         obj["ping"] = p;
-                    }
-                    if is_aivo_starter_base(&k.base_url) {
-                        obj["plan"] = plan_json.clone();
                     }
                     obj
                 })
@@ -1538,12 +1481,7 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
-            let starter = is_aivo_starter_base(&key.base_url)
-                .then(|| starter_provider_label(cached_plan, cached_label));
-            let name_col = match &starter {
-                Some(_) => style::magenta(&name_padded),
-                None => name_padded,
-            };
+            let name_col = name_padded;
 
             let ping_status = if SessionStore::decrypt_key_secret(&mut key).is_ok() {
                 let start = Instant::now();
@@ -1562,21 +1500,15 @@ impl KeysCommand {
                 format!("{} {}", style::red("✗"), style::red("decrypt failed"))
             };
 
-            let url_col = match &starter {
-                Some(label) => {
-                    let padded = format!("{:<width$}", label, width = url_display_width);
-                    style::dim(&padded)
-                }
-                None => {
-                    let hint = key_provider_hint(&key);
-                    let url_display = if hint.len() > url_display_width {
-                        truncate_url_for_display(&key.base_url, url_display_width)
-                    } else {
-                        hint
-                    };
-                    let url_padded = format!("{:<width$}", url_display, width = url_display_width);
-                    style::dim(&url_padded)
-                }
+            let hint = key_provider_hint(&key);
+            let url_display = if hint.len() > url_display_width {
+                truncate_url_for_display(&key.base_url, url_display_width)
+            } else {
+                hint
+            };
+            let url_col = {
+                let url_padded = format!("{:<width$}", url_display, width = url_display_width);
+                style::dim(&url_padded)
             };
             println!(
                 "{} {}  {}  {}  {}",
@@ -1656,11 +1588,8 @@ impl KeysCommand {
         Ok(ExitCode::Success)
     }
 
-    /// Starter rows never appear; login rows show disabled — hiding them
-    /// would read as a lost key.
+    /// Login rows show disabled — hiding them would read as a lost key.
     async fn prompt_pick_export_keys(&self) -> Result<ExportPick> {
-        use crate::services::provider_profile::is_aivo_starter_base;
-
         // Metadata-only load — the picker never needs decrypted secrets.
         let (keys, _) = self.session_store.get_keys_and_active_id_info().await?;
         if keys.is_empty() {
@@ -1668,15 +1597,10 @@ impl KeysCommand {
             println!("  {}", crate::commands::add_key_cta());
             return Ok(ExportPick::Stop(ExitCode::UserError));
         }
-        let mut skipped_starter = 0usize;
         let mut choices: Vec<ApiKey> = Vec::new();
         let mut items: Vec<String> = Vec::new();
         let mut annotations: Vec<Option<String>> = Vec::new();
         for key in keys {
-            if is_aivo_starter_base(&key.base_url) {
-                skipped_starter += 1;
-                continue;
-            }
             let login = crate::services::api_key_store::is_login_session_record(&key);
             items.push(format_key_choice(&key));
             annotations.push(login.then(|| "login session — never exports".to_string()));
@@ -1684,7 +1608,7 @@ impl KeysCommand {
         }
         let selectable = annotations.iter().filter(|a| a.is_none()).count();
         if selectable == 0 {
-            print_no_keys_to_export(choices.len(), skipped_starter);
+            print_no_keys_to_export(choices.len());
             return Ok(ExportPick::Stop(ExitCode::UserError));
         }
 
@@ -1765,7 +1689,7 @@ impl KeysCommand {
         // Fail on an empty selection or bad --ids before any prompt.
         let (records, filter_report) = self.session_store.export_keys(id_filter).await?;
         if records.is_empty() {
-            print_no_keys_to_export(filter_report.skipped_oauth, filter_report.skipped_starter);
+            print_no_keys_to_export(filter_report.skipped_oauth);
             return Ok(ExitCode::UserError);
         }
         let n = records.len();
@@ -1956,14 +1880,6 @@ impl KeysCommand {
                 style::cyan("--rename")
             );
         }
-        if report.skipped_starter > 0 {
-            println!(
-                "{dot} {}",
-                style::dim(
-                    "Skipped the export's aivo-starter key — it only works on its original machine."
-                )
-            );
-        }
         if report.skipped_oauth > 0 {
             println!(
                 "{dot} {}",
@@ -2036,7 +1952,7 @@ impl KeysCommand {
     ) -> Result<()> {
         self.session_store.set_active_key(id).await?;
         // Clear last_selection so key resolution picks the new active key
-        // instead of a stale last_selection (e.g. aivo-starter).
+        // instead of a stale last_selection.
         let _ = self.session_store.clear_last_selection().await;
 
         let display_name = style::cyan(if name.is_empty() { id } else { name });
@@ -2183,11 +2099,7 @@ impl KeysCommand {
             } else {
                 input
             };
-            if value == "copilot"
-                || value == "ollama"
-                || value == "aivo-starter"
-                || value == "aivo starter"
-            {
+            if value == "copilot" || value == "ollama" {
                 break value;
             }
             match validate_base_url(&value) {
@@ -3126,28 +3038,6 @@ impl KeysCommand {
         Ok(ExitCode::Success)
     }
 
-    /// Prints a notice and returns `Some(Success)` if an aivo-starter key is
-    /// already configured; returns `None` otherwise so the caller can create one.
-    async fn notify_if_starter_already_added(&self) -> Result<Option<ExitCode>> {
-        let Some(existing) = self
-            .session_store
-            .get_keys()
-            .await?
-            .into_iter()
-            .find(|k| k.base_url == crate::constants::AIVO_STARTER_SENTINEL)
-        else {
-            return Ok(None);
-        };
-        println!(
-            "{} aivo starter is already added as {} (ID: {}). Run {} to use it.",
-            style::yellow("Note:"),
-            style::cyan(&existing.name),
-            style::dim(&existing.id),
-            style::cyan("aivo code"),
-        );
-        Ok(Some(ExitCode::Success))
-    }
-
     async fn add_custom_interactive(&self, name: &str) -> Result<ExitCode> {
         keys_ui::step_header(3, 3, "Credentials", "base URL and API key, either order");
         // Either credential may come first, so a key already on the clipboard
@@ -3306,7 +3196,6 @@ impl KeysCommand {
             read_line("Name (optional): ")?
         };
 
-        let is_starter_name = name == "aivo-starter" || name == "aivo starter";
         // `aivo keys add cursor --api-key sk-…` is the non-interactive shortcut
         // into the cursor flow. Without `--api-key`, "cursor" is treated as a
         // plain key name — users who want OAuth / API-key sub-pickers run
@@ -3317,8 +3206,7 @@ impl KeysCommand {
         if is_cursor_shortcut {
             return self.add_cursor_interactive(&name, add_options.key).await;
         }
-        let interactive =
-            add_options.base_url.is_none() && add_options.key.is_none() && !is_starter_name;
+        let interactive = add_options.base_url.is_none() && add_options.key.is_none();
 
         if interactive {
             // Echo the name when it came from arg/flag so the user sees what
@@ -3329,9 +3217,7 @@ impl KeysCommand {
             return self.interactive_add(&name).await;
         }
 
-        let base_url = if is_starter_name {
-            crate::constants::AIVO_STARTER_SENTINEL.to_string()
-        } else {
+        let base_url = {
             let detected_url = detect_base_url(&name);
             let mut provided_base_url = add_options.base_url.map(str::to_string);
             loop {
@@ -3384,14 +3270,6 @@ impl KeysCommand {
                 };
                 if let Some((_, reason)) = picker_rejections.iter().find(|(s, _)| value == *s) {
                     if let Some(code) = reject(format!("{reason} — {picker_hint}.")) {
-                        return Ok(code);
-                    }
-                    continue;
-                }
-                if value == "aivo-starter" || value == "aivo starter" {
-                    if let Some(code) =
-                        reject("Use 'aivo keys add aivo-starter' instead.".to_string())
-                    {
                         return Ok(code);
                     }
                     continue;
@@ -3513,33 +3391,6 @@ impl KeysCommand {
             return Ok(ExitCode::Success);
         }
 
-        // Aivo starter: free provider, no API key needed
-        if base_url == crate::constants::AIVO_STARTER_SENTINEL {
-            keys_ui::provider_info(STARTER_INFO.0, STARTER_INFO.1);
-
-            if let Some(code) = self.notify_if_starter_already_added().await? {
-                return Ok(code);
-            }
-
-            // Clear the dismissed flag so ensure_starter_key works again
-            let _ = self.session_store.set_starter_key_dismissed(false).await;
-
-            let (starter, _) = self
-                .session_store
-                .ensure_starter_key()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("Failed to create aivo starter key"))?;
-            self.finalize_add(
-                &starter.id,
-                &name,
-                "Provider: aivo starter (free)",
-                Some(("aivo code", "(start coding)")),
-            )
-            .await?;
-
-            return Ok(ExitCode::Success);
-        }
-
         let key = if let Some(key) = add_options.key {
             key.to_string()
         } else {
@@ -3629,10 +3480,6 @@ impl KeysCommand {
             let _ = self.session_store.remove_key_stats(&key_to_remove.id).await;
             if let Some(shadow) = cursor_shadow_to_delete {
                 let _ = shadow.delete();
-            }
-            // Remember if the user dismissed the aivo-starter key
-            if key_to_remove.base_url == crate::constants::AIVO_STARTER_SENTINEL {
-                let _ = self.session_store.set_starter_key_dismissed(true).await;
             }
             println!(
                 "{} Removed key: {}",
@@ -3808,7 +3655,7 @@ fn print_help_add() {
         "OpenRouter, Anthropic, Groq, Bedrock, … (API key)",
     );
     keys_help_row("OAuth", "Codex, Claude Code, SuperGrok, Kimi Code");
-    keys_help_row("Other", "GitHub Copilot, Cursor, Ollama, aivo starter");
+    keys_help_row("Other", "GitHub Copilot, Cursor, Ollama");
     keys_help_row("Custom URL", "Any OpenAI-compatible base URL + API key");
     println!();
     println!("{}", style::bold("Options:"));

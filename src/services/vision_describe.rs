@@ -120,13 +120,13 @@ async fn describe_via_gateway(media_type: &str, base64: &str) -> Result<String, 
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
     let endpoint = override_endpoint
-        .unwrap_or_else(|| format!("{}/v1/describe", crate::constants::AIVO_STARTER_REAL_URL));
+        .unwrap_or_else(|| format!("{}/v1/describe", crate::constants::AIVO_GATEWAY_URL));
     // Device-signed (same auth as chat); the gateway holds the keys + quota.
     let builder = client.post(endpoint).json(&GatewayBody {
         image: base64,
         media_type,
     });
-    let resp = crate::services::device_fingerprint::with_starter_headers(builder)
+    let resp = crate::services::device_fingerprint::with_device_headers(builder)
         .send()
         .await
         .map_err(|e| format!("couldn't reach image describe ({e})"))?;

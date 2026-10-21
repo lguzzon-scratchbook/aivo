@@ -39,21 +39,9 @@ pub fn sign_request(_device_id: &str, timestamp: u64) -> String {
     hex_encode(&signature.to_bytes())
 }
 
-/// Conditionally attaches device identity headers when `is_starter` is true.
-pub fn maybe_with_starter_headers(
-    builder: reqwest::RequestBuilder,
-    is_starter: bool,
-) -> reqwest::RequestBuilder {
-    if is_starter {
-        with_starter_headers(builder)
-    } else {
-        builder
-    }
-}
-
 /// Device-identity headers as `(name, value)` pairs, for callers that build
-/// requests by hand. [`with_starter_headers`] wraps this.
-pub fn starter_header_pairs() -> [(&'static str, String); 5] {
+/// requests by hand. [`with_device_headers`] wraps this.
+pub fn device_header_pairs() -> [(&'static str, String); 5] {
     let did = device_id();
     let ts = current_unix_ts();
     let sig = sign_request(did, ts);
@@ -67,8 +55,8 @@ pub fn starter_header_pairs() -> [(&'static str, String); 5] {
 }
 
 /// Attaches device identity headers to a request builder.
-pub fn with_starter_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    starter_header_pairs()
+pub fn with_device_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    device_header_pairs()
         .into_iter()
         .fold(builder, |b, (name, value)| b.header(name, value))
 }

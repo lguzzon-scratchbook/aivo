@@ -954,7 +954,7 @@ async fn resolve_plugin_key(
 /// Which loopback proxy (if any) aivo uses to serve a key to a plugin.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PluginServe {
-    /// Any REST key, starter, Copilot, Ollama — served over a loopback proxy
+    /// Any REST key, Copilot, Ollama — served over a loopback proxy
     /// (`ServeRouter` or the responses-capable router; see `use_responses_router`).
     Serve,
     /// Cursor ACP — served through `CursorModelRouter` for coding-agent plugins.
@@ -1345,38 +1345,29 @@ async fn start_responses_endpoint(
     run_tally: Arc<RunTokenTally>,
 ) -> anyhow::Result<EndpointHandle> {
     use crate::services::copilot_auth::CopilotTokenManager;
-    use crate::services::provider_profile::{provider_profile_for_key, resolve_starter_base_url};
+    use crate::services::provider_profile::resolve_provider_base_url;
     use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
     use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
 
     let token = random_auth_token();
-    let profile = provider_profile_for_key(key);
     // Copilot is served like native codex's copilot router: the token manager
     // exchanges the GitHub token and supplies the upstream base URL, so the
     // config carries no static base/key. Everyone else targets the resolved REST
     // base directly.
-    let (base_url, api_key, target_protocol, copilot_token_manager, is_starter) =
-        if key.is_copilot() {
-            (
-                String::new(),
-                String::new(),
-                ProviderProtocol::Openai,
-                Some(Arc::new(CopilotTokenManager::new(
-                    key.key.as_str().to_string(),
-                ))),
-                false,
-            )
-        } else {
-            let base = resolve_starter_base_url(&key.base_url);
-            let proto = detect_provider_protocol(&base);
-            (
-                base,
+    let (base_url, api_key, target_protocol, copilot_token_manager) = if key.is_copilot() {
+        (
+            String::new(),
+            String::new(),
+            ProviderProtocol::Openai,
+            Some(Arc::new(CopilotTokenManager::new(
                 key.key.as_str().to_string(),
-                proto,
-                None,
-                profile.serve_flags.is_starter,
-            )
-        };
+            ))),
+        )
+    } else {
+        let base = resolve_provider_base_url(&key.base_url);
+        let proto = detect_provider_protocol(&base);
+        (base, key.key.as_str().to_string(), proto, None)
+    };
     let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
         target_base_url: base_url,
         api_key,
@@ -1388,8 +1379,6 @@ async fn start_responses_endpoint(
         actual_model: None,
         max_tokens_cap: None,
         responses_api_supported: key.responses_api_supported,
-        is_starter,
-        aivo_prefix_models: Vec::new(),
     })
     .with_tool(PLUGIN_ROUTE_TOOL)
     .with_seed_routes(key.routes_for_tool(PLUGIN_ROUTE_TOOL))

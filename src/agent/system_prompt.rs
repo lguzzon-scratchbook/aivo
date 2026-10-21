@@ -201,10 +201,7 @@ You are part of aivo, so you can inspect aivo itself: for questions about its AP
 providers, configuration, or usage, run the `aivo` command (e.g. `aivo keys list`, `aivo \
 models`, `aivo stats`) or read the usage from `aivo --help-json`. For how-to and \"how do I…\" \
 questions about aivo, run `aivo guide` (a built-in usage guide) rather than searching the web. \
-Two commands are the \
-exception: `aivo account login` and `logout` are interactive and act on the user's own device — \
-tell the user to run those in their own terminal rather than running them yourself (run headless \
-they just block until they time out).\n\n\
+\
 Read files before editing, and make the smallest change that works and reads like the \
 surrounding code (its naming, idiom, and comment density) — no premature abstraction or \
 unasked-for scope. After changing code, verify it before you \
@@ -459,7 +456,6 @@ mod tests {
         assert!(p.contains("never print, log, hard-code, or commit secrets")); // secrets hygiene
         assert!(p.contains("don't open secret-bearing files")); // secrets: read/exfil, not just write
         assert!(p.contains("change tactics rather than repeating it")); // loop-breaking
-        assert!(p.contains("run those in their own terminal rather than running them yourself")); // interactive login is the user's
         assert!(p.contains("<untrusted source=…>")); // web/MCP content is data, not instructions
         assert!(p.contains("Before deleting or overwriting anything")); // inspect target before destroying
         assert!(p.contains("don't relabel unfinished work")); // anti-sandbagging: no MVP/v1 relabel

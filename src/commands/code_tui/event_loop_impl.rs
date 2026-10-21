@@ -414,18 +414,6 @@ impl CodeTuiApp {
                 self.apply_skill_install_pick(source, project, staged)
                     .await?
             }
-            RuntimeEvent::AccountLoginPrompt {
-                account_gen,
-                result,
-            } => self.apply_account_login_prompt(account_gen, result),
-            RuntimeEvent::AccountLoginDone {
-                account_gen,
-                result,
-            } => self.apply_account_login_done(account_gen, result).await,
-            RuntimeEvent::AccountLogoutDone {
-                account_gen,
-                result,
-            } => self.apply_account_logout_done(account_gen, result).await,
         }
         Ok(())
     }
@@ -1071,7 +1059,7 @@ impl CodeTuiApp {
     }
 
     /// Pricing for the session's model, else the upstream-echoed `billed_model`
-    /// (an alias like `aivo/starter` has no snapshot row).
+    /// (an alias with no snapshot row).
     pub(super) fn session_pricing(&self) -> Option<crate::services::model_metadata::Pricing> {
         crate::services::model_metadata::model_pricing(&self.model).or_else(|| {
             self.billed_model

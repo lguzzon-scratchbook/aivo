@@ -165,9 +165,6 @@ pub(super) fn command_recall_text(command: &SlashCommand) -> String {
         SlashCommand::Compact { fast: false } => "/compact".to_string(),
         SlashCommand::Context => "/context".to_string(),
         SlashCommand::Session => "/session".to_string(),
-        SlashCommand::Login => "/login".to_string(),
-        SlashCommand::Logout => "/logout".to_string(),
-        SlashCommand::Usage => "/usage".to_string(),
         SlashCommand::Help => "/help".to_string(),
     }
 }

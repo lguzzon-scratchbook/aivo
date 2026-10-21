@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_anthropic_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::device_fingerprint;
 use crate::services::effort::gpt5_chat_completions_rejects_tools_with_none_reasoning;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
@@ -29,7 +28,6 @@ pub(crate) struct UpstreamRequestContext {
     pub(crate) upstream_api_key: String,
     pub(crate) is_copilot: bool,
     pub(crate) is_openrouter: bool,
-    pub(crate) is_starter: bool,
     pub(crate) copilot_tokens: Option<Arc<CopilotTokenManager>>,
     pub(crate) grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
     pub(crate) kimi_tokens: Option<Arc<crate::services::kimi_oauth::KimiTokenManager>>,
@@ -37,16 +35,6 @@ pub(crate) struct UpstreamRequestContext {
     /// Usage accounting is on — streamed OpenAI requests must ask for the
     /// trailing usage chunk or the sniffer records zero for the turn.
     pub(crate) accounting: bool,
-}
-
-impl UpstreamRequestContext {
-    /// Conditionally attaches device fingerprint headers for starter endpoint requests.
-    fn with_device_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if !self.is_starter {
-            return builder;
-        }
-        device_fingerprint::with_starter_headers(builder)
-    }
 }
 
 pub(crate) enum RouterResponse {
@@ -95,20 +83,19 @@ pub(crate) async fn send_anthropic_chat(
     let (fallback_model, anthropic_req) = build_anthropic_request(body, client_wants_stream);
 
     let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/messages");
-    let response = context
-        .with_device_headers(opencode_session::with_session_header(
-            context
-                .client
-                .post(&url)
-                .header("x-api-key", context.upstream_api_key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", CONTENT_TYPE_JSON),
-            &url,
-            Some(&anthropic_req),
-        ))
-        .json(&anthropic_req)
-        .send_logged()
-        .await?;
+    let response = opencode_session::with_session_header(
+        context
+            .client
+            .post(&url)
+            .header("x-api-key", context.upstream_api_key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", CONTENT_TYPE_JSON),
+        &url,
+        Some(&anthropic_req),
+    )
+    .json(&anthropic_req)
+    .send_logged()
+    .await?;
 
     finalize_anthropic_response(response, client_wants_stream, &fallback_model).await
 }
@@ -137,13 +124,10 @@ pub(crate) async fn send_gemini_chat(
         build_google_generate_content_url(&context.upstream_base_url, &model)
     };
     let response = context
-        .with_device_headers(
-            context
-                .client
-                .post(&url)
-                .header("x-goog-api-key", context.upstream_api_key.as_str())
-                .header("Content-Type", CONTENT_TYPE_JSON),
-        )
+        .client
+        .post(&url)
+        .header("x-goog-api-key", context.upstream_api_key.as_str())
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .json(&gemini_req)
         .send_logged()
         .await?;
@@ -165,13 +149,10 @@ pub(crate) async fn send_gemini_native(
         build_google_generate_content_url(&context.upstream_base_url, model)
     };
     let response = context
-        .with_device_headers(
-            context
-                .client
-                .post(&url)
-                .header("x-goog-api-key", context.upstream_api_key.as_str())
-                .header("Content-Type", CONTENT_TYPE_JSON),
-        )
+        .client
+        .post(&url)
+        .header("x-goog-api-key", context.upstream_api_key.as_str())
+        .header("Content-Type", CONTENT_TYPE_JSON)
         .json(gemini_req)
         .send_logged()
         .await?;
@@ -209,20 +190,19 @@ pub(crate) async fn send_anthropic_native(
     anthropic_req["stream"] = json!(false);
 
     let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/messages");
-    let response = context
-        .with_device_headers(opencode_session::with_session_header(
-            context
-                .client
-                .post(&url)
-                .header("x-api-key", context.upstream_api_key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", CONTENT_TYPE_JSON),
-            &url,
-            Some(&anthropic_req),
-        ))
-        .json(&anthropic_req)
-        .send_logged()
-        .await?;
+    let response = opencode_session::with_session_header(
+        context
+            .client
+            .post(&url)
+            .header("x-api-key", context.upstream_api_key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", CONTENT_TYPE_JSON),
+        &url,
+        Some(&anthropic_req),
+    )
+    .json(&anthropic_req)
+    .send_logged()
+    .await?;
 
     let status = response.status().as_u16();
     let content_type = http_utils::response_content_type(&response);
@@ -409,11 +389,7 @@ async fn send_openai_chat_once(
         req = req.header(crate::services::grok_oauth::MODEL_OVERRIDE_HEADER, model);
     }
     req = opencode_session::with_session_header(req, url, Some(body));
-    Ok(context
-        .with_device_headers(req)
-        .json(body)
-        .send_logged()
-        .await?)
+    Ok(req.json(body).send_logged().await?)
 }
 
 /// When usage accounting is on, streamed OpenAI upstreams only emit the
@@ -469,11 +445,7 @@ pub(crate) async fn send_copilot_responses(
         req = req.header("Copilot-Vision-Request", "true");
     }
 
-    let response = context
-        .with_device_headers(req)
-        .json(&responses_body)
-        .send_logged()
-        .await?;
+    let response = req.json(&responses_body).send_logged().await?;
     let status = response.status().as_u16();
     let content_type = http_utils::response_content_type(&response);
     let text = response.text().await?;
@@ -541,11 +513,7 @@ pub(crate) async fn send_openai_responses(
     )
     .await?;
     let req = opencode_session::with_session_header(req, &url, Some(&responses_body));
-    let response = context
-        .with_device_headers(req)
-        .json(&responses_body)
-        .send_logged()
-        .await?;
+    let response = req.json(&responses_body).send_logged().await?;
     let status = response.status().as_u16();
     let content_type = http_utils::response_content_type(&response);
     if status >= 400 {
@@ -797,11 +765,7 @@ pub(crate) async fn send_openai_embeddings(
     .await?;
     let req = opencode_session::with_session_header(req, &url, None);
 
-    let response = context
-        .with_device_headers(req)
-        .json(body)
-        .send_logged()
-        .await?;
+    let response = req.json(body).send_logged().await?;
     let status = response.status().as_u16();
     let content_type = http_utils::response_content_type(&response);
     let body_bytes = response.bytes().await?.to_vec();

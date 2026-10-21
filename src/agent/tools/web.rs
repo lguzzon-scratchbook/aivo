@@ -113,7 +113,7 @@ pub(super) fn search_endpoint() -> String {
     std::env::var("AIVO_SEARCH_ENDPOINT")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("{}/v1/search", crate::constants::AIVO_STARTER_REAL_URL))
+        .unwrap_or_else(|| format!("{}/v1/search", crate::constants::AIVO_GATEWAY_URL))
 }
 
 /// Latched once search is known-exhausted this session (quota/auth/config), so
@@ -145,7 +145,7 @@ pub(super) async fn web_search(args: &Value) -> Result<String, String> {
     let builder = client
         .post(search_endpoint())
         .json(&json!({ "query": query, "max_results": max_results }));
-    let resp = crate::services::device_fingerprint::with_starter_headers(builder)
+    let resp = crate::services::device_fingerprint::with_device_headers(builder)
         .send()
         .await
         .map_err(|e| search_unavailable(&format!("couldn't reach web search ({e})")))?;
@@ -203,7 +203,7 @@ pub(super) fn parse_search_results(body: &str, max: usize) -> Vec<SearchHit> {
 pub(super) fn classify_search_error(status: u16) -> (String, bool) {
     match status {
         401 => (
-            search_exhausted("Web search needs sign-in — run `aivo login`"),
+            search_exhausted("Web search is unavailable for this device"),
             true,
         ),
         429 => (

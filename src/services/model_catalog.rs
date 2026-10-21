@@ -16,7 +16,7 @@ use crate::services::http_utils;
 use crate::services::http_utils::normalize_base_url;
 use crate::services::models_cache::{ModelMetadata, ModelsCache, full_catalog_key};
 use crate::services::provider_profile::{
-    ModelListingStrategy, cloudflare_ai_base, is_aivo_starter_base, provider_profile_for_key,
+    ModelListingStrategy, cloudflare_ai_base, provider_profile_for_key,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 
@@ -45,7 +45,7 @@ pub(crate) struct ModelInfo {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub deprecated: bool,
     /// Reasoning-effort levels advertised by `/v1/models`; drives `/effort` for
-    /// catalog-only models (e.g. `aivo/starter`) the snapshot lacks.
+    /// catalog-only models the snapshot lacks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<String>,
     /// Live catalog `image_input` when advertised. `None` = unknown.
@@ -738,51 +738,6 @@ pub(crate) fn cursor_cache_looks_corrupt(key: &ApiKey, cached: &[String]) -> boo
     key.is_cursor_acp() && cached.iter().any(|id| id.trim() == "No")
 }
 
-/// Pure decision for `starter_model_still_available`: given a freshly-fetched
-/// catalog, decide whether `model` is still listed. An empty catalog is
-/// treated as a transient hiccup and passes through rather than flagging
-/// every user's model as gone.
-fn model_present_in_catalog(catalog: &[String], model: &str) -> bool {
-    catalog.is_empty() || catalog.iter().any(|m| m == model)
-}
-
-/// Whether `model` is still listed for the aivo-starter server. `true` (skip)
-/// for non-starter keys, the `aivo/starter` sentinel, `MODEL_DEFAULT_PLACEHOLDER`,
-/// and an un-cached catalog.
-///
-/// Non-blocking by design: reads only the last-known catalog and never fetches,
-/// so the chat/run/start launch never waits on `/v1/models` (that cost ~1s every
-/// launch). Reads both starter cache spellings — the picker/`aivo models` key by
-/// the sentinel, chat's background warm by the post-swap real URL — which are
-/// never unified (the routers depend on the real-URL entry). The warm keeps it
-/// fresh; a removal shows up a launch late, with the first request's error
-/// bridging the gap.
-pub(crate) async fn starter_model_still_available(
-    key: &ApiKey,
-    cache: &ModelsCache,
-    model: &str,
-) -> bool {
-    if !is_aivo_starter_base(&key.base_url) {
-        return true;
-    }
-    if model == crate::constants::AIVO_STARTER_MODEL
-        || model == crate::constants::MODEL_DEFAULT_PLACEHOLDER
-    {
-        return true;
-    }
-    let mut catalog = cache
-        .model_ids(crate::constants::AIVO_STARTER_SENTINEL)
-        .await
-        .unwrap_or_default();
-    if let Some(more) = cache
-        .model_ids(crate::constants::AIVO_STARTER_REAL_URL)
-        .await
-    {
-        catalog.extend(more);
-    }
-    model_present_in_catalog(&catalog, model)
-}
-
 /// Fetch models with full metadata from the API where available.
 /// Providers like OpenRouter/Vercel return context window, pricing, and max output.
 /// Google returns inputTokenLimit and outputTokenLimit.
@@ -871,32 +826,6 @@ pub(crate) async fn fetch_models_detailed_filtered(
     let profile = provider_profile_for_key(key);
 
     let raw: Vec<ModelInfo> = match profile.model_listing_strategy {
-        ModelListingStrategy::AivoStarter => {
-            let starter_base = crate::constants::AIVO_STARTER_REAL_URL;
-            let url = format!("{}/v1/models", starter_base.trim_end_matches('/'));
-            let response = crate::services::device_fingerprint::with_starter_headers(
-                client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", key.key.as_str())),
-            )
-            .send_logged()
-            .await?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(friendly_api_error(status, &body));
-            }
-
-            let resp: OpenAIModelsResponse = response.json().await?;
-            let scale = infer_price_scale(&resp.data);
-            Ok::<_, anyhow::Error>(
-                resp.data
-                    .into_iter()
-                    .filter_map(|m| m.into_model_info(scale))
-                    .collect(),
-            )
-        }
         ModelListingStrategy::Ollama => {
             crate::services::ollama::ensure_ready().await?;
             let ids = crate::services::ollama::list_models().await?;
@@ -1724,88 +1653,6 @@ mod tests {
             result.is_err(),
             "Expected network error, not cached stale data"
         );
-    }
-
-    // Tests for `starter_model_still_available`. Short-circuit paths (no
-    // network) are exercised through the full helper; catalog-content
-    // decisions are tested through the pure `model_present_in_catalog` so
-    // they don't depend on HTTP fixtures.
-
-    #[tokio::test]
-    async fn starter_validation_passes_non_starter_keys_without_network() {
-        let dir = TempDir::new().unwrap();
-        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
-        let key = make_key("https://api.example.com");
-        assert!(starter_model_still_available(&key, &cache, "any-model").await);
-    }
-
-    #[tokio::test]
-    async fn starter_validation_reads_cached_catalog_without_network() {
-        let dir = TempDir::new().unwrap();
-        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
-        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
-
-        // Empty cache → can't judge → passes (never blocks a fresh install).
-        assert!(starter_model_still_available(&key, &cache, "model-a").await);
-
-        // The chat warm keys the catalog by the post-swap real URL; validation
-        // must read it even though the key's base_url is the sentinel.
-        cache
-            .set(
-                &full_catalog_key(crate::constants::AIVO_STARTER_REAL_URL),
-                vec!["model-a".to_string()],
-            )
-            .await;
-        assert!(starter_model_still_available(&key, &cache, "model-a").await);
-        assert!(!starter_model_still_available(&key, &cache, "model-gone").await);
-    }
-
-    #[tokio::test]
-    async fn starter_validation_passes_sentinel_model_without_network() {
-        let dir = TempDir::new().unwrap();
-        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
-        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
-        // `aivo/starter` is the stable sentinel — the helper must short-circuit.
-        assert!(
-            starter_model_still_available(&key, &cache, crate::constants::AIVO_STARTER_MODEL,)
-                .await
-        );
-    }
-
-    #[tokio::test]
-    async fn starter_validation_passes_default_placeholder_without_network() {
-        let dir = TempDir::new().unwrap();
-        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
-        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
-        assert!(
-            starter_model_still_available(
-                &key,
-                &cache,
-                crate::constants::MODEL_DEFAULT_PLACEHOLDER,
-            )
-            .await
-        );
-    }
-
-    #[test]
-    fn model_present_when_catalog_contains_it() {
-        let catalog = vec!["a".to_string(), "b".to_string()];
-        assert!(model_present_in_catalog(&catalog, "a"));
-        assert!(model_present_in_catalog(&catalog, "b"));
-    }
-
-    #[test]
-    fn model_absent_when_catalog_does_not_contain_it() {
-        let catalog = vec!["a".to_string(), "b".to_string()];
-        assert!(!model_present_in_catalog(&catalog, "removed"));
-    }
-
-    #[test]
-    fn empty_catalog_passes_through() {
-        // A `200 OK` with `data: []` is almost always a transient server bug,
-        // not "every model was removed". Pass through rather than flagging
-        // every user's persisted model as gone.
-        assert!(model_present_in_catalog(&[], "anything"));
     }
 
     #[test]

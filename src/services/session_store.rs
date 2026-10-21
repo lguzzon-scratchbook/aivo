@@ -1269,10 +1269,6 @@ pub struct StoredConfig {
         deserialize_with = "deserialize_legacy_chat_sessions"
     )]
     pub chat_sessions: HashMap<String, CodeSessionState>,
-    /// Set to true when the user manually removes the aivo-starter key.
-    /// Prevents auto-recreation until the user explicitly re-adds it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub starter_key_dismissed: bool,
     /// Legacy seed for the `/skills` opt-outs. Storage moved to code-prefs.json
     /// (`disabledSkills`) so the high-frequency config.json writers (`run`/`start`/
     /// `serve`, key edits, route learning) — and any older aivo binary that predates
@@ -1389,7 +1385,6 @@ impl StoredConfig {
             aliases: HashMap::new(),
             last_selection: None,
             chat_sessions: HashMap::new(),
-            starter_key_dismissed: false,
             disabled_skills: Vec::new(),
             disabled_mcp_servers: Vec::new(),
             extra: BTreeMap::new(),
@@ -1865,51 +1860,6 @@ impl SessionStore {
     /// Gets the currently active API key with its secret decrypted.
     pub async fn get_active_key(&self) -> Result<Option<ApiKey>> {
         self.api_keys.get_active_key().await
-    }
-
-    /// Ensures the aivo starter key exists in the config.
-    /// Creates it if missing, does NOT change the active key.
-    /// Respects the dismissed flag — returns None if the user previously removed it.
-    /// Returns `(key, is_new_user)` where `is_new_user` is true when no keys existed before.
-    pub async fn ensure_starter_key(&self) -> Option<(ApiKey, bool)> {
-        use crate::constants::{
-            AIVO_STARTER_EMPTY_SECRET, AIVO_STARTER_KEY_NAME, AIVO_STARTER_MODEL,
-            AIVO_STARTER_SENTINEL,
-        };
-        let config = self.api_keys.ctx.load().await.ok()?;
-        if config.starter_key_dismissed {
-            return None;
-        }
-        let is_new_user = config.api_keys.is_empty();
-        // Common path: starter already exists. Reuse the entry we just
-        // loaded — no second `load()`, no PBKDF2 (callers only read `.id`).
-        if let Some(existing) = config
-            .api_keys
-            .iter()
-            .find(|k| k.base_url == AIVO_STARTER_SENTINEL)
-        {
-            return Some((existing.clone(), is_new_user));
-        }
-        let id = self
-            .add_key_with_protocol(
-                AIVO_STARTER_KEY_NAME,
-                AIVO_STARTER_SENTINEL,
-                None,
-                AIVO_STARTER_EMPTY_SECRET,
-            )
-            .await
-            .ok()?;
-        let _ = self.set_code_model(&id, AIVO_STARTER_MODEL).await;
-        let key = self.get_key_by_id(&id).await.ok().flatten()?;
-        Some((key, is_new_user))
-    }
-
-    /// Sets the starter_key_dismissed flag in the config.
-    pub async fn set_starter_key_dismissed(&self, dismissed: bool) -> Result<()> {
-        let _lock = self.api_keys.ctx.acquire_config_lock()?;
-        let mut config = self.api_keys.ctx.load().await?;
-        config.starter_key_dismissed = dismissed;
-        self.api_keys.ctx.save_raw(&config).await
     }
 
     /// Skill names the user has turned off in `/skills`. Backed by code-prefs.json
@@ -4239,7 +4189,6 @@ mod tests {
         assert_eq!(session.messages[0].content, "hello");
 
         // New fields default correctly
-        assert!(!config.starter_key_dismissed);
         assert!(config.aliases.is_empty());
     }
 
@@ -4274,8 +4223,7 @@ mod tests {
                 "tool": "claude",
                 "model": "claude-sonnet-4-6",
                 "updatedAt": "2026-01-15T00:00:00Z"
-            },
-            "starter_key_dismissed": true
+            }
         }"#;
 
         let config: StoredConfig = serde_json::from_str(json).unwrap();
@@ -4296,8 +4244,6 @@ mod tests {
         // Global last_selection (new format) loaded directly
         let sel = config.last_selection.unwrap();
         assert_eq!(sel.tool, "claude");
-
-        assert!(config.starter_key_dismissed);
     }
 
     /// Aliases of both shapes (string for Model, object for Bundle) must
@@ -4369,7 +4315,6 @@ mod tests {
         assert!(config.code_models.is_empty());
         assert!(config.aliases.is_empty());
         assert!(config.last_selection.is_none());
-        assert!(!config.starter_key_dismissed);
     }
 
     #[test]

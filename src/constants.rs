@@ -11,19 +11,9 @@ pub const MODEL_DEFAULT_PLACEHOLDER: &str = "__default__";
 /// Display label shown in the model picker for the default/skip option.
 pub const MODEL_DEFAULT_DISPLAY: &str = "(leave it to the tool)";
 
-/// Default provider for new users who have no API keys configured.
-/// The sentinel base URL is resolved to the real URL before HTTP calls.
-pub const AIVO_STARTER_SENTINEL: &str = "aivo-starter";
-pub const AIVO_STARTER_REAL_URL: &str = "https://api.getaivo.dev";
-pub const AIVO_STARTER_MODEL: &str = "aivo/starter";
-pub const AIVO_STARTER_KEY_NAME: &str = "aivo";
-pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
-
-/// Base URL of the aivo web app (account sign-in + device-link approval).
-/// `aivo login` hits its `/api/device/*` endpoints and opens its `/device`
-/// page. Distinct from the API gateway (`AIVO_STARTER_REAL_URL`). Overridable
-/// via the `AIVO_WEBSITE_BASE_URL` env var for testing against `wrangler pages dev`.
-pub const AIVO_WEBSITE_BASE_URL: &str = "https://getaivo.dev";
+/// Base URL of the aivo gateway that hosts the first-party web tools
+/// (search, image generation, image describe). Requests are device-signed.
+pub const AIVO_GATEWAY_URL: &str = "https://api.getaivo.dev";
 
 /// AI tool names recognized as positional arguments to `aivo run` and as the
 /// first token of a Bundle alias's launch line (e.g. `aivo alias quick claude
@@ -51,8 +41,6 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     // Top-level subcommands
     "run",
     "keys",
-    "account",
-    "usage",
     "code",
     "chat",
     "models",
@@ -60,8 +48,6 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "alias",
     "info",
     "ls",
-    "login",
-    "logout",
     "logs",
     "stats",
     "update",
