@@ -905,10 +905,6 @@ conversation is preserved."
                 label: "Mode",
             },
             ConfigRow {
-                setting: ConfigSetting::UseWebSearch,
-                label: "Web search",
-            },
-            ConfigRow {
                 setting: ConfigSetting::AgentTools,
                 label: "Agent tools",
             },
@@ -1003,12 +999,6 @@ conversation is preserved."
                 "Edits apply; risky commands ask first. Plan mode is /plan, not a standing setting."
                     .to_string()
             }
-            (ConfigSetting::UseWebSearch, "on") => {
-                "The agent can search the web through aivo (daily quota).".to_string()
-            }
-            (ConfigSetting::UseWebSearch, _) => {
-                "The agent won't search via aivo.".to_string()
-            }
             (ConfigSetting::AgentTools, "on") => {
                 "The agent can edit files, run commands, and use tools.".to_string()
             }
@@ -1035,21 +1025,14 @@ conversation is preserved."
             (ConfigSetting::VisionFallback, "custom") => {
                 "The picked model describes images the chat model can't read.".to_string()
             }
-            (ConfigSetting::VisionFallback, "off") => {
-                "Text-only models refuse images.".to_string()
-            }
             (ConfigSetting::VisionFallback, _) => {
-                "When the chat model can't read images, aivo describes them (daily quota)."
-                    .to_string()
+                "Text-only models refuse images.".to_string()
             }
             (ConfigSetting::ImageGen, "custom") => {
                 "The agent can generate images with this model.".to_string()
             }
-            (ConfigSetting::ImageGen, "aivo") => {
-                "The agent generates images through aivo (daily quota).".to_string()
-            }
             (ConfigSetting::ImageGen, _) => {
-                "The agent can't generate images. Switch to aivo, or to custom to pick a key with an image-output model."
+                "The agent can't generate images. Switch to custom to pick a key with an image-output model."
                     .to_string()
             }
         }
@@ -1153,7 +1136,6 @@ conversation is preserved."
                     OPTIONS.iter().position(|o| *o == label).unwrap_or(0),
                 )
             }
-            ConfigSetting::UseWebSearch => switch(self.web_search_enabled),
             ConfigSetting::AgentTools => switch(self.agent_tools_enabled),
             ConfigSetting::FooterTps => switch(self.footer_tps_enabled),
             ConfigSetting::FooterCacheHit => switch(self.footer_cache_enabled),
@@ -1161,22 +1143,20 @@ conversation is preserved."
             ConfigSetting::VisionFallback => {
                 use crate::services::session_store::VisionFallbackMode;
                 owned(
-                    &["aivo", "custom", "off"],
+                    &["custom", "off"],
                     match self.vision_fallback {
-                        VisionFallbackMode::Gateway => 0,
-                        VisionFallbackMode::Custom => 1,
-                        VisionFallbackMode::Off => 2,
+                        VisionFallbackMode::Custom => 0,
+                        VisionFallbackMode::Off => 1,
                     },
                 )
             }
             ConfigSetting::ImageGen => {
                 use crate::services::session_store::ImageGenMode;
                 owned(
-                    &["aivo", "custom", "off"],
+                    &["custom", "off"],
                     match self.image_gen {
-                        ImageGenMode::Gateway => 0,
-                        ImageGenMode::Custom => 1,
-                        ImageGenMode::Off => 2,
+                        ImageGenMode::Custom => 0,
+                        ImageGenMode::Off => 1,
                     },
                 )
             }
@@ -1293,7 +1273,6 @@ conversation is preserved."
                 let mode = segs.options.get(target).map_or("default", String::as_str);
                 self.set_approval_mode(mode).await;
             }
-            ConfigSetting::UseWebSearch => self.set_web_search_enabled(target == 0).await,
             ConfigSetting::AgentTools => self.set_agent_tools_enabled(target == 0).await,
             ConfigSetting::FooterTps => self.set_footer_tps_enabled(target == 0).await,
             ConfigSetting::FooterCacheHit => self.set_footer_cache_enabled(target == 0).await,
@@ -1313,10 +1292,7 @@ conversation is preserved."
             }
             ConfigSetting::ImageGen => {
                 use crate::services::session_store::ImageGenMode;
-                // `parse` reads the PERSISTED vocabulary ("gateway"); the row
-                // shows `aivo`, which would parse to the Off default.
                 let mode = match segs.options.get(target).map_or("", String::as_str) {
-                    "aivo" => ImageGenMode::Gateway,
                     "custom" => ImageGenMode::Custom,
                     _ => ImageGenMode::Off,
                 };
@@ -1439,9 +1415,6 @@ conversation is preserved."
         self.vision_fallback = mode;
         self.clear_config_error_if(ConfigSetting::VisionFallback);
         let toast = match mode {
-            VisionFallbackMode::Gateway => {
-                "Vision fallback: aivo describes images (daily quota)".to_string()
-            }
             VisionFallbackMode::Custom => match &self.vision_fallback_custom {
                 Some((_, model)) => format!("Vision fallback: {model} describes images"),
                 None => "Vision fallback: custom describer".to_string(),
@@ -1497,9 +1470,6 @@ conversation is preserved."
         self.image_gen = mode;
         self.clear_config_error_if(ConfigSetting::ImageGen);
         let toast = match mode {
-            ImageGenMode::Gateway => {
-                "Image generation: aivo generates images (daily quota)".to_string()
-            }
             ImageGenMode::Custom => match &self.image_gen_custom {
                 Some((_, model)) => format!("Image generation: {model} (generate_image tool)"),
                 None => "Image generation: custom generator".to_string(),
@@ -1540,20 +1510,6 @@ conversation is preserved."
         {
             state.error = None;
         }
-    }
-
-    /// Set the aivo-web-search flag and persist it; the engine applies it next turn.
-    pub(super) async fn set_web_search_enabled(&mut self, on: bool) {
-        if self.web_search_enabled == on {
-            return;
-        }
-        self.web_search_enabled = on;
-        self.show_toast(if on {
-            "aivo web search on"
-        } else {
-            "aivo web search off — the agent won't search via aivo"
-        });
-        let _ = self.session_store.set_chat_web_search_enabled(on).await;
     }
 
     pub(super) async fn set_inline_images_enabled(&mut self, on: bool) {

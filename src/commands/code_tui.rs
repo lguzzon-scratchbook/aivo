@@ -120,7 +120,6 @@ impl CodeTuiApp {
             auto_approve,
             ask_mode,
             thinking_enabled,
-            web_search_enabled,
             agent_tools_enabled,
             inline_images_enabled,
             footer_tps_enabled,
@@ -261,7 +260,6 @@ impl CodeTuiApp {
             }
         }
         app.thinking_enabled = thinking_enabled;
-        app.web_search_enabled = web_search_enabled;
         app.agent_tools_enabled = agent_tools_enabled;
         app.inline_images_enabled = inline_images_enabled;
         app.footer_tps_enabled = footer_tps_enabled;

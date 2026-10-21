@@ -1508,7 +1508,6 @@ pub(super) enum ConfigSetting {
     Thinking,
     /// Standing permission mode (`default` / `auto-approve`).
     Approval,
-    UseWebSearch,
     AgentTools,
     /// Footer generation-rate (tok/s) indicator.
     FooterTps,
@@ -1516,7 +1515,7 @@ pub(super) enum ConfigSetting {
     FooterCacheHit,
     /// Footer session-spend (`~$`) suffix on the context meter.
     FooterPrice,
-    /// Describe images for text-only models (`aivo` / `custom` / `off`).
+    /// Describe images for text-only models (`custom` / `off`).
     VisionFallback,
     /// The agent's `generate_image` tool (`custom` / `off`).
     ImageGen,
@@ -1737,24 +1736,6 @@ pub(super) struct BtwExchange {
 
 pub(super) use crate::services::image_generate::GeneratorSource;
 pub(super) use crate::services::vision_describe::DescriberSource;
-
-/// Whether the vision fallback can cover this turn, and if not why — the one
-/// place that policy is decided. Resolving `OwnKey` is deferred to dispatch.
-pub(super) enum DescriberStatus {
-    Gateway,
-    OwnKey {
-        key_id: String,
-        model: String,
-    },
-    Off,
-    /// Gateway quota/auth exhausted for the rest of the session.
-    Exhausted,
-    /// `custom` selected with no usable pair — unset, or equal to the active
-    /// model (which the per-model upstream would route back into the main chat).
-    Unconfigured,
-    /// Launch-bound OAuth/ACP key: no loopback router for the describe call.
-    NotAgentCapable,
-}
 
 #[derive(Clone)]
 pub(super) enum PickerValue {
@@ -3540,8 +3521,6 @@ pub(super) struct CodeTuiApp {
     /// Anthropic upstreams (so off truly stops reasoning, not just hides it).
     /// Toggled in `/config`, remembered across sessions.
     pub(super) thinking_enabled: bool,
-    /// aivo's hosted web_search; `/config` toggle, applied to the engine each turn.
-    pub(super) web_search_enabled: bool,
     pub(super) agent_tools_enabled: bool,
     /// Footer stat toggles (`/config`); remembered across sessions.
     pub(super) footer_tps_enabled: bool,
@@ -3979,7 +3958,6 @@ impl CodeTuiApp {
             ask_enter_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             plan_state_written: std::cell::Cell::new(false),
             thinking_enabled: true,
-            web_search_enabled: true,
             agent_tools_enabled: true,
             footer_tps_enabled: true,
             footer_cache_enabled: true,

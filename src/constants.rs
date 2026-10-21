@@ -11,8 +11,8 @@ pub const MODEL_DEFAULT_PLACEHOLDER: &str = "__default__";
 /// Display label shown in the model picker for the default/skip option.
 pub const MODEL_DEFAULT_DISPLAY: &str = "(leave it to the tool)";
 
-/// Base URL of the aivo gateway that hosts the first-party web tools
-/// (search, image generation, image describe). Requests are device-signed.
+/// Base URL of the legacy aivo gateway (`aivo/starter` rows written by older
+/// builds). Nothing in the tool path talks to it any more.
 pub const AIVO_GATEWAY_URL: &str = "https://api.getaivo.dev";
 
 /// AI tool names recognized as positional arguments to `aivo run` and as the

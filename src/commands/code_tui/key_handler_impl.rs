@@ -612,11 +612,7 @@ impl CodeTuiApp {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
             if self.enter_ask_mode().await {
-                self.show_toast(if self.ask_web_search_missing() {
-                    "Ask mode — web search is off (/config)"
-                } else {
-                    "Ask mode — ask anything, answers with sources"
-                });
+                self.show_toast("Ask mode — ask anything, answers with sources");
             } else {
                 self.show_toast("Default mode — risky actions ask first");
             }

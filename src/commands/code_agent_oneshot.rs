@@ -44,8 +44,6 @@ async fn resolve_image_generator(
     use crate::services::session_store::ImageGenMode;
     let toggles = session_store.get_chat_toggles().await;
     match toggles.image_gen {
-        // The gateway holds the model and key.
-        ImageGenMode::Gateway => return Some(GeneratorSource::Gateway),
         ImageGenMode::Custom => {}
         ImageGenMode::Off => return None,
     }
@@ -430,7 +428,7 @@ async fn run_agent_captured(
             .with_usage_accounting(session_store.clone(), "code".to_string())
             .with_route_cache(route_cache.clone())
             .quiet(true);
-        // Only an own-key generator needs an upstream; the gateway is direct.
+        // Only a chat-wire generator needs an upstream; the Images API is direct.
         if let Some(GeneratorSource::OwnKey {
             model,
             key: gen_key,

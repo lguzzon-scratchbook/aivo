@@ -371,10 +371,10 @@ async fn config_overlay_renders_live_values_and_focused_options() {
 
     // Theme focused: live values everywhere, alternatives only on that row.
     let text = render(&mut app);
-    for label in ["Theme", "Mode", "dark", "light", "default", "aivo"] {
+    for label in ["Theme", "Mode", "dark", "light", "default"] {
         assert!(text.contains(label), "{label:?} missing:\n{text}");
     }
-    for hidden in ["auto-approve", "gateway"] {
+    for hidden in ["auto-approve", "custom"] {
         assert!(!text.contains(hidden), "{hidden:?} leaked:\n{text}");
     }
     assert!(
@@ -432,9 +432,8 @@ async fn config_overlay_click_selects_list_row() {
         .expect("config list hitbox recorded");
     // Visual rows (split, with group gaps): Appearance, Theme, Inline images,
     // Thinking, Footer tok/s, Footer cache hit, Footer price, blank, Behavior,
-    // Mode, Web search, Agent tools, blank, Media, Vision fallback,
-    // Image generation.
-    let image_row = hitbox.list_area.y + 15;
+    // Mode, Agent tools, blank, Media, Vision fallback, Image generation.
+    let image_row = hitbox.list_area.y + 14;
     app.handle_mouse(left_click(hitbox.list_area.x, image_row))
         .await
         .unwrap();

@@ -1,4 +1,4 @@
-//! Web tools: fetch (SSRF-guarded) and gateway search, plus HTML-to-text.
+//! Web tools: fetch (SSRF-guarded) and keyless search, plus HTML-to-text.
 
 use super::*;
 
@@ -100,26 +100,53 @@ pub(super) async fn web_fetch(args: &Value) -> Result<String, String> {
     Ok(wrap_untrusted(&format!("web_fetch {current}"), &text))
 }
 
-// --- web_search: hosted /v1/search (layer B) ---
+// --- web_search: keyless HTML backends ---
 
+#[derive(Debug)]
 pub(super) struct SearchHit {
     pub(super) title: String,
     pub(super) url: String,
     pub(super) snippet: String,
 }
 
-/// `AIVO_SEARCH_ENDPOINT` overrides the gateway default (local wrangler in dev).
-pub(super) fn search_endpoint() -> String {
-    std::env::var("AIVO_SEARCH_ENDPOINT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("{}/v1/search", crate::constants::AIVO_GATEWAY_URL))
+/// A browser-shaped User-Agent: plain clients get a consent/challenge page from
+/// the HTML backends.
+const HTML_SEARCH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+const HTML_SEARCH_TIMEOUT_SECS: u64 = 8;
+const HTML_SEARCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+struct HtmlSearchProvider {
+    name: &'static str,
+    url: &'static str,
 }
 
-/// Latched once search is known-exhausted this session (quota/auth/config), so
-/// later web_search calls short-circuit instead of re-hitting the gateway.
-pub(super) static SEARCH_EXHAUSTED: std::sync::atomic::AtomicBool =
+/// Keyless fallbacks. Bing first: it redirects to a regional host, so it also
+/// works where the DuckDuckGo endpoints are unreachable. Order only affects
+/// which one answers; a provider that fails is skipped for the session.
+const HTML_SEARCH_PROVIDERS: &[HtmlSearchProvider] = &[
+    HtmlSearchProvider {
+        name: "bing",
+        url: "https://www.bing.com/search",
+    },
+    HtmlSearchProvider {
+        name: "duckduckgo",
+        url: "https://html.duckduckgo.com/html/",
+    },
+];
+
+/// Per-provider dead bitmask, so a network that blocks one backend doesn't pay
+/// its timeout on every later search.
+static HTML_DEAD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Latched when every HTML backend failed — search can't recover this session.
+pub(super) static HTML_EXHAUSTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+fn all_html_providers_dead() -> u8 {
+    (1u8 << HTML_SEARCH_PROVIDERS.len()) - 1
+}
 
 pub(super) async fn web_search(args: &Value) -> Result<String, String> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -127,7 +154,7 @@ pub(super) async fn web_search(args: &Value) -> Result<String, String> {
     if query.is_empty() {
         return Err("web_search: empty query".to_string());
     }
-    if SEARCH_EXHAUSTED.load(Relaxed) {
+    if HTML_EXHAUSTED.load(Relaxed) {
         return Err(search_exhausted(
             "Web search is unavailable for the rest of this session",
         ));
@@ -137,90 +164,214 @@ pub(super) async fn web_search(args: &Value) -> Result<String, String> {
         .unwrap_or(WEB_SEARCH_DEFAULT_RESULTS)
         .clamp(1, WEB_SEARCH_MAX_RESULTS);
 
+    match html_search(query, max_results).await {
+        Ok(hits) => Ok(render_hits(query, hits)),
+        Err(reason) => Err(search_unavailable(&format!(
+            "Couldn't search the web ({reason})"
+        ))),
+    }
+}
+
+fn render_hits(query: &str, hits: Vec<SearchHit>) -> String {
+    if hits.is_empty() {
+        return format!("No web results for {query:?}.");
+    }
+    wrap_untrusted("web_search", &render_search_results(query, &hits))
+}
+
+/// Keyless HTML chain. First provider with results wins; a failed provider is
+/// masked out and every masked-out provider latches `HTML_EXHAUSTED`.
+async fn html_search(query: &str, max_results: usize) -> Result<Vec<SearchHit>, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut reasons: Vec<String> = Vec::new();
+    let mut saw_response = false;
+    for (i, provider) in HTML_SEARCH_PROVIDERS.iter().enumerate() {
+        let bit = 1u8 << i;
+        if HTML_DEAD.load(Relaxed) & bit != 0 {
+            continue;
+        }
+        match fetch_html_results(provider, query).await {
+            Ok(hits) => {
+                saw_response = true;
+                if !hits.is_empty() {
+                    return Ok(hits.into_iter().take(max_results).collect());
+                }
+                reasons.push(format!("{}: no results", provider.name));
+            }
+            Err(reason) => {
+                HTML_DEAD.fetch_or(bit, Relaxed);
+                reasons.push(format!("{}: {reason}", provider.name));
+            }
+        }
+    }
+    if HTML_DEAD.load(Relaxed) & all_html_providers_dead() == all_html_providers_dead() {
+        HTML_EXHAUSTED.store(true, Relaxed);
+    }
+    if reasons.is_empty() {
+        reasons.push("no reachable search backend".to_string());
+    }
+    if saw_response {
+        return Ok(Vec::new());
+    }
+    Err(reasons.join("; "))
+}
+
+async fn fetch_html_results(
+    provider: &HtmlSearchProvider,
+    query: &str,
+) -> Result<Vec<SearchHit>, String> {
+    let mut url = url::Url::parse(provider.url).map_err(|e| e.to_string())?;
+    url.query_pairs_mut().append_pair("q", query);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(WEB_FETCH_TIMEOUT))
+        .timeout(Duration::from_secs(HTML_SEARCH_TIMEOUT_SECS))
+        .user_agent(HTML_SEARCH_USER_AGENT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
-    // Device-signed (same auth as chat); the gateway holds the keys + quota.
-    let builder = client
-        .post(search_endpoint())
-        .json(&json!({ "query": query, "max_results": max_results }));
-    let resp = crate::services::device_fingerprint::with_device_headers(builder)
+    let resp = client
+        .get(url)
         .send()
         .await
-        .map_err(|e| search_unavailable(&format!("couldn't reach web search ({e})")))?;
+        .map_err(|e| format!("couldn't reach it ({e})"))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        let hits = parse_search_results(&text, max_results);
-        if hits.is_empty() {
-            return Ok(format!("No web results for {query:?}."));
-        }
-        return Ok(wrap_untrusted(
-            "web_search",
-            &render_search_results(query, &hits),
-        ));
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
     }
-    let (message, latch) = classify_search_error(status.as_u16());
-    if latch {
-        // Persistent (quota/auth/config) — don't keep hammering the gateway.
-        SEARCH_EXHAUSTED.store(true, Relaxed);
-    }
-    Err(message)
+    let body = read_capped(resp.bytes_stream(), HTML_SEARCH_MAX_BYTES)
+        .await
+        .map_err(|e| format!("couldn't read the page ({e})"))?;
+    let html = String::from_utf8_lossy(&body);
+    Ok(match provider.name {
+        "bing" => parse_bing_results(&html, WEB_SEARCH_MAX_RESULTS),
+        _ => parse_duckduckgo_results(&html, WEB_SEARCH_MAX_RESULTS),
+    })
 }
 
-pub(super) fn parse_search_results(body: &str, max: usize) -> Vec<SearchHit> {
-    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    let Some(arr) = v.get("results").and_then(|r| r.as_array()) else {
-        return Vec::new();
-    };
-    arr.iter()
-        .take(max)
-        .filter_map(|it| {
-            let title = it.get("title")?.as_str()?.trim().to_string();
-            let url = it.get("url")?.as_str()?.trim().to_string();
-            if title.is_empty() || url.is_empty() {
-                return None;
+/// `name="value"` or `name='value'` from an opening tag.
+fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        if let Some(pos) = tag.find(&needle) {
+            let start = pos + needle.len();
+            if let Some(end) = tag[start..].find(quote) {
+                return Some(&tag[start..start + end]);
             }
-            Some(SearchHit {
-                title,
-                url,
-                snippet: it
-                    .get("snippet")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            })
-        })
-        .collect()
+        }
+    }
+    None
 }
 
-/// Non-200 → (actionable layer-C message, whether to latch the session
-/// exhausted). 401/429/503 are persistent (latch + tell the model to stop); 502
-/// and network errors are transient (no latch). Leads with the human-readable
-/// status so the truncated tool-card line stays meaningful.
-pub(super) fn classify_search_error(status: u16) -> (String, bool) {
-    match status {
-        401 => (
-            search_exhausted("Web search is unavailable for this device"),
-            true,
-        ),
-        429 => (
-            search_exhausted("Today's web-search quota is used up"),
-            true,
-        ),
-        503 => (search_exhausted("Web search isn't configured"), true),
-        502 => (search_unavailable("Web search is temporarily down"), false),
-        _ => (
-            search_unavailable(&format!("Web search failed (HTTP {status})")),
-            false,
-        ),
+/// Bing: `<li class="b_algo">` blocks with an `<h2><a href>` title and a `<p>`
+/// snippet.
+pub(super) fn parse_bing_results(html: &str, max: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    for block in html.split("b_algo").skip(1) {
+        if hits.len() >= max {
+            break;
+        }
+        let block = block.split("</li>").next().unwrap_or(block);
+        let Some(h2) = block.find("<h2").map(|i| &block[i..]) else {
+            continue;
+        };
+        let Some(a) = h2.find("<a").map(|i| &h2[i..]) else {
+            continue;
+        };
+        let Some(open_end) = a.find('>') else {
+            continue;
+        };
+        let Some(url) = attr_value(&a[..open_end], "href") else {
+            continue;
+        };
+        let title = a[open_end + 1..].split("</a>").next().unwrap_or("");
+        let snippet = block
+            .find("<p")
+            .and_then(|i| {
+                let p = &block[i..];
+                p.find('>')
+                    .map(|e| p[e + 1..].split("</p>").next().unwrap_or(""))
+            })
+            .unwrap_or("");
+        push_hit(&mut hits, url, title, snippet);
     }
+    hits
+}
+
+/// DuckDuckGo HTML/lite: anchors tagged `result__a`, snippets in
+/// `result__snippet` / `result-snippet`. Result URLs are `uddg=` redirects.
+pub(super) fn parse_duckduckgo_results(html: &str, max: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    let mut positions: Vec<usize> = ["result__a", "result-link"]
+        .iter()
+        .flat_map(|marker| html.match_indices(marker).map(|(i, _)| i))
+        .collect();
+    positions.sort_unstable();
+    for (n, &pos) in positions.iter().enumerate() {
+        if hits.len() >= max {
+            break;
+        }
+        let end = positions.get(n + 1).copied().unwrap_or(html.len());
+        let Some(tag_start) = html[..pos].rfind('<') else {
+            continue;
+        };
+        let Some(open_end) = html[pos..].find('>').map(|e| pos + e) else {
+            continue;
+        };
+        let Some(url) = attr_value(&html[tag_start..open_end], "href") else {
+            continue;
+        };
+        let title = html[open_end + 1..end].split("</a>").next().unwrap_or("");
+        let snippet = ["result__snippet", "result-snippet"]
+            .iter()
+            .find_map(|needle| {
+                let sp = html[pos..end].find(needle)? + pos;
+                let oe = sp + html[sp..].find('>')?;
+                let tail = &html[oe + 1..end];
+                let close = tail
+                    .find("</a>")
+                    .or_else(|| tail.find("</td>"))
+                    .unwrap_or(tail.len());
+                Some(&tail[..close])
+            })
+            .unwrap_or("");
+        push_hit(&mut hits, &decode_result_url(url), title, snippet);
+    }
+    hits
+}
+
+fn push_hit(hits: &mut Vec<SearchHit>, url: &str, title: &str, snippet: &str) {
+    let title = html_to_text(title).trim().to_string();
+    let url = decode_entities(url).trim().to_string();
+    if title.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return;
+    }
+    hits.push(SearchHit {
+        title,
+        url,
+        snippet: html_to_text(snippet).trim().to_string(),
+    });
+}
+
+fn decode_result_url(raw: &str) -> String {
+    let raw = decode_entities(raw);
+    let full = if raw.starts_with("//") {
+        format!("https:{raw}")
+    } else {
+        raw
+    };
+    if let Ok(u) = url::Url::parse(&full)
+        && u.host_str()
+            .is_some_and(|h| h == "duckduckgo.com" || h.ends_with(".duckduckgo.com"))
+        && let Some(target) = u
+            .query_pairs()
+            .find(|(k, _)| k == "uddg")
+            .map(|(_, v)| v.into_owned())
+    {
+        return target;
+    }
+    full
 }
 
 /// Persistent unavailability — tell the model to STOP retrying (the engine also
-/// short-circuits later calls via `SEARCH_EXHAUSTED`).
+/// short-circuits later calls via `HTML_EXHAUSTED`).
 pub(super) fn search_exhausted(reason: &str) -> String {
     format!(
         "{reason}. Don't call web_search again this session — answer from what you already \
@@ -451,6 +602,17 @@ pub(super) fn decode_entities(s: &str) -> String {
         ("&#39;", "'"),
         ("&apos;", "'"),
         ("&nbsp;", " "),
+        ("&ensp;", " "),
+        ("&emsp;", " "),
+        ("&thinsp;", " "),
+        ("&middot;", "·"),
+        ("&hellip;", "…"),
+        ("&mdash;", "—"),
+        ("&ndash;", "–"),
+        ("&rsquo;", "’"),
+        ("&lsquo;", "‘"),
+        ("&ldquo;", "“"),
+        ("&rdquo;", "”"),
         ("&amp;", "&"),
     ];
     let mut out = String::with_capacity(s.len());

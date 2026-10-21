@@ -183,23 +183,6 @@ fn test_placeholder_follows_the_mode() {
     assert!(p.contains("queue"), "{p}");
 }
 
-#[tokio::test]
-async fn test_ask_entry_hints_when_web_search_is_off() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-
-    app.web_search_enabled = false;
-    app.run_ask_command(None).await;
-    let notice = app.notice.as_ref().map(|(_, m)| m.clone()).unwrap();
-    assert!(notice.contains("web search is off"), "{notice}");
-
-    app.run_ask_command(Some("exit".to_string())).await;
-    app.web_search_enabled = true;
-    app.run_ask_command(None).await;
-    let notice = app.notice.as_ref().map(|(_, m)| m.clone()).unwrap();
-    assert!(!notice.contains("web search is off"), "{notice}");
-}
-
 /// auto-approve → /ask → /new must land back in auto-approve, not default.
 #[tokio::test]
 async fn test_new_chat_restores_standing_mode_from_ask_and_plan() {

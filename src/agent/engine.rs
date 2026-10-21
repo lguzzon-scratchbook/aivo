@@ -654,7 +654,7 @@ pub struct AgentEngine {
     /// Whether the model is asked to think this turn. Off makes [`Self::thinking_request`]
     /// emit a disable signal. Set per turn from the `/config` toggle.
     thinking_enabled: bool,
-    /// `/config` toggle for aivo's hosted web_search (the local tool); native search untouched.
+    /// `/config` toggle for the local web_search tool; native search untouched.
     use_web_search_enabled: bool,
     /// `/config` Image generation model; `Some` advertises `generate_image`.
     /// `None` → `generate_image` isn't advertised.

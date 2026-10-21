@@ -710,37 +710,22 @@ impl CodeTuiApp {
         crate::commands::code_agent_oneshot::key_is_agent_capable(&self.key)
     }
 
-    pub(super) fn describer_status(&self) -> DescriberStatus {
-        use crate::services::session_store::VisionFallbackMode;
-        if !self.agent_capable() {
-            return DescriberStatus::NotAgentCapable;
-        }
-        match &self.vision_fallback {
-            VisionFallbackMode::Off => DescriberStatus::Off,
-            VisionFallbackMode::Gateway
-                if crate::services::vision_describe::describe_exhausted() =>
-            {
-                DescriberStatus::Exhausted
-            }
-            VisionFallbackMode::Gateway => DescriberStatus::Gateway,
-            VisionFallbackMode::Custom => match &self.vision_fallback_custom {
-                Some((key_id, model)) if *model != self.model => DescriberStatus::OwnKey {
-                    key_id: key_id.clone(),
-                    model: model.clone(),
-                },
-                _ => DescriberStatus::Unconfigured,
-            },
-        }
-    }
-
-    /// The custom key is resolved + decrypted here so the spawned turn just
-    /// calls it.
+    /// Resolve the describer for this turn from the stored `custom` pair; `off`
+    /// refuses. The key is decrypted here so the spawned turn just calls it.
     pub(super) async fn resolve_describer(&self) -> std::result::Result<DescriberSource, String> {
-        let status = self.describer_status();
-        match &status {
-            DescriberStatus::Gateway => return Ok(DescriberSource::Gateway),
-            DescriberStatus::OwnKey { key_id, model } => {
-                if let Ok(Some(mut key)) = self.session_store.get_key_by_id(key_id).await
+        use crate::services::session_store::VisionFallbackMode;
+        let base = self.image_refusal_base();
+        if !self.agent_capable() {
+            return Err(base);
+        }
+        match self.vision_fallback {
+            VisionFallbackMode::Off => {
+                Err(format!("{base} Or turn on Vision fallback in /config."))
+            }
+            VisionFallbackMode::Custom => {
+                if let Some((key_id, model)) = &self.vision_fallback_custom
+                    && *model != self.model
+                    && let Ok(Some(mut key)) = self.session_store.get_key_by_id(key_id).await
                     && crate::services::session_store::SessionStore::decrypt_key_secret(&mut key)
                         .is_ok()
                 {
@@ -749,23 +734,21 @@ impl CodeTuiApp {
                         key: Box::new(key),
                     });
                 }
+                Err(format!(
+                    "{base} Or re-pick the describer: /config → Vision fallback → custom."
+                ))
             }
-            _ => {}
         }
-        Err(self.vision_refusal_message(&status))
     }
 
-    /// Generator source, resolved at dispatch. `None` (off, unconfigured, or
-    /// the pair's model equals the chat model — that would hijack main turns)
-    /// leaves `generate_image` unregistered; no refusal flow.
+    /// Generator source, resolved at dispatch. `None` (off, or no usable
+    /// `custom` pair) leaves `generate_image` unregistered; no refusal flow.
     pub(super) async fn resolve_image_generator(&self) -> Option<GeneratorSource> {
         use crate::services::session_store::ImageGenMode;
         if !self.agent_capable() {
             return None;
         }
         match self.image_gen {
-            // The gateway holds the model and key; failures surface as tool errors.
-            ImageGenMode::Gateway => return Some(GeneratorSource::Gateway),
             ImageGenMode::Custom => {}
             ImageGenMode::Off => return None,
         }
@@ -806,20 +789,6 @@ impl CodeTuiApp {
             "{} can't read images — switch to a vision model (e.g. /model) and resend.",
             self.model
         )
-    }
-
-    /// The image refusal, hinted by WHY the fallback didn't cover. `OwnKey` lands
-    /// here only when the stored key vanished or wouldn't decrypt.
-    fn vision_refusal_message(&self, status: &DescriberStatus) -> String {
-        let base = self.image_refusal_base();
-        match status {
-            DescriberStatus::Off => format!("{base} Or turn on Vision fallback in /config."),
-            DescriberStatus::Exhausted => format!("image-describe quota used up — {base}"),
-            DescriberStatus::Unconfigured | DescriberStatus::OwnKey { .. } => {
-                format!("{base} Or re-pick the describer: /config → Vision fallback → custom.")
-            }
-            DescriberStatus::Gateway | DescriberStatus::NotAgentCapable => base,
-        }
     }
 
     /// Refresh the cached git branch for `display_cwd`, throttled so the footer's
@@ -1117,7 +1086,7 @@ impl CodeTuiApp {
             model_upstreams.push((model.clone(), key.as_ref().clone()));
         }
         let image_source = self.resolve_image_generator().await;
-        // Only an own-key generator needs an upstream; the gateway is direct.
+        // Only a chat-wire generator needs an upstream; the Images API is direct.
         if let Some(GeneratorSource::OwnKey { model, key }) = &image_source {
             // The router keys upstreams by model name; if the describer already
             // claimed this model, keep its route (generation still works, same
@@ -1160,8 +1129,6 @@ impl CodeTuiApp {
         // Thinking on/off, carried in per turn like the effort; off makes the engine
         // emit the provider-correct disable signal.
         let thinking_enabled = self.thinking_enabled;
-        // `/config` "use aivo web search" toggle, applied like thinking each turn.
-        let web_search_enabled = self.web_search_enabled;
         let agent_tools_enabled = self.agent_tools_enabled;
         // The pane renders through the graphics stack — no protocol, no tool.
         let preview_supported = self.inline_images.caps.enabled();
@@ -1230,7 +1197,6 @@ impl CodeTuiApp {
             engine.set_context_window(context_window);
             engine.set_reply_obligation(reply_obligation);
             engine.set_thinking_enabled(thinking_enabled);
-            engine.set_web_search_enabled(web_search_enabled);
             engine.set_agent_tools_enabled(agent_tools_enabled);
             engine.set_image_source(image_source);
             engine.set_preview_supported(preview_supported);
@@ -3088,12 +3054,6 @@ and keep each turn's work small"
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// True when ask mode has NO web retrieval (toggle off, no native search) —
-    /// a research mode that silently can't reach the web misleads, so entry hints.
-    pub(super) fn ask_web_search_missing(&self) -> bool {
-        !self.web_search_enabled && !crate::agent::tools::native_web_search_enabled(&self.model)
-    }
-
     /// `/ask` — enter read-only research/learning mode; with a question, ask it
     /// in the same breath; `exit` leaves and restores the prior standing mode.
     pub(super) async fn run_ask_command(&mut self, arg: Option<String>) {
@@ -3150,12 +3110,8 @@ and keep each turn's work small"
                 }
                 self.notice = Some((
                     MUTED(),
-                    if self.ask_web_search_missing() {
-                        "Ask mode — web search is off (/config to enable); answers come from the model's own knowledge"
-                    } else {
-                        "Ask mode — general Q&A with web search, no project context (/ask exit to leave)"
-                    }
-                    .to_string(),
+                    "Ask mode — general Q&A with web search, no project context (/ask exit to leave)"
+                        .to_string(),
                 ));
             }
             question => {
@@ -3174,11 +3130,6 @@ and keep each turn's work small"
                 // record: None keeps the question out of ↑/↓ recall (mirrors /plan).
                 if let Err(e) = self.dispatch_user_message(question.to_string(), None).await {
                     self.notice = Some((ERROR(), e.to_string()));
-                } else if self.ask_web_search_missing() {
-                    self.notice = Some((
-                        MUTED(),
-                        "Ask mode — note: web search is off (/config to enable)".to_string(),
-                    ));
                 }
             }
         }

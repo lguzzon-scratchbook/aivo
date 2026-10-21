@@ -1,21 +1,16 @@
 //! Vision fallback: describe images with a cheap vision model so text-only
-//! models can "see" them, via the hosted gateway `/v1/describe` (device-signed
-//! and quota'd, mirroring `/v1/search`) or the user's own vision key.
+//! models can "see" them, through one of the user's own configured keys.
 
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
-use serde::Serialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::services::session_store::ApiKey;
 
-/// Where a describe call goes, resolved (and the custom key decrypted) at
-/// dispatch so the spawned turn just calls it.
+/// Where a describe call goes, resolved (and the key decrypted) at dispatch so
+/// the spawned turn just calls it.
 #[derive(Clone)]
 pub enum DescriberSource {
-    Gateway,
     OwnKey { model: String, key: Box<ApiKey> },
 }
 
@@ -29,20 +24,6 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 const TIMEOUT_SECS: u64 = 60;
 
-/// Latched once describe is known-exhausted this session (quota/auth/config),
-/// so the shim falls back to the plain refusal instead of re-hitting the gateway.
-pub static DESCRIBE_EXHAUSTED: AtomicBool = AtomicBool::new(false);
-
-/// Held by tests that flip the process-global latch or the endpoint env var, so
-/// parallel threads can't observe each other's window. Async because both
-/// holders await mid-critical-section.
-#[cfg(test)]
-pub static TEST_DESCRIBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-pub fn describe_exhausted() -> bool {
-    DESCRIBE_EXHAUSTED.load(Relaxed)
-}
-
 /// The own-key path rides the caller's loopback serve, so usage is accounted
 /// under "code" like any other turn request.
 pub async fn describe(
@@ -52,7 +33,7 @@ pub async fn describe(
     auth: &str,
     data_url: &str,
 ) -> Result<String, String> {
-    let Some((mime, data)) = parse_data_url(data_url).filter(|(mime, _)| !mime.is_empty()) else {
+    let Some((_mime, data)) = parse_data_url(data_url).filter(|(mime, _)| !mime.is_empty()) else {
         return Err("image attachment isn't a base64 data URL".to_string());
     };
     if image_too_large(data) {
@@ -61,97 +42,13 @@ pub async fn describe(
             MAX_IMAGE_BYTES / (1024 * 1024)
         ));
     }
-    match src {
-        DescriberSource::Gateway => describe_via_gateway(mime, data).await,
-        DescriberSource::OwnKey { model, .. } => {
-            describe_via_key(client, base, auth, model, data_url).await
-        }
-    }
-}
-
-/// Non-200 → (actionable message, whether to latch the session exhausted).
-fn classify_describe_error(status: u16) -> (String, bool) {
-    match status {
-        401 => (
-            "image describe needs sign-in — run `aivo login`".to_string(),
-            true,
-        ),
-        403 => (
-            "image describe isn't available on your plan".to_string(),
-            true,
-        ),
-        429 => ("today's image-describe quota is used up".to_string(), true),
-        503 => ("image describe isn't configured".to_string(), true),
-        413 => ("image too large for describe".to_string(), false),
-        400 => ("image couldn't be decoded for describe".to_string(), false),
-        502 => ("image describe is temporarily down".to_string(), false),
-        _ => (format!("image describe failed (HTTP {status})"), false),
-    }
+    let DescriberSource::OwnKey { model, .. } = src;
+    describe_via_key(client, base, auth, model, data_url).await
 }
 
 /// Cap check on base64 length — no decode.
 fn image_too_large(base64: &str) -> bool {
     base64.len() / 4 * 3 > MAX_IMAGE_BYTES
-}
-
-#[derive(Serialize)]
-struct GatewayBody<'a> {
-    image: &'a str,
-    media_type: &'a str,
-}
-
-/// Latches `DESCRIBE_EXHAUSTED` on persistent failures so callers can stop
-/// offering the shim this session.
-async fn describe_via_gateway(media_type: &str, base64: &str) -> Result<String, String> {
-    if describe_exhausted() {
-        return Err("image describe is unavailable for the rest of this session".to_string());
-    }
-    // `AIVO_DESCRIBE_ENDPOINT` (tests, local wrangler) points at loopback, which
-    // an HTTP(S)_PROXY env would swallow.
-    let override_endpoint = std::env::var("AIVO_DESCRIBE_ENDPOINT")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let mut builder = crate::services::http_utils::aivo_http_client_builder()
-        .timeout(Duration::from_secs(TIMEOUT_SECS));
-    if override_endpoint.is_some() {
-        builder = builder.no_proxy();
-    }
-    let client = builder
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-    let endpoint = override_endpoint
-        .unwrap_or_else(|| format!("{}/v1/describe", crate::constants::AIVO_GATEWAY_URL));
-    // Device-signed (same auth as chat); the gateway holds the keys + quota.
-    let builder = client.post(endpoint).json(&GatewayBody {
-        image: base64,
-        media_type,
-    });
-    let resp = crate::services::device_fingerprint::with_device_headers(builder)
-        .send()
-        .await
-        .map_err(|e| format!("couldn't reach image describe ({e})"))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        let description = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("description")?
-                    .as_str()
-                    .map(str::trim)
-                    .map(String::from)
-            })
-            .unwrap_or_default();
-        if description.is_empty() {
-            return Err("describe returned no text".to_string());
-        }
-        return Ok(description);
-    }
-    let (message, latch) = classify_describe_error(status.as_u16());
-    if latch {
-        DESCRIBE_EXHAUSTED.store(true, Relaxed);
-    }
-    Err(message)
 }
 
 async fn describe_via_key(
@@ -220,65 +117,6 @@ pub fn format_described_image(desc: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Latching statuses are covered by the pure classify table — hitting them
-    /// here would race other tests through the process-global latch.
-    #[tokio::test]
-    async fn gateway_round_trip_against_fake_server() {
-        let _guard = TEST_DESCRIBE_LOCK.lock().await;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            for body in [
-                r#"{"description":"a red Submit button"}"#,
-                r#"{"description":""}"#,
-            ] {
-                let (mut sock, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf);
-                let _ = sock.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                );
-            }
-        });
-        unsafe {
-            std::env::set_var(
-                "AIVO_DESCRIBE_ENDPOINT",
-                format!("http://{addr}/v1/describe"),
-            );
-        }
-        let ok = describe_via_gateway("image/png", "aGVsbG8=").await;
-        let empty = describe_via_gateway("image/png", "aGVsbG8=").await;
-        unsafe {
-            std::env::remove_var("AIVO_DESCRIBE_ENDPOINT");
-        }
-        assert_eq!(ok.unwrap(), "a red Submit button");
-        empty.expect_err("empty description is a failure");
-        assert!(!describe_exhausted(), "empty description must not latch");
-    }
-
-    #[test]
-    fn classify_latches_only_persistent_statuses() {
-        for (status, latch) in [
-            (401, true),
-            (403, true),
-            (429, true),
-            (503, true),
-            (413, false),
-            (400, false),
-            (502, false),
-            (500, false),
-        ] {
-            let (message, got) = classify_describe_error(status);
-            assert_eq!(got, latch, "status {status}");
-            assert!(!message.is_empty());
-        }
-    }
 
     #[test]
     fn image_hash_is_stable_and_distinct() {

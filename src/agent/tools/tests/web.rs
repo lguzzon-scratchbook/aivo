@@ -15,21 +15,52 @@ fn decode_entities_handles_numeric_references() {
 }
 
 #[test]
-fn web_search_parses_gateway_results() {
-    let body = r#"{"results":[
-        {"title":"The Rust Book","url":"https://doc.rust-lang.org/book/","snippet":"Learn Rust.","source":"brave"},
-        {"title":"Tokio","url":"https://tokio.rs/","snippet":"Async runtime.","source":"tavily"},
-        {"title":"","url":"https://drop.me/","snippet":"no title"}
-    ]}"#;
-    let hits = parse_search_results(body, 8);
-    assert_eq!(hits.len(), 2); // the title-less row is dropped
-    assert_eq!(hits[0].url, "https://doc.rust-lang.org/book/");
-    assert_eq!(hits[0].title, "The Rust Book");
+fn bing_html_results_parse() {
+    let html = r#"<ol id="b_results">
+        <li class="b_algo"><h2><a target="_blank" href="https://www.rust-lang.org/"><strong>Rust</strong> Programming Language</a></h2>
+        <div class="b_caption"><p class="b_lineclamp2">A language empowering everyone.</p></div></li>
+        <li class="b_algo"><h2><a href="https://tokio.rs/">Tokio</a></h2><p>Async runtime.</p></li>
+    </ol>"#;
+    let hits = parse_bing_results(html, 8);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].url, "https://www.rust-lang.org/");
+    assert_eq!(hits[0].title, "Rust Programming Language");
+    assert!(
+        hits[0].snippet.contains("empowering"),
+        "{:?}",
+        hits[0].snippet
+    );
     assert_eq!(hits[1].url, "https://tokio.rs/");
-    // max caps the count; a malformed/empty body yields no hits.
-    assert_eq!(parse_search_results(body, 1).len(), 1);
-    assert!(parse_search_results("not json", 8).is_empty());
-    assert!(parse_search_results(r#"{"results":[]}"#, 8).is_empty());
+    assert_eq!(parse_bing_results(html, 1).len(), 1);
+}
+
+#[test]
+fn duckduckgo_html_results_parse_and_unwrap_redirects() {
+    let html = r##"<div class="result results_links">
+        <h2><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fbook%2F&amp;rut=x">The Book</a></h2>
+        <a class="result__snippet" href="#">Learn &amp; practice</a></div>"##;
+    let hits = parse_duckduckgo_results(html, 8);
+    assert_eq!(hits.len(), 1, "got: {hits:?}");
+    assert_eq!(hits[0].url, "https://doc.rust-lang.org/book/");
+    assert_eq!(hits[0].title, "The Book");
+    assert_eq!(hits[0].snippet, "Learn & practice");
+}
+
+#[test]
+fn duckduckgo_lite_results_parse() {
+    let html = r##"<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage" class='result-link'>Example</a>
+        <td class='result-snippet'>A &amp; B</td>"##;
+    let hits = parse_duckduckgo_results(html, 8);
+    assert_eq!(hits.len(), 1, "got: {hits:?}");
+    assert_eq!(hits[0].url, "https://example.com/page");
+    assert_eq!(hits[0].title, "Example");
+    assert_eq!(hits[0].snippet, "A & B");
+}
+
+#[test]
+fn html_results_drop_rows_without_a_usable_url() {
+    let bing = r#"<li class="b_algo"><h2><a href="/relative">No host</a></h2></li>"#;
+    assert!(parse_bing_results(bing, 8).is_empty());
 }
 
 #[test]
@@ -42,7 +73,7 @@ fn wrap_untrusted_frames_content_with_source() {
 
 #[test]
 fn web_search_error_messages_are_actionable() {
-    // Every layer-C message must steer the model away from fabricating.
+    // Every unavailability message must steer the model away from fabricating.
     let antifab = |s: &str| {
         assert!(
             s.to_lowercase().contains("invent"),
@@ -50,27 +81,12 @@ fn web_search_error_messages_are_actionable() {
         );
         assert!(s.contains("web_fetch"), "no next step: {s}");
     };
-    // Persistent failures latch the session and tell the model to stop.
-    let (auth, auth_latch) = classify_search_error(401);
-    assert!(auth.contains("unavailable for this device") && auth.contains("Don't call web_search"));
-    assert!(auth_latch);
-    antifab(&auth);
+    let exhausted = search_exhausted("Web search is unavailable for the rest of this session");
+    assert!(exhausted.contains("Don't call web_search"));
+    antifab(&exhausted);
 
-    let (quota, quota_latch) = classify_search_error(429);
-    assert!(quota.contains("quota is used up") && quota.contains("Don't call web_search"));
-    assert!(quota_latch);
-    antifab(&quota);
-
-    assert!(classify_search_error(503).1, "503 latches");
-
-    // Transient failures don't latch — a later call might succeed.
-    let (down, down_latch) = classify_search_error(502);
-    assert!(!down_latch);
+    let down = search_unavailable("Couldn't search the web (bing: HTTP 503)");
     antifab(&down);
-    assert!(
-        !classify_search_error(500).1,
-        "unknown status doesn't latch"
-    );
 
     // web_fetch failures get the same anti-fabrication steer.
     let f = fetch_failed("https://blocked.example/page", "HTTP 403");

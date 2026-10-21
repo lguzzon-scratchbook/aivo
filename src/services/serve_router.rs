@@ -192,7 +192,7 @@ struct ServeState {
     codex_tokens: Option<Arc<crate::services::codex_oauth::CodexTokenManager>>,
     /// Per-model learned protocol routes (in-memory only — `aivo serve` doesn't
     /// persist routes yet). Replaces the old single per-process pin so a
-    /// multi-model gateway key learns a route per model instead of thrashing
+    /// multi-model key learns a route per model instead of thrashing
     /// one scalar.
     route_cache: Arc<RouteCache>,
     log_store: LogStore,

@@ -805,8 +805,6 @@ pub struct ChatToggles {
     /// Whether the model is asked to think (and its reasoning shown, folded) — the
     /// single thinking on/off concept. Defaults on.
     pub thinking_enabled: bool,
-    /// aivo's hosted web_search (`/config`). Defaults off (opt-in).
-    pub web_search_enabled: bool,
     pub agent_tools_enabled: bool,
     /// Inline transcript image previews (`/config`). Defaults on.
     pub inline_images_enabled: bool,
@@ -857,43 +855,38 @@ impl ChatTheme {
 
 /// Persisted vision-fallback mode (`"visionFallback"` in code-prefs.json). The
 /// describer pair lives under the sibling `"visionFallbackCustom"` key so
-/// flipping the mode away and back doesn't lose it. `Gateway` persists as
-/// `"gateway"` but displays as `aivo` in `/config`.
+/// flipping the mode away and back doesn't lose it. Default `Off`: a fallback
+/// is opt-in, and picking a describer (`custom`) is how it's turned on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VisionFallbackMode {
-    #[default]
-    Gateway,
     Custom,
+    #[default]
     Off,
 }
 
 impl VisionFallbackMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Gateway => "gateway",
             Self::Custom => "custom",
             Self::Off => "off",
         }
     }
 
-    /// Missing/unknown → the default (gateway), so the feature is on out of the box.
+    /// Missing/unknown (including the retired `"gateway"`/`"auto"`) → `Off`.
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "custom" => Self::Custom,
-            "off" => Self::Off,
-            _ => Self::Gateway,
+            _ => Self::Off,
         }
     }
 }
 
 /// Persisted image-generation mode (`"imageGen"` in code-prefs.json). The
 /// generator pair lives under the sibling `"imageGenCustom"` key so flipping
-/// the mode away and back doesn't lose it. `Gateway` persists as `"gateway"`
-/// but displays as `aivo` in `/config`. Default `Off` (unlike vision fallback):
-/// a generation costs orders of magnitude more than a describe.
+/// the mode away and back doesn't lose it. Default `Off`: generation costs
+/// money, so it's opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImageGenMode {
-    Gateway,
     Custom,
     #[default]
     Off,
@@ -902,16 +895,15 @@ pub enum ImageGenMode {
 impl ImageGenMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Gateway => "gateway",
             Self::Custom => "custom",
             Self::Off => "off",
         }
     }
 
-    /// Missing/unknown → the default (off): generation is opt-in either way.
+    /// Missing/unknown (including the retired `"gateway"`/`"aivo"`/`"auto"`)
+    /// → `Off`.
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "gateway" => Self::Gateway,
             "custom" => Self::Custom,
             _ => Self::Off,
         }
@@ -2068,12 +2060,6 @@ impl SessionStore {
     }
 
     /// Persist the web_search toggle, preserving sibling prefs (atomic write).
-    pub async fn set_chat_web_search_enabled(&self, on: bool) -> Result<()> {
-        let mut prefs = self.read_code_prefs().await;
-        prefs.insert("useWebSearch".into(), serde_json::Value::Bool(on));
-        self.write_code_prefs(&prefs).await
-    }
-
     pub async fn set_chat_agent_tools_enabled(&self, on: bool) -> Result<()> {
         let mut prefs = self.read_code_prefs().await;
         prefs.insert("agentTools".into(), serde_json::Value::Bool(on));
@@ -2202,7 +2188,6 @@ impl SessionStore {
             auto_approve: bool_or("autoApprove", false),
             ask_mode: bool_or("askMode", false),
             thinking_enabled,
-            web_search_enabled: bool_or("useWebSearch", false),
             agent_tools_enabled: bool_or("agentTools", true),
             inline_images_enabled: bool_or("inlineImages", true),
             footer_tps_enabled: bool_or("footerTps", true),
@@ -2836,7 +2821,7 @@ mod tests {
         let store = SessionStore::with_path(temp_dir.path().join("config.json"));
 
         let toggles = store.get_chat_toggles().await;
-        assert_eq!(toggles.vision_fallback, VisionFallbackMode::Gateway);
+        assert_eq!(toggles.vision_fallback, VisionFallbackMode::Off);
         assert!(toggles.vision_fallback_custom.is_none());
 
         store
@@ -2862,9 +2847,16 @@ mod tests {
             store.get_chat_toggles().await.vision_fallback,
             VisionFallbackMode::Custom
         );
+        // A retired `"gateway"`/`"auto"` value lands on off, never on a fallback.
         assert_eq!(
-            VisionFallbackMode::parse("bogus"),
-            VisionFallbackMode::Gateway
+            VisionFallbackMode::parse("gateway"),
+            VisionFallbackMode::Off
+        );
+        assert_eq!(VisionFallbackMode::parse("auto"), VisionFallbackMode::Off);
+        assert_eq!(VisionFallbackMode::parse("bogus"), VisionFallbackMode::Off);
+        assert_eq!(
+            VisionFallbackMode::parse("custom"),
+            VisionFallbackMode::Custom
         );
     }
 
@@ -2901,20 +2893,13 @@ mod tests {
         assert_eq!(toggles.image_gen, ImageGenMode::Off);
         assert!(toggles.image_gen_custom.is_some());
 
-        // The hosted mode round-trips and keeps the custom pair for a flip back.
-        store
-            .set_chat_image_gen(ImageGenMode::Gateway, None)
-            .await
-            .unwrap();
-        let toggles = store.get_chat_toggles().await;
-        assert_eq!(toggles.image_gen, ImageGenMode::Gateway);
-        assert!(toggles.image_gen_custom.is_some());
-
-        assert_eq!(ImageGenMode::parse("gateway"), ImageGenMode::Gateway);
-        // Unknown → off (not gateway): generation is opt-in, so a typo must
-        // never silently start spending the hosted quota.
+        // Unknown and retired values → off: generation is opt-in, so a typo
+        // must never silently start spending on images.
+        assert_eq!(ImageGenMode::parse("gateway"), ImageGenMode::Off);
+        assert_eq!(ImageGenMode::parse("auto"), ImageGenMode::Off);
         assert_eq!(ImageGenMode::parse("bogus"), ImageGenMode::Off);
         assert_eq!(ImageGenMode::parse(""), ImageGenMode::Off);
+        assert_eq!(ImageGenMode::parse("custom"), ImageGenMode::Custom);
     }
 
     /// The per-repo project-MCP allow-list round-trips and shares code-prefs.json

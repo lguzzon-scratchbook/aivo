@@ -3,7 +3,6 @@
 use super::super::*;
 use super::helpers::*;
 use crate::services::session_store::VisionFallbackMode;
-use crate::services::vision_describe::DESCRIBE_EXHAUSTED;
 
 fn image_attachment() -> MessageAttachment {
     image_attachment_with("iVBOR".to_string())
@@ -18,24 +17,22 @@ fn image_attachment_with(data: String) -> MessageAttachment {
 }
 
 #[tokio::test]
-async fn exhausted_latch_refuses_with_quota_wording() {
+async fn off_mode_refuses_images_with_config_hint() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.model_image_input = Some(false);
-    app.vision_fallback = VisionFallbackMode::Gateway;
+    app.vision_fallback = VisionFallbackMode::Off;
     app.draft_attachments.push(image_attachment());
 
-    let guard = crate::services::vision_describe::TEST_DESCRIBE_LOCK
-        .lock()
-        .await;
-    DESCRIBE_EXHAUSTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    let dispatched = app.dispatch_user_message("look".to_string(), None).await;
-    DESCRIBE_EXHAUSTED.store(false, std::sync::atomic::Ordering::Relaxed);
-    drop(guard);
-    dispatched.unwrap();
+    app.dispatch_user_message("look".to_string(), None)
+        .await
+        .unwrap();
 
     let msg = notice_text(&app);
-    assert!(msg.contains("quota used up"), "got: {msg}");
+    assert!(
+        msg.contains("can't read images") && msg.contains("Vision fallback"),
+        "got: {msg}"
+    );
     assert!(!app.sending, "nothing went out");
     assert_eq!(app.draft_attachments.len(), 1, "attachment retained");
 }
@@ -286,11 +283,7 @@ async fn config_custom_opens_key_then_model_picker() {
 
     // custom with NO stored pair: opens the picker, mode unchanged.
     app.cycle_config_setting(row, CycleDir::Enter).await;
-    assert_eq!(
-        app.vision_fallback,
-        VisionFallbackMode::Gateway,
-        "unchanged"
-    );
+    assert_eq!(app.vision_fallback, VisionFallbackMode::Off, "unchanged");
     match &app.overlay {
         Overlay::Picker(picker) => assert!(matches!(
             picker.kind,
@@ -312,7 +305,7 @@ async fn config_custom_opens_key_then_model_picker() {
         ),
         other => panic!("expected config overlay, got {}", overlay_name(other)),
     }
-    assert_eq!(app.vision_fallback, VisionFallbackMode::Gateway);
+    assert_eq!(app.vision_fallback, VisionFallbackMode::Off);
 
     // With a stored pair it's a PLAIN selection — no picker.
     app.vision_fallback_custom = Some((zhipu_id, "glm-4.6v".to_string()));
@@ -360,14 +353,14 @@ async fn config_custom_opens_key_then_model_picker() {
         matches!(app.overlay, Overlay::Config(_)),
         "tab must not open the picker"
     );
-    assert_eq!(app.config_segments(ConfigSetting::VisionFallback).active, 2);
+    assert_eq!(app.config_segments(ConfigSetting::VisionFallback).active, 1);
 
     app.vision_fallback = VisionFallbackMode::Custom;
     app.step_config_setting(row, 1).await;
     assert_eq!(app.vision_fallback, VisionFallbackMode::Off);
 }
 
-/// aivo's own gateway rejects `image_url` parts in serde wording.
+/// Strict providers reject `image_url` parts in serde wording.
 #[test]
 fn image_input_rejection_matches_gateway_serde_wording() {
     use super::super::event_loop_impl::is_image_input_rejection;
@@ -651,8 +644,11 @@ async fn config_vision_row_wraps_description_and_advertises_enter() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(text.contains("daily quota"), "aivo help missing:\n{text}");
-    // gateway is live, so Enter cycles rather than re-picking — no drill-in hint.
+    assert!(
+        text.contains("Text-only models refuse images"),
+        "off help missing:\n{text}"
+    );
+    // auto needs no pair, so Enter cycles rather than re-picking — no drill-in hint.
     assert!(!text.contains("pick model"), "stale Enter hint:\n{text}");
 
     app.vision_fallback = VisionFallbackMode::Custom;
@@ -695,7 +691,7 @@ async fn config_reverse_cycle_and_row_wrap() {
     );
     assert!(!app.agent_auto_approve, "mode chord must not fire");
 
-    // gateway wraps back to off, then custom (pair present, so no picker).
+    // off wraps back to custom (pair present, so no picker), then off again.
     let row = match &app.overlay {
         Overlay::Config(state) => state
             .items
@@ -705,9 +701,9 @@ async fn config_reverse_cycle_and_row_wrap() {
         _ => panic!("expected config overlay"),
     };
     app.cycle_config_setting(row, CycleDir::Prev).await;
-    assert_eq!(app.vision_fallback, VisionFallbackMode::Off);
-    app.cycle_config_setting(row, CycleDir::Prev).await;
     assert_eq!(app.vision_fallback, VisionFallbackMode::Custom);
+    app.cycle_config_setting(row, CycleDir::Prev).await;
+    assert_eq!(app.vision_fallback, VisionFallbackMode::Off);
     assert!(matches!(app.overlay, Overlay::Config(_)), "no picker");
 
     if let Overlay::Config(state) = &mut app.overlay {
@@ -987,35 +983,34 @@ async fn image_generator_resolution_requires_custom_mode_and_pair() {
     assert!(app.resolve_image_generator().await.is_none());
 }
 
-/// The row shows `aivo`; the persisted value is "gateway". Routing the label
-/// through `ImageGenMode::parse` would silently select Off.
+/// Image generation is opt-in: it starts off and only turns on through a
+/// picked generator pair, which also arms the `generate_image` tool.
 #[tokio::test]
-async fn config_image_gen_aivo_segment_selects_the_gateway_mode() {
+async fn config_image_gen_starts_off_and_custom_opens_the_picker() {
     use crate::services::session_store::ImageGenMode;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.open_config_overlay_at(ConfigSetting::ImageGen);
-    assert_eq!(app.image_gen, ImageGenMode::Off);
+    assert_eq!(app.image_gen, ImageGenMode::Off, "defaults off");
+    assert!(
+        app.resolve_image_generator().await.is_none(),
+        "the tool is unarmed while off"
+    );
     let row = match &app.overlay {
         Overlay::Config(state) => state.selected,
         other => panic!("expected config overlay, got {}", overlay_name(other)),
     };
 
-    // Off is the last segment; one step forward wraps to `aivo`.
+    // Off is the last segment; one step forward wraps to `custom`, which has no
+    // stored pair yet — it asks for a key and leaves the mode off. (This app has
+    // no keys, so the request surfaces as an inline /config error.)
     app.cycle_config_setting(row, CycleDir::Next).await;
-    assert_eq!(app.image_gen, ImageGenMode::Gateway);
+    assert_eq!(app.image_gen, ImageGenMode::Off, "unchanged");
     assert!(
-        app.resolve_image_generator().await.is_some(),
-        "tool is armed"
+        config_error_text(&app).contains("No key can serve as a generator"),
+        "got: {}",
+        config_error_text(&app)
     );
-    assert!(
-        !app.config_has_drill_in(ConfigSetting::ImageGen),
-        "the hosted mode has no key/model to pick"
-    );
-
-    // Unconfigured `custom` opens the picker and leaves the mode alone.
-    app.cycle_config_setting(row, CycleDir::Next).await;
-    assert_eq!(app.image_gen, ImageGenMode::Gateway);
 }
 
 #[tokio::test]

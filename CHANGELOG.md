@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.50.0
+
+Live session sharing is removed: `aivo share`, `aivo logs share`, the in-session
+`/share` command, and `--share` are gone, along with the tunnel and local viewer
+that published redacted transcripts to a URL. The aivo account and bundled
+starter provider are gone too: `aivo login`/`logout`, account/usage, the
+auto-created `aivo/starter` key, and its `aivo keys add` entry are removed.
+
+Web search, vision fallback, and image generation no longer depend on that
+gateway. Search uses keyless HTML results (Bing, then DuckDuckGo). The `/config`
+web-search toggle is gone (search is always available), and vision fallback and
+image generation now default to `off` — each is turned on by picking a `custom`
+describer/generator on one of your own keys.
+
+- feat!: remove live sharing; stop auto-creating the starter key (da093fc0)
+- feat!: remove the aivo account and bundled starter provider (030cbf3b)
+- feat(code): own-key fallbacks for web search, vision, and image generation
+
 ## v0.49.14
 
 MCP servers now connect at launch instead of lazily on the first tool call, and

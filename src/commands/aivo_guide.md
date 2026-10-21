@@ -194,9 +194,12 @@ Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/
 `Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (default/auto-approve/plan/ask) · `Ctrl+R` resume ·
 `Ctrl+T` cycle thinking (off + effort levels) · `Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
 
-`/config` toggles: Thinking (off + the model's effort levels), Auto-approve tools, aivo web search,
-Agent tools (off = plain chat, no tools). The agent can also change the live model, key/provider, and effort itself when you
-ask (it calls its `switch_model` / `switch_key` / `set_effort` tools); the switch applies from your next message.
+`/config` toggles: Thinking (off + the model's effort levels), Auto-approve tools, Agent tools
+(off = plain chat, no tools), and under Media, Vision fallback and Image generation. Both media
+features are off by default: set one to `custom` to pick the key and model that describes images
+or generates them. The agent can also change the live model, key/provider, and effort itself when
+you ask (it calls its `switch_model` / `switch_key` / `set_effort` tools); the switch applies from
+your next message.
 
 ### Skills & MCP servers — `aivo code skills`, `aivo code mcp`
 
